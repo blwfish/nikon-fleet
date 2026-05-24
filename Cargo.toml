@@ -1,0 +1,27 @@
+[package]
+name = "nikon-fleet"
+version = "0.1.0"
+edition = "2024"
+description = "Fleet-wide settings management for Nikon Z cameras"
+
+[dependencies]
+# CLI parsing — derive-style, very ergonomic
+clap = { version = "4", features = ["derive"] }
+
+# JSON serialization for snapshots
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling. Two crates that play different roles:
+#   anyhow:    great for application code; "any error" with context chaining.
+#   thiserror: great for library code; lets you define your own error enums.
+# We'll mostly use anyhow at the boundary and thiserror in the parser modules.
+anyhow = "1"
+thiserror = "2"
+
+# Timestamps on snapshots
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+
+[dev-dependencies]
+# Nicer assertion output for tests
+pretty_assertions = "1"

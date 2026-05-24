@@ -1,0 +1,5 @@
+/target
+/snapshots
+/references
+*.swp
+.DS_Store
