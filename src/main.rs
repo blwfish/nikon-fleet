@@ -3,14 +3,26 @@
 //! All real logic lives in the `nikon_fleet` library; this file is just
 //! the command-line surface.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use nikon_fleet::diff::{Diff, DiffOptions, diff};
-use nikon_fleet::snapshot::Snapshot;
+use nikon_fleet::maid_layer::MaidLayerConfig;
+use nikon_fleet::sdk::Sdk;
+use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
+
+const DEFAULT_SDK_BUNDLE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/sdk-runtime/TypeCommon Module.bundle/Contents/MacOS/TypeCommon Module"
+);
+
+const DEFAULT_SCHEMA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/sdk-runtime/MaidLayer.config");
 
 /// Top-level CLI parser. `clap` generates --help, completion, validation,
 /// and arg parsing from these derives.
@@ -21,16 +33,26 @@ struct Cli {
     #[arg(long, default_value = ".", global = true)]
     data_dir: PathBuf,
 
+    /// Path to the Nikon SDK bundle's executable. Default points at the
+    /// project-local sdk-runtime/ (set up by scripts/setup-sdk-runtime.sh).
+    #[arg(long, default_value = DEFAULT_SDK_BUNDLE, global = true)]
+    sdk_bundle: PathBuf,
+
+    /// Path to MaidLayer.config used to translate numeric capability codes
+    /// into kNkMAIDCapability_* symbol names.
+    #[arg(long, default_value = DEFAULT_SCHEMA, global = true)]
+    schema: PathBuf,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// List USB-attached cameras (requires SDK wiring; not yet implemented).
+    /// List USB-attached cameras.
     Discover,
 
-    /// Capture current settings from a live camera (not yet implemented).
+    /// Capture current settings from a live camera.
     Snapshot(SnapshotArgs),
 
     /// Manage per-camera reference snapshots.
@@ -40,7 +62,7 @@ enum Cmd {
     /// Diff two snapshot files.
     Diff(DiffArgs),
 
-    /// Diff a live camera against its reference (not yet implemented).
+    /// Diff a live camera against its reference.
     Check(CheckArgs),
 
     /// List stored snapshots.
@@ -292,9 +314,187 @@ fn cmd_ref(data_dir: &Path, sub: &RefCmd) -> Result<()> {
     Ok(())
 }
 
-fn cmd_not_yet(name: &str) -> Result<()> {
-    println!("`fleet {name}` is not wired up yet — needs the Nikon SDK FFI module.");
-    println!("Coming next once a camera is available for testing.");
+// ─────────────────────────────────────────────────────────────────────────
+// Live-camera commands (SDK)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Bit in NkMAIDCapInfo.ulOperations that indicates GetCapability is supported.
+const OP_GET: u32 = 0x0002;
+
+fn open_sdk(bundle_path: &Path) -> Result<Sdk> {
+    if !bundle_path.exists() {
+        bail!(
+            "SDK bundle not found at {}.\n\
+             Run scripts/setup-sdk-runtime.sh first, or pass --sdk-bundle <path>.",
+            bundle_path.display()
+        );
+    }
+    let mut sdk = Sdk::open(bundle_path)
+        .with_context(|| format!("loading SDK from {}", bundle_path.display()))?;
+    sdk.initialize().context("InitializeSDK")?;
+    Ok(sdk)
+}
+
+fn cmd_discover(bundle_path: &Path) -> Result<()> {
+    let sdk = open_sdk(bundle_path)?;
+    let devices = sdk.devices()?;
+    if devices.is_empty() {
+        println!("(no Nikon cameras detected)");
+        return Ok(());
+    }
+    println!("{} device(s):", devices.len());
+    for d in devices {
+        println!(
+            "  id={}  name={:?}  available={}  pid={}  version={:?}",
+            d.id, d.name, d.available, d.connected_pid, d.version
+        );
+    }
+    Ok(())
+}
+
+/// Build a map from numeric capability code → symbolic name for one model.
+/// Takes the union across all firmware versions of that model.
+fn name_map_for_model(schema: &MaidLayerConfig, model: &str) -> HashMap<u32, String> {
+    let mut map = HashMap::new();
+    for section in schema.sections_for_model(model) {
+        for cap in &section.capabilities {
+            map.entry(cap.code).or_insert_with(|| cap.name.clone());
+        }
+    }
+    map
+}
+
+fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &SnapshotArgs) -> Result<()> {
+    let mut sdk = open_sdk(bundle)?;
+    let devices = sdk.devices()?;
+    if devices.is_empty() {
+        bail!("no Nikon cameras detected");
+    }
+    // Pick by --serial if given, else first available, else first.
+    let target = match args.serial.as_deref() {
+        Some(s) => devices.iter().find(|d| d.id.to_string() == s)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no device with id {s}"))?,
+        None => devices.iter().find(|d| d.available).cloned().unwrap_or_else(|| devices[0].clone()),
+    };
+    println!("Connecting to {:?} (id={})…", target.name, target.id);
+
+    let schema = MaidLayerConfig::parse_file(schema_path)
+        .with_context(|| format!("loading schema from {}", schema_path.display()))?;
+    let name_lookup = name_map_for_model(&schema, &target.name);
+    if name_lookup.is_empty() {
+        eprintln!(
+            "warning: no schema entries found for model {:?}; properties will be keyed by numeric id",
+            target.name
+        );
+    }
+
+    let device = sdk.connect(target.id)?;
+    println!("Reading {} capabilities…", device.capabilities.len());
+
+    let captured_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    // Until we find a real serial-via-capability, use the device id.
+    let serial = format!("id-{}", target.id);
+    let mut snap = Snapshot::new(
+        Camera {
+            model: target.name.clone(),
+            serial: serial.clone(),
+            firmware: target.version.clone(),
+        },
+        Transport::Usb,
+        captured_at,
+    );
+    snap.label = args.label.clone();
+
+    let mut read_ok = 0usize;
+    let mut read_err = 0usize;
+    let mut skipped_no_get = 0usize;
+    for cap in &device.capabilities {
+        if cap.operations & OP_GET == 0 {
+            skipped_no_get += 1;
+            continue;
+        }
+        match device.read_capability(cap.id) {
+            Ok(value) => {
+                let name = name_lookup
+                    .get(&cap.id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("cap_{:#x}", cap.id));
+                snap.insert(name, cap.id, value);
+                read_ok += 1;
+            }
+            Err(_) => read_err += 1,
+        }
+    }
+    println!(
+        "  ok={read_ok}  err={read_err}  skipped(no-get-bit)={skipped_no_get}"
+    );
+
+    // Save under snapshots/.
+    let dir = snapshots_dir(data_dir);
+    ensure_dir(&dir)?;
+    let filename = snap.suggested_filename();
+    let path = dir.join(&filename);
+    snap.save_to_file(&path)?;
+    println!("Wrote {}", path.display());
+    Ok(())
+}
+
+fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArgs) -> Result<()> {
+    let mut sdk = open_sdk(bundle)?;
+    let devices = sdk.devices()?;
+    if devices.is_empty() {
+        bail!("no Nikon cameras detected");
+    }
+    let target = match args.serial.as_deref() {
+        Some(s) => devices.iter().find(|d| d.id.to_string() == s)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no device with id {s}"))?,
+        None => devices.iter().find(|d| d.available).cloned().unwrap_or_else(|| devices[0].clone()),
+    };
+
+    // Live snapshot (same logic as cmd_snapshot but in-memory).
+    let schema = MaidLayerConfig::parse_file(schema_path)?;
+    let name_lookup = name_map_for_model(&schema, &target.name);
+    let device = sdk.connect(target.id)?;
+    let serial = format!("id-{}", target.id);
+
+    let mut live = Snapshot::new(
+        Camera {
+            model: target.name.clone(),
+            serial: serial.clone(),
+            firmware: target.version.clone(),
+        },
+        Transport::Usb,
+        OffsetDateTime::now_utc().format(&Rfc3339)?,
+    );
+    live.label = Some("live".into());
+    for cap in &device.capabilities {
+        if cap.operations & OP_GET == 0 {
+            continue;
+        }
+        if let Ok(value) = device.read_capability(cap.id) {
+            let name = name_lookup
+                .get(&cap.id)
+                .cloned()
+                .unwrap_or_else(|| format!("cap_{:#x}", cap.id));
+            live.insert(name, cap.id, value);
+        }
+    }
+
+    // Reference for this body.
+    let ref_path = references_dir(data_dir).join(reference_filename(&target.name, &serial));
+    if !ref_path.exists() {
+        bail!(
+            "no reference for {} {} at {}.\n\
+             Hint: `fleet snapshot` first, then `fleet ref set <snapshot>`.",
+            target.name, serial, ref_path.display()
+        );
+    }
+    let reference = Snapshot::load_from_file(&ref_path)?;
+
+    let d = diff(&reference, &live, &DiffOptions::default())?;
+    print_diff_human(&reference, &live, &d);
     Ok(())
 }
 
@@ -305,9 +505,9 @@ fn cmd_not_yet(name: &str) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
-        Cmd::Discover => cmd_not_yet("discover"),
-        Cmd::Snapshot(_) => cmd_not_yet("snapshot"),
-        Cmd::Check(_) => cmd_not_yet("check"),
+        Cmd::Discover => cmd_discover(&cli.sdk_bundle),
+        Cmd::Snapshot(args) => cmd_snapshot(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args),
+        Cmd::Check(args) => cmd_check(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args),
         Cmd::Diff(args) => cmd_diff(&cli.data_dir, args),
         Cmd::Ls(args) => cmd_ls(&cli.data_dir, args),
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
