@@ -4,3 +4,4 @@
 //! Keeping the logic in `lib.rs` makes it directly testable and reusable.
 
 pub mod maid_layer;
+pub mod range_value;
