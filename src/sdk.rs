@@ -355,10 +355,18 @@ impl Sdk {
 
 impl Drop for Sdk {
     fn drop(&mut self) {
-        if self.initialized {
-            // SAFETY: FreeSDK is the documented cleanup; ignore the result code.
-            let _ = unsafe { (self.free_sdk)() };
-        }
+        // We deliberately do NOT call FreeSDK here. Empirically, doing so
+        // leaves the connected Z 9 in a state where the next process's
+        // InitializeSDK + EnumDevices returns no devices until the camera
+        // is power-cycled or the USB cable replugged. Letting the OS reap
+        // the process (and thus the loaded dylib + USB handles) appears
+        // to be cleaner than the SDK's own teardown.
+        //
+        // If we ever embed Sdk in a long-lived process and need to
+        // re-initialize within one process lifetime, we'll need a real
+        // fix — possibly an explicit DisconnectDevice + a longer settle
+        // before the next Init. Out of scope for the CLI use case.
+        let _ = self.initialized;
     }
 }
 
