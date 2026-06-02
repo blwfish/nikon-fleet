@@ -167,7 +167,8 @@ const DT_RANGE_PTR: u32 = 14;
 const DT_ARRAY_PTR: u32 = 15; // needs GetArray, not GetCapability
 const DT_ENUM_PTR: u32 = 16;
 
-const GET_VALUE: u32 = 0; // eNkSDKGetSettingRequestType
+const GET_VALUE: u32 = 0; // eNkSDKGetSettingRequestType — current index only; p_data = NULL for enums
+const GET_ARRAY: u32 = 1; // eNkSDKGetSettingRequestType — full data; p_data populated for enums
 
 // kNkMAIDCapOperation bits — ulOperations field in NkMAIDCapInfo.
 pub const OP_GET: u32 = 0x0002;
@@ -570,6 +571,11 @@ pub struct Device<'sdk> {
 
 impl<'sdk> Device<'sdk> {
     /// Read the current value of one capability as a JSON value.
+    ///
+    /// Enum capabilities require two SDK calls: GET_VALUE returns the current
+    /// index with p_data = NULL; GET_ARRAY returns the full options list.
+    /// If GET_ARRAY fails (unknown e_type on older firmware, etc.) we fall back
+    /// to the index-only representation already stored in `values: []`.
     pub fn read_capability(&self, capability_id: u32) -> Result<Value, SdkError> {
         let mut data_ptr: *mut c_void = ptr::null_mut();
         let mut data_type: u32 = 0;
@@ -577,9 +583,54 @@ impl<'sdk> Device<'sdk> {
             (self.sdk.get_capability)(capability_id, GET_VALUE, &mut data_ptr, &mut data_type)
         };
         check("GetCapability", code)?;
+
+        if data_type == DT_ENUM_PTR && !data_ptr.is_null() {
+            return Ok(unsafe { self.read_enum_capability(capability_id, data_ptr) });
+        }
+
         let value = unsafe { decode_value(data_ptr, data_type) };
         unsafe { free_cap_value(data_ptr, data_type) };
         Ok(value)
+    }
+
+    /// Two-call enum read: GET_VALUE for the current index, GET_ARRAY for the
+    /// options list. Frees val_ptr before returning.
+    unsafe fn read_enum_capability(&self, capability_id: u32, val_ptr: *mut c_void) -> Value {
+        // Snapshot the index fields before freeing.
+        let st = unsafe { &*(val_ptr as *const NkMAIDEnum) };
+        let value_idx   = st.ul_value;
+        let default_idx = st.ul_default;
+        let elem_count  = st.ul_elements;
+        let elem_type   = st.ul_type;
+        let elem_bytes  = st.w_physical_bytes;
+        unsafe { free_cap_value(val_ptr, DT_ENUM_PTR) };
+
+        // Second call — retrieve the full options array.
+        let mut arr_ptr: *mut c_void = ptr::null_mut();
+        let mut arr_type: u32 = 0;
+        let arr_ok = unsafe {
+            (self.sdk.get_capability)(capability_id, GET_ARRAY, &mut arr_ptr, &mut arr_type)
+        } >= 0;
+
+        let (values, effective_bytes) = if arr_ok && arr_type == DT_ENUM_PTR && !arr_ptr.is_null() {
+            let arr_st = unsafe { &*(arr_ptr as *const NkMAIDEnum) };
+            let v = decode_enum_values(arr_st);
+            let b = arr_st.w_physical_bytes;
+            unsafe { free_cap_value(arr_ptr, DT_ENUM_PTR) };
+            (v, b)
+        } else {
+            if !arr_ptr.is_null() { unsafe { free_cap_value(arr_ptr, arr_type) }; }
+            (Value::Array(vec![]), elem_bytes)
+        };
+
+        json!({
+            "value_index":   value_idx,
+            "default_index": default_idx,
+            "elem_count":    elem_count,
+            "elem_type":     elem_type,
+            "elem_bytes":    effective_bytes,
+            "values":        values,
+        })
     }
 
     /// Write a capability value back to the camera.
