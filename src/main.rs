@@ -63,7 +63,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// List USB-attached cameras.
-    Discover,
+    Discover(DiscoverArgs),
 
     /// Capture current settings from a live camera.
     Snapshot(SnapshotArgs),
@@ -86,6 +86,13 @@ enum Cmd {
 
     /// Restore settings from a snapshot to a live camera.
     Restore(RestoreArgs),
+}
+
+#[derive(Args, Debug)]
+struct DiscoverArgs {
+    /// Output camera list as JSON (for GUI / scripting).
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -370,19 +377,31 @@ fn open_sdk(bundle_path: &Path) -> Result<Sdk> {
     Ok(sdk)
 }
 
-fn cmd_discover(bundle_path: &Path) -> Result<()> {
+fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs) -> Result<()> {
     let sdk = open_sdk(bundle_path)?;
-    let devices = sdk.devices()?;
-    if devices.is_empty() {
-        println!("(no Nikon cameras detected)");
+    let enriched = enrich_devices(sdk.devices()?);
+    if enriched.is_empty() {
+        if args.json {
+            println!("{{\"cameras\":[]}}");
+        } else {
+            println!("(no Nikon cameras detected)");
+        }
         return Ok(());
     }
-    println!("{} device(s):", devices.len());
-    for d in devices {
-        println!(
-            "  id={}  name={:?}  available={}  pid={}  version={:?}",
-            d.id, d.name, d.available, d.connected_pid, d.version
-        );
+    if args.json {
+        let cameras: Vec<serde_json::Value> = enriched.iter().map(|(dev, usb)| {
+            let serial   = usb.as_ref().map(|u| u.serial.as_str()).unwrap_or("").to_string();
+            let firmware = usb.as_ref().map(|u| u.firmware.as_str()).unwrap_or(dev.version.as_str()).to_string();
+            serde_json::json!({ "model": dev.name, "serial": serial, "firmware": firmware })
+        }).collect();
+        println!("{}", serde_json::json!({ "cameras": cameras }));
+    } else {
+        println!("{} device(s):", enriched.len());
+        for (dev, usb) in &enriched {
+            let serial   = usb.as_ref().map(|u| u.serial.as_str()).unwrap_or("?");
+            let firmware = usb.as_ref().map(|u| u.firmware.as_str()).unwrap_or(dev.version.as_str());
+            println!("  {}  serial={}  fw={}  id={}", dev.name, serial, firmware, dev.id);
+        }
     }
     Ok(())
 }
@@ -633,7 +652,7 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs) -> Result<()>
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
-        Cmd::Discover => cmd_discover(&cli.sdk_bundle),
+        Cmd::Discover(a) => cmd_discover(&cli.sdk_bundle, a),
         Cmd::Snapshot(args) => cmd_snapshot(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args),
         Cmd::Check(args) => cmd_check(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args),
         Cmd::Diff(args) => cmd_diff(&cli.data_dir, args),

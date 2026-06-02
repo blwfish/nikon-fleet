@@ -7,3 +7,5 @@
 
 # GUI
 /gui/target
+/gui/__pycache__
+/gui/*.pyc
