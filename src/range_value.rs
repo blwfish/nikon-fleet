@@ -344,4 +344,17 @@ mod tests {
         assert_eq!(t, "range");
         assert_eq!(b, "1,32767,32767");
     }
+
+    #[test]
+    fn split_name_code_hyphen_in_name() {
+        assert_eq!(
+            split_name_code("kNkMAIDCapability_Some-Name-33285").unwrap(),
+            ("kNkMAIDCapability_Some-Name".to_string(), 33285u32)
+        );
+    }
+
+    #[test]
+    fn split_name_code_no_dash_is_err() {
+        assert!(split_name_code("kNkMAIDCapability_NoDash").is_err());
+    }
 }

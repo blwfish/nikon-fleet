@@ -38,6 +38,7 @@
 //! hardcode any user path. See `scripts/setup-sdk-runtime.sh` for the
 //! recommended layout (sdk-runtime/ at the project root).
 
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -309,7 +310,11 @@ pub fn usb_camera_list() -> Vec<UsbCameraInfo> {
         let serial = read_usb_string(&handle, desc.serial_number_string_index().unwrap_or(0));
         let product = read_usb_string(&handle, desc.product_string_index().unwrap_or(0));
         let v = desc.device_version();
-        let firmware = format!("{}.{:02}", v.0, u32::from(v.1) * 10 + u32::from(v.2));
+        // rusb splits bcdDevice into (high_byte, upper_nibble, lower_nibble).
+        // Reconstruct the raw BCD u16 so bcd_decode_version handles both
+        // single- and two-digit majors correctly.
+        let raw_bcd: u16 = (v.0 as u16) << 8 | (v.1 as u16) << 4 | (v.2 as u16);
+        let firmware = bcd_decode_version(raw_bcd);
         out.push(UsbCameraInfo {
             product_id: desc.product_id(),
             serial,
@@ -318,6 +323,29 @@ pub fn usb_camera_list() -> Vec<UsbCameraInfo> {
         });
     }
     out
+}
+
+/// Pair SDK devices to USB camera info by model + position within same-model group.
+///
+/// Both the SDK and the OS USB stack enumerate in the same physical order, so
+/// the nth "Z 9" in `devices` corresponds to the nth "Z 9" in `usb`. Returns
+/// `None` for the USB slot when there are more SDK devices of a model than USB
+/// entries (shouldn't happen in practice, but pins the fallback).
+pub fn pair_devices(
+    devices: Vec<DeviceInfo>,
+    usb: &[UsbCameraInfo],
+) -> Vec<(DeviceInfo, Option<UsbCameraInfo>)> {
+    let mut model_idx: HashMap<String, usize> = HashMap::new();
+    devices.into_iter().map(|dev| {
+        let idx = {
+            let c = model_idx.entry(dev.name.clone()).or_insert(0);
+            let i = *c;
+            *c += 1;
+            i
+        };
+        let usb_info = usb.iter().filter(|u| u.model == dev.name).nth(idx).cloned();
+        (dev, usb_info)
+    }).collect()
 }
 
 /// Reset all connected Nikon USB cameras via a USB port reset.
@@ -688,22 +716,47 @@ fn decode_enum_values(st: &NkMAIDEnum) -> Value {
             let s = unsafe { std::slice::from_raw_parts(st.p_data as *const i32, n) };
             Value::Array(s.iter().map(|&v| json!(v)).collect())
         }
-        (7, _) => { // PackedString — scan for n null-terminated strings
-            let raw = unsafe {
-                // Conservative bound: each string is at most 256 bytes
-                std::slice::from_raw_parts(st.p_data as *const u8, n * 256)
-            };
+        (7, bytes) if bytes > 0 => {
+            // For PackedString, w_physical_bytes is the per-element stride:
+            // each string occupies exactly `bytes` bytes in the SDK allocation.
+            let total = n * bytes;
+            let raw = unsafe { std::slice::from_raw_parts(st.p_data as *const u8, total) };
             let mut out = Vec::with_capacity(n);
-            let mut pos = 0;
-            while out.len() < n && pos < raw.len() {
-                let end = raw[pos..].iter().position(|&b| b == 0).map(|i| pos + i).unwrap_or(raw.len());
-                out.push(json!(String::from_utf8_lossy(&raw[pos..end]).into_owned()));
-                pos = end + 1;
+            for chunk in raw.chunks(bytes).take(n) {
+                let end = chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len());
+                out.push(json!(String::from_utf8_lossy(&chunk[..end]).into_owned()));
             }
             Value::Array(out)
         }
         _ => Value::Null, // unsupported element type — index still stored
     }
+}
+
+/// Build an NkMAIDEnum from the JSON that `decode_value` produced for DT_ENUM_PTR.
+/// Returns `Err(InvalidValue)` if `value_index` is absent or not numeric.
+fn enum_write_data(value: &Value) -> Result<NkMAIDEnum, SdkError> {
+    Ok(NkMAIDEnum {
+        ul_type: value["elem_type"].as_u64().unwrap_or(2) as u32,
+        ul_elements: value["elem_count"].as_u64().unwrap_or(0) as u32,
+        ul_value: value["value_index"].as_u64().ok_or(SdkError::InvalidValue)? as u32,
+        ul_default: value["default_index"].as_u64().unwrap_or(0) as u32,
+        w_physical_bytes: value["elem_bytes"].as_i64().unwrap_or(4) as i16,
+        p_data: ptr::null_mut(), // SDK does not need the array for Set
+    })
+}
+
+/// Build an NkMAIDRange from the JSON that `decode_value` produced for DT_RANGE_PTR.
+/// Returns `Err(InvalidValue)` if `value` is absent or not numeric.
+fn range_write_data(value: &Value) -> Result<NkMAIDRange, SdkError> {
+    Ok(NkMAIDRange {
+        lf_value: value["value"].as_f64().ok_or(SdkError::InvalidValue)?,
+        lf_default: value["default"].as_f64().unwrap_or(0.0),
+        ul_value_index: value["value_index"].as_u64().unwrap_or(0) as u32,
+        ul_default_index: value["default_index"].as_u64().unwrap_or(0) as u32,
+        lf_lower: value["lower"].as_f64().unwrap_or(0.0),
+        lf_upper: value["upper"].as_f64().unwrap_or(0.0),
+        ul_steps: value["steps"].as_u64().unwrap_or(0) as u32,
+    })
 }
 
 /// Marshal a JSON value back to the camera via SetCapability.
@@ -752,35 +805,188 @@ unsafe fn write_cap_value(
             })
         }
         CAP_TYPE_ENUM => {
-            // value must contain the fields decode_value stored for DT_ENUM_PTR
-            let vi = value["value_index"].as_u64().ok_or(SdkError::InvalidValue)? as u32;
-            let st = NkMAIDEnum {
-                ul_type: value["elem_type"].as_u64().unwrap_or(2) as u32,
-                ul_elements: value["elem_count"].as_u64().unwrap_or(0) as u32,
-                ul_value: vi,
-                ul_default: value["default_index"].as_u64().unwrap_or(0) as u32,
-                w_physical_bytes: value["elem_bytes"].as_i64().unwrap_or(4) as i16,
-                p_data: ptr::null_mut(), // SDK does not need the array for Set
-            };
+            let st = enum_write_data(value)?;
             check("SetCapability", unsafe {
                 (sdk.set_capability)(capability_id, &st as *const _ as *const c_void, DT_ENUM_PTR)
             })
         }
         CAP_TYPE_RANGE => {
-            // value must contain the fields decode_value stored for DT_RANGE_PTR
-            let st = NkMAIDRange {
-                lf_value: value["value"].as_f64().ok_or(SdkError::InvalidValue)?,
-                lf_default: value["default"].as_f64().unwrap_or(0.0),
-                ul_value_index: value["value_index"].as_u64().unwrap_or(0) as u32,
-                ul_default_index: value["default_index"].as_u64().unwrap_or(0) as u32,
-                lf_lower: value["lower"].as_f64().unwrap_or(0.0),
-                lf_upper: value["upper"].as_f64().unwrap_or(0.0),
-                ul_steps: value["steps"].as_u64().unwrap_or(0) as u32,
-            };
+            let st = range_write_data(value)?;
             check("SetCapability", unsafe {
                 (sdk.set_capability)(capability_id, &st as *const _ as *const c_void, DT_RANGE_PTR)
             })
         }
         other => Err(SdkError::UnsupportedWrite(other)),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── bcd_decode_version ───────────────────────────────────────────────
+
+    #[test]
+    fn bcd_decode_doc_examples() {
+        assert_eq!(bcd_decode_version(0x0531), "5.31");
+        assert_eq!(bcd_decode_version(0x0143), "1.43");
+        assert_eq!(bcd_decode_version(0x0200), "2.00");
+    }
+
+    #[test]
+    fn bcd_decode_two_digit_major() {
+        // The inline rusb formula (v.0 as integer) gives "16.00" for 0x1000;
+        // BCD decoding gives "10.00". This is the divergence point.
+        assert_eq!(bcd_decode_version(0x1000), "10.00");
+        assert_eq!(bcd_decode_version(0x1231), "12.31");
+    }
+
+    #[test]
+    fn bcd_decode_single_digit_boundary() {
+        assert_eq!(bcd_decode_version(0x0900), "9.00"); // last single-digit major
+        assert_eq!(bcd_decode_version(0x0000), "0.00");
+    }
+
+    // ── pair_devices ─────────────────────────────────────────────────────
+
+    fn dev(id: u32, name: &str) -> DeviceInfo {
+        DeviceInfo { id, name: name.into(), available: true, connected_pid: 0, version: String::new() }
+    }
+    fn usb(model: &str, serial: &str) -> UsbCameraInfo {
+        UsbCameraInfo { product_id: 0, serial: serial.into(), firmware: String::new(), model: model.into() }
+    }
+
+    #[test]
+    fn pair_single_device() {
+        let pairs = pair_devices(vec![dev(1, "Z 9")], &[usb("Z 9", "SER001")]);
+        assert_eq!(pairs[0].1.as_ref().unwrap().serial, "SER001");
+    }
+
+    #[test]
+    fn pair_two_same_model_preserves_order() {
+        let pairs = pair_devices(
+            vec![dev(1, "Z 9"), dev(2, "Z 9")],
+            &[usb("Z 9", "FIRST"), usb("Z 9", "SECOND")],
+        );
+        assert_eq!(pairs[0].1.as_ref().unwrap().serial, "FIRST");
+        assert_eq!(pairs[1].1.as_ref().unwrap().serial, "SECOND");
+    }
+
+    #[test]
+    fn pair_more_sdk_than_usb_gives_none() {
+        let pairs = pair_devices(
+            vec![dev(1, "Z 9"), dev(2, "Z 9")],
+            &[usb("Z 9", "ONLY")],
+        );
+        assert_eq!(pairs[0].1.as_ref().unwrap().serial, "ONLY");
+        assert!(pairs[1].1.is_none());
+    }
+
+    #[test]
+    fn pair_mixed_models_interleaved() {
+        // SDK list: Z9, Z6III, Z9 — USB list has all three; Z9s must not cross-contaminate.
+        let pairs = pair_devices(
+            vec![dev(1, "Z 9"), dev(2, "Z 6III"), dev(3, "Z 9")],
+            &[usb("Z 9", "Z9_A"), usb("Z 6III", "Z6_A"), usb("Z 9", "Z9_B")],
+        );
+        assert_eq!(pairs[0].1.as_ref().unwrap().serial, "Z9_A");
+        assert_eq!(pairs[1].1.as_ref().unwrap().serial, "Z6_A");
+        assert_eq!(pairs[2].1.as_ref().unwrap().serial, "Z9_B");
+    }
+
+    #[test]
+    fn pair_no_usb_gives_all_none() {
+        let pairs = pair_devices(vec![dev(1, "Z 9")], &[]);
+        assert!(pairs[0].1.is_none());
+    }
+
+    // ── enum_write_data ───────────────────────────────────────────────────
+
+    #[test]
+    fn enum_write_missing_value_index_is_invalid() {
+        let v = json!({"elem_type": 2, "elem_count": 5, "elem_bytes": 4});
+        assert!(matches!(enum_write_data(&v), Err(SdkError::InvalidValue)));
+    }
+
+    #[test]
+    fn enum_write_null_value_index_is_invalid() {
+        let v = json!({"value_index": null, "elem_type": 2, "elem_count": 5, "elem_bytes": 4});
+        assert!(matches!(enum_write_data(&v), Err(SdkError::InvalidValue)));
+    }
+
+    #[test]
+    fn enum_write_extracts_all_fields() {
+        let v = json!({
+            "value_index": 3u64,
+            "default_index": 1u64,
+            "elem_count": 7u64,
+            "elem_type": 2u64,
+            "elem_bytes": 4i64,
+            "values": [0, 1, 2, 3, 4, 5, 6],
+        });
+        let st = enum_write_data(&v).unwrap();
+        assert_eq!(st.ul_value, 3);
+        assert_eq!(st.ul_default, 1);
+        assert_eq!(st.ul_elements, 7);
+        assert_eq!(st.ul_type, 2);
+        assert_eq!(st.w_physical_bytes, 4);
+        assert!(st.p_data.is_null()); // never passed to Set
+    }
+
+    #[test]
+    fn enum_write_missing_optional_fields_use_defaults() {
+        // Only value_index is required; everything else has a fallback.
+        let v = json!({"value_index": 0u64});
+        let st = enum_write_data(&v).unwrap();
+        assert_eq!(st.ul_value, 0);
+        assert_eq!(st.ul_type, 2);   // default elem_type
+        assert_eq!(st.w_physical_bytes, 4); // default elem_bytes
+    }
+
+    // ── range_write_data ──────────────────────────────────────────────────
+
+    #[test]
+    fn range_write_missing_value_is_invalid() {
+        let v = json!({"lower": 1.0, "upper": 10.0, "steps": 0u64});
+        assert!(matches!(range_write_data(&v), Err(SdkError::InvalidValue)));
+    }
+
+    #[test]
+    fn range_write_null_value_is_invalid() {
+        let v = json!({"value": null, "lower": 1.0, "upper": 10.0});
+        assert!(matches!(range_write_data(&v), Err(SdkError::InvalidValue)));
+    }
+
+    #[test]
+    fn range_write_extracts_all_fields() {
+        let v = json!({
+            "value": 3.5f64,
+            "default": 0.0f64,
+            "value_index": 7u64,
+            "default_index": 0u64,
+            "lower": 1.0f64,
+            "upper": 10.0f64,
+            "steps": 20u64,
+        });
+        let st = range_write_data(&v).unwrap();
+        assert_eq!(st.lf_value, 3.5);
+        assert_eq!(st.ul_value_index, 7);
+        assert_eq!(st.ul_steps, 20);
+        assert_eq!(st.lf_lower, 1.0);
+        assert_eq!(st.lf_upper, 10.0);
+    }
+
+    #[test]
+    fn range_write_missing_optional_fields_use_defaults() {
+        let v = json!({"value": 5.0f64});
+        let st = range_write_data(&v).unwrap();
+        assert_eq!(st.lf_value, 5.0);
+        assert_eq!(st.lf_default, 0.0);
+        assert_eq!(st.ul_steps, 0);
     }
 }

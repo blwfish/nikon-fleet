@@ -468,4 +468,24 @@ mod tests {
             ("kNkMAIDCapability_Aperture".to_string(), 33285u32)
         );
     }
+
+    #[test]
+    fn split_name_code_hyphen_in_name() {
+        // rfind ensures the LAST '-' is the code separator, so hyphens
+        // within the capability name are preserved.
+        assert_eq!(
+            split_name_code("kNkMAIDCapability_Some-Name-33285").unwrap(),
+            ("kNkMAIDCapability_Some-Name".to_string(), 33285u32)
+        );
+    }
+
+    #[test]
+    fn split_name_code_no_dash_is_err() {
+        assert!(split_name_code("kNkMAIDCapability_NoDash").is_err());
+    }
+
+    #[test]
+    fn split_name_code_non_numeric_code_is_err() {
+        assert!(split_name_code("kNkMAIDCapability_Foo-BAR").is_err());
+    }
 }

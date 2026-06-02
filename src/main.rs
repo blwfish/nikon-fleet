@@ -14,7 +14,7 @@ use time::format_description::well_known::Rfc3339;
 
 use nikon_fleet::diff::{Diff, DiffOptions, diff};
 use nikon_fleet::maid_layer::MaidLayerConfig;
-use nikon_fleet::sdk::{CapabilityInfo, DeviceInfo, Sdk, SdkError, UsbCameraInfo, usb_camera_list, OP_GET, OP_SET};
+use nikon_fleet::sdk::{CapabilityInfo, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET, OP_SET};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 
 const DEFAULT_SDK_BUNDLE: &str = concat!(
@@ -164,24 +164,8 @@ fn reference_filename(model: &str, serial: &str) -> String {
 // USB enrichment
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Pair each SDK device with its USB descriptor info (serial, firmware).
-///
-/// Matching is by model name + position within same-model group. Both the
-/// SDK and the OS USB stack enumerate in the same physical order, so the
-/// nth Z 9 in the SDK list corresponds to the nth Z 9 in the USB list.
 fn enrich_devices(devices: Vec<DeviceInfo>) -> Vec<(DeviceInfo, Option<UsbCameraInfo>)> {
-    let usb = usb_camera_list();
-    let mut model_idx: HashMap<String, usize> = HashMap::new();
-    devices.into_iter().map(|dev| {
-        let idx = {
-            let c = model_idx.entry(dev.name.clone()).or_insert(0);
-            let i = *c;
-            *c += 1;
-            i
-        };
-        let usb_info = usb.iter().filter(|u| u.model == dev.name).nth(idx).cloned();
-        (dev, usb_info)
-    }).collect()
+    pair_devices(devices, &usb_camera_list())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
