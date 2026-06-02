@@ -50,18 +50,28 @@ use thiserror::Error;
 const NIKON_VID: u16 = 0x04B0;
 
 // ─────────────────────────────────────────────────────────────────────────
-// CoreFoundation run loop — delivers pending IOKit notifications.
+// CoreFoundation run loop — delivers pending IOKit notifications (macOS only).
+//
+// On Windows the SDK's DLL does not use IOKit; EnumDevices returns connected
+// cameras without needing a run-loop pump.
 // ─────────────────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: u8) -> i32;
     static kCFRunLoopDefaultMode: *const c_void;
 }
 
+#[cfg(target_os = "macos")]
 fn pump_cf_runloop(duration: std::time::Duration) {
     // returnAfterSourceHandled=0: process all pending events, not just the first.
     unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, duration.as_secs_f64(), 0); }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pump_cf_runloop(_duration: std::time::Duration) {
+    // No-op: Windows does not need a run-loop pump between EnumDevices retries.
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -348,12 +358,16 @@ pub fn pair_devices(
     }).collect()
 }
 
-/// Reset all connected Nikon USB cameras via a USB port reset.
+/// Reset all connected Nikon USB cameras via a USB port reset (macOS only).
 ///
-/// This forces a disconnect/reconnect cycle, making the camera appear as a
-/// "new" device to IOKit's matching notification system. Call immediately
-/// before `InitializeSDK` so the SDK's notification is registered before the
-/// camera completes its reconnection.
+/// On macOS the SDK registers an IOKit matching notification during
+/// `InitializeSDK` that only fires for devices appearing *after* registration.
+/// Resetting the cameras just before `InitializeSDK` forces a reconnect event,
+/// making already-connected cameras visible to the SDK.
+///
+/// On Windows the SDK's `EnumDevices` sees already-connected cameras without
+/// any reset, so this is a no-op there.
+#[cfg(target_os = "macos")]
 fn reset_nikon_usb_cameras() -> usize {
     let mut count = 0;
     for device in nikon_usb_devices() {
@@ -365,6 +379,9 @@ fn reset_nikon_usb_cameras() -> usize {
     }
     count
 }
+
+#[cfg(not(target_os = "macos"))]
+fn reset_nikon_usb_cameras() -> usize { 0 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Sdk — the loaded library + initialized session.

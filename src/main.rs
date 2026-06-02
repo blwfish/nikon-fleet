@@ -17,10 +17,23 @@ use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::sdk::{CapabilityInfo, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET, OP_SET};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 
+#[cfg(target_os = "macos")]
 const DEFAULT_SDK_BUNDLE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/sdk-runtime/TypeCommon Module.bundle/Contents/MacOS/TypeCommon Module"
 );
+
+// On Windows, ControlServiceLayer.dll is the entry point. The other DLLs
+// (NkdPTP.dll, NkRoyalmile.dll, dnssd.dll) must sit alongside it so Windows
+// can find them when ControlServiceLayer loads them.
+#[cfg(target_os = "windows")]
+const DEFAULT_SDK_BUNDLE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/sdk-runtime/ControlServiceLayer.dll"
+);
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const DEFAULT_SDK_BUNDLE: &str = "";
 
 const DEFAULT_SCHEMA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/sdk-runtime/MaidLayer.config");
 
