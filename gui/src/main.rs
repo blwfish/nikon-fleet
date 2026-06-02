@@ -6,6 +6,7 @@ use eframe::egui;
 use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::sdk::{Sdk, OP_GET, pair_devices, usb_camera_list};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -29,9 +30,51 @@ const SCHEMA_PATH: &str = concat!(
     "/../sdk-runtime/MaidLayer.config"
 );
 
-// ── App data directory ────────────────────────────────────────────────────
+// ── Settings ──────────────────────────────────────────────────────────────
+//
+// Persisted at dirs::config_dir()/net.blw.fleet/settings.json.
+// The data_dir field overrides where snapshots/references are stored.
 
-fn app_data_dir() -> PathBuf {
+#[derive(Serialize, Deserialize, Default)]
+struct Settings {
+    data_dir: Option<String>,
+}
+
+impl Settings {
+    fn load() -> Self {
+        std::fs::read_to_string(settings_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        let path = settings_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    fn effective_data_dir(&self) -> PathBuf {
+        self.data_dir
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(default_data_dir)
+    }
+}
+
+fn settings_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("net.blw.fleet")
+        .join("settings.json")
+}
+
+fn default_data_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("net.blw.fleet")
@@ -44,6 +87,7 @@ enum Cmd {
     Snapshot { serial: String, label: String },
     ListSnapshots { serial: String },
     SetReference { filename: String },
+    SetDataDir(PathBuf),
 }
 
 enum Evt {
@@ -80,14 +124,23 @@ struct FleetApp {
     label: String,
     status: String,
     busy: bool,
+    // Preferences
+    settings: Settings,
+    prefs_open: bool,
+    prefs_data_dir: String, // edit buffer for the prefs window
 }
 
 impl FleetApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let settings = Settings::load();
+        let data_dir = settings.effective_data_dir();
+        let prefs_data_dir = data_dir.to_string_lossy().into_owned();
+
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = mpsc::channel();
         let ctx = cc.egui_ctx.clone();
-        std::thread::spawn(move || worker(cmd_rx, evt_tx, ctx));
+        std::thread::spawn(move || worker(cmd_rx, evt_tx, ctx, data_dir));
+
         Self {
             cmd_tx,
             evt_rx,
@@ -97,6 +150,9 @@ impl FleetApp {
             label: String::new(),
             status: "Click Discover to find cameras.".into(),
             busy: false,
+            settings,
+            prefs_open: false,
+            prefs_data_dir,
         }
     }
 
@@ -155,6 +211,9 @@ impl eframe::App for FleetApp {
                         self.send(Cmd::Discover);
                     }
                 });
+                if ui.button("⚙ Preferences").clicked() {
+                    self.prefs_open = !self.prefs_open;
+                }
                 ui.separator();
                 if self.busy {
                     ui.spinner();
@@ -165,8 +224,76 @@ impl eframe::App for FleetApp {
             });
         });
 
-        // Collect camera selection intent — applied after the closure
-        // so we can mutably borrow self.
+        // ── Preferences window ───────────────────────────────────────────
+        let mut prefs_open = self.prefs_open;
+        let mut save_prefs = false;
+        let mut cancel_prefs = false;
+
+        egui::Window::new("Preferences")
+            .open(&mut prefs_open)
+            .resizable(false)
+            .collapsible(false)
+            .min_width(480.0)
+            .show(ctx, |ui| {
+                ui.label("Data directory — snapshots and references are stored here:");
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.prefs_data_dir)
+                            .desired_width(380.0),
+                    );
+                    if ui.button("Browse…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.prefs_data_dir = path.to_string_lossy().into_owned();
+                        }
+                    }
+                });
+
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Default: {}",
+                        default_data_dir().display()
+                    ))
+                    .small()
+                    .weak(),
+                );
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save_prefs = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_prefs = true;
+                    }
+                });
+            });
+
+        if save_prefs {
+            let trimmed = self.prefs_data_dir.trim().to_string();
+            self.settings.data_dir = (!trimmed.is_empty()).then(|| trimmed);
+            self.settings.save();
+            let effective = self.settings.effective_data_dir();
+            self.prefs_data_dir = effective.to_string_lossy().into_owned();
+            // No need to mark busy — SetDataDir produces no reply event.
+            let _ = self.cmd_tx.send(Cmd::SetDataDir(effective.clone()));
+            if let Some(i) = self.selected {
+                let serial = self.cameras[i].serial.clone();
+                self.send(Cmd::ListSnapshots { serial });
+            }
+            self.status = format!("Data dir: {}", effective.display());
+            prefs_open = false;
+        }
+        if cancel_prefs {
+            // Restore the edit buffer to whatever is currently saved.
+            self.prefs_data_dir = self.settings.effective_data_dir().to_string_lossy().into_owned();
+            prefs_open = false;
+        }
+        self.prefs_open = prefs_open;
+
+        // ── Camera sidebar ───────────────────────────────────────────────
         let mut cam_select: Option<usize> = None;
         egui::SidePanel::left("cameras").min_width(180.0).show(ctx, |ui| {
             ui.heading("Cameras");
@@ -187,7 +314,7 @@ impl eframe::App for FleetApp {
             self.send(Cmd::ListSnapshots { serial });
         }
 
-        // Collect actions from main panel — applied after the closure.
+        // ── Main panel ───────────────────────────────────────────────────
         let mut snap_trigger = false;
         let mut ref_action: Option<String> = None;
 
@@ -223,7 +350,6 @@ impl eframe::App for FleetApp {
             });
             ui.separator();
 
-            // Snapshot list — clone to avoid borrow conflict with self.send below.
             let snaps = self.snapshots.clone();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for snap in &snaps {
@@ -263,17 +389,30 @@ impl eframe::App for FleetApp {
 
 // ── Worker thread ─────────────────────────────────────────────────────────
 
-fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Evt>, ctx: egui::Context) {
-    let data_dir = app_data_dir();
+fn worker(
+    rx: mpsc::Receiver<Cmd>,
+    tx: mpsc::Sender<Evt>,
+    ctx: egui::Context,
+    initial_data_dir: PathBuf,
+) {
+    let mut data_dir = initial_data_dir;
     for cmd in rx {
-        let evt = match cmd {
-            Cmd::Discover => do_discover(),
-            Cmd::Snapshot { serial, label } => do_snapshot(&data_dir, &serial, &label),
-            Cmd::ListSnapshots { serial } => Ok(Evt::Snapshots(list_snapshots(&data_dir, &serial))),
-            Cmd::SetReference { filename } => set_reference(&data_dir, &filename),
+        let opt_evt: Option<Result<Evt, String>> = match cmd {
+            Cmd::SetDataDir(dir) => {
+                data_dir = dir;
+                None
+            }
+            Cmd::Discover => Some(do_discover()),
+            Cmd::Snapshot { serial, label } => Some(do_snapshot(&data_dir, &serial, &label)),
+            Cmd::ListSnapshots { serial } => {
+                Some(Ok(Evt::Snapshots(list_snapshots(&data_dir, &serial))))
+            }
+            Cmd::SetReference { filename } => Some(set_reference(&data_dir, &filename)),
         };
-        let _ = tx.send(evt.unwrap_or_else(Evt::Err));
-        ctx.request_repaint();
+        if let Some(result) = opt_evt {
+            let _ = tx.send(result.unwrap_or_else(Evt::Err));
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -307,11 +446,10 @@ fn do_discover() -> Result<Evt, String> {
 }
 
 fn do_snapshot(data_dir: &Path, serial: &str, label: &str) -> Result<Evt, String> {
-    let sdk_path = Path::new(SDK_PATH);
     let schema = MaidLayerConfig::parse_file(Path::new(SCHEMA_PATH))
         .map_err(|e| e.to_string())?;
 
-    let mut sdk = Sdk::open(sdk_path).map_err(|e| e.to_string())?;
+    let mut sdk = Sdk::open(Path::new(SDK_PATH)).map_err(|e| e.to_string())?;
     sdk.initialize().map_err(|e| e.to_string())?;
     let devices = sdk.devices().map_err(|e| e.to_string())?;
     let usb = usb_camera_list();
