@@ -14,7 +14,7 @@ use time::format_description::well_known::Rfc3339;
 
 use nikon_fleet::diff::{Diff, DiffOptions, diff};
 use nikon_fleet::maid_layer::MaidLayerConfig;
-use nikon_fleet::sdk::Sdk;
+use nikon_fleet::sdk::{DeviceInfo, Sdk, UsbCameraInfo, usb_camera_list};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 
 const DEFAULT_SDK_BUNDLE: &str = concat!(
@@ -143,6 +143,30 @@ fn ensure_dir(p: &Path) -> Result<()> {
 fn reference_filename(model: &str, serial: &str) -> String {
     let model = model.replace(' ', "_");
     format!("{model}_{serial}.json")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// USB enrichment
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Pair each SDK device with its USB descriptor info (serial, firmware).
+///
+/// Matching is by model name + position within same-model group. Both the
+/// SDK and the OS USB stack enumerate in the same physical order, so the
+/// nth Z 9 in the SDK list corresponds to the nth Z 9 in the USB list.
+fn enrich_devices(devices: Vec<DeviceInfo>) -> Vec<(DeviceInfo, Option<UsbCameraInfo>)> {
+    let usb = usb_camera_list();
+    let mut model_idx: HashMap<String, usize> = HashMap::new();
+    devices.into_iter().map(|dev| {
+        let idx = {
+            let c = model_idx.entry(dev.name.clone()).or_insert(0);
+            let i = *c;
+            *c += 1;
+            i
+        };
+        let usb_info = usb.iter().filter(|u| u.model == dev.name).nth(idx).cloned();
+        (dev, usb_info)
+    }).collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -370,12 +394,18 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     if devices.is_empty() {
         bail!("no Nikon cameras detected");
     }
-    // Pick by --serial if given, else first available, else first.
-    let target = match args.serial.as_deref() {
-        Some(s) => devices.iter().find(|d| d.id.to_string() == s)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no device with id {s}"))?,
-        None => devices.iter().find(|d| d.available).cloned().unwrap_or_else(|| devices[0].clone()),
+    let enriched = enrich_devices(devices);
+    // Pick by --serial if given (matched against USB iSerialNumber), else first available.
+    let (target, usb_info) = match args.serial.as_deref() {
+        Some(s) => enriched.into_iter()
+            .find(|(dev, usb)| {
+                usb.as_ref().map(|u| u.serial.as_str()) == Some(s) || dev.id.to_string() == s
+            })
+            .ok_or_else(|| anyhow::anyhow!("no device with serial {s}"))?,
+        None => {
+            let idx = enriched.iter().position(|(d, _)| d.available).unwrap_or(0);
+            enriched.into_iter().nth(idx).unwrap()
+        }
     };
     println!("Connecting to {:?} (id={})…", target.name, target.id);
 
@@ -393,13 +423,15 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     println!("Reading {} capabilities…", device.capabilities.len());
 
     let captured_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
-    // Until we find a real serial-via-capability, use the device id.
-    let serial = format!("id-{}", target.id);
+    let serial = usb_info.as_ref().map(|u| u.serial.clone())
+        .unwrap_or_else(|| format!("id-{}", target.id));
+    let firmware = usb_info.as_ref().map(|u| u.firmware.clone())
+        .unwrap_or_else(|| target.version.clone());
     let mut snap = Snapshot::new(
         Camera {
             model: target.name.clone(),
             serial: serial.clone(),
-            firmware: target.version.clone(),
+            firmware,
         },
         Transport::Usb,
         captured_at,
@@ -446,24 +478,33 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     if devices.is_empty() {
         bail!("no Nikon cameras detected");
     }
-    let target = match args.serial.as_deref() {
-        Some(s) => devices.iter().find(|d| d.id.to_string() == s)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no device with id {s}"))?,
-        None => devices.iter().find(|d| d.available).cloned().unwrap_or_else(|| devices[0].clone()),
+    let enriched = enrich_devices(devices);
+    let (target, usb_info) = match args.serial.as_deref() {
+        Some(s) => enriched.into_iter()
+            .find(|(dev, usb)| {
+                usb.as_ref().map(|u| u.serial.as_str()) == Some(s) || dev.id.to_string() == s
+            })
+            .ok_or_else(|| anyhow::anyhow!("no device with serial {s}"))?,
+        None => {
+            let idx = enriched.iter().position(|(d, _)| d.available).unwrap_or(0);
+            enriched.into_iter().nth(idx).unwrap()
+        }
     };
 
     // Live snapshot (same logic as cmd_snapshot but in-memory).
     let schema = MaidLayerConfig::parse_file(schema_path)?;
     let name_lookup = name_map_for_model(&schema, &target.name);
     let device = sdk.connect(target.id)?;
-    let serial = format!("id-{}", target.id);
+    let serial = usb_info.as_ref().map(|u| u.serial.clone())
+        .unwrap_or_else(|| format!("id-{}", target.id));
+    let firmware = usb_info.as_ref().map(|u| u.firmware.clone())
+        .unwrap_or_else(|| target.version.clone());
 
     let mut live = Snapshot::new(
         Camera {
             model: target.name.clone(),
             serial: serial.clone(),
-            firmware: target.version.clone(),
+            firmware,
         },
         Transport::Usb,
         OffsetDateTime::now_utc().format(&Rfc3339)?,
