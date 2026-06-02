@@ -100,6 +100,34 @@ struct NkMAIDEnumCapInfo {
     ul_allocation_size: u32,
 }
 
+/// NkMAIDEnum — returned by GetCapability for kNkMAIDCapType_Enum capabilities.
+///
+/// Layout verified against Maid3.h (Mac 64-bit / LP64):
+///   offsets 0–15: four u32 fields; offset 16: i16; 6-byte pad; offset 24: *mut c_void.
+#[repr(C)]
+struct NkMAIDEnum {
+    ul_type: u32,          // eNkMAIDArrayType of the element data
+    ul_elements: u32,      // number of valid choices
+    ul_value: u32,         // CURRENT index — the only field changed on Set
+    ul_default: u32,       // default index
+    w_physical_bytes: i16, // bytes per element in pData
+    // 6 bytes implicit padding so *mut c_void lands at offset 24
+    p_data: *mut c_void,   // SDK-allocated element array; NULL when writing
+}
+
+/// NkMAIDRange — returned by GetCapability for kNkMAIDCapType_Range capabilities.
+#[repr(C)]
+struct NkMAIDRange {
+    lf_value: f64,
+    lf_default: f64,
+    ul_value_index: u32,
+    ul_default_index: u32,
+    lf_lower: f64,
+    lf_upper: f64,
+    ul_steps: u32, // 0 = continuous; ≥2 = discrete steps
+    // 4 bytes implicit padding (struct alignment = 8 due to f64 fields)
+}
+
 /// InitializeSDK requires non-null callbacks even for a snapshot-only workflow.
 #[repr(C)]
 struct NkMAIDCSCallback {
@@ -111,7 +139,7 @@ struct NkMAIDCSCallback {
     ref_proc: *mut c_void,
 }
 
-// eNkMAIDDataType values.
+// eNkMAIDDataType values (from Maid3.h eNkMAIDDataType enum).
 const DT_NULL: u32 = 0;
 #[allow(dead_code)] const DT_BOOLEAN: u32 = 1;
 const DT_INTEGER: u32 = 2;
@@ -120,11 +148,29 @@ const DT_BOOLEAN_PTR: u32 = 4;
 const DT_INTEGER_PTR: u32 = 5;
 const DT_UNSIGNED_PTR: u32 = 6;
 const DT_FLOAT_PTR: u32 = 7;
+// 8=PointPtr 9=SizePtr 10=RectPtr — not used by settings capabilities
 const DT_STRING_PTR: u32 = 11;
-const DT_RANGE_PTR: u32 = 13;
-const DT_ENUM_PTR: u32 = 15;
+const DT_DATETIME_PTR: u32 = 12;
+// 13=CallbackPtr — not returned by GetCapability
+const DT_RANGE_PTR: u32 = 14;
+const DT_ARRAY_PTR: u32 = 15; // needs GetArray, not GetCapability
+const DT_ENUM_PTR: u32 = 16;
 
 const GET_VALUE: u32 = 0; // eNkSDKGetSettingRequestType
+
+// kNkMAIDCapOperation bits — ulOperations field in NkMAIDCapInfo.
+pub const OP_GET: u32 = 0x0002;
+pub const OP_SET: u32 = 0x0004;
+
+// kNkMAIDCapType_* — capability type codes (CapabilityInfo.kind).
+// Used by write_capability to choose the right SetCapability data type.
+const CAP_TYPE_BOOLEAN: u32 = 1;
+const CAP_TYPE_INTEGER: u32 = 2;
+const CAP_TYPE_UNSIGNED: u32 = 3;
+const CAP_TYPE_FLOAT: u32 = 4;
+const CAP_TYPE_STRING: u32 = 8;
+const CAP_TYPE_ENUM: u32 = 12;
+const CAP_TYPE_RANGE: u32 = 13;
 
 // ─────────────────────────────────────────────────────────────────────────
 // SDK function pointer types.
@@ -155,6 +201,11 @@ type FnGetCapability = unsafe extern "C" fn(
     pp_data: *mut *mut c_void,
     p_data_type: *mut u32,
 ) -> i32;
+type FnSetCapability = unsafe extern "C" fn(
+    ul_capability_id: u32,
+    p_data: *const c_void,
+    ul_data_type: u32,
+) -> i32;
 
 // ─────────────────────────────────────────────────────────────────────────
 // SDK allocator and no-op callbacks.
@@ -184,6 +235,10 @@ pub enum SdkError {
     SdkCall { call: &'static str, code: i32 },
     #[error("UTF-8 conversion failed: {0}")]
     Utf8(#[from] std::str::Utf8Error),
+    #[error("capability kind {0} is not supported for write")]
+    UnsupportedWrite(u32),
+    #[error("JSON value missing required field for SetCapability")]
+    InvalidValue,
 }
 
 fn check(call: &'static str, code: i32) -> Result<(), SdkError> {
@@ -298,6 +353,7 @@ pub struct Sdk {
     connect_device: FnConnectDevice,
     disconnect_device: FnDisconnectDevice,
     get_capability: FnGetCapability,
+    set_capability: FnSetCapability,
     initialized: bool,
     _lib: Library, // last — outlives the function pointers above
 }
@@ -347,6 +403,7 @@ impl Sdk {
                 connect_device: resolve(&lib, b"ConnectDevice\0")?,
                 disconnect_device: resolve(&lib, b"DisconnectDevice\0")?,
                 get_capability: resolve(&lib, b"GetCapability\0")?,
+                set_capability: resolve(&lib, b"SetCapability\0")?,
                 initialized: false,
                 _lib: lib,
             })
@@ -476,10 +533,18 @@ impl<'sdk> Device<'sdk> {
         };
         check("GetCapability", code)?;
         let value = unsafe { decode_value(data_ptr, data_type) };
-        if data_type >= DT_BOOLEAN_PTR && !data_ptr.is_null() {
-            unsafe { sdk_free(data_ptr) };
-        }
+        unsafe { free_cap_value(data_ptr, data_type) };
         Ok(value)
+    }
+
+    /// Write a capability value back to the camera.
+    ///
+    /// `cap_kind` is the `CapabilityInfo.kind` field (kNkMAIDCapType_*), which
+    /// determines which SetCapability data type and struct layout to use.
+    /// `value` must be the JSON that `read_capability` previously returned for
+    /// this capability (or an equivalent with the same structure).
+    pub fn write_capability(&self, capability_id: u32, cap_kind: u32, value: &Value) -> Result<(), SdkError> {
+        unsafe { write_cap_value(self.sdk, capability_id, cap_kind, value) }
     }
 }
 
@@ -520,22 +585,44 @@ unsafe fn take_capabilities(p: *mut NkMAIDEnumCapInfo) -> Vec<CapabilityInfo> {
     out
 }
 
+/// Free a pointer returned by GetCapability, respecting the ownership rules
+/// documented in the SDK sample's `freeByDataType`. EnumPtr has a nested
+/// `pData` allocation that must be freed first.
+unsafe fn free_cap_value(data_ptr: *mut c_void, data_type: u32) {
+    if data_ptr.is_null() { return; }
+    match data_type {
+        DT_ENUM_PTR => {
+            let st = unsafe { &*(data_ptr as *const NkMAIDEnum) };
+            if !st.p_data.is_null() { unsafe { sdk_free(st.p_data) }; }
+            unsafe { sdk_free(data_ptr) };
+        }
+        t if t >= DT_BOOLEAN_PTR => {
+            unsafe { sdk_free(data_ptr) };
+        }
+        _ => {} // DT_NULL / by-value types — no allocation to free
+    }
+}
+
 unsafe fn decode_value(data_ptr: *mut c_void, data_type: u32) -> Value {
     match data_type {
         DT_NULL => Value::Null,
         DT_INTEGER => json!(data_ptr as i64 as i32),
         DT_UNSIGNED => json!(data_ptr as usize as u32),
         DT_BOOLEAN_PTR => {
-            if data_ptr.is_null() { Value::Null } else { json!(unsafe { *(data_ptr as *const u8) } != 0) }
+            if data_ptr.is_null() { Value::Null }
+            else { json!(unsafe { *(data_ptr as *const u8) } != 0) }
         }
         DT_INTEGER_PTR => {
-            if data_ptr.is_null() { Value::Null } else { json!(unsafe { *(data_ptr as *const i32) }) }
+            if data_ptr.is_null() { Value::Null }
+            else { json!(unsafe { *(data_ptr as *const i32) }) }
         }
         DT_UNSIGNED_PTR => {
-            if data_ptr.is_null() { Value::Null } else { json!(unsafe { *(data_ptr as *const u32) }) }
+            if data_ptr.is_null() { Value::Null }
+            else { json!(unsafe { *(data_ptr as *const u32) }) }
         }
         DT_FLOAT_PTR => {
-            if data_ptr.is_null() { Value::Null } else { json!(unsafe { *(data_ptr as *const f64) }) }
+            if data_ptr.is_null() { Value::Null }
+            else { json!(unsafe { *(data_ptr as *const f64) }) }
         }
         DT_STRING_PTR => {
             if data_ptr.is_null() { Value::Null } else {
@@ -543,7 +630,157 @@ unsafe fn decode_value(data_ptr: *mut c_void, data_type: u32) -> Value {
                 json!(cs.to_string_lossy().into_owned())
             }
         }
-        DT_RANGE_PTR | DT_ENUM_PTR => json!({ "_unsupported_type": data_type }),
+        DT_DATETIME_PTR => json!({ "_type": "datetime" }), // rare; not round-trip-able
+        DT_ARRAY_PTR => json!({ "_type": "array" }), // requires GetArray, not GetCapability
+        DT_ENUM_PTR => {
+            if data_ptr.is_null() { return Value::Null; }
+            let st = unsafe { &*(data_ptr as *const NkMAIDEnum) };
+            let values = decode_enum_values(st);
+            json!({
+                "value_index": st.ul_value,
+                "default_index": st.ul_default,
+                "elem_count": st.ul_elements,
+                "elem_type": st.ul_type,
+                "elem_bytes": st.w_physical_bytes,
+                "values": values,
+            })
+        }
+        DT_RANGE_PTR => {
+            if data_ptr.is_null() { return Value::Null; }
+            let st = unsafe { &*(data_ptr as *const NkMAIDRange) };
+            json!({
+                "value": st.lf_value,
+                "default": st.lf_default,
+                "value_index": st.ul_value_index,
+                "default_index": st.ul_default_index,
+                "lower": st.lf_lower,
+                "upper": st.lf_upper,
+                "steps": st.ul_steps,
+            })
+        }
         _ => json!({ "_unknown_type": data_type }),
+    }
+}
+
+/// Decode the element array of an NkMAIDEnum into a JSON array.
+///
+/// kNkMAIDArrayType values: 0=Boolean, 1=Integer, 2=Unsigned, 3=Float,
+/// 7=PackedString (null-terminated strings packed end-to-end), 8=String.
+/// Only Unsigned and Integer are common for camera settings.
+fn decode_enum_values(st: &NkMAIDEnum) -> Value {
+    let n = st.ul_elements as usize;
+    let bytes = st.w_physical_bytes as usize;
+    if st.p_data.is_null() || n == 0 { return Value::Array(vec![]); }
+    match (st.ul_type, bytes) {
+        (2, 4) => { // Unsigned, 4 bytes
+            let s = unsafe { std::slice::from_raw_parts(st.p_data as *const u32, n) };
+            Value::Array(s.iter().map(|&v| json!(v)).collect())
+        }
+        (2, 2) => { // Unsigned, 2 bytes
+            let s = unsafe { std::slice::from_raw_parts(st.p_data as *const u16, n) };
+            Value::Array(s.iter().map(|&v| json!(v as u32)).collect())
+        }
+        (2, 1) => { // Unsigned, 1 byte
+            let s = unsafe { std::slice::from_raw_parts(st.p_data as *const u8, n) };
+            Value::Array(s.iter().map(|&v| json!(v as u32)).collect())
+        }
+        (1, 4) => { // Integer, 4 bytes
+            let s = unsafe { std::slice::from_raw_parts(st.p_data as *const i32, n) };
+            Value::Array(s.iter().map(|&v| json!(v)).collect())
+        }
+        (7, _) => { // PackedString — scan for n null-terminated strings
+            let raw = unsafe {
+                // Conservative bound: each string is at most 256 bytes
+                std::slice::from_raw_parts(st.p_data as *const u8, n * 256)
+            };
+            let mut out = Vec::with_capacity(n);
+            let mut pos = 0;
+            while out.len() < n && pos < raw.len() {
+                let end = raw[pos..].iter().position(|&b| b == 0).map(|i| pos + i).unwrap_or(raw.len());
+                out.push(json!(String::from_utf8_lossy(&raw[pos..end]).into_owned()));
+                pos = end + 1;
+            }
+            Value::Array(out)
+        }
+        _ => Value::Null, // unsupported element type — index still stored
+    }
+}
+
+/// Marshal a JSON value back to the camera via SetCapability.
+///
+/// Dispatches on `cap_kind` (kNkMAIDCapType_*) to select the right data type
+/// and struct layout. For Enum and Range, `value` must be the JSON that
+/// `decode_value` produced (containing the full struct fields needed for Set).
+unsafe fn write_cap_value(
+    sdk: &Sdk,
+    capability_id: u32,
+    cap_kind: u32,
+    value: &Value,
+) -> Result<(), SdkError> {
+    match cap_kind {
+        CAP_TYPE_BOOLEAN => {
+            let b: u8 = if value.as_bool().ok_or(SdkError::InvalidValue)? { 1 } else { 0 };
+            check("SetCapability", unsafe {
+                (sdk.set_capability)(capability_id, &b as *const _ as *const c_void, DT_BOOLEAN_PTR)
+            })
+        }
+        CAP_TYPE_INTEGER => {
+            let v = value.as_i64().ok_or(SdkError::InvalidValue)? as i32;
+            check("SetCapability", unsafe {
+                (sdk.set_capability)(capability_id, &v as *const _ as *const c_void, DT_INTEGER_PTR)
+            })
+        }
+        CAP_TYPE_UNSIGNED => {
+            let v = value.as_u64().ok_or(SdkError::InvalidValue)? as u32;
+            check("SetCapability", unsafe {
+                (sdk.set_capability)(capability_id, &v as *const _ as *const c_void, DT_UNSIGNED_PTR)
+            })
+        }
+        CAP_TYPE_FLOAT => {
+            let v = value.as_f64().ok_or(SdkError::InvalidValue)?;
+            check("SetCapability", unsafe {
+                (sdk.set_capability)(capability_id, &v as *const _ as *const c_void, DT_FLOAT_PTR)
+            })
+        }
+        CAP_TYPE_STRING => {
+            let s = value.as_str().ok_or(SdkError::InvalidValue)?;
+            let mut buf = [0u8; 256];
+            let n = s.len().min(255);
+            buf[..n].copy_from_slice(&s.as_bytes()[..n]);
+            check("SetCapability", unsafe {
+                (sdk.set_capability)(capability_id, buf.as_ptr() as *const c_void, DT_STRING_PTR)
+            })
+        }
+        CAP_TYPE_ENUM => {
+            // value must contain the fields decode_value stored for DT_ENUM_PTR
+            let vi = value["value_index"].as_u64().ok_or(SdkError::InvalidValue)? as u32;
+            let st = NkMAIDEnum {
+                ul_type: value["elem_type"].as_u64().unwrap_or(2) as u32,
+                ul_elements: value["elem_count"].as_u64().unwrap_or(0) as u32,
+                ul_value: vi,
+                ul_default: value["default_index"].as_u64().unwrap_or(0) as u32,
+                w_physical_bytes: value["elem_bytes"].as_i64().unwrap_or(4) as i16,
+                p_data: ptr::null_mut(), // SDK does not need the array for Set
+            };
+            check("SetCapability", unsafe {
+                (sdk.set_capability)(capability_id, &st as *const _ as *const c_void, DT_ENUM_PTR)
+            })
+        }
+        CAP_TYPE_RANGE => {
+            // value must contain the fields decode_value stored for DT_RANGE_PTR
+            let st = NkMAIDRange {
+                lf_value: value["value"].as_f64().ok_or(SdkError::InvalidValue)?,
+                lf_default: value["default"].as_f64().unwrap_or(0.0),
+                ul_value_index: value["value_index"].as_u64().unwrap_or(0) as u32,
+                ul_default_index: value["default_index"].as_u64().unwrap_or(0) as u32,
+                lf_lower: value["lower"].as_f64().unwrap_or(0.0),
+                lf_upper: value["upper"].as_f64().unwrap_or(0.0),
+                ul_steps: value["steps"].as_u64().unwrap_or(0) as u32,
+            };
+            check("SetCapability", unsafe {
+                (sdk.set_capability)(capability_id, &st as *const _ as *const c_void, DT_RANGE_PTR)
+            })
+        }
+        other => Err(SdkError::UnsupportedWrite(other)),
     }
 }

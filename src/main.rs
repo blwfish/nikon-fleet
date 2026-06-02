@@ -14,7 +14,7 @@ use time::format_description::well_known::Rfc3339;
 
 use nikon_fleet::diff::{Diff, DiffOptions, diff};
 use nikon_fleet::maid_layer::MaidLayerConfig;
-use nikon_fleet::sdk::{DeviceInfo, Sdk, UsbCameraInfo, usb_camera_list};
+use nikon_fleet::sdk::{DeviceInfo, Sdk, UsbCameraInfo, usb_camera_list, OP_GET};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 
 const DEFAULT_SDK_BUNDLE: &str = concat!(
@@ -342,8 +342,7 @@ fn cmd_ref(data_dir: &Path, sub: &RefCmd) -> Result<()> {
 // Live-camera commands (SDK)
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Bit in NkMAIDCapInfo.ulOperations that indicates GetCapability is supported.
-const OP_GET: u32 = 0x0002;
+// OP_GET and OP_SET are re-exported from nikon_fleet::sdk.
 
 fn open_sdk(bundle_path: &Path) -> Result<Sdk> {
     if !bundle_path.exists() {
