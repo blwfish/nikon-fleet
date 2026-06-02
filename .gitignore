@@ -4,3 +4,6 @@
 /sdk-runtime
 *.swp
 .DS_Store
+
+# GUI
+/gui/target
