@@ -14,7 +14,7 @@ use time::format_description::well_known::Rfc3339;
 
 use nikon_fleet::diff::{Diff, DiffOptions, diff};
 use nikon_fleet::maid_layer::MaidLayerConfig;
-use nikon_fleet::sdk::{DeviceInfo, Sdk, UsbCameraInfo, usb_camera_list, OP_GET};
+use nikon_fleet::sdk::{CapabilityInfo, DeviceInfo, Sdk, SdkError, UsbCameraInfo, usb_camera_list, OP_GET, OP_SET};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 
 const DEFAULT_SDK_BUNDLE: &str = concat!(
@@ -70,6 +70,9 @@ enum Cmd {
 
     /// Remove a stored snapshot.
     Rm(RmArgs),
+
+    /// Restore settings from a snapshot to a live camera.
+    Restore(RestoreArgs),
 }
 
 #[derive(Args, Debug)]
@@ -120,6 +123,18 @@ struct LsArgs {
 #[derive(Args, Debug)]
 struct RmArgs {
     snapshot_path: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct RestoreArgs {
+    /// Snapshot to restore from. Resolved relative to snapshots/ if not absolute.
+    snapshot_path: PathBuf,
+    /// Target camera serial. Defaults to the serial recorded in the snapshot.
+    #[arg(long)]
+    serial: Option<String>,
+    /// Print what would be written without sending anything to the camera.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -538,6 +553,82 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     Ok(())
 }
 
+fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs) -> Result<()> {
+    let snap_path = resolve_snapshot_path(data_dir, &args.snapshot_path);
+    let snap = Snapshot::load_from_file(&snap_path)
+        .with_context(|| format!("loading {}", snap_path.display()))?;
+
+    let mut sdk = open_sdk(bundle)?;
+    let devices = sdk.devices()?;
+    if devices.is_empty() {
+        bail!("no Nikon cameras detected");
+    }
+    let enriched = enrich_devices(devices);
+
+    // Match by --serial override, or by the serial embedded in the snapshot.
+    let target_serial = args.serial.as_deref().unwrap_or(&snap.camera.serial);
+    let (target, _usb) = enriched
+        .into_iter()
+        .find(|(dev, usb)| {
+            usb.as_ref().map(|u| u.serial.as_str()) == Some(target_serial)
+                || dev.id.to_string() == target_serial
+        })
+        .ok_or_else(|| anyhow::anyhow!(
+            "no connected camera with serial {}  (snapshot is for {} {})",
+            target_serial, snap.camera.model, snap.camera.serial
+        ))?;
+
+    if target.name != snap.camera.model {
+        eprintln!(
+            "warning: snapshot is for model {:?} but connected camera is {:?}",
+            snap.camera.model, target.name
+        );
+    }
+
+    println!("Connecting to {:?} (id={})…", target.name, target.id);
+    let device = sdk.connect(target.id)?;
+
+    // Index capabilities by code for O(1) lookup.
+    let cap_map: HashMap<u32, &CapabilityInfo> =
+        device.capabilities.iter().map(|c| (c.id, c)).collect();
+
+    let mut written = 0usize;
+    let mut skipped_no_set = 0usize;
+    let mut skipped_type = 0usize;
+    let mut errors = 0usize;
+
+    for (name, prop) in &snap.properties {
+        let Some(cap) = cap_map.get(&prop.code) else {
+            skipped_no_set += 1;
+            continue;
+        };
+        if cap.operations & OP_SET == 0 {
+            skipped_no_set += 1;
+            continue;
+        }
+        if args.dry_run {
+            println!("  would write  {} [{:#x}]", name, prop.code);
+            written += 1;
+            continue;
+        }
+        match device.write_capability(prop.code, cap.kind, &prop.value) {
+            Ok(()) => written += 1,
+            Err(SdkError::UnsupportedWrite(_)) => skipped_type += 1,
+            Err(e) => {
+                eprintln!("  warn: {} [{:#x}]: {}", name, prop.code, e);
+                errors += 1;
+            }
+        }
+    }
+
+    println!(
+        "{} written={written}  skipped(read-only)={skipped_no_set}  \
+         skipped(unsupported-type)={skipped_type}  errors={errors}",
+        if args.dry_run { "Dry run:" } else { "Restore complete:" }
+    );
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────
@@ -552,5 +643,6 @@ fn main() -> Result<()> {
         Cmd::Ls(args) => cmd_ls(&cli.data_dir, args),
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
+        Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, args),
     }
 }
