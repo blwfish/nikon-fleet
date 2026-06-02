@@ -1,26 +1,36 @@
 //! Nikon Remote SDK v2 — FFI and safe Rust wrapper.
 //!
-//! This is the only module in nikon-fleet that contains `unsafe`. The
-//! intent is to keep the surface area of `unsafe` as small and well-named
-//! as possible; everything outside this file is plain safe Rust.
+//! This is the only `unsafe` module in nikon-fleet. The intent is to keep the
+//! surface area of `unsafe` as small and well-named as possible; everything
+//! outside this file is plain safe Rust.
 //!
 //! ## Lifecycle
 //!
 //! ```text
 //!   Sdk::open(bundle_path)         // dlopen the bundle, resolve symbols
-//!     .initialize()                // InitializeSDK, returns first device list
-//!   sdk.devices()                  // EnumDevices, returns Vec<DeviceInfo>
-//!   sdk.connect(device_id)         // ConnectDevice, returns capability list
+//!     .initialize()                // USB reset → InitializeSDK → IOKit notifications armed
+//!   sdk.devices()                  // EnumDevices (with CF run-loop pump) → Vec<DeviceInfo>
+//!   sdk.connect(device_id)         // ConnectDevice → capability list
 //!     .read_capability(cap_id)     // GetCapability(Value) → JSON
-//!   (drop the Device → DisconnectDevice)
-//!   (drop the Sdk → FreeSDK)
+//!   (drop Device → DisconnectDevice)
+//!   (drop Sdk → library unloaded; FreeSDK deliberately NOT called — see Drop impl)
 //! ```
+//!
+//! ## Why the USB reset + run-loop pump?
+//!
+//! The SDK registers `IOServiceAddMatchingNotification` during `InitializeSDK`.
+//! That notification only fires for devices that appear *after* registration.
+//! Cameras already connected at process startup are invisible. We fix this by:
+//!  1. Resetting the camera's USB connection (via rusb) immediately before
+//!     `InitializeSDK`, so the reconnect event fires after registration.
+//!  2. Pumping the CoreFoundation run loop between `EnumDevices` retries,
+//!     so the IOKit callback that adds the device to the SDK's internal list
+//!     is actually delivered.
 //!
 //! ## Threading
 //!
-//! The SDK is not documented to be thread-safe. We're single-threaded
-//! everywhere in this codebase; if we ever need concurrency around it,
-//! gate calls behind a Mutex at this layer.
+//! The SDK is not documented to be thread-safe. We are single-threaded
+//! everywhere; if concurrency is ever needed, gate calls behind a Mutex here.
 //!
 //! ## SDK Path
 //!
@@ -36,22 +46,33 @@ use libloading::{Library, Symbol};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+const NIKON_VID: u16 = 0x04B0;
+
 // ─────────────────────────────────────────────────────────────────────────
-// C types — must mirror Maid3.h exactly. #[repr(C)] guarantees field order
-// and ABI-compatible layout.
+// CoreFoundation run loop — delivers pending IOKit notifications.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// `NkMAIDDeviceInfo` from Maid3.h.
-///
-/// Layout discipline: u32 (4) + char[64] + C bool (1 byte) + 3 padding +
-/// u32 (4) + char[64] = 140 bytes. We let Rust compute the padding via
-/// the standard struct rules under `#[repr(C)]`.
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: u8) -> i32;
+    static kCFRunLoopDefaultMode: *const c_void;
+}
+
+fn pump_cf_runloop(duration: std::time::Duration) {
+    // returnAfterSourceHandled=0: process all pending events, not just the first.
+    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, duration.as_secs_f64(), 0); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// C types — must mirror Maid3.h exactly.
+// ─────────────────────────────────────────────────────────────────────────
+
 #[repr(C)]
 struct NkMAIDDeviceInfo {
     id: u32,
     name: [c_char; 64],
     availability: bool,
-    // 3 bytes of padding implicitly here under repr(C).
+    // 3 bytes of implicit padding under repr(C).
     connected_pid: u32,
     version: [c_char; 64],
 }
@@ -79,8 +100,7 @@ struct NkMAIDEnumCapInfo {
     ul_allocation_size: u32,
 }
 
-/// Callback registration struct — InitializeSDK wants this. We provide
-/// no-op callbacks since snapshotting doesn't need them.
+/// InitializeSDK requires non-null callbacks even for a snapshot-only workflow.
 #[repr(C)]
 struct NkMAIDCSCallback {
     p_ui_req_proc: *mut c_void,
@@ -91,8 +111,7 @@ struct NkMAIDCSCallback {
     ref_proc: *mut c_void,
 }
 
-// eNkMAIDDataType — the discriminator the SDK returns alongside a value
-// pointer to tell us how to interpret it.
+// eNkMAIDDataType values.
 const DT_NULL: u32 = 0;
 #[allow(dead_code)] const DT_BOOLEAN: u32 = 1;
 const DT_INTEGER: u32 = 2;
@@ -105,12 +124,10 @@ const DT_STRING_PTR: u32 = 11;
 const DT_RANGE_PTR: u32 = 13;
 const DT_ENUM_PTR: u32 = 15;
 
-// eNkSDKGetSettingRequestType
-const GET_VALUE: u32 = 0;
+const GET_VALUE: u32 = 0; // eNkSDKGetSettingRequestType
 
 // ─────────────────────────────────────────────────────────────────────────
-// Function pointer signatures. We trust Maid3.h here. CALLPASCAL is a
-// no-op on macOS so plain `extern "C"` is correct.
+// SDK function pointer types.
 // ─────────────────────────────────────────────────────────────────────────
 
 type MAIDAllocateMemory = unsafe extern "C" fn(size: libc::size_t) -> *mut c_void;
@@ -140,8 +157,7 @@ type FnGetCapability = unsafe extern "C" fn(
 ) -> i32;
 
 // ─────────────────────────────────────────────────────────────────────────
-// Allocator callbacks the SDK uses to allocate buffers it returns to us.
-// We hand back the same allocator for freeing.
+// SDK allocator and no-op callbacks.
 // ─────────────────────────────────────────────────────────────────────────
 
 unsafe extern "C" fn sdk_alloc(size: libc::size_t) -> *mut c_void {
@@ -152,10 +168,6 @@ unsafe extern "C" fn sdk_free(ptr: *mut c_void) {
     unsafe { libc::free(ptr) }
 }
 
-// Stub callbacks. The SDK appears to validate that these are non-null even
-// though we don't actually need event/UI/progress/data delivery for a
-// snapshot-only workflow. Their exact signatures vary, but since we don't
-// expect them to be invoked in this code path, a no-op extern "C" works.
 unsafe extern "C" fn cb_noop() {}
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -175,13 +187,100 @@ pub enum SdkError {
 }
 
 fn check(call: &'static str, code: i32) -> Result<(), SdkError> {
-    // Per Maid3.h: negative values are errors, non-negative are success
-    // (some functions return 0 or a positive HRESULT-style success code).
-    if code < 0 {
-        Err(SdkError::SdkCall { call, code })
-    } else {
-        Ok(())
+    if code < 0 { Err(SdkError::SdkCall { call, code }) } else { Ok(()) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// USB descriptor helpers (rusb / IOKit layer)
+//
+// The Nikon SDK returns empty strings for both firmware version and serial
+// number on all tested models. We read them directly from the USB device
+// descriptors instead.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Camera identity read from USB device descriptors.
+#[derive(Debug, Clone)]
+pub struct UsbCameraInfo {
+    pub product_id: u16,
+    /// `iSerialNumber` string descriptor, e.g. `"0000003023668"`.
+    pub serial: String,
+    /// `bcdDevice` BCD-decoded firmware version, e.g. `"5.31"`.
+    pub firmware: String,
+    /// USB product string minus `"NIKON DSC "` prefix, e.g. `"Z 9"`.
+    /// Matches MaidLayerConfig keys directly.
+    pub model: String,
+}
+
+/// Decode a USB `bcdDevice` value (u16) to a dotted version string.
+///
+/// BCD encoding: each nibble is a decimal digit.
+/// `0x0531` → `"5.31"`, `0x0143` → `"1.43"`, `0x0200` → `"2.00"`.
+pub fn bcd_decode_version(bcd: u16) -> String {
+    let major = ((bcd >> 12) & 0xF) * 10 + ((bcd >> 8) & 0xF);
+    let minor = ((bcd >> 4) & 0xF) * 10 + (bcd & 0xF);
+    format!("{major}.{minor:02}")
+}
+
+fn model_from_product_string(product: &str) -> String {
+    product.strip_prefix("NIKON DSC ").unwrap_or(product).to_owned()
+}
+
+fn nikon_usb_devices() -> Vec<rusb::Device<rusb::GlobalContext>> {
+    let list = match rusb::DeviceList::new() {
+        Ok(l) => l,
+        Err(_) => return Vec::new(),
+    };
+    list.iter()
+        .filter(|d| d.device_descriptor().map(|desc| desc.vendor_id() == NIKON_VID).unwrap_or(false))
+        .collect()
+}
+
+fn read_usb_string(handle: &rusb::DeviceHandle<rusb::GlobalContext>, idx: u8) -> String {
+    if idx == 0 { return String::new(); }
+    let timeout = std::time::Duration::from_secs(1);
+    let lang = match handle.read_languages(timeout).ok().and_then(|l| l.into_iter().next()) {
+        Some(l) => l,
+        None => return String::new(),
+    };
+    handle.read_string_descriptor(lang, idx, timeout).unwrap_or_default()
+}
+
+/// List all Nikon cameras visible on USB with firmware version and serial number.
+pub fn usb_camera_list() -> Vec<UsbCameraInfo> {
+    let mut out = Vec::new();
+    for device in nikon_usb_devices() {
+        let desc = match device.device_descriptor() { Ok(d) => d, Err(_) => continue };
+        let handle = match device.open() { Ok(h) => h, Err(_) => continue };
+        let serial = read_usb_string(&handle, desc.serial_number_string_index().unwrap_or(0));
+        let product = read_usb_string(&handle, desc.product_string_index().unwrap_or(0));
+        let v = desc.device_version();
+        let firmware = format!("{}.{:02}", v.0, u32::from(v.1) * 10 + u32::from(v.2));
+        out.push(UsbCameraInfo {
+            product_id: desc.product_id(),
+            serial,
+            firmware,
+            model: model_from_product_string(&product),
+        });
     }
+    out
+}
+
+/// Reset all connected Nikon USB cameras via a USB port reset.
+///
+/// This forces a disconnect/reconnect cycle, making the camera appear as a
+/// "new" device to IOKit's matching notification system. Call immediately
+/// before `InitializeSDK` so the SDK's notification is registered before the
+/// camera completes its reconnection.
+fn reset_nikon_usb_cameras() -> usize {
+    let mut count = 0;
+    for device in nikon_usb_devices() {
+        if let Ok(handle) = device.open() {
+            if handle.reset().is_ok() {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -189,11 +288,10 @@ fn check(call: &'static str, code: i32) -> Result<(), SdkError> {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Resolved SDK entry points. Created with `Sdk::open`, kept alive for the
-/// duration of any camera I/O. Dropping it calls FreeSDK.
+/// duration of any camera I/O.
 pub struct Sdk {
-    // Field order matters for Drop: function pointers (which borrow from
-    // `_lib`) must drop before the Library does. Rust drops fields in
-    // declaration order, so list these BEFORE `_lib`.
+    // Field order matters for Drop: function pointers (borrowing from `_lib`)
+    // must drop before the Library. Rust drops fields in declaration order.
     initialize: FnInitializeSDK,
     free_sdk: FnFreeSDK,
     enum_devices: FnEnumDevices,
@@ -201,7 +299,7 @@ pub struct Sdk {
     disconnect_device: FnDisconnectDevice,
     get_capability: FnGetCapability,
     initialized: bool,
-    _lib: Library, // last — outlives the function pointers
+    _lib: Library, // last — outlives the function pointers above
 }
 
 /// Single device entry returned by `Sdk::devices()`.
@@ -232,14 +330,9 @@ impl Sdk {
     ///   `<sdk-runtime>/TypeCommon Module.bundle/Contents/MacOS/TypeCommon Module`
     pub fn open<P: AsRef<Path>>(bundle_exe_path: P) -> Result<Self, SdkError> {
         let path = bundle_exe_path.as_ref().to_path_buf();
-        // SAFETY: dlopen has global side effects. We trust the user-given path.
         let lib = unsafe { Library::new(&path) }
             .map_err(|e| SdkError::Load { path: path.clone(), source: e })?;
 
-        // Helper: resolve a symbol by name into a typed function pointer.
-        // We immediately cast away the lifetime tying it to `lib`; the
-        // Sdk struct keeps `lib` alive for as long as the function pointers
-        // are used (field-drop-order discipline above).
         unsafe fn resolve<T: Copy>(lib: &Library, name: &[u8]) -> Result<T, SdkError> {
             let sym: Symbol<T> = unsafe { lib.get(name) }
                 .map_err(|e| SdkError::Symbol(String::from_utf8_lossy(name).into_owned(), e))?;
@@ -247,28 +340,30 @@ impl Sdk {
         }
 
         unsafe {
-            let initialize = resolve(&lib, b"InitializeSDK\0")?;
-            let free_sdk = resolve(&lib, b"FreeSDK\0")?;
-            let enum_devices = resolve(&lib, b"EnumDevices\0")?;
-            let connect_device = resolve(&lib, b"ConnectDevice\0")?;
-            let disconnect_device = resolve(&lib, b"DisconnectDevice\0")?;
-            let get_capability = resolve(&lib, b"GetCapability\0")?;
-
             Ok(Sdk {
-                initialize,
-                free_sdk,
-                enum_devices,
-                connect_device,
-                disconnect_device,
-                get_capability,
+                initialize: resolve(&lib, b"InitializeSDK\0")?,
+                free_sdk: resolve(&lib, b"FreeSDK\0")?,
+                enum_devices: resolve(&lib, b"EnumDevices\0")?,
+                connect_device: resolve(&lib, b"ConnectDevice\0")?,
+                disconnect_device: resolve(&lib, b"DisconnectDevice\0")?,
+                get_capability: resolve(&lib, b"GetCapability\0")?,
                 initialized: false,
                 _lib: lib,
             })
         }
     }
 
-    /// Calls InitializeSDK. Required before any other call.
+    /// Initialize an SDK session. Must be called before any other method.
+    ///
+    /// Resets all connected Nikon cameras via USB before calling
+    /// `InitializeSDK`, so the SDK's IOKit matching notifications fire when
+    /// the cameras reconnect (see module-level doc for the full explanation).
     pub fn initialize(&mut self) -> Result<(), SdkError> {
+        // Reset first, then immediately call InitializeSDK. The camera will
+        // finish reconnecting while InitializeSDK is running or shortly after,
+        // and devices() will pick it up via the run-loop-pumped retry loop.
+        reset_nikon_usb_cameras();
+
         let stub: *mut c_void = cb_noop as *mut c_void;
         let callback = NkMAIDCSCallback {
             p_ui_req_proc: stub,
@@ -279,73 +374,73 @@ impl Sdk {
             ref_proc: ptr::null_mut(),
         };
         let mut device_list: *mut NkMAIDEnumDevices = ptr::null_mut();
-        // We pass NULL for ppEnumCapInfo here — that argument is only valid
-        // once we've connected to a device. The sample app does the same;
-        // passing a non-null address triggers InvalidArguments (-93).
-        // SAFETY: all pointers are valid; allocator callbacks are valid extern "C" fns.
         let code = unsafe {
-            (self.initialize)(
-                sdk_alloc,
-                sdk_free,
-                &callback,
-                &mut device_list,
-                ptr::null_mut(),
-            )
+            (self.initialize)(sdk_alloc, sdk_free, &callback, &mut device_list, ptr::null_mut())
         };
         check("InitializeSDK", code)?;
         self.initialized = true;
-        // The SDK allocated buffers for device_list; we'll re-query via
-        // EnumDevices on demand. Free what was returned here.
         if !device_list.is_null() {
             unsafe {
                 let dl = &*device_list;
-                if !dl.p_device_data.is_null() {
-                    sdk_free(dl.p_device_data as *mut c_void);
-                }
+                if !dl.p_device_data.is_null() { sdk_free(dl.p_device_data as *mut c_void); }
                 sdk_free(device_list as *mut c_void);
             }
         }
         Ok(())
     }
 
-    /// Enumerate USB-attached devices.
+    /// Enumerate USB-attached Nikon cameras.
+    ///
+    /// Retries with CoreFoundation run-loop pumps between attempts so that
+    /// the IOKit matching notification (fired when the camera completes its
+    /// post-reset USB reconnection) is delivered to the SDK's callback before
+    /// we give up.
     pub fn devices(&self) -> Result<Vec<DeviceInfo>, SdkError> {
         let mut list: *mut NkMAIDEnumDevices = ptr::null_mut();
-        // SAFETY: SDK fills `list` to a heap-allocated buffer; we own it
-        // until we explicitly free.
-        let code = unsafe {
-            (self.enum_devices)(&mut list, ptr::null_mut(), ptr::null_mut())
-        };
-        check("EnumDevices", code)?;
-        if list.is_null() {
-            return Ok(Vec::new());
+        let mut code = 0i32;
+        for _ in 0..10u32 {
+            list = ptr::null_mut();
+            code = unsafe {
+                (self.enum_devices)(&mut list, ptr::null_mut(), ptr::null_mut())
+            };
+            let elements = if list.is_null() { 0 } else { unsafe { (*list).ul_elements } };
+            if elements > 0 { break; }
+            if !list.is_null() {
+                unsafe {
+                    let dl = &*list;
+                    if !dl.p_device_data.is_null() { sdk_free(dl.p_device_data as *mut c_void); }
+                    sdk_free(list as *mut c_void);
+                }
+                list = ptr::null_mut();
+            }
+            pump_cf_runloop(std::time::Duration::from_millis(300));
         }
+        check("EnumDevices", code)?;
         let mut out = Vec::new();
-        unsafe {
-            let dl = &*list;
-            for i in 0..dl.ul_elements as usize {
-                let info = &*dl.p_device_data.add(i);
-                out.push(DeviceInfo {
-                    id: info.id,
-                    name: cstr_to_string(&info.name),
-                    available: info.availability,
-                    connected_pid: info.connected_pid,
-                    version: cstr_to_string(&info.version),
-                });
+        if !list.is_null() {
+            unsafe {
+                let dl = &*list;
+                for i in 0..dl.ul_elements as usize {
+                    let info = &*dl.p_device_data.add(i);
+                    out.push(DeviceInfo {
+                        id: info.id,
+                        name: cstr_to_string(&info.name),
+                        available: info.availability,
+                        connected_pid: info.connected_pid,
+                        version: cstr_to_string(&info.version),
+                    });
+                }
+                if !dl.p_device_data.is_null() { sdk_free(dl.p_device_data as *mut c_void); }
+                sdk_free(list as *mut c_void);
             }
-            if !dl.p_device_data.is_null() {
-                sdk_free(dl.p_device_data as *mut c_void);
-            }
-            sdk_free(list as *mut c_void);
         }
         Ok(out)
     }
 
     /// Open a session on the given device. Returns a `Device` that holds
-    /// the connection. Dropping it disconnects.
+    /// the connection and disconnects on drop.
     pub fn connect(&mut self, device_id: u32) -> Result<Device<'_>, SdkError> {
         let mut cap_info: *mut NkMAIDEnumCapInfo = ptr::null_mut();
-        // SAFETY: SDK fills cap_info to a heap-allocated buffer.
         let code = unsafe { (self.connect_device)(device_id, &mut cap_info) };
         check("ConnectDevice", code)?;
         let capabilities = unsafe { take_capabilities(cap_info) };
@@ -355,17 +450,12 @@ impl Sdk {
 
 impl Drop for Sdk {
     fn drop(&mut self) {
-        // We deliberately do NOT call FreeSDK here. Empirically, doing so
-        // leaves the connected Z 9 in a state where the next process's
-        // InitializeSDK + EnumDevices returns no devices until the camera
-        // is power-cycled or the USB cable replugged. Letting the OS reap
-        // the process (and thus the loaded dylib + USB handles) appears
-        // to be cleaner than the SDK's own teardown.
-        //
-        // If we ever embed Sdk in a long-lived process and need to
-        // re-initialize within one process lifetime, we'll need a real
-        // fix — possibly an explicit DisconnectDevice + a longer settle
-        // before the next Init. Out of scope for the CLI use case.
+        // FreeSDK is deliberately NOT called. Calling it leaves the camera in
+        // a state where subsequent process invocations cannot enumerate it via
+        // InitializeSDK + EnumDevices until the USB cable is replugged. Letting
+        // the OS reap the process and its USB handles is cleaner for the CLI
+        // use case. The USB reset at the start of the next initialize() call
+        // sidesteps this entirely.
         let _ = self.initialized;
     }
 }
@@ -377,25 +467,15 @@ pub struct Device<'sdk> {
 }
 
 impl<'sdk> Device<'sdk> {
-    /// Read the current value of one capability. Returns a JSON-compatible
-    /// value when the data type is one we know how to decode; otherwise
-    /// returns a tagged object describing the unrecognized type.
+    /// Read the current value of one capability as a JSON value.
     pub fn read_capability(&self, capability_id: u32) -> Result<Value, SdkError> {
         let mut data_ptr: *mut c_void = ptr::null_mut();
         let mut data_type: u32 = 0;
-        // SAFETY: SDK fills data_ptr with either a primitive cast to *mut c_void
-        // (for by-value types) or a heap-allocated buffer we must free.
         let code = unsafe {
-            (self.sdk.get_capability)(
-                capability_id,
-                GET_VALUE,
-                &mut data_ptr,
-                &mut data_type,
-            )
+            (self.sdk.get_capability)(capability_id, GET_VALUE, &mut data_ptr, &mut data_type)
         };
         check("GetCapability", code)?;
         let value = unsafe { decode_value(data_ptr, data_type) };
-        // For pointer-typed values, free the SDK's buffer after decoding.
         if data_type >= DT_BOOLEAN_PTR && !data_ptr.is_null() {
             unsafe { sdk_free(data_ptr) };
         }
@@ -405,7 +485,6 @@ impl<'sdk> Device<'sdk> {
 
 impl<'sdk> Drop for Device<'sdk> {
     fn drop(&mut self) {
-        // SAFETY: SDK contract — Disconnect is idempotent-enough; ignore code.
         let _ = unsafe { (self.sdk.disconnect_device)() };
     }
 }
@@ -414,20 +493,14 @@ impl<'sdk> Drop for Device<'sdk> {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Convert a fixed-length C char array to a Rust String, stopping at the
-/// first NUL.
 fn cstr_to_string(buf: &[c_char]) -> String {
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
     let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..nul]).into_owned()
 }
 
-/// Pull the capability list out of an EnumCapInfo* the SDK allocated, then
-/// free its backing buffers.
 unsafe fn take_capabilities(p: *mut NkMAIDEnumCapInfo) -> Vec<CapabilityInfo> {
-    if p.is_null() {
-        return Vec::new();
-    }
+    if p.is_null() { return Vec::new(); }
     let info = unsafe { &*p };
     let mut out = Vec::with_capacity(info.ul_cap_count as usize);
     for i in 0..info.ul_cap_count as usize {
@@ -441,72 +514,36 @@ unsafe fn take_capabilities(p: *mut NkMAIDEnumCapInfo) -> Vec<CapabilityInfo> {
         });
     }
     unsafe {
-        if !info.p_cap_array.is_null() {
-            sdk_free(info.p_cap_array as *mut c_void);
-        }
+        if !info.p_cap_array.is_null() { sdk_free(info.p_cap_array as *mut c_void); }
         sdk_free(p as *mut c_void);
     }
     out
 }
 
-/// Decode a (data_ptr, data_type) pair from GetCapability into JSON.
-///
-/// For by-value types (Integer, Unsigned, Boolean), the SDK stuffs the
-/// value directly into the pointer width — we cast accordingly.
-/// For pointer types, the pointer is to a heap buffer of the indicated type.
 unsafe fn decode_value(data_ptr: *mut c_void, data_type: u32) -> Value {
     match data_type {
         DT_NULL => Value::Null,
         DT_INTEGER => json!(data_ptr as i64 as i32),
         DT_UNSIGNED => json!(data_ptr as usize as u32),
         DT_BOOLEAN_PTR => {
-            if data_ptr.is_null() {
-                Value::Null
-            } else {
-                let b = unsafe { *(data_ptr as *const u8) };
-                json!(b != 0)
-            }
+            if data_ptr.is_null() { Value::Null } else { json!(unsafe { *(data_ptr as *const u8) } != 0) }
         }
         DT_INTEGER_PTR => {
-            if data_ptr.is_null() {
-                Value::Null
-            } else {
-                let i = unsafe { *(data_ptr as *const i32) };
-                json!(i)
-            }
+            if data_ptr.is_null() { Value::Null } else { json!(unsafe { *(data_ptr as *const i32) }) }
         }
         DT_UNSIGNED_PTR => {
-            if data_ptr.is_null() {
-                Value::Null
-            } else {
-                let u = unsafe { *(data_ptr as *const u32) };
-                json!(u)
-            }
+            if data_ptr.is_null() { Value::Null } else { json!(unsafe { *(data_ptr as *const u32) }) }
         }
         DT_FLOAT_PTR => {
-            if data_ptr.is_null() {
-                Value::Null
-            } else {
-                let f = unsafe { *(data_ptr as *const f64) };
-                json!(f)
-            }
+            if data_ptr.is_null() { Value::Null } else { json!(unsafe { *(data_ptr as *const f64) }) }
         }
         DT_STRING_PTR => {
-            // NkMAIDString has a length field + char buffer; for now treat
-            // as a C string from the buffer. Refine if we hit garbled output.
-            if data_ptr.is_null() {
-                Value::Null
-            } else {
+            if data_ptr.is_null() { Value::Null } else {
                 let cs = unsafe { CStr::from_ptr(data_ptr as *const c_char) };
                 json!(cs.to_string_lossy().into_owned())
             }
         }
-        DT_RANGE_PTR | DT_ENUM_PTR => {
-            // Decoding these requires struct definitions we haven't pulled in
-            // yet. Surface the raw type for now so we can see in snapshot output
-            // which properties need attention.
-            json!({ "_unsupported_type": data_type })
-        }
+        DT_RANGE_PTR | DT_ENUM_PTR => json!({ "_unsupported_type": data_type }),
         _ => json!({ "_unknown_type": data_type }),
     }
 }
