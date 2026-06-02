@@ -216,6 +216,10 @@ impl FleetApp {
 }
 
 impl eframe::App for FleetApp {
+    // eframe 0.34 requires ui() for the simplified single-panel path; our
+    // update() override handles layout directly so this is never called.
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
 
