@@ -461,12 +461,29 @@ impl Sdk {
     /// Resets all connected Nikon cameras via USB before calling
     /// `InitializeSDK`, so the SDK's IOKit matching notifications fire when
     /// the cameras reconnect (see module-level doc for the full explanation).
+    ///
+    /// Use this variant for the CLI and other contexts where no AppKit run
+    /// loop is running. For the GUI, prefer [`Sdk::initialize_no_usb_reset`]
+    /// to avoid invalidating the Metal drawing surface via USB events.
     pub fn initialize(&mut self) -> Result<(), SdkError> {
         // Reset first, then immediately call InitializeSDK. The camera will
         // finish reconnecting while InitializeSDK is running or shortly after,
         // and devices() will pick it up via the run-loop-pumped retry loop.
         reset_nikon_usb_cameras();
+        self.initialize_sdk()
+    }
 
+    /// Initialize an SDK session without resetting USB devices.
+    ///
+    /// Use this from the GUI (where the AppKit run loop is already running).
+    /// `kIOMatchedNotification` returns already-connected devices via its
+    /// initial iterator, so the SDK can enumerate them without a USB reset.
+    /// If no cameras are found, prompt the user to unplug and replug.
+    pub fn initialize_no_usb_reset(&mut self) -> Result<(), SdkError> {
+        self.initialize_sdk()
+    }
+
+    fn initialize_sdk(&mut self) -> Result<(), SdkError> {
         let stub: *mut c_void = cb_noop as *mut c_void;
         let callback = NkMAIDCSCallback {
             p_ui_req_proc: stub,

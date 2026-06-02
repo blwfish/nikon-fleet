@@ -486,7 +486,13 @@ fn do_discover() -> Result<Evt, String> {
         ));
     }
     let mut sdk = Sdk::open(path).map_err(|e| e.to_string())?;
-    sdk.initialize().map_err(|e| e.to_string())?;
+    // Skip USB reset in the GUI: resetting cameras from a background thread
+    // fires USB disconnect/reconnect events through the main AppKit run loop,
+    // which invalidates the Metal drawing surface mid-frame and causes a crash.
+    // The AppKit run loop is already running (via NSApplication), so the SDK's
+    // IOServiceAddMatchingNotification delivers already-connected cameras via
+    // its initial iterator without needing a reset.
+    sdk.initialize_no_usb_reset().map_err(|e| e.to_string())?;
     let devices = sdk.devices().map_err(|e| e.to_string())?;
     let usb = usb_camera_list();
     let rows = pair_devices(devices, &usb)
