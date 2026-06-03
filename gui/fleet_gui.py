@@ -33,6 +33,17 @@ def _data_dir() -> Path:
         pass
     return Path.home() / "Library" / "Application Support" / "net.blw.fleet"
 
+def _firmware_dir() -> Path:
+    return _data_dir() / "firmware"
+
+def _parse_fw_filename(name: str) -> tuple[str, str]:
+    """'Z_9_0531.bin' → ('Z_9', '5.31')"""
+    stem = Path(name).stem
+    parts = stem.rsplit('_', 1)
+    if len(parts) == 2 and len(parts[1]) == 4 and parts[1].isdigit():
+        return parts[0], f"{int(parts[1][:2])}.{parts[1][2:]}"
+    return stem, ""
+
 def _save_data_dir(new_dir: str) -> None:
     cfg_dir = Path.home() / "Library" / "Preferences" / "net.blw.fleet"
     cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -54,7 +65,11 @@ class FleetApp:
         self.cameras: list[dict] = []
         self.selected: int | None = None
         self._build_ui()
-        self._status("Click Discover to find cameras.")
+        self._scan_known_cameras()
+        self._load_firmware()
+        if not self.cameras:
+            self._status("Click Discover to find cameras.")
+        self.root.after(100, self.root.focus_force)
 
     # ── UI ──────────────────────────────────────────────────────────────
 
@@ -65,7 +80,8 @@ class FleetApp:
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=4)
         ttk.Label(bar, text="Label:").pack(side=tk.LEFT)
         self._label = tk.StringVar()
-        ttk.Entry(bar, textvariable=self._label, width=18).pack(side=tk.LEFT, padx=2)
+        self._label_entry = tk.Entry(bar, textvariable=self._label, width=18)
+        self._label_entry.pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="Take Snapshot",    command=self.take_snapshot).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=4)
         ttk.Button(bar, text="⚙  Preferences",  command=self.show_prefs).pack(side=tk.LEFT)
@@ -83,23 +99,58 @@ class FleetApp:
         self._cam_lb.bind("<<ListboxSelect>>", self._on_cam_select)
         pw.add(cam_f, weight=1)
 
-        # Snapshot table
-        snap_f = ttk.LabelFrame(pw, text="Snapshots", padding=4)
-        self._tree = ttk.Treeview(snap_f, columns=("ts", "label", "ref"),
+        # Right panel: Snapshots tab + Firmware Library tab
+        self._right_nb = ttk.Notebook(pw)
+
+        snap_f = ttk.Frame(self._right_nb, padding=4)
+        self._right_nb.add(snap_f, text="Snapshots")
+        ttk.Button(snap_f, text="Set as Reference",
+                   command=self.set_reference).pack(side=tk.BOTTOM, anchor=tk.W, pady=4)
+        self._tree = ttk.Treeview(snap_f, columns=("ts", "label", "fw", "ref"),
                                     show="headings", selectmode="browse")
         self._tree.heading("ts",    text="Captured")
         self._tree.heading("label", text="Label")
+        self._tree.heading("fw",    text="Firmware")
         self._tree.heading("ref",   text="")
         self._tree.column("ts",    width=175, stretch=False)
         self._tree.column("label", width=200)
+        self._tree.column("fw",    width=70,  stretch=False)
         self._tree.column("ref",   width=55,  stretch=False)
-        sb = ttk.Scrollbar(snap_f, orient=tk.VERTICAL, command=self._tree.yview)
-        self._tree.configure(yscrollcommand=sb.set)
+        snap_sb = ttk.Scrollbar(snap_f, orient=tk.VERTICAL, command=self._tree.yview)
+        self._tree.configure(yscrollcommand=snap_sb.set)
+        snap_sb.pack(side=tk.RIGHT, fill=tk.Y)
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        ttk.Button(snap_f, text="Set as Reference",
-                   command=self.set_reference).pack(side=tk.BOTTOM, anchor=tk.W, pady=4)
-        pw.add(snap_f, weight=3)
+
+        fw_f = ttk.Frame(self._right_nb, padding=4)
+        self._right_nb.add(fw_f, text="Firmware Library")
+        self._build_fw_tab(fw_f)
+
+        self._right_nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
+        pw.add(self._right_nb, weight=3)
+
+    def _scan_known_cameras(self) -> None:
+        """Populate camera list from existing snapshot files, without needing a live camera."""
+        snap_dir = _data_dir() / "snapshots"
+        if not snap_dir.exists():
+            return
+        seen: dict[str, dict] = {}
+        for f in snap_dir.glob("*.json"):
+            try:
+                cam = json.loads(f.read_text())["camera"]
+                if cam["serial"] not in seen:
+                    seen[cam["serial"]] = {"model": cam["model"], "serial": cam["serial"],
+                                           "firmware": cam.get("firmware", "")}
+            except Exception:
+                pass
+        if not seen:
+            return
+        self.cameras = list(seen.values())
+        self._cam_lb.delete(0, tk.END)
+        for cam in self.cameras:
+            self._cam_lb.insert(tk.END, f"  {cam['model']}  ·  {cam['serial']}")
+        self._status(f"Loaded {len(self.cameras)} known camera(s). Click Discover to connect.")
+        self._cam_lb.selection_set(0)
+        self._on_cam_select(None)
 
     def _status(self, msg: str) -> None:
         self._status_var.set(msg)
@@ -162,13 +213,15 @@ class FleetApp:
                 d = json.loads(f.read_text())
                 if d["camera"]["serial"] == serial:
                     rows.append((d.get("captured_at", "")[:19],
-                                 d.get("label") or "", f.name))
+                                 d.get("label") or "",
+                                 d["camera"].get("firmware", ""),
+                                 f.name))
             except Exception:
                 pass
         rows.sort(reverse=True)
-        for ts, label, fname in rows:
+        for ts, label, fw, fname in rows:
             ref_mark = "◀ ref" if fname in refs else ""
-            self._tree.insert("", tk.END, iid=fname, values=(ts, label, ref_mark))
+            self._tree.insert("", tk.END, iid=fname, values=(ts, label, fw, ref_mark))
 
     def take_snapshot(self) -> None:
         if self.selected is None:
@@ -209,6 +262,81 @@ class FleetApp:
         self._load_snapshots()
         self._status("Reference set.")
 
+    # ── Firmware library ────────────────────────────────────────────────
+
+    def _build_fw_tab(self, parent: ttk.Frame) -> None:
+        bf = ttk.Frame(parent)
+        bf.pack(side=tk.BOTTOM, anchor=tk.W, pady=4)
+        ttk.Button(bf, text="Add Firmware…", command=self.add_firmware).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bf, text="Remove",        command=self.remove_firmware).pack(side=tk.LEFT, padx=2)
+        self._fw_tree = ttk.Treeview(parent, columns=("model", "version", "filename"),
+                                      show="headings", selectmode="browse")
+        self._fw_tree.heading("model",    text="Model")
+        self._fw_tree.heading("version",  text="Version")
+        self._fw_tree.heading("filename", text="Filename")
+        self._fw_tree.column("model",    width=100, stretch=False)
+        self._fw_tree.column("version",  width=70,  stretch=False)
+        self._fw_tree.column("filename", width=260)
+        fw_sb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self._fw_tree.yview)
+        self._fw_tree.configure(yscrollcommand=fw_sb.set)
+        fw_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._fw_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def _on_tab_change(self, _evt) -> None:
+        if self._right_nb.tab(self._right_nb.select(), "text") == "Firmware Library":
+            self._load_firmware()
+
+    def _load_firmware(self) -> None:
+        self._fw_tree.delete(*self._fw_tree.get_children())
+        fw_dir = _firmware_dir()
+        if not fw_dir.exists():
+            return
+        for f in sorted(fw_dir.glob("*.bin")):
+            model, version = _parse_fw_filename(f.name)
+            self._fw_tree.insert("", tk.END, iid=f.name, values=(model, version, f.name))
+
+    def add_firmware(self) -> None:
+        src = filedialog.askopenfilename(
+            title="Add firmware to library",
+            filetypes=[("Nikon firmware", "*.bin"), ("All files", "*.*")],
+            parent=self.root,
+        )
+        if not src:
+            return
+        fw_dir = _firmware_dir()
+        fw_dir.mkdir(parents=True, exist_ok=True)
+        dest = fw_dir / Path(src).name
+        if dest.exists():
+            if not messagebox.askyesno("Already exists",
+                                       f"{dest.name} is already in the library. Overwrite?",
+                                       parent=self.root):
+                return
+        try:
+            shutil.copy2(src, dest)
+        except OSError as e:
+            messagebox.showerror("Add firmware failed", str(e), parent=self.root)
+            return
+        self._load_firmware()
+        self._status(f"Added {dest.name}.")
+
+    def remove_firmware(self) -> None:
+        sel = self._fw_tree.selection()
+        if not sel:
+            messagebox.showwarning("No selection", "Select a firmware file first.", parent=self.root)
+            return
+        fname = sel[0]
+        if not messagebox.askyesno("Remove firmware",
+                                    f"Remove {fname} from the library?\nThis cannot be undone.",
+                                    parent=self.root):
+            return
+        try:
+            (_firmware_dir() / fname).unlink()
+        except OSError as e:
+            messagebox.showerror("Remove failed", str(e), parent=self.root)
+            return
+        self._load_firmware()
+        self._status(f"Removed {fname}.")
+
     # ── Preferences ─────────────────────────────────────────────────────
 
     def show_prefs(self) -> None:
@@ -240,6 +368,7 @@ class FleetApp:
         def _save():
             _save_data_dir(dir_var.get().strip())
             self._load_snapshots()
+            self._load_firmware()
             self._status(f"Data dir saved.")
             w.destroy()
 
@@ -268,6 +397,11 @@ class FleetApp:
                     for f in d.glob("*.json"):
                         zf.write(f, f"{folder}/{f.name}")
                         count += 1
+            fw_dir = dd / "firmware"
+            if fw_dir.exists():
+                for f in fw_dir.glob("*.bin"):
+                    zf.write(f, f"firmware/{f.name}", compress_type=zipfile.ZIP_STORED)
+                    count += 1
         self._status(f"Exported {count} file(s) → {Path(dest).name}")
 
     def import_data(self) -> None:
@@ -278,19 +412,25 @@ class FleetApp:
         if not src:
             return
         dd = _data_dir()
-        snaps = refs = 0
+        snaps = refs = fw = 0
         with zipfile.ZipFile(src) as zf:
             for name in zf.namelist():
                 parts = Path(name).parts
-                if len(parts) == 2 and parts[0] in ("snapshots", "references") \
-                        and name.endswith(".json"):
-                    out = dd / parts[0] / parts[1]
-                    out.parent.mkdir(parents=True, exist_ok=True)
-                    out.write_bytes(zf.read(name))
-                    if parts[0] == "snapshots": snaps += 1
-                    else:                        refs  += 1
+                if len(parts) != 2 or parts[0] not in ("snapshots", "references", "firmware"):
+                    continue
+                if parts[0] == "firmware" and not name.endswith(".bin"):
+                    continue
+                if parts[0] != "firmware" and not name.endswith(".json"):
+                    continue
+                out = dd / parts[0] / parts[1]
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(zf.read(name))
+                if parts[0] == "snapshots":   snaps += 1
+                elif parts[0] == "references": refs  += 1
+                else:                          fw    += 1
         self._load_snapshots()
-        self._status(f"Imported {snaps} snapshot(s), {refs} reference(s).")
+        self._load_firmware()
+        self._status(f"Imported {snaps} snapshot(s), {refs} reference(s), {fw} firmware file(s).")
 
 # ── Entry point ────────────────────────────────────────────────────────────
 

@@ -1,6 +1,7 @@
 /target
 /snapshots
 /references
+/firmware
 /sdk-runtime
 *.swp
 .DS_Store
