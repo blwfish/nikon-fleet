@@ -56,6 +56,11 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_SCHEMA, global = true)]
     schema: PathBuf,
 
+    /// Skip the USB reset before InitializeSDK. Use this when running from a
+    /// GUI context (AppKit run loop active) to avoid invalidating Metal surfaces.
+    #[arg(long, global = true)]
+    no_usb_reset: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -363,7 +368,7 @@ fn cmd_ref(data_dir: &Path, sub: &RefCmd) -> Result<()> {
 
 // OP_GET and OP_SET are re-exported from nikon_fleet::sdk.
 
-fn open_sdk(bundle_path: &Path) -> Result<Sdk> {
+fn open_sdk(bundle_path: &Path, no_usb_reset: bool) -> Result<Sdk> {
     if !bundle_path.exists() {
         bail!(
             "SDK bundle not found at {}.\n\
@@ -373,12 +378,16 @@ fn open_sdk(bundle_path: &Path) -> Result<Sdk> {
     }
     let mut sdk = Sdk::open(bundle_path)
         .with_context(|| format!("loading SDK from {}", bundle_path.display()))?;
-    sdk.initialize().context("InitializeSDK")?;
+    if no_usb_reset {
+        sdk.initialize_no_usb_reset().context("InitializeSDK")?;
+    } else {
+        sdk.initialize().context("InitializeSDK")?;
+    }
     Ok(sdk)
 }
 
-fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs) -> Result<()> {
-    let sdk = open_sdk(bundle_path)?;
+fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs, no_usb_reset: bool) -> Result<()> {
+    let sdk = open_sdk(bundle_path, no_usb_reset)?;
     let enriched = enrich_devices(sdk.devices()?);
     if enriched.is_empty() {
         if args.json {
@@ -390,7 +399,8 @@ fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs) -> Result<()> {
     }
     if args.json {
         let cameras: Vec<serde_json::Value> = enriched.iter().map(|(dev, usb)| {
-            let serial   = usb.as_ref().map(|u| u.serial.as_str()).unwrap_or("").to_string();
+            let id_str   = dev.id.to_string();
+            let serial   = usb.as_ref().and_then(|u| (!u.serial.is_empty()).then_some(u.serial.as_str())).unwrap_or(id_str.as_str()).to_string();
             let firmware = usb.as_ref().map(|u| u.firmware.as_str()).unwrap_or(dev.version.as_str()).to_string();
             serde_json::json!({ "model": dev.name, "serial": serial, "firmware": firmware })
         }).collect();
@@ -418,8 +428,8 @@ fn name_map_for_model(schema: &MaidLayerConfig, model: &str) -> HashMap<u32, Str
     map
 }
 
-fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &SnapshotArgs) -> Result<()> {
-    let mut sdk = open_sdk(bundle)?;
+fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &SnapshotArgs, no_usb_reset: bool) -> Result<()> {
+    let mut sdk = open_sdk(bundle, no_usb_reset)?;
     let devices = sdk.devices()?;
     if devices.is_empty() {
         bail!("no Nikon cameras detected");
@@ -502,8 +512,8 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     Ok(())
 }
 
-fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArgs) -> Result<()> {
-    let mut sdk = open_sdk(bundle)?;
+fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArgs, no_usb_reset: bool) -> Result<()> {
+    let mut sdk = open_sdk(bundle, no_usb_reset)?;
     let devices = sdk.devices()?;
     if devices.is_empty() {
         bail!("no Nikon cameras detected");
@@ -569,12 +579,12 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     Ok(())
 }
 
-fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs) -> Result<()> {
+fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset: bool) -> Result<()> {
     let snap_path = resolve_snapshot_path(data_dir, &args.snapshot_path);
     let snap = Snapshot::load_from_file(&snap_path)
         .with_context(|| format!("loading {}", snap_path.display()))?;
 
-    let mut sdk = open_sdk(bundle)?;
+    let mut sdk = open_sdk(bundle, no_usb_reset)?;
     let devices = sdk.devices()?;
     if devices.is_empty() {
         bail!("no Nikon cameras detected");
@@ -651,14 +661,15 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs) -> Result<()>
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let no_reset = cli.no_usb_reset;
     match &cli.cmd {
-        Cmd::Discover(a) => cmd_discover(&cli.sdk_bundle, a),
-        Cmd::Snapshot(args) => cmd_snapshot(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args),
-        Cmd::Check(args) => cmd_check(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args),
+        Cmd::Discover(a) => cmd_discover(&cli.sdk_bundle, a, no_reset),
+        Cmd::Snapshot(args) => cmd_snapshot(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
+        Cmd::Check(args) => cmd_check(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
         Cmd::Diff(args) => cmd_diff(&cli.data_dir, args),
         Cmd::Ls(args) => cmd_ls(&cli.data_dir, args),
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
-        Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, args),
+        Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, args, no_reset),
     }
 }

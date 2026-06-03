@@ -14,8 +14,8 @@ from tkinter import ttk, messagebox, filedialog
 _PROJECT = Path(__file__).resolve().parent.parent   # repo root
 
 def _fleet_bin() -> Path:
-    for p in [_PROJECT / "target" / "release" / "fleet",
-              _PROJECT / "target" / "debug"   / "fleet"]:
+    for p in [_PROJECT / "target" / "release" / "nikon-fleet",
+              _PROJECT / "target" / "debug"   / "nikon-fleet"]:
         if p.exists():
             return p
     raise RuntimeError(
@@ -108,7 +108,7 @@ class FleetApp:
     # ── CLI bridge ──────────────────────────────────────────────────────
 
     def _run(self, *args: str) -> str:
-        cmd = [str(_fleet_bin()), "--data-dir", str(_data_dir())] + list(args)
+        cmd = [str(_fleet_bin()), "--no-usb-reset", "--data-dir", str(_data_dir())] + list(args)
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip() or f"fleet exited {r.returncode}")
@@ -122,7 +122,8 @@ class FleetApp:
         self.root.update()
         try:
             out = self._run("discover", "--json")
-            self.cameras = json.loads(out)["cameras"]
+            json_start = out.index('{')
+            self.cameras = json.loads(out[json_start:])["cameras"]
             self._cam_lb.delete(0, tk.END)
             for cam in self.cameras:
                 self._cam_lb.insert(tk.END, f"  {cam['model']}  ·  {cam['serial']}")
@@ -200,7 +201,11 @@ class FleetApp:
         dd      = _data_dir()
         ref_dir = dd / "references"
         ref_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(dd / "snapshots" / fname, ref_dir / fname)
+        try:
+            shutil.copy2(dd / "snapshots" / fname, ref_dir / fname)
+        except OSError as e:
+            messagebox.showerror("Set reference failed", str(e), parent=self.root)
+            return
         self._load_snapshots()
         self._status("Reference set.")
 
