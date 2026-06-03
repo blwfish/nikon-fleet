@@ -1074,4 +1074,259 @@ mod tests {
         assert_eq!(st.lf_default, 0.0);
         assert_eq!(st.ul_steps, 0);
     }
+
+    // ── decode_value ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_null_type() {
+        let v = unsafe { decode_value(std::ptr::null_mut(), DT_NULL) };
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn decode_integer_by_value() {
+        // DT_INTEGER: the value is carried in the pointer itself, sign-extended.
+        let v = unsafe { decode_value(-42i32 as i64 as *mut c_void, DT_INTEGER) };
+        assert_eq!(v, json!(-42i32));
+    }
+
+    #[test]
+    fn decode_integer_by_value_positive() {
+        let v = unsafe { decode_value(7i32 as i64 as *mut c_void, DT_INTEGER) };
+        assert_eq!(v, json!(7i32));
+    }
+
+    #[test]
+    fn decode_unsigned_by_value() {
+        let v = unsafe { decode_value(100u32 as usize as *mut c_void, DT_UNSIGNED) };
+        assert_eq!(v, json!(100u32));
+    }
+
+    #[test]
+    fn decode_bool_ptr_true() {
+        let b: u8 = 1;
+        let v = unsafe { decode_value(&b as *const u8 as *mut c_void, DT_BOOLEAN_PTR) };
+        assert_eq!(v, json!(true));
+    }
+
+    #[test]
+    fn decode_bool_ptr_false() {
+        let b: u8 = 0;
+        let v = unsafe { decode_value(&b as *const u8 as *mut c_void, DT_BOOLEAN_PTR) };
+        assert_eq!(v, json!(false));
+    }
+
+    #[test]
+    fn decode_bool_ptr_null() {
+        let v = unsafe { decode_value(std::ptr::null_mut(), DT_BOOLEAN_PTR) };
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn decode_integer_ptr() {
+        let i: i32 = -7;
+        let v = unsafe { decode_value(&i as *const i32 as *mut c_void, DT_INTEGER_PTR) };
+        assert_eq!(v, json!(-7i32));
+    }
+
+    #[test]
+    fn decode_integer_ptr_null() {
+        let v = unsafe { decode_value(std::ptr::null_mut(), DT_INTEGER_PTR) };
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn decode_unsigned_ptr() {
+        let u: u32 = 42;
+        let v = unsafe { decode_value(&u as *const u32 as *mut c_void, DT_UNSIGNED_PTR) };
+        assert_eq!(v, json!(42u32));
+    }
+
+    #[test]
+    fn decode_unsigned_ptr_null() {
+        let v = unsafe { decode_value(std::ptr::null_mut(), DT_UNSIGNED_PTR) };
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn decode_float_ptr() {
+        let f: f64 = 3.14;
+        let v = unsafe { decode_value(&f as *const f64 as *mut c_void, DT_FLOAT_PTR) };
+        assert!((v.as_f64().unwrap() - 3.14).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decode_float_ptr_null() {
+        let v = unsafe { decode_value(std::ptr::null_mut(), DT_FLOAT_PTR) };
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn decode_string_ptr() {
+        let s = b"hello\0";
+        let v = unsafe { decode_value(s.as_ptr() as *mut c_void, DT_STRING_PTR) };
+        assert_eq!(v, json!("hello"));
+    }
+
+    #[test]
+    fn decode_string_ptr_empty() {
+        let s = b"\0";
+        let v = unsafe { decode_value(s.as_ptr() as *mut c_void, DT_STRING_PTR) };
+        assert_eq!(v, json!(""));
+    }
+
+    #[test]
+    fn decode_string_ptr_null() {
+        let v = unsafe { decode_value(std::ptr::null_mut(), DT_STRING_PTR) };
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn decode_datetime_ptr_returns_sentinel() {
+        // DT_DATETIME_PTR is rare; we emit a sentinel rather than trying to parse it.
+        let v = unsafe { decode_value(1u64 as *mut c_void, DT_DATETIME_PTR) };
+        assert_eq!(v["_type"], json!("datetime"));
+    }
+
+    #[test]
+    fn decode_array_ptr_returns_sentinel() {
+        let v = unsafe { decode_value(std::ptr::null_mut(), DT_ARRAY_PTR) };
+        assert_eq!(v["_type"], json!("array"));
+    }
+
+    #[test]
+    fn decode_unknown_type_returns_sentinel() {
+        let v = unsafe { decode_value(std::ptr::null_mut(), 99) };
+        assert_eq!(v["_unknown_type"], json!(99u32));
+    }
+
+    #[test]
+    fn decode_enum_ptr_null() {
+        let v = unsafe { decode_value(std::ptr::null_mut(), DT_ENUM_PTR) };
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn decode_enum_ptr_unsigned4() {
+        let mut data = [10u32, 20u32, 30u32];
+        let st = NkMAIDEnum {
+            ul_type: 2, ul_elements: 3, ul_value: 1, ul_default: 0,
+            w_physical_bytes: 4, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        let v = unsafe { decode_value(&st as *const NkMAIDEnum as *mut c_void, DT_ENUM_PTR) };
+        assert_eq!(v["value_index"], json!(1u32));
+        assert_eq!(v["elem_count"],  json!(3u32));
+        assert_eq!(v["values"],      json!([10u32, 20u32, 30u32]));
+    }
+
+    #[test]
+    fn decode_range_ptr() {
+        let st = NkMAIDRange {
+            lf_value: 2.5, lf_default: 1.0,
+            ul_value_index: 5, ul_default_index: 2,
+            lf_lower: 0.0, lf_upper: 10.0, ul_steps: 11,
+        };
+        let v = unsafe { decode_value(&st as *const NkMAIDRange as *mut c_void, DT_RANGE_PTR) };
+        assert_eq!(v["steps"], json!(11u32));
+        assert!((v["value"].as_f64().unwrap() - 2.5).abs() < 1e-9);
+        assert!((v["upper"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decode_range_ptr_null() {
+        let v = unsafe { decode_value(std::ptr::null_mut(), DT_RANGE_PTR) };
+        assert_eq!(v, Value::Null);
+    }
+
+    // ── decode_enum_values ───────────────────────────────────────────────────
+
+    #[test]
+    fn enum_values_empty_elements() {
+        let st = NkMAIDEnum {
+            ul_type: 2, ul_elements: 0, ul_value: 0, ul_default: 0,
+            w_physical_bytes: 4, p_data: std::ptr::null_mut(),
+        };
+        assert_eq!(decode_enum_values(&st), json!([]));
+    }
+
+    #[test]
+    fn enum_values_null_data() {
+        let st = NkMAIDEnum {
+            ul_type: 2, ul_elements: 3, ul_value: 0, ul_default: 0,
+            w_physical_bytes: 4, p_data: std::ptr::null_mut(),
+        };
+        assert_eq!(decode_enum_values(&st), json!([]));
+    }
+
+    #[test]
+    fn enum_values_unsigned4() {
+        let mut data = [100u32, 200u32, 300u32];
+        let st = NkMAIDEnum {
+            ul_type: 2, ul_elements: 3, ul_value: 0, ul_default: 0,
+            w_physical_bytes: 4, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        assert_eq!(decode_enum_values(&st), json!([100u32, 200u32, 300u32]));
+    }
+
+    #[test]
+    fn enum_values_unsigned2() {
+        let mut data = [1u16, 2u16, 3u16];
+        let st = NkMAIDEnum {
+            ul_type: 2, ul_elements: 3, ul_value: 0, ul_default: 0,
+            w_physical_bytes: 2, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        assert_eq!(decode_enum_values(&st), json!([1u32, 2u32, 3u32]));
+    }
+
+    #[test]
+    fn enum_values_unsigned1() {
+        let mut data = [5u8, 10u8, 15u8];
+        let st = NkMAIDEnum {
+            ul_type: 2, ul_elements: 3, ul_value: 0, ul_default: 0,
+            w_physical_bytes: 1, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        assert_eq!(decode_enum_values(&st), json!([5u32, 10u32, 15u32]));
+    }
+
+    #[test]
+    fn enum_values_integer4() {
+        let mut data = [-1i32, 0i32, 1i32];
+        let st = NkMAIDEnum {
+            ul_type: 1, ul_elements: 3, ul_value: 0, ul_default: 0,
+            w_physical_bytes: 4, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        assert_eq!(decode_enum_values(&st), json!([-1i32, 0i32, 1i32]));
+    }
+
+    #[test]
+    fn enum_values_packed_string() {
+        // Two strings, stride 4: "foo\0" and "bar\0"
+        let mut data = *b"foo\0bar\0";
+        let st = NkMAIDEnum {
+            ul_type: 7, ul_elements: 2, ul_value: 0, ul_default: 0,
+            w_physical_bytes: 4, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        assert_eq!(decode_enum_values(&st), json!(["foo", "bar"]));
+    }
+
+    #[test]
+    fn enum_values_packed_string_no_null_terminator() {
+        // Chunk fills all bytes with no null — should use full chunk.
+        let mut data = *b"abcdxyz!";
+        let st = NkMAIDEnum {
+            ul_type: 7, ul_elements: 2, ul_value: 0, ul_default: 0,
+            w_physical_bytes: 4, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        assert_eq!(decode_enum_values(&st), json!(["abcd", "xyz!"]));
+    }
+
+    #[test]
+    fn enum_values_unknown_type_returns_null() {
+        let mut data = [0u32; 2];
+        let st = NkMAIDEnum {
+            ul_type: 99, ul_elements: 2, ul_value: 0, ul_default: 0,
+            w_physical_bytes: 4, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        assert_eq!(decode_enum_values(&st), Value::Null);
+    }
 }

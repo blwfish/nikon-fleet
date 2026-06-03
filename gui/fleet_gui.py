@@ -9,6 +9,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename
+
 # ── Paths ──────────────────────────────────────────────────────────────────
 
 _PROJECT = Path(__file__).resolve().parent.parent   # repo root
@@ -35,14 +37,6 @@ def _data_dir() -> Path:
 
 def _firmware_dir() -> Path:
     return _data_dir() / "firmware"
-
-def _parse_fw_filename(name: str) -> tuple[str, str]:
-    """'Z_9_0531.bin' → ('Z_9', '5.31')"""
-    stem = Path(name).stem
-    parts = stem.rsplit('_', 1)
-    if len(parts) == 2 and len(parts[1]) == 4 and parts[1].isdigit():
-        return parts[0], f"{int(parts[1][:2])}.{parts[1][2:]}"
-    return stem, ""
 
 def _save_data_dir(new_dir: str) -> None:
     cfg_dir = Path.home() / "Library" / "Preferences" / "net.blw.fleet"
@@ -173,8 +167,7 @@ class FleetApp:
         self.root.update()
         try:
             out = self._run("discover", "--json")
-            json_start = out.index('{')
-            self.cameras = json.loads(out[json_start:])["cameras"]
+            self.cameras = json.loads(strip_sdk_prefix(out))["cameras"]
             self._cam_lb.delete(0, tk.END)
             for cam in self.cameras:
                 self._cam_lb.insert(tk.END, f"  {cam['model']}  ·  {cam['serial']}")
@@ -292,7 +285,7 @@ class FleetApp:
         if not fw_dir.exists():
             return
         for f in sorted(fw_dir.glob("*.bin")):
-            model, version = _parse_fw_filename(f.name)
+            model, version = parse_fw_filename(f.name)
             self._fw_tree.insert("", tk.END, iid=f.name, values=(model, version, f.name))
 
     def add_firmware(self) -> None:
@@ -415,13 +408,9 @@ class FleetApp:
         snaps = refs = fw = 0
         with zipfile.ZipFile(src) as zf:
             for name in zf.namelist():
+                if not accept_zip_entry(name):
+                    continue
                 parts = Path(name).parts
-                if len(parts) != 2 or parts[0] not in ("snapshots", "references", "firmware"):
-                    continue
-                if parts[0] == "firmware" and not name.endswith(".bin"):
-                    continue
-                if parts[0] != "firmware" and not name.endswith(".json"):
-                    continue
                 out = dd / parts[0] / parts[1]
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_bytes(zf.read(name))
