@@ -678,16 +678,20 @@ fn cmd_firmware_add(data_dir: &Path, args: &FirmwareAddArgs) -> Result<()> {
             path: dir.display().to_string(),
         }.into());
     }
+
+    // Hash the source before copying so the stored digest reflects the original,
+    // not a potentially truncated copy written under disk-full conditions.
+    let size = fs::metadata(&args.bin_path)
+        .with_context(|| format!("stat {}", args.bin_path.display()))?.len();
+    let sha256 = sha256_file(&args.bin_path)
+        .with_context(|| format!("hashing {}", args.bin_path.display()))?;
+
     fs::create_dir_all(&dir)
         .with_context(|| format!("creating {}", dir.display()))?;
 
     let dest = dir.join("firmware.bin");
     fs::copy(&args.bin_path, &dest)
         .with_context(|| format!("copying firmware to {}", dest.display()))?;
-
-    let size = fs::metadata(&dest)?.len();
-    let sha256 = sha256_file(&dest)
-        .with_context(|| format!("hashing {}", dest.display()))?;
     let archived_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
 
     let meta = FirmwareMeta {
@@ -767,11 +771,15 @@ fn cmd_firmware_pin(data_dir: &Path, args: &FirmwarePinArgs) -> Result<()> {
     }
 
     let mut meta = load_meta(data_dir, &args.model, &args.version)?;
-    // Store relative to data_dir for portability.
+    // canonical_snapshot_path must be relative to data_dir for portability.
     let rel = args.snapshot_path
         .strip_prefix(data_dir)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| args.snapshot_path.display().to_string());
+        .with_context(|| format!(
+            "snapshot {} is outside data-dir {}; the canonical path must be \
+             relative for portability. Move the snapshot under data-dir first.",
+            args.snapshot_path.display(), data_dir.display()
+        ))?
+        .display().to_string();
     meta.canonical_snapshot_path = Some(rel.clone());
 
     let dir = archive_dir(data_dir, &args.model, &args.version);

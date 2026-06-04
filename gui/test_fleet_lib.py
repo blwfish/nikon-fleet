@@ -87,6 +87,17 @@ class TestAcceptZipEntry:
         # 5-part firmware path is rejected
         assert accept_zip_entry("firmware/Z_9/5.31/extra/firmware.bin") is False
 
+    # path-traversal attacks
+    def test_dotdot_in_firmware_path_rejected(self):
+        # 4-part path with ".." as middle component — must be rejected
+        assert accept_zip_entry("firmware/../snapshots/metadata.json") is False
+
+    def test_dotdot_in_snapshots_path_rejected(self):
+        assert accept_zip_entry("snapshots/../etc/passwd") is False
+
+    def test_dotdot_as_slug_component_rejected(self):
+        assert accept_zip_entry("firmware/../Z_9/5.31/firmware.bin") is False
+
     def test_bare_filename_rejected(self):
         assert accept_zip_entry("foo.json") is False
 

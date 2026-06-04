@@ -334,4 +334,138 @@ mod tests {
         fs::write(adir.join("metadata.json"), "{}").unwrap();
         assert!(archive_exists(dir.path(), "Z 9", "5.31"));
     }
+
+    // ── load_meta version guard ──────────────────────────────────────────
+
+    #[test]
+    fn load_meta_wrong_version_returns_error() {
+        let data_dir = TempDir::new().unwrap();
+        let adir = archive_dir(data_dir.path(), "Z 9", "5.31");
+        fs::create_dir_all(&adir).unwrap();
+        let bad = FirmwareMeta {
+            format_version: 99,  // unsupported
+            model: "Z 9".into(),
+            firmware_version: "5.31".into(),
+            archived_at: "2026-06-03T00:00:00Z".into(),
+            archived_by: "fleet firmware add".into(),
+            bin_sha256: "abc".into(),
+            bin_size_bytes: 0,
+            source_path: "".into(),
+            canonical_snapshot_path: None,
+            notes: None,
+        };
+        fs::write(adir.join("metadata.json"), serde_json::to_string(&bad).unwrap()).unwrap();
+        let err = load_meta(data_dir.path(), "Z 9", "5.31").unwrap_err();
+        assert!(
+            matches!(err, FirmwareError::UnsupportedVersion { found: 99, expected: 1 }),
+            "expected UnsupportedVersion, got {err:?}"
+        );
+    }
+
+    // ── list_archives filtering and corrupt-entry handling ───────────────
+
+    fn write_meta(data_dir: &Path, model: &str, version: &str) {
+        let adir = archive_dir(data_dir, model, version);
+        fs::create_dir_all(&adir).unwrap();
+        let meta = FirmwareMeta {
+            format_version: FIRMWARE_META_FORMAT_VERSION,
+            model: model.to_owned(),
+            firmware_version: version.to_owned(),
+            archived_at: "2026-06-03T00:00:00Z".into(),
+            archived_by: "fleet firmware add".into(),
+            bin_sha256: "abc".into(),
+            bin_size_bytes: 0,
+            source_path: "".into(),
+            canonical_snapshot_path: None,
+            notes: None,
+        };
+        fs::write(adir.join("metadata.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn list_archives_model_filter() {
+        let dir = TempDir::new().unwrap();
+        write_meta(dir.path(), "Z 9", "5.31");
+        write_meta(dir.path(), "Z 9", "4.00");
+        write_meta(dir.path(), "Z6_3", "2.00");
+
+        let all = list_archives(dir.path(), None);
+        assert_eq!(all.len(), 3);
+
+        let z9_only = list_archives(dir.path(), Some("Z 9"));
+        assert_eq!(z9_only.len(), 2);
+        assert!(z9_only.iter().all(|e| e.model == "Z 9"));
+
+        let z6_only = list_archives(dir.path(), Some("Z6_3"));
+        assert_eq!(z6_only.len(), 1);
+        assert_eq!(z6_only[0].version, "2.00");
+    }
+
+    #[test]
+    fn list_archives_skips_corrupt_metadata() {
+        let dir = TempDir::new().unwrap();
+        write_meta(dir.path(), "Z 9", "5.31");
+        // Add a directory with invalid JSON.
+        let bad_dir = archive_dir(dir.path(), "Z 9", "4.00");
+        fs::create_dir_all(&bad_dir).unwrap();
+        fs::write(bad_dir.join("metadata.json"), b"not valid json").unwrap();
+
+        let entries = list_archives(dir.path(), None);
+        assert_eq!(entries.len(), 1, "corrupt entry should be silently skipped");
+        assert_eq!(entries[0].version, "5.31");
+    }
+
+    #[test]
+    fn list_archives_sorted_by_model_then_version() {
+        let dir = TempDir::new().unwrap();
+        write_meta(dir.path(), "Z 9", "5.31");
+        write_meta(dir.path(), "Z 9", "4.00");
+        write_meta(dir.path(), "Z6_3", "2.00");
+
+        let entries = list_archives(dir.path(), None);
+        let keys: Vec<(&str, &str)> = entries.iter().map(|e| (e.model.as_str(), e.version.as_str())).collect();
+        assert_eq!(keys, vec![("Z 9", "4.00"), ("Z 9", "5.31"), ("Z6_3", "2.00")]);
+    }
+
+    // ── capability_map_for_fw boundary ───────────────────────────────────
+
+    #[test]
+    fn capability_map_fw_boundary() {
+        use crate::maid_layer::MaidLayerConfig;
+        let schema_text = r#"
+<model:Z 9>
+  <version>4.0</version>
+  <caplist>
+    <capability:kNkMAIDCapability_OldMode-100>
+      <description>0,0,"OldMode"</description>
+      <allowedoperation:14></allowedoperation>
+    </capability>
+  </caplist>
+</model>
+<model:Z 9>
+  <version>5.0</version>
+  <caplist>
+    <capability:kNkMAIDCapability_NewMode-200>
+      <description>0,0,"NewMode"</description>
+      <allowedoperation:14></allowedoperation>
+    </capability>
+  </caplist>
+</model>
+"#;
+        let schema = MaidLayerConfig::parse(schema_text).unwrap();
+
+        // At exactly fw_major=4: should include section 4.0 but NOT 5.0
+        let caps4 = capability_map_for_fw(&schema, "Z 9", 4);
+        assert!(caps4.contains_key("kNkMAIDCapability_OldMode"),  "4.0 section must be included at fw_major=4");
+        assert!(!caps4.contains_key("kNkMAIDCapability_NewMode"), "5.0 section must not be included at fw_major=4");
+
+        // At fw_major=5: both sections included
+        let caps5 = capability_map_for_fw(&schema, "Z 9", 5);
+        assert!(caps5.contains_key("kNkMAIDCapability_OldMode"),  "4.0 section must be included at fw_major=5");
+        assert!(caps5.contains_key("kNkMAIDCapability_NewMode"),  "5.0 section must be included at fw_major=5");
+
+        // At fw_major=3: neither section included (both above the boundary)
+        let caps3 = capability_map_for_fw(&schema, "Z 9", 3);
+        assert!(caps3.is_empty(), "no sections should be included at fw_major=3");
+    }
 }

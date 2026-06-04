@@ -30,6 +30,8 @@ def accept_zip_entry(name: str) -> bool:
     parts = Path(name).parts
     if not parts:
         return False
+    if any(p == ".." for p in parts):
+        return False
     folder = parts[0]
     if folder not in ("snapshots", "references", "firmware"):
         return False

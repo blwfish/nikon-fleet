@@ -202,8 +202,15 @@ pub fn diff_with_schema(
     let schema_only_in_b: Vec<String> = d.only_in_b.iter()
         .filter(|n| caps_b.contains_key(*n) && !caps_a.contains_key(*n))
         .cloned().collect();
+    // A capability is "schema-changed" only when BOTH firmware schemas define it
+    // but with different allowed_ops.  When one schema omits it entirely the
+    // capability falls into schema_only_in_a/b, not here.
     let schema_changed: Vec<String> = d.changed.iter()
-        .filter(|c| caps_a.get(&c.name) != caps_b.get(&c.name))
+        .filter(|c| {
+            let a_ops = caps_a.get(&c.name);
+            let b_ops = caps_b.get(&c.name);
+            a_ops.is_some() && b_ops.is_some() && a_ops != b_ops
+        })
         .map(|c| c.name.clone()).collect();
 
     d.firmware_annotation = Some(FirmwareAnnotation {
@@ -223,6 +230,7 @@ pub fn diff_with_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::maid_layer::MaidLayerConfig;
     use crate::snapshot::{Camera, Snapshot, Transport};
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -237,6 +245,44 @@ mod tests {
             s.insert(*n, *c, v.clone());
         }
         s
+    }
+
+    fn snap_fw(fw: &str, props: &[(&str, u32, serde_json::Value)]) -> Snapshot {
+        let mut s = snap(props);
+        s.camera.firmware = fw.into();
+        s
+    }
+
+    /// Minimal schema with two firmware sections for Z 9.
+    fn test_schema() -> MaidLayerConfig {
+        MaidLayerConfig::parse(r#"
+<model:Z 9>
+  <version>4.0</version>
+  <caplist>
+    <capability:OldCap-100>
+      <description>0,0,"OldCap"</description>
+      <allowedoperation:14></allowedoperation>
+    </capability>
+    <capability:SharedCap-200>
+      <description>0,0,"SharedCap"</description>
+      <allowedoperation:14></allowedoperation>
+    </capability>
+  </caplist>
+</model>
+<model:Z 9>
+  <version>5.0</version>
+  <caplist>
+    <capability:NewCap-300>
+      <description>0,0,"NewCap"</description>
+      <allowedoperation:14></allowedoperation>
+    </capability>
+    <capability:SharedCap-200>
+      <description>0,0,"SharedCap"</description>
+      <allowedoperation:10></allowedoperation>
+    </capability>
+  </caplist>
+</model>
+"#).unwrap()
     }
 
     #[test]
@@ -314,5 +360,90 @@ mod tests {
                 assert_eq!(model_b, "Z 6III");
             }
         }
+    }
+
+    // ── diff_with_schema ────────────────────────────────────────────────
+
+    #[test]
+    fn schema_no_annotation_when_same_firmware() {
+        let schema = test_schema();
+        let a = snap_fw("5.31", &[("SharedCap", 200, json!(1))]);
+        let b = snap_fw("5.31", &[("SharedCap", 200, json!(2))]);
+        let d = diff_with_schema(&a, &b, &DiffOptions::default(), &schema).unwrap();
+        assert!(d.firmware_annotation.is_none(), "same firmware → no annotation");
+    }
+
+    #[test]
+    fn schema_no_annotation_when_firmware_empty() {
+        let schema = test_schema();
+        let a = snap_fw("", &[("SharedCap", 200, json!(1))]);
+        let b = snap_fw("5.31", &[("SharedCap", 200, json!(2))]);
+        let d = diff_with_schema(&a, &b, &DiffOptions::default(), &schema).unwrap();
+        assert!(d.firmware_annotation.is_none(), "empty firmware → no annotation");
+    }
+
+    #[test]
+    fn schema_annotates_capability_added_in_newer_fw() {
+        let schema = test_schema();
+        // A is fw 4.31 (older), B is fw 5.00 (newer).
+        // caps_a (fw4) = {OldCap, SharedCap}; caps_b (fw5) = {OldCap, SharedCap, NewCap}.
+        // NewCap is only in caps_b → if it appears in d.only_in_b, it's schema_only_in_b.
+        let a = snap_fw("4.31", &[("SharedCap", 200, json!(7))]);
+        let b = snap_fw("5.00", &[("NewCap", 300, json!(1)), ("SharedCap", 200, json!(7))]);
+        let d = diff_with_schema(&a, &b, &DiffOptions::default(), &schema).unwrap();
+        let ann = d.firmware_annotation.as_ref().expect("should have annotation");
+        assert_eq!(ann.firmware_a, "4.31");
+        assert_eq!(ann.firmware_b, "5.00");
+        assert!(ann.schema_only_in_b.contains(&"NewCap".to_string()),
+            "NewCap (added in 5.x schema) should appear in schema_only_in_b");
+    }
+
+    #[test]
+    fn schema_annotates_capability_only_in_older_fw() {
+        let schema = test_schema();
+        // A is fw 5.00 (newer), B is fw 4.31 (older).
+        // caps_a (fw5) = {OldCap, SharedCap, NewCap}; caps_b (fw4) = {OldCap, SharedCap}.
+        // NewCap is only in caps_a → if it appears in d.only_in_a, it's schema_only_in_a.
+        let a = snap_fw("5.00", &[("NewCap", 300, json!(1)), ("SharedCap", 200, json!(7))]);
+        let b = snap_fw("4.31", &[("SharedCap", 200, json!(7))]);
+        let d = diff_with_schema(&a, &b, &DiffOptions::default(), &schema).unwrap();
+        let ann = d.firmware_annotation.as_ref().expect("should have annotation");
+        assert!(ann.schema_only_in_a.contains(&"NewCap".to_string()),
+            "NewCap (only in 5.x schema) should appear in schema_only_in_a when A is the newer fw");
+    }
+
+    #[test]
+    fn schema_changed_allowed_ops_detected() {
+        let schema = test_schema();
+        // SharedCap has allowed_ops=14 in 4.0, allowed_ops=10 in 5.0 override
+        // But capability_map_for_fw takes the last-inserted value; for fw5 the 5.0
+        // section overrides the 4.0 section's value → allowed_ops=10.
+        // For fw4 only section 4.0 applies → allowed_ops=14.
+        // diff: SharedCap value differs between A and B → should be in schema_changed.
+        let a = snap_fw("4.31", &[("SharedCap", 200, json!(1))]);
+        let b = snap_fw("5.00", &[("SharedCap", 200, json!(9))]);
+        let d = diff_with_schema(&a, &b, &DiffOptions::default(), &schema).unwrap();
+        let ann = d.firmware_annotation.as_ref().expect("should have annotation");
+        assert!(ann.schema_changed.contains(&"SharedCap".to_string()),
+            "SharedCap has different allowed_ops across firmware versions → schema_changed");
+    }
+
+    #[test]
+    fn schema_changed_no_double_count_with_only_in_a() {
+        // A capability that is in d.changed AND present in caps_a but absent
+        // from caps_b (unusual: both cameras have it but 5.x schema omits it)
+        // should NOT appear in schema_changed — only allowed_ops difference counts.
+        // Here OldCap is absent from 5.0 schema so caps_b won't have it.
+        // We contrive snapshots where both cameras happen to expose OldCap.
+        let schema = test_schema();
+        let a = snap_fw("4.31", &[("OldCap", 100, json!(1))]);
+        let b = snap_fw("5.00", &[("OldCap", 100, json!(99))]);  // also has OldCap
+        let d = diff_with_schema(&a, &b, &DiffOptions::default(), &schema).unwrap();
+        let ann = d.firmware_annotation.as_ref().expect("should have annotation");
+        // OldCap value differs → in d.changed
+        assert!(d.changed.iter().any(|c| c.name == "OldCap"), "OldCap should be in changed");
+        // OldCap absent from caps_b → NOT in schema_changed (one side is None)
+        assert!(!ann.schema_changed.contains(&"OldCap".to_string()),
+            "OldCap absent from 5.x schema should NOT be in schema_changed");
     }
 }

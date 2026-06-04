@@ -194,12 +194,22 @@ class FleetApp:
         if self.selected is None:
             return
         serial   = self.cameras[self.selected]["serial"]
+        model    = self.cameras[self.selected]["model"]
         dd       = _data_dir()
         snap_dir = dd / "snapshots"
         ref_dir  = dd / "references"
-        refs     = {f.name for f in ref_dir.iterdir()} if ref_dir.exists() else set()
         if not snap_dir.exists():
             return
+        # Read the reference file for this camera (CLI naming: {model_slug}_{serial}.json).
+        ref_captured_at: str | None = None
+        if ref_dir.exists():
+            ref_name = f"{model.replace(' ', '_')}_{serial}.json"
+            ref_path = ref_dir / ref_name
+            if ref_path.exists():
+                try:
+                    ref_captured_at = json.loads(ref_path.read_text()).get("captured_at", "")[:19]
+                except Exception:
+                    pass
         rows = []
         for f in snap_dir.glob("*.json"):
             try:
@@ -213,7 +223,7 @@ class FleetApp:
                 pass
         rows.sort(reverse=True)
         for ts, label, fw, fname in rows:
-            ref_mark = "◀ ref" if fname in refs else ""
+            ref_mark = "◀ ref" if ref_captured_at and ts == ref_captured_at else ""
             self._tree.insert("", tk.END, iid=fname, values=(ts, label, fw, ref_mark))
 
     def take_snapshot(self) -> None:
@@ -248,7 +258,11 @@ class FleetApp:
         ref_dir = dd / "references"
         ref_dir.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.copy2(dd / "snapshots" / fname, ref_dir / fname)
+            snap = json.loads((dd / "snapshots" / fname).read_text())
+            cam  = snap["camera"]
+            # Match `fleet ref set` naming so `fleet check` finds the reference.
+            ref_fname = f"{cam['model'].replace(' ', '_')}_{cam['serial']}.json"
+            shutil.copy2(dd / "snapshots" / fname, ref_dir / ref_fname)
         except OSError as e:
             messagebox.showerror("Set reference failed", str(e), parent=self.root)
             return
@@ -284,9 +298,24 @@ class FleetApp:
         fw_dir = _firmware_dir()
         if not fw_dir.exists():
             return
+        # Nested archive layout: firmware/{model_slug}/{version}/metadata.json
+        for meta_file in sorted(fw_dir.rglob("metadata.json")):
+            try:
+                meta = json.loads(meta_file.read_text())
+                model   = meta.get("model", "")
+                version = meta.get("firmware_version", "")
+                slug    = meta_file.parent.parent.name
+                ver     = meta_file.parent.name
+                iid     = f"nested|{slug}|{ver}"
+                self._fw_tree.insert("", tk.END, iid=iid,
+                                     values=(model, version, f"{slug}/{ver}/firmware.bin"))
+            except Exception:
+                continue
+        # Legacy flat layout: firmware/*.bin (added via old GUI Add button)
         for f in sorted(fw_dir.glob("*.bin")):
             model, version = parse_fw_filename(f.name)
-            self._fw_tree.insert("", tk.END, iid=f.name, values=(model, version, f.name))
+            self._fw_tree.insert("", tk.END, iid=f"flat|{f.name}",
+                                 values=(model, version, f.name))
 
     def add_firmware(self) -> None:
         src = filedialog.askopenfilename(
@@ -317,18 +346,30 @@ class FleetApp:
         if not sel:
             messagebox.showwarning("No selection", "Select a firmware file first.", parent=self.root)
             return
-        fname = sel[0]
+        iid = sel[0]
+        fw_dir = _firmware_dir()
+        if iid.startswith("nested|"):
+            _, slug, ver = iid.split("|", 2)
+            target = fw_dir / slug / ver
+            label  = f"{slug}/{ver}"
+        else:
+            _, fname = iid.split("|", 1)
+            target = fw_dir / fname
+            label  = fname
         if not messagebox.askyesno("Remove firmware",
-                                    f"Remove {fname} from the library?\nThis cannot be undone.",
+                                    f"Remove {label} from the library?\nThis cannot be undone.",
                                     parent=self.root):
             return
         try:
-            (_firmware_dir() / fname).unlink()
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
         except OSError as e:
             messagebox.showerror("Remove failed", str(e), parent=self.root)
             return
         self._load_firmware()
-        self._status(f"Removed {fname}.")
+        self._status(f"Removed {label}.")
 
     # ── Preferences ─────────────────────────────────────────────────────
 
