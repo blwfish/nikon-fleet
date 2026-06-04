@@ -43,14 +43,26 @@ class TestAcceptZipEntry:
         assert accept_zip_entry("references/bar.json") is True
 
     def test_firmware_bin(self):
-        assert accept_zip_entry("firmware/Z_9_0531.bin") is True
+        # Nested layout: firmware/{model_slug}/{version}/firmware.bin
+        assert accept_zip_entry("firmware/Z_9/5.31/firmware.bin") is True
 
-    # wrong extension
+    def test_firmware_metadata_json(self):
+        assert accept_zip_entry("firmware/Z_9/5.31/metadata.json") is True
+
+    def test_firmware_z6iii(self):
+        assert accept_zip_entry("firmware/Z6_3/2.00/firmware.bin") is True
+
+    # wrong extension / wrong filename
     def test_snapshot_bin_rejected(self):
         assert accept_zip_entry("snapshots/foo.bin") is False
 
-    def test_firmware_json_rejected(self):
-        assert accept_zip_entry("firmware/Z_9_0531.json") is False
+    def test_firmware_arbitrary_json_rejected(self):
+        # Only metadata.json (exact filename) is accepted, not arbitrary .json
+        assert accept_zip_entry("firmware/Z_9/5.31/other.json") is False
+
+    def test_firmware_flat_bin_rejected(self):
+        # Old flat layout (2-part) is no longer accepted
+        assert accept_zip_entry("firmware/Z_9_0531.bin") is False
 
     def test_reference_bin_rejected(self):
         assert accept_zip_entry("references/bar.bin") is False
@@ -66,6 +78,14 @@ class TestAcceptZipEntry:
 
     def test_too_deep_rejected(self):
         assert accept_zip_entry("snapshots/subdir/foo.json") is False
+
+    def test_firmware_too_shallow_rejected(self):
+        # 3-part firmware path (missing version level) is rejected
+        assert accept_zip_entry("firmware/Z_9/firmware.bin") is False
+
+    def test_firmware_too_deep_rejected(self):
+        # 5-part firmware path is rejected
+        assert accept_zip_entry("firmware/Z_9/5.31/extra/firmware.bin") is False
 
     def test_bare_filename_rejected(self):
         assert accept_zip_entry("foo.json") is False

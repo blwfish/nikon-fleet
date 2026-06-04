@@ -392,8 +392,11 @@ class FleetApp:
                         count += 1
             fw_dir = dd / "firmware"
             if fw_dir.exists():
-                for f in fw_dir.glob("*.bin"):
-                    zf.write(f, f"firmware/{f.name}", compress_type=zipfile.ZIP_STORED)
+                for f in fw_dir.rglob("firmware.bin"):
+                    zf.write(f, str(f.relative_to(dd)), compress_type=zipfile.ZIP_STORED)
+                    count += 1
+                for f in fw_dir.rglob("metadata.json"):
+                    zf.write(f, str(f.relative_to(dd)))
                     count += 1
         self._status(f"Exported {count} file(s) → {Path(dest).name}")
 
@@ -410,10 +413,10 @@ class FleetApp:
             for name in zf.namelist():
                 if not accept_zip_entry(name):
                     continue
-                parts = Path(name).parts
-                out = dd / parts[0] / parts[1]
+                out = dd / Path(name)
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_bytes(zf.read(name))
+                parts = Path(name).parts
                 if parts[0] == "snapshots":   snaps += 1
                 elif parts[0] == "references": refs  += 1
                 else:                          fw    += 1

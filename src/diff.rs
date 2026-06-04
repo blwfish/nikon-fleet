@@ -11,6 +11,8 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::firmware::{capability_map_for_fw, schema_major};
+use crate::maid_layer::MaidLayerConfig;
 use crate::snapshot::Snapshot;
 
 /// A single property whose value differs between two snapshots.
@@ -22,6 +24,22 @@ pub struct Change {
     pub value_b: serde_json::Value,
 }
 
+/// Schema-driven explanation of diff entries that cross a firmware version
+/// boundary. Present only when both snapshots have non-empty, distinct firmware
+/// versions and the model has per-version schema sections.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FirmwareAnnotation {
+    pub firmware_a: String,
+    pub firmware_b: String,
+    /// Subset of `only_in_a` that the schema explains as removed in newer firmware.
+    pub schema_only_in_a: Vec<String>,
+    /// Subset of `only_in_b` that the schema explains as added in newer firmware.
+    pub schema_only_in_b: Vec<String>,
+    /// Subset of `changed[].name` where `allowed_ops` differs between the two
+    /// firmware versions' schemas.
+    pub schema_changed: Vec<String>,
+}
+
 /// Result of comparing two snapshots. `only_in_a` and `only_in_b` should
 /// typically be empty when comparing snapshots of the same body unless one
 /// was captured before a firmware update that added or removed properties.
@@ -30,6 +48,11 @@ pub struct Diff {
     pub changed: Vec<Change>,
     pub only_in_a: Vec<String>,
     pub only_in_b: Vec<String>,
+    /// Set when both snapshots have differing, non-empty firmware versions and
+    /// the model has per-version schema sections. `None` for legacy snapshots
+    /// or models with only a `common` section (e.g. Z 5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firmware_annotation: Option<FirmwareAnnotation>,
 }
 
 impl Diff {
@@ -121,8 +144,76 @@ pub fn diff(a: &Snapshot, b: &Snapshot, opts: &DiffOptions) -> Result<Diff, Diff
     Ok(result)
 }
 
-fn is_volatile(name: &str) -> bool {
+pub fn is_volatile(name: &str) -> bool {
     VOLATILE_SUBSTRINGS.iter().any(|s| name.contains(s))
+}
+
+/// Like `diff`, but adds firmware-version annotation when the two snapshots
+/// were captured on different firmware versions and the schema knows about both.
+pub fn diff_with_schema(
+    a: &Snapshot,
+    b: &Snapshot,
+    opts: &DiffOptions,
+    schema: &MaidLayerConfig,
+) -> Result<Diff, DiffError> {
+    let mut d = diff(a, b, opts)?;
+
+    let fw_a = &a.camera.firmware;
+    let fw_b = &b.camera.firmware;
+    if fw_a.is_empty() || fw_b.is_empty() || fw_a == fw_b {
+        return Ok(d);
+    }
+    let (Some(major_a), Some(major_b)) = (schema_major(fw_a), schema_major(fw_b)) else {
+        return Ok(d);
+    };
+
+    // Skip if the model has no per-firmware sections (e.g. Z 5 with only "common").
+    let has_versioned = schema.sections_for_model(&a.camera.model)
+        .any(|s| schema_major(&s.version).is_some());
+    if !has_versioned {
+        return Ok(d);
+    }
+
+    // Warn and skip for any firmware version not covered by the schema.
+    let known_majors: BTreeSet<u32> = schema.sections_for_model(&a.camera.model)
+        .filter_map(|s| schema_major(&s.version))
+        .collect();
+    if !known_majors.contains(&major_a) {
+        eprintln!(
+            "Warning: no schema section found for {} firmware {}; cross-firmware annotation skipped.",
+            a.camera.model, fw_a
+        );
+        return Ok(d);
+    }
+    if !known_majors.contains(&major_b) {
+        eprintln!(
+            "Warning: no schema section found for {} firmware {}; cross-firmware annotation skipped.",
+            a.camera.model, fw_b
+        );
+        return Ok(d);
+    }
+
+    let caps_a = capability_map_for_fw(schema, &a.camera.model, major_a);
+    let caps_b = capability_map_for_fw(schema, &a.camera.model, major_b);
+
+    let schema_only_in_a: Vec<String> = d.only_in_a.iter()
+        .filter(|n| caps_a.contains_key(*n) && !caps_b.contains_key(*n))
+        .cloned().collect();
+    let schema_only_in_b: Vec<String> = d.only_in_b.iter()
+        .filter(|n| caps_b.contains_key(*n) && !caps_a.contains_key(*n))
+        .cloned().collect();
+    let schema_changed: Vec<String> = d.changed.iter()
+        .filter(|c| caps_a.get(&c.name) != caps_b.get(&c.name))
+        .map(|c| c.name.clone()).collect();
+
+    d.firmware_annotation = Some(FirmwareAnnotation {
+        firmware_a: fw_a.clone(),
+        firmware_b: fw_b.clone(),
+        schema_only_in_a,
+        schema_only_in_b,
+        schema_changed,
+    });
+    Ok(d)
 }
 
 // ─────────────────────────────────────────────────────────────────────────

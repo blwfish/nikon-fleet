@@ -33,6 +33,11 @@ libc = "0.2"
 # the USB descriptor, and reset cameras so the SDK's IOKit notifications fire.
 rusb = "0.9"
 
+# SHA-256 hashing for firmware archive integrity checks.
+sha2 = "0.10"
+
 [dev-dependencies]
 # Nicer assertion output for tests
 pretty_assertions = "1"
+# Temporary directories for firmware tests
+tempfile = "3"

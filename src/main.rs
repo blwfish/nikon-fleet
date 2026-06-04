@@ -12,7 +12,12 @@ use clap::{Args, Parser, Subcommand};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use nikon_fleet::diff::{Diff, DiffOptions, diff};
+use nikon_fleet::diff::{Diff, DiffOptions, diff, is_volatile};
+use nikon_fleet::firmware::{
+    FirmwareError, FirmwareMeta, FIRMWARE_META_FORMAT_VERSION,
+    archive_dir, archive_exists, format_size, list_archives, load_meta,
+    model_slug, save_meta, sha256_file,
+};
 use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::sdk::{CapabilityInfo, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET, OP_SET};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
@@ -91,6 +96,10 @@ enum Cmd {
 
     /// Restore settings from a snapshot to a live camera.
     Restore(RestoreArgs),
+
+    /// Manage the firmware archive.
+    #[command(subcommand)]
+    Firmware(FirmwareCmd),
 }
 
 #[derive(Args, Debug)]
@@ -148,6 +157,80 @@ struct LsArgs {
 #[derive(Args, Debug)]
 struct RmArgs {
     snapshot_path: PathBuf,
+}
+
+#[derive(Subcommand, Debug)]
+enum FirmwareCmd {
+    /// Archive a firmware binary file.
+    Add(FirmwareAddArgs),
+    /// List archived firmware versions.
+    Ls(FirmwareLsArgs),
+    /// Associate a snapshot as the canonical settings for a firmware version.
+    Pin(FirmwarePinArgs),
+    /// Generate a rollback bundle for a given firmware version.
+    Rollback(FirmwareRollbackArgs),
+    /// Compare live camera firmware against references and check archive coverage.
+    Check(FirmwareCheckArgs),
+}
+
+#[derive(Args, Debug)]
+struct FirmwareAddArgs {
+    /// Path to the firmware .bin file to archive.
+    bin_path: PathBuf,
+    /// Camera model, e.g. "Z 9".
+    #[arg(long)]
+    model: String,
+    /// Firmware version string, e.g. "5.31".
+    #[arg(long)]
+    version: String,
+    /// Optional free-form notes.
+    #[arg(long)]
+    notes: Option<String>,
+    /// Overwrite an existing archive entry.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args, Debug)]
+struct FirmwareLsArgs {
+    /// Limit to a specific model, e.g. "Z 9".
+    #[arg(long)]
+    model: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct FirmwarePinArgs {
+    /// Snapshot to pin as the canonical settings for this firmware version.
+    snapshot_path: PathBuf,
+    /// Camera model, e.g. "Z 9".
+    #[arg(long)]
+    model: String,
+    /// Firmware version string, e.g. "5.31".
+    #[arg(long)]
+    version: String,
+}
+
+#[derive(Args, Debug)]
+struct FirmwareRollbackArgs {
+    /// Camera model, e.g. "Z 9".
+    #[arg(long)]
+    model: String,
+    /// Firmware version string, e.g. "5.31".
+    #[arg(long)]
+    version: String,
+    /// Restrict bundle to a specific camera serial.
+    #[arg(long)]
+    serial: Option<String>,
+    /// Directory to write the rollback bundle into. Default: <data-dir>/rollback-bundles/{model}_{version}_{timestamp}/
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct FirmwareCheckArgs {
+    /// Check only the camera with this serial number.
+    #[arg(long)]
+    serial: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -579,6 +662,301 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Firmware commands
+// ─────────────────────────────────────────────────────────────────────────
+
+fn cmd_firmware_add(data_dir: &Path, args: &FirmwareAddArgs) -> Result<()> {
+    if !args.bin_path.exists() {
+        bail!("firmware file not found: {}", args.bin_path.display());
+    }
+    let dir = archive_dir(data_dir, &args.model, &args.version);
+    if dir.join("metadata.json").exists() && !args.force {
+        return Err(FirmwareError::AlreadyArchived {
+            model: args.model.clone(),
+            version: args.version.clone(),
+            path: dir.display().to_string(),
+        }.into());
+    }
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+
+    let dest = dir.join("firmware.bin");
+    fs::copy(&args.bin_path, &dest)
+        .with_context(|| format!("copying firmware to {}", dest.display()))?;
+
+    let size = fs::metadata(&dest)?.len();
+    let sha256 = sha256_file(&dest)
+        .with_context(|| format!("hashing {}", dest.display()))?;
+    let archived_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+
+    let meta = FirmwareMeta {
+        format_version: FIRMWARE_META_FORMAT_VERSION,
+        model: args.model.clone(),
+        firmware_version: args.version.clone(),
+        archived_at,
+        archived_by: "fleet firmware add".into(),
+        bin_sha256: sha256.clone(),
+        bin_size_bytes: size,
+        source_path: args.bin_path.display().to_string(),
+        canonical_snapshot_path: None,
+        notes: args.notes.clone(),
+    };
+    save_meta(&meta, &dir)?;
+
+    println!(
+        "Archived {} firmware {}\n  bin:    firmware/{}/{}/firmware.bin  ({})\n  sha256: {}",
+        args.model, args.version,
+        model_slug(&args.model), args.version,
+        format_size(size),
+        sha256,
+    );
+    println!(
+        "  Hint: run `fleet firmware pin --model {:?} --version {} <snapshot>` to associate settings.",
+        args.model, args.version
+    );
+    Ok(())
+}
+
+fn cmd_firmware_ls(data_dir: &Path, args: &FirmwareLsArgs) -> Result<()> {
+    let entries = list_archives(data_dir, args.model.as_deref());
+    if entries.is_empty() {
+        if let Some(m) = &args.model {
+            println!("(no firmware archived for {m})");
+        } else {
+            println!("(no firmware archived)");
+        }
+        return Ok(());
+    }
+    let mut cur_model = String::new();
+    for e in &entries {
+        if e.model != cur_model {
+            println!("{}", e.model);
+            cur_model = e.model.clone();
+        }
+        let canonical = match &e.meta.canonical_snapshot_path {
+            Some(p) => p.clone(),
+            None => "(none)  ← pin needed".into(),
+        };
+        println!(
+            "  {}   {}   {}   canonical: {}",
+            e.version,
+            e.meta.archived_at.get(..10).unwrap_or(&e.meta.archived_at),
+            format_size(e.meta.bin_size_bytes),
+            canonical,
+        );
+    }
+    Ok(())
+}
+
+fn cmd_firmware_pin(data_dir: &Path, args: &FirmwarePinArgs) -> Result<()> {
+    let snap = Snapshot::load_from_file(&args.snapshot_path)
+        .with_context(|| format!("loading {}", args.snapshot_path.display()))?;
+
+    if snap.camera.model != args.model {
+        bail!(
+            "snapshot is for model {:?} but --model is {:?}",
+            snap.camera.model, args.model
+        );
+    }
+    if !snap.camera.firmware.is_empty() && snap.camera.firmware != args.version {
+        eprintln!(
+            "warning: snapshot firmware field is {:?}, expected {:?} (proceeding)",
+            snap.camera.firmware, args.version
+        );
+    }
+
+    let mut meta = load_meta(data_dir, &args.model, &args.version)?;
+    // Store relative to data_dir for portability.
+    let rel = args.snapshot_path
+        .strip_prefix(data_dir)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| args.snapshot_path.display().to_string());
+    meta.canonical_snapshot_path = Some(rel.clone());
+
+    let dir = archive_dir(data_dir, &args.model, &args.version);
+    save_meta(&meta, &dir)?;
+    println!("Pinned {} {} → {}", args.model, args.version, rel);
+    Ok(())
+}
+
+fn generate_settings_table(snap: &Snapshot, schema: &MaidLayerConfig) -> String {
+    let mut display_map: HashMap<String, String> = HashMap::new();
+    for section in schema.sections_for_model(&snap.camera.model) {
+        for cap in &section.capabilities {
+            display_map.entry(cap.name.clone())
+                .or_insert_with(|| cap.display.clone());
+        }
+    }
+    let mut rows: Vec<(String, String)> = snap.properties.iter()
+        .filter(|(name, _)| !is_volatile(name))
+        .map(|(name, prop)| {
+            let label = display_map.get(name)
+                .filter(|d| !d.is_empty())
+                .cloned()
+                .unwrap_or_else(|| name.clone());
+            (label, prop.value.to_string())
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.iter()
+        .map(|(label, value)| format!("  {label:<50} {value}\n"))
+        .collect()
+}
+
+fn cmd_firmware_rollback(data_dir: &Path, schema_path: &Path, args: &FirmwareRollbackArgs) -> Result<()> {
+    let meta = load_meta(data_dir, &args.model, &args.version)?;
+    let archive = archive_dir(data_dir, &args.model, &args.version);
+    let bin_path = archive.join("firmware.bin");
+
+    // Integrity check.
+    let computed = sha256_file(&bin_path)
+        .with_context(|| format!("hashing {}", bin_path.display()))?;
+    if computed != meta.bin_sha256 {
+        return Err(FirmwareError::ChecksumMismatch {
+            stored: meta.bin_sha256.clone(),
+            computed,
+        }.into());
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let ts = now.format(&Rfc3339)?.replace(':', "").replace('-', "");
+    let out_dir = match &args.output_dir {
+        Some(d) => d.clone(),
+        None => data_dir.join("rollback-bundles").join(format!(
+            "{}_{}_{}", model_slug(&args.model), args.version, ts
+        )),
+    };
+    fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating {}", out_dir.display()))?;
+
+    fs::copy(&bin_path, out_dir.join("firmware.bin"))?;
+
+    let canonical_snap: Option<Snapshot> = match &meta.canonical_snapshot_path {
+        Some(rel) => {
+            let p = data_dir.join(rel);
+            match Snapshot::load_from_file(&p) {
+                Ok(s) => {
+                    fs::copy(&p, out_dir.join("canonical_settings.json"))?;
+                    Some(s)
+                }
+                Err(e) => {
+                    eprintln!("warning: could not load canonical snapshot {}: {e}", p.display());
+                    None
+                }
+            }
+        }
+        None => {
+            eprintln!("warning: no canonical snapshot pinned for {} {}; bundle will lack settings reference.", args.model, args.version);
+            None
+        }
+    };
+
+    // Generate rollback instructions.
+    let schema = MaidLayerConfig::parse_file(schema_path)
+        .with_context(|| format!("loading schema from {}", schema_path.display()))?;
+    let timestamp_str = now.format(&Rfc3339)?;
+
+    let mut instructions = String::new();
+    instructions.push_str(&format!("Rollback Procedure: {} → firmware {}\n", args.model, args.version));
+    instructions.push_str(&format!("Generated: {timestamp_str}\n"));
+    instructions.push_str(&format!("Bundle: {}\n", out_dir.display()));
+    instructions.push_str("\nSTEP 1 — VERIFY FIRMWARE FILE\n");
+    instructions.push_str(&format!("  File:    firmware.bin\n"));
+    instructions.push_str(&format!("  Size:    {} bytes\n", meta.bin_size_bytes));
+    instructions.push_str(&format!("  SHA-256: {}\n", meta.bin_sha256));
+    instructions.push_str("  Confirm the file is not corrupt before proceeding.\n");
+    instructions.push_str("\nSTEP 2 — COPY TO SD CARD\n");
+    instructions.push_str("  Copy firmware.bin to an SD card formatted in the camera.\n");
+    instructions.push_str("  Rename to the filename required by the camera's firmware update procedure.\n");
+    instructions.push_str("  (See camera manual — Nikon requires a specific filename per model;\n");
+    instructions.push_str("  the exact name is not encoded in this tool.)\n");
+    instructions.push_str("\nSTEP 3 — FLASH\n");
+    instructions.push_str("  Insert SD card into camera slot 1.\n");
+    instructions.push_str("  MENU → SETUP MENU → Firmware version → Update\n");
+    instructions.push_str("  Follow on-screen prompts. Do not power off during flashing.\n");
+    instructions.push_str("\nSTEP 4 — VERIFY\n");
+    instructions.push_str("  After restart: MENU → SETUP MENU → Firmware version\n");
+    instructions.push_str(&format!("  Confirm the displayed version is {}.\n", args.version));
+    instructions.push_str("  Or reconnect and run:\n");
+    instructions.push_str("    fleet discover\n");
+    instructions.push_str("    fleet firmware check\n");
+    instructions.push_str("\nSTEP 5 — RESTORE SETTINGS\n");
+    instructions.push_str("  (Automatic settings push is not yet implemented — see future work.)\n");
+    instructions.push_str("  Restore settings manually using the table below as reference.\n");
+    instructions.push_str("  canonical_settings.json contains the full snapshot for archival.\n\n");
+    if let Some(snap) = &canonical_snap {
+        instructions.push_str("  Key settings from canonical snapshot (non-volatile):\n");
+        instructions.push_str("  ─────────────────────────────────────────────────────\n");
+        instructions.push_str(&generate_settings_table(snap, &schema));
+    } else {
+        instructions.push_str("  (No canonical snapshot pinned for this firmware version.)\n");
+    }
+    fs::write(out_dir.join("rollback-instructions.txt"), instructions)?;
+
+    println!(
+        "Rollback bundle for {} → {}\n  {}/\n    firmware.bin              ({}, sha256 verified)",
+        args.model, args.version, out_dir.display(), format_size(meta.bin_size_bytes)
+    );
+    if canonical_snap.is_some() {
+        println!("    canonical_settings.json");
+    }
+    println!("    rollback-instructions.txt\n\nFollow rollback-instructions.txt to proceed.");
+    Ok(())
+}
+
+fn cmd_firmware_check(data_dir: &Path, args: &FirmwareCheckArgs) -> Result<()> {
+    let cameras = usb_camera_list();
+    let filtered: Vec<&UsbCameraInfo> = match &args.serial {
+        Some(s) => cameras.iter().filter(|c| &c.serial == s).collect(),
+        None => cameras.iter().collect(),
+    };
+    if filtered.is_empty() {
+        if args.serial.is_some() {
+            bail!("no camera found with serial {:?}", args.serial);
+        } else {
+            println!("(no Nikon cameras detected via USB)");
+            return Ok(());
+        }
+    }
+    let refs_dir = references_dir(data_dir);
+    for cam in filtered {
+        let ref_fw = if refs_dir.exists() {
+            let ref_path = refs_dir.join(reference_filename(&cam.model, &cam.serial));
+            if ref_path.exists() {
+                Snapshot::load_from_file(&ref_path)
+                    .ok()
+                    .map(|s| s.camera.firmware)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        let status = if ref_fw.is_empty() {
+            "[NO REF]"
+        } else if cam.firmware == ref_fw {
+            "[OK]     "
+        } else {
+            "[CHANGED]"
+        };
+
+        let archived = if archive_exists(data_dir, &cam.model, &cam.firmware) {
+            "archived"
+        } else {
+            "no archive"
+        };
+
+        println!(
+            "{:<6}  {}   fw={}   ref-fw={:<6}  {}  {}",
+            cam.model, cam.serial, cam.firmware, ref_fw, status, archived
+        );
+    }
+    Ok(())
+}
+
 fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset: bool) -> Result<()> {
     let snap_path = resolve_snapshot_path(data_dir, &args.snapshot_path);
     let snap = Snapshot::load_from_file(&snap_path)
@@ -671,5 +1049,12 @@ fn main() -> Result<()> {
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
         Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, args, no_reset),
+        Cmd::Firmware(sub) => match sub {
+            FirmwareCmd::Add(args) => cmd_firmware_add(&cli.data_dir, args),
+            FirmwareCmd::Ls(args) => cmd_firmware_ls(&cli.data_dir, args),
+            FirmwareCmd::Pin(args) => cmd_firmware_pin(&cli.data_dir, args),
+            FirmwareCmd::Rollback(args) => cmd_firmware_rollback(&cli.data_dir, &cli.schema, args),
+            FirmwareCmd::Check(args) => cmd_firmware_check(&cli.data_dir, args),
+        },
     }
 }

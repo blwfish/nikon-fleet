@@ -18,23 +18,30 @@ def strip_sdk_prefix(out: str) -> str:
 def accept_zip_entry(name: str) -> bool:
     """Return True if a zip archive entry should be imported.
 
-    Accepted layout:  <folder>/<filename>
-      snapshots/   — *.json only
-      references/  — *.json only
-      firmware/    — *.bin  only
+    Accepted layouts:
+      snapshots/<file>.json       — 2-part, .json only
+      references/<file>.json      — 2-part, .json only
+      firmware/<slug>/<ver>/firmware.bin   — 4-part nested, .bin
+      firmware/<slug>/<ver>/metadata.json  — 4-part nested, .json
 
-    Rejects directory entries (trailing slash → single part), path-traversal
-    attempts (more than two parts), unknown folders, and wrong extensions.
+    Rejects directory entries, path-traversal attempts, unknown folders,
+    and wrong extensions.
     """
     parts = Path(name).parts
-    if len(parts) != 2:
+    if not parts:
         return False
     folder = parts[0]
     if folder not in ("snapshots", "references", "firmware"):
         return False
-    if folder == "firmware":
-        return name.endswith(".bin")
-    return name.endswith(".json")
+
+    if folder in ("snapshots", "references"):
+        return len(parts) == 2 and name.endswith(".json")
+
+    # firmware — nested layout: firmware/{model_slug}/{version}/{file}
+    if len(parts) != 4:
+        return False
+    filename = parts[3]
+    return filename == "firmware.bin" or filename == "metadata.json"
 
 
 def parse_fw_filename(name: str) -> tuple[str, str]:

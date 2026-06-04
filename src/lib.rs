@@ -4,6 +4,7 @@
 //! Keeping the logic in `lib.rs` makes it directly testable and reusable.
 
 pub mod diff;
+pub mod firmware;
 pub mod maid_layer;
 pub mod range_value;
 pub mod sdk;
