@@ -36,9 +36,9 @@ EXTRACT="$(mktemp -d)"
 trap "rm -rf '$EXTRACT'" EXIT
 ( cd "$EXTRACT" && unzip -q "$ZIP" )
 
-cp -R "$EXTRACT/TestApp/TypeCommon Module.bundle" "$RUNTIME/"
-cp -R "$EXTRACT/TestApp/Frameworks"               "$RUNTIME/"
-cp     "$EXTRACT/TestApp/TestApp/"*.config        "$RUNTIME/"
+cp -R "$EXTRACT/TestApp/TestApp/TypeCommon Module.bundle" "$RUNTIME/"
+cp -R "$EXTRACT/TestApp/Frameworks"                      "$RUNTIME/"
+cp     "$EXTRACT/TestApp/TestApp/"*.config               "$RUNTIME/"
 
 BUNDLE_EXE="$RUNTIME/TypeCommon Module.bundle/Contents/MacOS/TypeCommon Module"
 DRIVER="$RUNTIME/Frameworks/libNkPTPDriver2.dylib"

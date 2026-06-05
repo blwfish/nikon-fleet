@@ -114,6 +114,7 @@ class FleetApp:
         self._tree.configure(yscrollcommand=snap_sb.set)
         snap_sb.pack(side=tk.RIGHT, fill=tk.Y)
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._tree.bind("<Double-1>", self._on_snapshot_double_click)
 
         fw_f = ttk.Frame(self._right_nb, padding=4)
         self._right_nb.add(fw_f, text="Firmware Library")
@@ -247,6 +248,20 @@ class FleetApp:
             messagebox.showerror("Snapshot failed", str(e), parent=self.root)
         finally:
             self.root.config(cursor="")
+
+    def _on_snapshot_double_click(self, evt) -> None:
+        row = self._tree.identify_row(evt.y)
+        if not row:
+            return
+        self._tree.selection_set(row)
+        fname = row   # iid == filename
+        path  = _data_dir() / "snapshots" / fname
+        try:
+            data = json.loads(path.read_text())
+        except Exception as e:
+            messagebox.showerror("Could not open snapshot", str(e), parent=self.root)
+            return
+        SnapshotDetailWindow(self.root, fname, data)
 
     def set_reference(self) -> None:
         sel = self._tree.selection()
@@ -464,6 +479,116 @@ class FleetApp:
         self._load_snapshots()
         self._load_firmware()
         self._status(f"Imported {snaps} snapshot(s), {refs} reference(s), {fw} firmware file(s).")
+
+# ── Snapshot detail window ─────────────────────────────────────────────────
+
+_CAP_PREFIX = "kNkMAIDCapability_"
+
+def _fmt_value(v) -> str:
+    """Render a JSON property value as a compact, readable string."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return "Yes" if v else "No"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        if len(v) <= 6:
+            return "[" + ", ".join(_fmt_value(x) for x in v) + "]"
+        return f"[{_fmt_value(v[0])}, … {len(v)} items]"
+    if isinstance(v, dict):
+        # Range values: {value, default, min, max, step}
+        parts = []
+        for key in ("value", "min", "max", "step", "default"):
+            if key in v:
+                parts.append(f"{key}={_fmt_value(v[key])}")
+        return "  ".join(parts) if parts else json.dumps(v)
+    return json.dumps(v)
+
+class SnapshotDetailWindow:
+    def __init__(self, parent: tk.Tk, filename: str, data: dict) -> None:
+        cam   = data.get("camera", {})
+        label = data.get("label") or ""
+        ts    = (data.get("captured_at") or "")[:19]
+        props = data.get("properties", {})
+
+        title = f"{cam.get('model','')}  {cam.get('serial','')}  {ts}"
+        if label:
+            title += f"  [{label}]"
+
+        w = tk.Toplevel(parent)
+        w.title(title)
+        w.geometry("740x520")
+
+        # ── header ──────────────────────────────────────────────────────
+        hdr = ttk.Frame(w, padding=(8, 6, 8, 4))
+        hdr.pack(fill=tk.X)
+        ttk.Label(hdr, text=title, font=("", 13, "bold")).pack(side=tk.LEFT)
+        fw = cam.get("firmware", "")
+        if fw:
+            ttk.Label(hdr, text=f"fw {fw}", foreground="gray").pack(side=tk.LEFT, padx=8)
+        ttk.Label(hdr, text=f"{len(props)} properties", foreground="gray").pack(side=tk.RIGHT)
+
+        # ── search bar ──────────────────────────────────────────────────
+        sf = ttk.Frame(w, padding=(8, 0, 8, 4))
+        sf.pack(fill=tk.X)
+        ttk.Label(sf, text="Filter:").pack(side=tk.LEFT)
+        self._filter_var = tk.StringVar()
+        filter_entry = ttk.Entry(sf, textvariable=self._filter_var, width=30)
+        filter_entry.pack(side=tk.LEFT, padx=4)
+        filter_entry.focus_set()
+        ttk.Button(sf, text="✕", width=2,
+                   command=lambda: self._filter_var.set("")).pack(side=tk.LEFT)
+
+        # ── treeview ────────────────────────────────────────────────────
+        cols = ("setting", "value", "code")
+        tree = ttk.Treeview(w, columns=cols, show="headings", selectmode="browse")
+        tree.heading("setting", text="Setting")
+        tree.heading("value",   text="Value")
+        tree.heading("code",    text="Code")
+        tree.column("setting", width=260, stretch=False)
+        tree.column("value",   width=380)
+        tree.column("code",    width=70,  stretch=False, anchor=tk.E)
+        vsb = ttk.Scrollbar(w, orient=tk.VERTICAL,   command=tree.yview)
+        hsb = ttk.Scrollbar(w, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X, padx=8)
+        vsb.pack(side=tk.RIGHT,  fill=tk.Y)
+        tree.pack(fill=tk.BOTH, expand=True, padx=(8, 0), pady=(0, 4))
+
+        # ── status bar ──────────────────────────────────────────────────
+        self._count_var = tk.StringVar()
+        ttk.Label(w, textvariable=self._count_var, foreground="gray",
+                  padding=(8, 2)).pack(side=tk.LEFT)
+
+        # pre-process rows once
+        self._all_rows: list[tuple[str, str, str]] = []
+        for name, entry in sorted(props.items()):
+            display = name.removeprefix(_CAP_PREFIX)
+            value   = _fmt_value(entry.get("value"))
+            code    = f"{entry.get('code', 0):#06x}"
+            self._all_rows.append((display, value, code))
+
+        self._tree = tree
+        self._populate(self._all_rows)
+
+        self._filter_var.trace_add("write", lambda *_: self._on_filter())
+
+    def _populate(self, rows: list[tuple[str, str, str]]) -> None:
+        self._tree.delete(*self._tree.get_children())
+        for row in rows:
+            self._tree.insert("", tk.END, values=row)
+        self._count_var.set(f"{len(rows)} shown")
+
+    def _on_filter(self) -> None:
+        q = self._filter_var.get().lower()
+        if not q:
+            self._populate(self._all_rows)
+            return
+        filtered = [r for r in self._all_rows
+                    if q in r[0].lower() or q in r[1].lower()]
+        self._populate(filtered)
+
 
 # ── Entry point ────────────────────────────────────────────────────────────
 
