@@ -54,6 +54,9 @@ install_name_tool -change \
   "@rpath/Royalmile.framework/Versions/A/Royalmile" "$ROYALMILE" \
   "$DRIVER"
 
+echo "Clearing Gatekeeper quarantine (files came from a downloaded zip)"
+xattr -r -d com.apple.quarantine "$RUNTIME" 2>/dev/null || true
+
 echo "Re-signing modified Mach-Os (ad-hoc) so hardened-runtime loaders will accept them"
 codesign --force --sign - "$BUNDLE_EXE"
 codesign --force --sign - "$DRIVER"
