@@ -1,5 +1,5 @@
 import pytest
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, decode_packed_strings, fmt_cap_value
 
 
 # ── strip_sdk_prefix ──────────────────────────────────────────────────────────
@@ -158,3 +158,93 @@ class TestParseFwFilename:
     def test_extension_not_included_in_model(self):
         model, _ = parse_fw_filename("Z_9_0531.bin")
         assert not model.endswith(".bin")
+
+
+# ── decode_packed_strings ─────────────────────────────────────────────────────
+
+class TestDecodePackedStrings:
+    def test_basic(self):
+        chars = ["R","A","W","", "J","P","E","G",""]
+        assert decode_packed_strings(chars) == ["RAW", "JPEG"]
+
+    def test_single_char_entries(self):
+        # Aperture-style: single-digit labels
+        chars = ["4","", "5","", "8",""]
+        assert decode_packed_strings(chars) == ["4", "5", "8"]
+
+    def test_multichar_entry(self):
+        chars = ["J","P","E","G"," ","F","i","n","e",""]
+        assert decode_packed_strings(chars) == ["JPEG Fine"]
+
+    def test_trailing_no_terminator(self):
+        # Last entry missing trailing ""
+        chars = ["A","u","t","o","", "M","a","n","u","a","l"]
+        assert decode_packed_strings(chars) == ["Auto", "Manual"]
+
+    def test_empty_input(self):
+        assert decode_packed_strings([]) == []
+
+    def test_real_wb_fragment(self):
+        # Fragment from WBMode: Auto / Incandescent
+        chars = ["A","u","t","o","", "I","n","c","a","n","d","e","s","c","e","n","t",""]
+        assert decode_packed_strings(chars) == ["Auto", "Incandescent"]
+
+
+# ── fmt_cap_value ─────────────────────────────────────────────────────────────
+
+class TestFmtCapValue:
+    def test_scalar_int(self):
+        assert fmt_cap_value(100) == "100"
+
+    def test_scalar_float(self):
+        assert fmt_cap_value(5.6) == "5.6"
+
+    def test_bool_true(self):
+        assert fmt_cap_value(True) == "Yes"
+
+    def test_bool_false(self):
+        assert fmt_cap_value(False) == "No"
+
+    def test_string_passthrough(self):
+        assert fmt_cap_value("USB") == "USB"
+
+    def test_range_dict(self):
+        v = {"lower": -5.0, "upper": 5.0, "steps": 31, "value": 0.0,
+             "value_index": 15, "default": 0.0, "default_index": 15}
+        assert fmt_cap_value(v) == "0.0"
+
+    def test_range_dict_nonzero(self):
+        v = {"lower": -5.0, "upper": 5.0, "steps": 31, "value": 1.0,
+             "value_index": 18, "default": 0.0, "default_index": 15}
+        assert fmt_cap_value(v) == "1.0"
+
+    def test_packed_string_enum(self):
+        # CompressionLevel: value_index=6 → "RAW"
+        chars = (["J","P","E","G"," ","B","a","s","i","c",""] +
+                 ["J","P","E","G"," ","N","o","r","m","a","l",""] +
+                 ["J","P","E","G"," ","F","i","n","e",""] +
+                 ["R","A","W",""] +
+                 ["R","A","W","+"," ","B","a","s","i","c",""] +
+                 ["R","A","W","+"," ","F","i","n","e",""])
+        v = {"elem_type": 7, "value_index": 3, "elem_count": 6,
+             "elem_bytes": 1, "default_index": 0, "values": chars}
+        assert fmt_cap_value(v) == "RAW"
+
+    def test_packed_string_enum_aperture(self):
+        # Aperture value_index=0 → "4" (f/4)
+        chars = ["4","", "4",".","5","", "5",".", "6",""]
+        v = {"elem_type": 7, "value_index": 0, "elem_count": 3,
+             "elem_bytes": 1, "default_index": 0, "values": chars}
+        assert fmt_cap_value(v) == "4"
+
+    def test_integer_enum(self):
+        # ExposureMode: values=[0,1,2,3], value_index=2 → "2"
+        v = {"elem_type": 2, "value_index": 2, "elem_count": 4,
+             "elem_bytes": 4, "default_index": 0, "values": [0, 1, 2, 3]}
+        assert fmt_cap_value(v) == "2"
+
+    def test_out_of_bounds_index(self):
+        v = {"elem_type": 7, "value_index": 99, "values": ["A",""], "elem_bytes": 1,
+             "elem_count": 1, "default_index": 0}
+        result = fmt_cap_value(v)
+        assert "99" in result

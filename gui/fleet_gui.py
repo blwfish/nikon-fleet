@@ -9,7 +9,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, decode_packed_strings
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -484,27 +484,6 @@ class FleetApp:
 
 _CAP_PREFIX = "kNkMAIDCapability_"
 
-def _fmt_value(v) -> str:
-    """Render a JSON property value as a compact, readable string."""
-    if isinstance(v, str):
-        return v
-    if isinstance(v, bool):
-        return "Yes" if v else "No"
-    if isinstance(v, (int, float)):
-        return str(v)
-    if isinstance(v, list):
-        if len(v) <= 6:
-            return "[" + ", ".join(_fmt_value(x) for x in v) + "]"
-        return f"[{_fmt_value(v[0])}, … {len(v)} items]"
-    if isinstance(v, dict):
-        # Range values: {value, default, min, max, step}
-        parts = []
-        for key in ("value", "min", "max", "step", "default"):
-            if key in v:
-                parts.append(f"{key}={_fmt_value(v[key])}")
-        return "  ".join(parts) if parts else json.dumps(v)
-    return json.dumps(v)
-
 class SnapshotDetailWindow:
     def __init__(self, parent: tk.Tk, filename: str, data: dict) -> None:
         cam   = data.get("camera", {})
@@ -565,7 +544,7 @@ class SnapshotDetailWindow:
         self._all_rows: list[tuple[str, str, str]] = []
         for name, entry in sorted(props.items()):
             display = name.removeprefix(_CAP_PREFIX)
-            value   = _fmt_value(entry.get("value"))
+            value   = fmt_cap_value(entry.get("value"))
             code    = f"{entry.get('code', 0):#06x}"
             self._all_rows.append((display, value, code))
 
