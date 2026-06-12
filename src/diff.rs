@@ -362,6 +362,21 @@ mod tests {
         }
     }
 
+    // ── is_empty boundary ───────────────────────────────────────────────
+    // Surviving mutant: `changed.is_empty() &&` → if removed, a diff with
+    // only `changed` entries would wrongly report is_empty()=true.
+
+    #[test]
+    fn non_empty_changed_not_is_empty() {
+        let a = snap(&[("kNkMAIDCapability_Aperture", 33285, json!(56))]);
+        let b = snap(&[("kNkMAIDCapability_Aperture", 33285, json!(80))]);
+        let d = diff(&a, &b, &DiffOptions::default()).unwrap();
+        assert!(!d.changed.is_empty(), "changed should have one entry");
+        assert!(d.only_in_a.is_empty(), "only_in_a should be empty");
+        assert!(d.only_in_b.is_empty(), "only_in_b should be empty");
+        assert!(!d.is_empty(), "diff with changed entries must not be is_empty()");
+    }
+
     // ── diff_with_schema ────────────────────────────────────────────────
 
     #[test]
@@ -371,6 +386,19 @@ mod tests {
         let b = snap_fw("5.31", &[("SharedCap", 200, json!(2))]);
         let d = diff_with_schema(&a, &b, &DiffOptions::default(), &schema).unwrap();
         assert!(d.firmware_annotation.is_none(), "same firmware → no annotation");
+    }
+
+    #[test]
+    fn schema_no_annotation_when_firmware_unknown() {
+        // Firmware version "99.00" has no entry in the test schema (which only
+        // defines 4.0 and 5.0 sections). diff_with_schema should fall back to
+        // no annotation rather than panic or produce a spurious annotation.
+        let schema = test_schema();
+        let a = snap_fw("3.00", &[("SharedCap", 200, json!(1))]);
+        let b = snap_fw("99.00", &[("SharedCap", 200, json!(2))]);
+        let d = diff_with_schema(&a, &b, &DiffOptions::default(), &schema).unwrap();
+        assert!(d.firmware_annotation.is_none(),
+            "unknown firmware major → no annotation");
     }
 
     #[test]

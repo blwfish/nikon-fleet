@@ -152,8 +152,21 @@ pub fn list_archives(data_dir: &Path, model_filter: Option<&str>) -> Vec<Archive
             if !version_dir.path().is_dir() { continue; }
             let meta_path = version_dir.path().join("metadata.json");
             if !meta_path.exists() { continue; }
-            let Ok(text) = fs::read_to_string(&meta_path) else { continue; };
-            let Ok(meta) = serde_json::from_str::<FirmwareMeta>(&text) else { continue; };
+            let Ok(text) = fs::read_to_string(&meta_path) else {
+                eprintln!("warning: could not read {}", meta_path.display());
+                continue;
+            };
+            let Ok(meta) = serde_json::from_str::<FirmwareMeta>(&text) else {
+                eprintln!("warning: skipping corrupt metadata at {}", meta_path.display());
+                continue;
+            };
+            if meta.format_version != FIRMWARE_META_FORMAT_VERSION {
+                eprintln!(
+                    "warning: skipping {} (format_version={}, expected {})",
+                    meta_path.display(), meta.format_version, FIRMWARE_META_FORMAT_VERSION
+                );
+                continue;
+            }
             if let Some(f) = model_filter {
                 if meta.model != f { continue; }
             }
@@ -266,6 +279,12 @@ mod tests {
     fn format_size_bytes() {
         assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(0),   "0 B");
+    }
+
+    #[test]
+    fn format_size_just_below_mib() {
+        // Surviving mutant: `>=` → `>` would make 1 MiB-1 fall into MiB branch.
+        assert_eq!(format_size(1024 * 1024 - 1), "1048575 B");
     }
 
     // ── sha256_file ─────────────────────────────────────────────────────────

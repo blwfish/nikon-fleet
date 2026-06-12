@@ -1005,17 +1005,18 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
         device.capabilities.iter().map(|c| (c.id, c)).collect();
 
     let mut written = 0usize;
-    let mut skipped_no_set = 0usize;
+    let mut skipped_absent = 0usize;   // cap code not present in this camera
+    let mut skipped_read_only = 0usize; // present but OP_SET not allowed
     let mut skipped_type = 0usize;
     let mut errors = 0usize;
 
     for (name, prop) in &snap.properties {
         let Some(cap) = cap_map.get(&prop.code) else {
-            skipped_no_set += 1;
+            skipped_absent += 1;
             continue;
         };
         if cap.operations & OP_SET == 0 {
-            skipped_no_set += 1;
+            skipped_read_only += 1;
             continue;
         }
         if args.dry_run {
@@ -1034,7 +1035,8 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
     }
 
     println!(
-        "{} written={written}  skipped(read-only)={skipped_no_set}  \
+        "{} written={written}  skipped(absent)={skipped_absent}  \
+         skipped(read-only)={skipped_read_only}  \
          skipped(unsupported-type)={skipped_type}  errors={errors}",
         if args.dry_run { "Dry run:" } else { "Restore complete:" }
     );
@@ -1064,5 +1066,31 @@ fn main() -> Result<()> {
             FirmwareCmd::Rollback(args) => cmd_firmware_rollback(&cli.data_dir, &cli.schema, args),
             FirmwareCmd::Check(args) => cmd_firmware_check(&cli.data_dir, args),
         },
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── reference_filename parity ────────────────────────────────────────
+    // Python GUI uses: f"{model.replace(' ', '_')}_{serial}.json"
+    // This test pins that contract so CLI and GUI produce identical paths.
+    // A mismatch breaks `fleet check` because the reference file cannot be found.
+
+    #[test]
+    fn reference_filename_spaces_become_underscores() {
+        assert_eq!(reference_filename("Z 9",   "30012345"), "Z_9_30012345.json");
+        assert_eq!(reference_filename("Z 6III", "30098765"), "Z_6III_30098765.json");
+        assert_eq!(reference_filename("Z 30",  "30011111"), "Z_30_30011111.json");
+    }
+
+    #[test]
+    fn reference_filename_no_spaces_unchanged() {
+        assert_eq!(reference_filename("Z6_3", "30056789"), "Z6_3_30056789.json");
     }
 }

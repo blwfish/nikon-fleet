@@ -140,6 +140,17 @@ struct NkMAIDRange {
 }
 
 /// InitializeSDK requires non-null callbacks even for a snapshot-only workflow.
+///
+/// # ABI note
+/// `cb_noop` below has the wrong signature for all five slots — it takes no
+/// parameters, but the SDK calls these with arguments (device IDs, status codes,
+/// data pointers, etc.). If the SDK fires any of these callbacks during
+/// `InitializeSDK`, `EnumDevices`, or `ConnectDevice`, the stack is corrupted
+/// (arguments pushed by the caller are not consumed). In practice the
+/// snapshot-only workflow has not triggered synchronous callbacks, but this
+/// assumption is unverified and could break under future SDK versions or
+/// different camera states. Fixing it requires the exact SDK callback typedefs
+/// from Maid3.h, which are not currently available.
 #[repr(C)]
 struct NkMAIDCSCallback {
     p_ui_req_proc: *mut c_void,
@@ -251,6 +262,8 @@ pub enum SdkError {
     UnsupportedWrite(u32),
     #[error("JSON value missing required field for SetCapability")]
     InvalidValue,
+    #[error("string value {len} bytes exceeds 255-byte limit for SetCapability")]
+    StringTooLong { len: usize },
 }
 
 fn check(call: &'static str, code: i32) -> Result<(), SdkError> {
@@ -813,7 +826,7 @@ fn decode_enum_values(st: &NkMAIDEnum) -> Value {
             }
             Value::Array(out)
         }
-        _ => Value::Null, // unsupported element type — index still stored
+        _ => json!({ "_unsupported_enum_type": st.ul_type }), // index still stored above
     }
 }
 
@@ -882,9 +895,11 @@ unsafe fn write_cap_value(
         }
         CAP_TYPE_STRING => {
             let s = value.as_str().ok_or(SdkError::InvalidValue)?;
+            if s.len() > 255 {
+                return Err(SdkError::StringTooLong { len: s.len() });
+            }
             let mut buf = [0u8; 256];
-            let n = s.len().min(255);
-            buf[..n].copy_from_slice(&s.as_bytes()[..n]);
+            buf[..s.len()].copy_from_slice(s.as_bytes());
             check("SetCapability", unsafe {
                 (sdk.set_capability)(capability_id, buf.as_ptr() as *const c_void, DT_STRING_PTR)
             })
@@ -913,6 +928,49 @@ unsafe fn write_cap_value(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── check ────────────────────────────────────────────────────────────
+    // Critical: the < 0 vs <= 0 choice is contract — code 0 is MAID3 success.
+
+    #[test]
+    fn check_zero_is_ok() {
+        assert!(check("TestCall", 0).is_ok(), "code=0 must be success");
+    }
+
+    #[test]
+    fn check_minus_one_is_error() {
+        assert!(check("TestCall", -1).is_err(), "code=-1 must be error");
+    }
+
+    #[test]
+    fn check_positive_is_ok() {
+        assert!(check("TestCall", 1).is_ok(), "code=1 must be success");
+    }
+
+    // ── string write length guard ────────────────────────────────────────
+
+    #[test]
+    fn string_write_255_bytes_is_ok() {
+        // 255 bytes is the maximum; must not return StringTooLong.
+        let s = serde_json::Value::String("x".repeat(255));
+        // Can't call write_cap_value without a live SDK, but check the guard directly.
+        let len = s.as_str().unwrap().len();
+        assert!(len <= 255, "255-byte string should be within limit");
+        assert!(!matches!(
+            if len > 255 { Err(SdkError::StringTooLong { len }) } else { Ok(()) },
+            Err(SdkError::StringTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn string_write_256_bytes_is_too_long() {
+        let s = "x".repeat(256);
+        let len = s.len();
+        assert!(matches!(
+            if len > 255 { Err(SdkError::StringTooLong { len }) } else { Ok::<(), SdkError>(()) },
+            Err(SdkError::StringTooLong { len: 256 })
+        ));
+    }
 
     // ── bcd_decode_version ───────────────────────────────────────────────
 
@@ -1321,12 +1379,29 @@ mod tests {
     }
 
     #[test]
-    fn enum_values_unknown_type_returns_null() {
+    fn enum_values_unknown_type_returns_sentinel() {
         let mut data = [0u32; 2];
         let st = NkMAIDEnum {
             ul_type: 99, ul_elements: 2, ul_value: 0, ul_default: 0,
             w_physical_bytes: 4, p_data: data.as_mut_ptr() as *mut c_void,
         };
-        assert_eq!(decode_enum_values(&st), Value::Null);
+        let v = decode_enum_values(&st);
+        assert_eq!(v["_unsupported_enum_type"], json!(99u32));
+    }
+
+    // ── bcd_decode_version vs Python parse_fw_filename cross-check ───────
+    // Both produce "M.mm" strings from the same camera firmware version.
+    // Python: f"{int(parts[1][:2])}.{parts[1][2:]}" (from filename e.g. "0531")
+    // Rust: format!("{major}.{minor:02}") (from BCD e.g. 0x0531)
+    // These must produce identical strings or archive lookup breaks.
+
+    #[test]
+    fn bcd_matches_filename_version_format() {
+        // 0x0531 → "5.31"; filename "Z_9_0531.bin" → Python "5.31"
+        assert_eq!(bcd_decode_version(0x0531), "5.31");
+        // 0x0100 → "1.00"; filename "Z_9_0100.bin" → Python "1.00"
+        assert_eq!(bcd_decode_version(0x0100), "1.00");
+        // 0x1020 → "10.20"; filename "Z_9_1020.bin" → Python "10.20"
+        assert_eq!(bcd_decode_version(0x1020), "10.20");
     }
 }

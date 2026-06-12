@@ -521,7 +521,7 @@ fn do_snapshot(data_dir: &Path, serial: &str, label: &str) -> Result<Evt, String
         .map_err(|e| e.to_string())?;
 
     let mut sdk = Sdk::open(Path::new(SDK_PATH)).map_err(|e| e.to_string())?;
-    sdk.initialize().map_err(|e| e.to_string())?;
+    sdk.initialize_no_usb_reset().map_err(|e| e.to_string())?;
     let devices = sdk.devices().map_err(|e| e.to_string())?;
     let usb = usb_camera_list();
 
@@ -592,7 +592,14 @@ fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {
             if !fname.ends_with(".json") {
                 return None;
             }
-            let snap = Snapshot::load_from_file(&snap_dir.join(&fname)).ok()?;
+            let path = snap_dir.join(&fname);
+            let snap = match Snapshot::load_from_file(&path) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("warning: skipping {}: {err}", path.display());
+                    return None;
+                }
+            };
             if snap.camera.serial != serial {
                 return None;
             }
@@ -611,9 +618,17 @@ fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {
 
 fn set_reference(data_dir: &Path, filename: &str) -> Result<Evt, String> {
     let src = data_dir.join("snapshots").join(filename);
+    let snap = Snapshot::load_from_file(&src).map_err(|e| e.to_string())?;
+
+    // Canonical reference filename: {model_slug}_{serial}.json
+    // Must match the convention in src/main.rs reference_filename() and
+    // gui/fleet_lib.py fmt_cap_value — all three must produce identical paths.
+    let model_slug = snap.camera.model.replace(' ', "_");
+    let canonical = format!("{model_slug}_{}.json", snap.camera.serial);
+
     let ref_dir = data_dir.join("references");
     std::fs::create_dir_all(&ref_dir).map_err(|e| e.to_string())?;
-    std::fs::copy(&src, ref_dir.join(filename)).map_err(|e| e.to_string())?;
+    std::fs::copy(&src, ref_dir.join(&canonical)).map_err(|e| e.to_string())?;
     Ok(Evt::ReferenceDone)
 }
 
@@ -626,6 +641,8 @@ fn do_export(data_dir: &Path, dest: &Path) -> Result<Evt, String> {
         .compression_method(zip::CompressionMethod::Deflated);
 
     let mut count = 0usize;
+
+    // Flat folders: snapshots/*.json and references/*.json
     for folder in ["snapshots", "references"] {
         let dir = data_dir.join(folder);
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
@@ -640,6 +657,34 @@ fn do_export(data_dir: &Path, dest: &Path) -> Result<Evt, String> {
             count += 1;
         }
     }
+
+    // Nested firmware: firmware/{slug}/{version}/firmware.bin + metadata.json
+    let fw_root = data_dir.join("firmware");
+    if let Ok(slug_dirs) = std::fs::read_dir(&fw_root) {
+        for slug_entry in slug_dirs.filter_map(|e| e.ok()) {
+            if !slug_entry.path().is_dir() { continue; }
+            let slug = slug_entry.file_name();
+            let slug_str = slug.to_string_lossy();
+            let Ok(ver_dirs) = std::fs::read_dir(slug_entry.path()) else { continue };
+            for ver_entry in ver_dirs.filter_map(|e| e.ok()) {
+                if !ver_entry.path().is_dir() { continue; }
+                let ver = ver_entry.file_name();
+                let ver_str = ver.to_string_lossy();
+                for filename in ["firmware.bin", "metadata.json"] {
+                    let fpath = ver_entry.path().join(filename);
+                    if !fpath.exists() { continue; }
+                    let data = std::fs::read(&fpath).map_err(|e| e.to_string())?;
+                    zip.start_file(
+                        format!("firmware/{slug_str}/{ver_str}/{filename}"),
+                        opts,
+                    ).map_err(|e| e.to_string())?;
+                    zip.write_all(&data).map_err(|e| e.to_string())?;
+                    count += 1;
+                }
+            }
+        }
+    }
+
     zip.finish().map_err(|e| e.to_string())?;
     Ok(Evt::ExportDone { dest: dest.to_path_buf(), count })
 }
@@ -654,6 +699,12 @@ fn do_import(data_dir: &Path, src: &Path) -> Result<Evt, String> {
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
         if entry.is_dir() { continue; }
+
+        // Content filter: only accept known safe paths.
+        if !accept_zip_entry(entry.name()) {
+            eprintln!("warning: skipping unexpected archive entry: {}", entry.name());
+            continue;
+        }
 
         let outpath = safe_join(data_dir, entry.name())
             .ok_or_else(|| format!("unsafe path in archive: {}", entry.name()))?;
@@ -670,6 +721,30 @@ fn do_import(data_dir: &Path, src: &Path) -> Result<Evt, String> {
     }
 
     Ok(Evt::ImportDone { snapshots: snap_count, references: ref_count })
+}
+
+/// Return true if a zip archive entry should be imported.
+///
+/// Mirrors fleet_lib.accept_zip_entry (Python) — both must stay in sync.
+/// Accepted layouts:
+///   snapshots/<file>.json        — 2-part, .json only
+///   references/<file>.json       — 2-part, .json only
+///   firmware/<slug>/<ver>/firmware.bin   — 4-part, exact filename
+///   firmware/<slug>/<ver>/metadata.json  — 4-part, exact filename
+fn accept_zip_entry(name: &str) -> bool {
+    let parts: Vec<&str> = Path::new(name).components()
+        .filter_map(|c| if let Component::Normal(s) = c { s.to_str() } else { None })
+        .collect();
+    if parts.is_empty() { return false; }
+    // Reject any path with ".." — safe_join also rejects, but belt-and-suspenders.
+    if parts.iter().any(|&p| p == "..") { return false; }
+    match parts[0] {
+        "snapshots" | "references" => parts.len() == 2 && parts[1].ends_with(".json"),
+        "firmware" => {
+            parts.len() == 4 && (parts[3] == "firmware.bin" || parts[3] == "metadata.json")
+        }
+        _ => false,
+    }
 }
 
 // Guard against zip-slip: walk path components and reject anything that

@@ -3,16 +3,25 @@ from pathlib import Path
 
 
 def strip_sdk_prefix(out: str) -> str:
-    """Return the substring of *out* starting at the first '{'.
+    """Return the substring of *out* starting at the first line-starting '{'.
 
     The Nikon SDK binary unconditionally writes diagnostic lines (e.g.
     'InitializeSDK Execution duration: 209') to stdout before any JSON.
     This strips that prefix so json.loads() receives valid input.
 
-    Raises ValueError if no '{' is present — callers should treat that as
-    a subprocess failure, not a silent empty result.
+    We search for a '{' that is either at position 0 or immediately after a
+    newline, so a brace embedded inside a diagnostic message (e.g. a timing
+    report with '{elapsed: 42ms}') is not mistaken for the JSON start.
+
+    Raises ValueError if no line-starting '{' is present — callers should
+    treat that as a subprocess failure, not a silent empty result.
     """
-    return out[out.index('{'):]
+    if out.startswith('{'):
+        return out
+    idx = out.find('\n{')
+    if idx == -1:
+        raise ValueError("no JSON object found in SDK output")
+    return out[idx + 1:]
 
 
 def accept_zip_entry(name: str) -> bool:
@@ -99,10 +108,11 @@ def fmt_cap_value(v) -> str:
         raw_vals  = v.get("values", [])
 
         if elem_type == 7 and idx is not None:
-            options = decode_packed_strings(raw_vals)
-            if 0 <= idx < len(options):
-                return options[idx]
-            return f"[index {idx} / {len(options)}]"
+            # raw_vals is already decoded by Rust into ["JPEG Fine", "RAW", ...]
+            # decode_packed_strings() is for the raw char-by-char wire format only.
+            if 0 <= idx < len(raw_vals):
+                return str(raw_vals[idx])
+            return f"[index {idx} / {len(raw_vals)}]"
 
         if elem_type is not None and idx is not None:
             # Integer-code enum (elem_type 2, etc.) — raw code until resource

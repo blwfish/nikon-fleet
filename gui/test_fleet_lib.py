@@ -18,9 +18,9 @@ class TestStripSdkPrefix:
         assert strip_sdk_prefix(out) == '{"k":1}'
 
     def test_brace_in_prefix_ignored(self):
-        # A '{' inside a diagnostic line must not confuse the parser — we want
-        # the FIRST '{', which the SDK diagnostic lines don't contain.
-        out = 'Duration: 42\n{"ok":true}'
+        # A '{' INSIDE a diagnostic line must not be treated as JSON start.
+        # Only a '{' that begins a line (pos=0 or after '\n') is accepted.
+        out = 'SDK {debug} info\n{"ok":true}'
         assert strip_sdk_prefix(out) == '{"ok":true}'
 
     def test_no_json_raises(self):
@@ -219,23 +219,20 @@ class TestFmtCapValue:
         assert fmt_cap_value(v) == "1.0"
 
     def test_packed_string_enum(self):
-        # CompressionLevel: value_index=6 → "RAW"
-        chars = (["J","P","E","G"," ","B","a","s","i","c",""] +
-                 ["J","P","E","G"," ","N","o","r","m","a","l",""] +
-                 ["J","P","E","G"," ","F","i","n","e",""] +
-                 ["R","A","W",""] +
-                 ["R","A","W","+"," ","B","a","s","i","c",""] +
-                 ["R","A","W","+"," ","F","i","n","e",""])
+        # Rust decodes elem_type=7 into already-decoded string labels.
+        # fmt_cap_value must index raw_vals[value_index] directly.
+        # CompressionLevel: value_index=3 → "RAW"
+        labels = ["JPEG Basic", "JPEG Normal", "JPEG Fine", "RAW", "RAW+Basic", "RAW+Fine"]
         v = {"elem_type": 7, "value_index": 3, "elem_count": 6,
-             "elem_bytes": 1, "default_index": 0, "values": chars}
+             "elem_bytes": 1, "default_index": 0, "values": labels}
         assert fmt_cap_value(v) == "RAW"
 
     def test_packed_string_enum_aperture(self):
-        # Aperture value_index=0 → "4" (f/4)
-        chars = ["4","", "4",".","5","", "5",".", "6",""]
+        # Aperture value_index=0 → "f/4" (already decoded string from Rust)
+        labels = ["f/4", "f/4.5", "f/5.6"]
         v = {"elem_type": 7, "value_index": 0, "elem_count": 3,
-             "elem_bytes": 1, "default_index": 0, "values": chars}
-        assert fmt_cap_value(v) == "4"
+             "elem_bytes": 1, "default_index": 0, "values": labels}
+        assert fmt_cap_value(v) == "f/4"
 
     def test_integer_enum(self):
         # ExposureMode: values=[0,1,2,3], value_index=2 → "2"
@@ -244,7 +241,24 @@ class TestFmtCapValue:
         assert fmt_cap_value(v) == "2"
 
     def test_out_of_bounds_index(self):
-        v = {"elem_type": 7, "value_index": 99, "values": ["A",""], "elem_bytes": 1,
+        v = {"elem_type": 7, "value_index": 99, "values": ["Auto"], "elem_bytes": 1,
              "elem_count": 1, "default_index": 0}
         result = fmt_cap_value(v)
         assert "99" in result
+
+    # ── list rendering boundary (6 vs 7 items) ────────────────────────────
+
+    def test_list_empty(self):
+        assert fmt_cap_value([]) == "[]"
+
+    def test_list_exactly_six(self):
+        # Six items must render fully (no truncation).
+        result = fmt_cap_value([1, 2, 3, 4, 5, 6])
+        assert "…" not in result
+        assert result == "[1, 2, 3, 4, 5, 6]"
+
+    def test_list_exactly_seven(self):
+        # Seven items must use the truncated "first, … N items" form.
+        result = fmt_cap_value([1, 2, 3, 4, 5, 6, 7])
+        assert "…" in result
+        assert "7 items" in result

@@ -4,6 +4,7 @@
 import json
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 import tkinter as tk
@@ -135,8 +136,8 @@ class FleetApp:
                 if cam["serial"] not in seen:
                     seen[cam["serial"]] = {"model": cam["model"], "serial": cam["serial"],
                                            "firmware": cam.get("firmware", "")}
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"warning: could not read snapshot {f}: {e}", file=sys.stderr)
         if not seen:
             return
         self.cameras = list(seen.values())
@@ -220,8 +221,8 @@ class FleetApp:
                                  d.get("label") or "",
                                  d["camera"].get("firmware", ""),
                                  f.name))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"warning: could not read snapshot {f}: {e}", file=sys.stderr)
         rows.sort(reverse=True)
         for ts, label, fw, fname in rows:
             ref_mark = "◀ ref" if ref_captured_at and ts == ref_captured_at else ""
@@ -310,6 +311,7 @@ class FleetApp:
 
     def _load_firmware(self) -> None:
         self._fw_tree.delete(*self._fw_tree.get_children())
+        self._fw_meta: dict[str, dict] = {}  # iid → full metadata dict
         fw_dir = _firmware_dir()
         if not fw_dir.exists():
             return
@@ -322,9 +324,11 @@ class FleetApp:
                 slug    = meta_file.parent.parent.name
                 ver     = meta_file.parent.name
                 iid     = f"nested|{slug}|{ver}"
+                self._fw_meta[iid] = meta
                 self._fw_tree.insert("", tk.END, iid=iid,
                                      values=(model, version, f"{slug}/{ver}/firmware.bin"))
-            except Exception:
+            except Exception as e:
+                print(f"warning: could not read firmware metadata {meta_file}: {e}", file=sys.stderr)
                 continue
         # Legacy flat layout: firmware/*.bin (added via old GUI Add button)
         for f in sorted(fw_dir.glob("*.bin")):

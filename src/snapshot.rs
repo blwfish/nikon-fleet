@@ -220,9 +220,18 @@ mod tests {
     fn filename_shape() {
         let s = sample_snapshot();
         let name = s.suggested_filename();
-        // Sanity: contains the model (with spaces underscored), serial, label.
-        assert!(name.starts_with("Z_9_ABC123_baseline_"));
-        assert!(name.ends_with(".json"));
-        assert!(!name.contains(':'));
+        // Exact contract: spaces→_, no colons, no dashes in timestamp.
+        // captured_at="2026-05-24T17:30:00Z" → "20260524T173000Z"
+        assert_eq!(name, "Z_9_ABC123_baseline_20260524T173000Z.json");
+    }
+
+    #[test]
+    fn filename_empty_serial_uses_unknown() {
+        // Surviving mutant: removing the empty-serial branch makes this return
+        // "Z_9__baseline_..." which doesn't match reference filename convention.
+        let mut s = sample_snapshot();
+        s.camera.serial = String::new();
+        let name = s.suggested_filename();
+        assert!(name.starts_with("Z_9_unknown_"), "empty serial must map to 'unknown'");
     }
 }
