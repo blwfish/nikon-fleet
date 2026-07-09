@@ -55,6 +55,55 @@ Once we have the code → name mapping, the Rust snapshot walk can call
 `GetDevicePropValue` for the additional codes directly — no SDK changes
 needed, it's a standard PTP operation already used for MAID-enumerated caps.
 
+### 2026-07-09 raw-USB baseline pass (pre-capture-session prep)
+
+Ran Phase 0/4 of `docs/ptpip-capture-plan-2026-07-10.md` directly over USB
+via `gphoto2`/`libgphoto2` — no NX Field/MITM/capture needed for this part.
+`libgphoto2`'s Nikon driver already issues `GetDeviceInfo` (0x1001) +
+`GetVendorPropCodes` (0x90CA) + loops `GetDevicePropDesc` (0x1014) and
+ships names for hundreds of `0xD0xx` codes already. Opcodes/property codes
+verified against real `camlibs/ptp2/ptp.h` source (not a summarized
+guess): `0x1001`, `0x1014`, `0x90CA`, `0xD053`, `0xD072`, `0xD073`,
+`0x501E`, `0x501F` all confirmed.
+
+Baselines saved to `references/` (gitignored): `z9-ptp-baseline`,
+`z6iii-ptp-baseline`, `z5-ptp-baseline`, `z8-ptp-baseline`
+(`-2026-07-09.txt`). The Z8 belongs to Vic (collaborator), not the fleet —
+its Artist/Copyright fields read "VICTOR NEWMAN PHOTOGRAPHY", included in
+the comparison below at the user's request.
+
+**Copyright fields resolved without any capture** (answers the Phase 0
+"cheap targeted check"): `0xD053`/`0xD072`/`0xD073` (and standard mirrors
+`0x501E`/`0x501F`) work identically across all four bodies.
+
+**Per-body unique codes** (present on that body, absent from at least one
+other):
+- Z9-only vs Z6III: `d013 d040 d043 d05e d07f d0b0 d0b1 d0b2 d0b3 d0f6 d177 d186`
+- Z6III-only vs Z9: `d037 d045 d04d d04e d050 d051 d094 d095 d096 d097 d0fc d156 d16a d20d ffec`
+- Z5-only vs Z9/Z6III: `501c d045 d09d d0a7 d0fc d131 d149 d15d d16a d17a d197 d1ad d1b7 d1b9 d1f0 d1ff d20d d20e d235`
+  (Z5 is the simplest body — 280 codes total vs. ~330 for the others)
+- Codes present on all four bodies: 261; union across the fleet: 359
+
+**Actual remaining gap — `[Unknown Property]` codes libgphoto2 has no name
+for** (this is the real target for tomorrow's NX Field capture, not the
+codes above which libgphoto2 already names):
+```
+d000 d001 d002 d005 d006 d007 d008 d009 d00a d00b d00c d00e d00f d060
+d094 d095 d096 d097 d098 d099 d09a d09b d0b0 d0b1 d0bd d0cd d0f6 d119
+d12f d19c d1c5 d1c6 d1ff d259 d25a d25b d406 d407
+```
+
+**Open anomaly to explain, not yet understood:** every body's summary
+lists a handful of `0xD0xx` codes (e.g. `d053`, `d073`) *twice* — once from
+the `GetDeviceInfo` properties-supported list, again later (presumably
+from `GetVendorPropCodes`). Most duplicates return identical values both
+times, but on the Z9 some codes that resolved fine on the first pass
+returned PTP error `200a` (device-prop-not-supported) on the second pass,
+same live camera state. Unclear if this is a `libgphoto2` driver artifact
+(querying the same code via two different capability-list contexts) or a
+genuine state-dependent property-availability quirk worth knowing about
+for the capture session.
+
 ---
 
 ## MaidLayer resource strings (elem_type 2 labels)
