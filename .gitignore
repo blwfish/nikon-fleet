@@ -3,6 +3,7 @@
 /references
 /firmware
 /sdk-runtime
+/captures
 *.swp
 .DS_Store
 
