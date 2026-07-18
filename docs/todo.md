@@ -140,3 +140,39 @@ camera-native terms (same labels the camera shows).
 mode. Should detect Nikon devices in non-PTP USB modes and print a helpful
 message ("Camera detected in USB LAN mode — switch to MTP/PTP to use
 nikon-fleet").
+
+---
+
+## Per-series flag interpretation config (RaceMonitor → Gateway)
+
+See [racemonitor-live-timing-session-2026-07-10.md](racemonitor-live-timing-session-2026-07-10.md)
+for the live-capture background. The flag→action mapping for the planned
+RaceMonitor Gateway (Laura-remote camera control) can't be a single
+hardcoded color→action table — the same flag color means a genuinely
+different *kind* of action depending on sanctioning body, not just a
+different severity. Confirmed examples:
+
+- **NASCAR red** — stop in place, immediately, on track.
+- **PCA red** — keep circulating, but at greatly reduced pace.
+- **IndyCar black (shown to a specific car)** — penalty notice to that one
+  car; not a field-wide event at all.
+- **PCA black (session-wide)** — racing stops, but the session clock keeps
+  running; all cars queue behind the pace car, which then leads them into
+  the pits and holds there for the duration.
+
+Each config entry needs at minimum:
+- **Scope** — field-wide vs. directed at a single car (requires RaceMonitor's
+  feed to actually distinguish this — not yet confirmed it does)
+- **Action** — stop-in-place / reduced-pace-circulating / queue-behind-pace-car
+  / penalty-only-no-camera-action / etc. (not just a binary CAP_ON/CAP_OFF)
+- **Clock behavior during the flag** — does the session clock/lap count
+  keep running (PCA black) or effectively pause, since that changes whether
+  "session ended" can be inferred from clock/lap state at all
+- **Resume signal** — what ends the condition (green flag again? pace car
+  peels off pit lane? not necessarily the same event that started it)
+
+Green → `CAP_ON` and Yellow → no action (ignore) are already decided (see
+session notes doc). Red/Black are the open cases this config needs to
+cover, and the config needs to be loaded per-event/per-series, not
+hardcoded — the same literal flag color must not imply the same action
+across series.
