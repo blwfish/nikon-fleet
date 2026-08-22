@@ -1076,6 +1076,9 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+    use serde_json::json;
 
     // ── reference_filename parity ────────────────────────────────────────
     // Python GUI uses: f"{model.replace(' ', '_')}_{serial}.json"
@@ -1092,5 +1095,368 @@ mod tests {
     #[test]
     fn reference_filename_no_spaces_unchanged() {
         assert_eq!(reference_filename("Z6_3", "30056789"), "Z6_3_30056789.json");
+    }
+
+    // ── resolve_snapshot_path ─────────────────────────────────────────────
+    // "Snapshots are addressable by absolute path OR by basename inside
+    // snapshots/" — the is_absolute() branch is safe to test directly, but
+    // the p.exists() branch depends on the process's current directory, so
+    // those two cases are serialized behind CWD_LOCK to avoid racing other
+    // tests in this binary that also touch cwd.
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn resolve_snapshot_path_absolute_passthrough_regardless_of_existence() {
+        let data_dir = Path::new("/some/data-dir");
+        let abs = Path::new("/somewhere/else/snap.json");
+        assert_eq!(resolve_snapshot_path(data_dir, abs), abs.to_path_buf());
+    }
+
+    #[test]
+    fn resolve_snapshot_path_relative_nonexistent_joins_snapshots_dir() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let data_dir = tmp.path().join("data");
+        let resolved = resolve_snapshot_path(&data_dir, Path::new("missing.json"));
+        std::env::set_current_dir(&prev).unwrap();
+        assert_eq!(resolved, snapshots_dir(&data_dir).join("missing.json"));
+    }
+
+    #[test]
+    fn resolve_snapshot_path_relative_existing_in_cwd_passthrough() {
+        // Ambiguous case pinned: a relative path that happens to exist
+        // relative to cwd is returned as-is, NOT joined under snapshots/ —
+        // even though it wasn't found there. This is the p.exists() branch.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        fs::write(tmp.path().join("here.json"), "{}").unwrap();
+        let data_dir = tmp.path().join("data");
+        let resolved = resolve_snapshot_path(&data_dir, Path::new("here.json"));
+        std::env::set_current_dir(&prev).unwrap();
+        assert_eq!(resolved, PathBuf::from("here.json"));
+    }
+
+    // ── name_map_for_model ────────────────────────────────────────────────
+    // Same contract as gui/src/main.rs's copy of this function — kept as a
+    // separate parity test since the two are hand-duplicated, not shared.
+
+    const DUP_CODE_SCHEMA: &str = r#"<model:Z 9>
+    <version>common</version>
+    <caplist>
+        <capability:kNkMAIDCapability_Aperture-100>
+            <description>0,0,"Aperture"</description>
+            <allowedoperation:14></allowedoperation>
+        </capability>
+    </caplist>
+</model>
+<model:Z 9>
+    <version>2.0</version>
+    <caplist>
+        <capability:kNkMAIDCapability_ApertureNew-100>
+            <description>0,0,"Aperture New"</description>
+            <allowedoperation:14></allowedoperation>
+        </capability>
+        <capability:kNkMAIDCapability_Iso-200>
+            <description>0,0,"ISO"</description>
+            <allowedoperation:14></allowedoperation>
+        </capability>
+    </caplist>
+</model>
+"#;
+
+    #[test]
+    fn name_map_first_seen_wins_on_duplicate_code() {
+        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
+        let map = name_map_for_model(&cfg, "Z 9");
+        assert_eq!(map.get(&100), Some(&"kNkMAIDCapability_Aperture".to_string()));
+    }
+
+    #[test]
+    fn name_map_unions_across_sections() {
+        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
+        let map = name_map_for_model(&cfg, "Z 9");
+        assert_eq!(map.get(&200), Some(&"kNkMAIDCapability_Iso".to_string()));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn name_map_unknown_model_is_empty() {
+        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
+        assert!(name_map_for_model(&cfg, "Z 30").is_empty());
+    }
+
+    // ── generate_settings_table ───────────────────────────────────────────
+
+    const DISPLAY_SCHEMA: &str = r#"<model:Z 9>
+    <version>common</version>
+    <caplist>
+        <capability:kNkMAIDCapability_Aperture-100>
+            <description>0,0,"Aperture"</description>
+            <allowedoperation:14></allowedoperation>
+        </capability>
+    </caplist>
+</model>
+"#;
+
+    #[test]
+    fn generate_settings_table_filters_volatile_properties() {
+        let schema = MaidLayerConfig::parse(DISPLAY_SCHEMA).unwrap();
+        let mut snap = Snapshot::new(
+            Camera { model: "Z 9".into(), serial: "ABC123".into(), firmware: "5.00".into() },
+            Transport::Usb,
+            "2026-01-01T00:00:00Z".into(),
+        );
+        snap.insert("kNkMAIDCapability_Aperture", 100, json!(56));
+        snap.insert("kNkMAIDCapability_BatteryLevel", 999, json!(80));
+
+        let table = generate_settings_table(&snap, &schema);
+        assert!(table.contains("Aperture"), "non-volatile property with a display name should appear");
+        assert!(!table.contains("BatteryLevel"), "volatile property must be filtered out");
+    }
+
+    #[test]
+    fn generate_settings_table_falls_back_to_raw_name_without_display() {
+        let schema = MaidLayerConfig::parse(DISPLAY_SCHEMA).unwrap();
+        let mut snap = Snapshot::new(
+            Camera { model: "Z 9".into(), serial: "ABC123".into(), firmware: "5.00".into() },
+            Transport::Usb,
+            "2026-01-01T00:00:00Z".into(),
+        );
+        // Not present in DISPLAY_SCHEMA, so no display label is known.
+        snap.insert("kNkMAIDCapability_Unknown", 777, json!("x"));
+
+        let table = generate_settings_table(&snap, &schema);
+        assert!(table.contains("kNkMAIDCapability_Unknown"));
+    }
+
+    #[test]
+    fn generate_settings_table_sorts_rows_by_label() {
+        let schema = MaidLayerConfig::parse("").unwrap();
+        let mut snap = Snapshot::new(
+            Camera { model: "Z 9".into(), serial: "ABC123".into(), firmware: "5.00".into() },
+            Transport::Usb,
+            "2026-01-01T00:00:00Z".into(),
+        );
+        snap.insert("Zebra", 1, json!(1));
+        snap.insert("Alpha", 2, json!(2));
+
+        let table = generate_settings_table(&snap, &schema);
+        let alpha_pos = table.find("Alpha").unwrap();
+        let zebra_pos = table.find("Zebra").unwrap();
+        assert!(alpha_pos < zebra_pos, "rows must be sorted alphabetically by label");
+    }
+
+    // ── cmd_ref ───────────────────────────────────────────────────────────
+
+    fn write_snapshot(path: &Path, model: &str, serial: &str) {
+        let s = Snapshot::new(
+            Camera { model: model.into(), serial: serial.into(), firmware: "5.00".into() },
+            Transport::File,
+            "2026-01-01T00:00:00Z".into(),
+        );
+        s.save_to_file(path).unwrap();
+    }
+
+    #[test]
+    fn cmd_ref_set_then_show_round_trip() {
+        let data_dir = TempDir::new().unwrap();
+        let snap_path = data_dir.path().join("snap.json");
+        write_snapshot(&snap_path, "Z 9", "ABC123");
+
+        cmd_ref(data_dir.path(), &RefCmd::Set { snapshot_path: snap_path.clone() }).unwrap();
+
+        let ref_path = references_dir(data_dir.path()).join("Z_9_ABC123.json");
+        assert!(ref_path.exists());
+
+        // Show must succeed now that the reference exists.
+        assert!(cmd_ref(data_dir.path(), &RefCmd::Show {
+            model: "Z 9".into(), serial: "ABC123".into(),
+        }).is_ok());
+    }
+
+    #[test]
+    fn cmd_ref_show_missing_reference_errors() {
+        let data_dir = TempDir::new().unwrap();
+        let err = cmd_ref(data_dir.path(), &RefCmd::Show {
+            model: "Z 9".into(), serial: "NOPE".into(),
+        }).unwrap_err();
+        assert!(err.to_string().contains("no reference"));
+    }
+
+    #[test]
+    fn cmd_ref_list_missing_dir_ok_empty() {
+        let data_dir = TempDir::new().unwrap();
+        assert!(cmd_ref(data_dir.path(), &RefCmd::List).is_ok());
+    }
+
+    // ── cmd_firmware_add ──────────────────────────────────────────────────
+
+    fn firmware_add_args(bin_path: PathBuf, model: &str, version: &str, force: bool) -> FirmwareAddArgs {
+        FirmwareAddArgs { bin_path, model: model.into(), version: version.into(), notes: None, force }
+    }
+
+    #[test]
+    fn cmd_firmware_add_missing_bin_file_errors() {
+        let data_dir = TempDir::new().unwrap();
+        let args = firmware_add_args(data_dir.path().join("nope.bin"), "Z 9", "5.31", false);
+        let err = cmd_firmware_add(data_dir.path(), &args).unwrap_err();
+        assert!(err.to_string().contains("firmware file not found"));
+    }
+
+    #[test]
+    fn cmd_firmware_add_duplicate_without_force_errors() {
+        let data_dir = TempDir::new().unwrap();
+        let bin_path = data_dir.path().join("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+
+        cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path.clone(), "Z 9", "5.31", false)).unwrap();
+        let err = cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path, "Z 9", "5.31", false)).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<FirmwareError>(),
+            Some(FirmwareError::AlreadyArchived { .. })
+        ));
+    }
+
+    #[test]
+    fn cmd_firmware_add_duplicate_with_force_overwrites() {
+        let data_dir = TempDir::new().unwrap();
+        let bin_path = data_dir.path().join("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+        cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path.clone(), "Z 9", "5.31", false)).unwrap();
+
+        fs::write(&bin_path, b"v2-longer-content").unwrap();
+        cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path, "Z 9", "5.31", true)).unwrap();
+
+        let archived = archive_dir(data_dir.path(), "Z 9", "5.31").join("firmware.bin");
+        assert_eq!(fs::read(archived).unwrap(), b"v2-longer-content");
+    }
+
+    // ── cmd_firmware_pin ──────────────────────────────────────────────────
+
+    #[test]
+    fn cmd_firmware_pin_model_mismatch_errors() {
+        let data_dir = TempDir::new().unwrap();
+        let bin_path = data_dir.path().join("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+        cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path, "Z 9", "5.31", false)).unwrap();
+
+        let snap_path = data_dir.path().join("snap.json");
+        write_snapshot(&snap_path, "Z 8", "ABC123"); // wrong model
+
+        let err = cmd_firmware_pin(data_dir.path(), &FirmwarePinArgs {
+            snapshot_path: snap_path, model: "Z 9".into(), version: "5.31".into(),
+        }).unwrap_err();
+        assert!(err.to_string().contains("but --model is"));
+    }
+
+    #[test]
+    fn cmd_firmware_pin_snapshot_outside_data_dir_errors() {
+        // Ambiguous/boundary case: canonical_snapshot_path must be relative
+        // to data_dir for portability, so a snapshot living outside it
+        // can't be pinned as-is (strip_prefix fails).
+        let data_dir = TempDir::new().unwrap();
+        let bin_path = data_dir.path().join("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+        cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path, "Z 9", "5.31", false)).unwrap();
+
+        let outside = TempDir::new().unwrap();
+        let snap_path = outside.path().join("snap.json");
+        write_snapshot(&snap_path, "Z 9", "ABC123");
+
+        let err = cmd_firmware_pin(data_dir.path(), &FirmwarePinArgs {
+            snapshot_path: snap_path, model: "Z 9".into(), version: "5.31".into(),
+        }).unwrap_err();
+        assert!(err.to_string().contains("outside data-dir"));
+    }
+
+    #[test]
+    fn cmd_firmware_pin_success_records_relative_path() {
+        let data_dir = TempDir::new().unwrap();
+        let bin_path = data_dir.path().join("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+        cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path, "Z 9", "5.31", false)).unwrap();
+
+        let snap_path = data_dir.path().join("snap.json");
+        write_snapshot(&snap_path, "Z 9", "ABC123");
+
+        cmd_firmware_pin(data_dir.path(), &FirmwarePinArgs {
+            snapshot_path: snap_path, model: "Z 9".into(), version: "5.31".into(),
+        }).unwrap();
+
+        let meta = load_meta(data_dir.path(), "Z 9", "5.31").unwrap();
+        assert_eq!(meta.canonical_snapshot_path.as_deref(), Some("snap.json"));
+    }
+
+    // ── cmd_firmware_rollback ─────────────────────────────────────────────
+
+    #[test]
+    fn cmd_firmware_rollback_checksum_mismatch_errors() {
+        let data_dir = TempDir::new().unwrap();
+        let bin_path = data_dir.path().join("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+        cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path, "Z 9", "5.31", false)).unwrap();
+
+        // Corrupt the archived binary after the fact so its hash no longer
+        // matches the recorded metadata.
+        fs::write(archive_dir(data_dir.path(), "Z 9", "5.31").join("firmware.bin"), b"corrupted").unwrap();
+
+        let schema_path = data_dir.path().join("schema.config");
+        fs::write(&schema_path, "").unwrap();
+        let err = cmd_firmware_rollback(data_dir.path(), &schema_path, &FirmwareRollbackArgs {
+            model: "Z 9".into(), version: "5.31".into(), serial: None, output_dir: None,
+        }).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<FirmwareError>(),
+            Some(FirmwareError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn cmd_firmware_rollback_without_canonical_snapshot_still_succeeds() {
+        let data_dir = TempDir::new().unwrap();
+        let bin_path = data_dir.path().join("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+        cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path, "Z 9", "5.31", false)).unwrap();
+
+        let schema_path = data_dir.path().join("schema.config");
+        fs::write(&schema_path, "").unwrap();
+        let out_dir = data_dir.path().join("out");
+        cmd_firmware_rollback(data_dir.path(), &schema_path, &FirmwareRollbackArgs {
+            model: "Z 9".into(), version: "5.31".into(), serial: None,
+            output_dir: Some(out_dir.clone()),
+        }).unwrap();
+
+        assert!(out_dir.join("firmware.bin").exists());
+        assert!(out_dir.join("rollback-instructions.txt").exists());
+        assert!(!out_dir.join("canonical_settings.json").exists());
+    }
+
+    #[test]
+    fn cmd_firmware_rollback_with_canonical_snapshot_bundles_it() {
+        let data_dir = TempDir::new().unwrap();
+        let bin_path = data_dir.path().join("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+        cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path, "Z 9", "5.31", false)).unwrap();
+
+        let snap_path = data_dir.path().join("snap.json");
+        write_snapshot(&snap_path, "Z 9", "ABC123");
+        cmd_firmware_pin(data_dir.path(), &FirmwarePinArgs {
+            snapshot_path: snap_path, model: "Z 9".into(), version: "5.31".into(),
+        }).unwrap();
+
+        let schema_path = data_dir.path().join("schema.config");
+        fs::write(&schema_path, "").unwrap();
+        let out_dir = data_dir.path().join("out");
+        cmd_firmware_rollback(data_dir.path(), &schema_path, &FirmwareRollbackArgs {
+            model: "Z 9".into(), version: "5.31".into(), serial: None,
+            output_dir: Some(out_dir.clone()),
+        }).unwrap();
+
+        assert!(out_dir.join("canonical_settings.json").exists());
     }
 }

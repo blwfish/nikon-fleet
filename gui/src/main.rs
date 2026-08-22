@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
@@ -573,17 +573,17 @@ fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {
     let snap_dir = data_dir.join("snapshots");
     let ref_dir = data_dir.join("references");
 
-    let refs: HashSet<String> = std::fs::read_dir(&ref_dir)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-
     let Ok(entries) = std::fs::read_dir(&snap_dir) else {
         return Vec::new();
     };
+
+    // A reference is a byte copy of some snapshot, saved under a different
+    // (canonical model+serial) filename — so filename membership never
+    // matches the original snapshot's filename. Instead, mirror
+    // fleet_gui.py's _load_snapshots: read the reference's own captured_at
+    // and flag any snapshot whose captured_at[:19] matches. Resolved lazily
+    // per model since list_snapshots only receives a serial.
+    let mut ref_captured_at_by_model: HashMap<String, Option<String>> = HashMap::new();
 
     let mut rows: Vec<SnapRow> = entries
         .filter_map(|e| e.ok())
@@ -603,8 +603,20 @@ fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {
             if snap.camera.serial != serial {
                 return None;
             }
+            let model = snap.camera.model.clone();
+            let ref_captured_at = ref_captured_at_by_model
+                .entry(model.clone())
+                .or_insert_with(|| {
+                    let model_slug = model.replace(' ', "_");
+                    let ref_path = ref_dir.join(format!("{model_slug}_{serial}.json"));
+                    Snapshot::load_from_file(&ref_path).ok().map(|s| s.captured_at)
+                })
+                .clone();
+            let is_reference = ref_captured_at
+                .as_deref()
+                .is_some_and(|r| snap.captured_at.get(..19) == r.get(..19));
             Some(SnapRow {
-                is_reference: refs.contains(&fname),
+                is_reference,
                 filename: fname,
                 label: snap.label.clone(),
                 captured_at: snap.captured_at.clone(),
@@ -732,12 +744,25 @@ fn do_import(data_dir: &Path, src: &Path) -> Result<Evt, String> {
 ///   firmware/<slug>/<ver>/firmware.bin   — 4-part, exact filename
 ///   firmware/<slug>/<ver>/metadata.json  — 4-part, exact filename
 fn accept_zip_entry(name: &str) -> bool {
-    let parts: Vec<&str> = Path::new(name).components()
-        .filter_map(|c| if let Component::Normal(s) = c { s.to_str() } else { None })
-        .collect();
+    // Every component must be a plain path segment — reject RootDir/Prefix/
+    // ParentDir/CurDir outright instead of silently dropping them, so this
+    // function is self-contained and doesn't rely on safe_join as a second
+    // gate to reject e.g. absolute paths. (A prior version filter_map'd to
+    // Normal components only, which meant "/snapshots/foo.json" passed this
+    // check — only caught later by safe_join. Mirrors fleet_lib.py, where
+    // Path(name).parts keeps the root as a literal part and so already
+    // rejects it here.)
+    let mut parts: Vec<&str> = Vec::new();
+    for c in Path::new(name).components() {
+        match c {
+            Component::Normal(s) => match s.to_str() {
+                Some(s) => parts.push(s),
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
     if parts.is_empty() { return false; }
-    // Reject any path with ".." — safe_join also rejects, but belt-and-suspenders.
-    if parts.iter().any(|&p| p == "..") { return false; }
     match parts[0] {
         "snapshots" | "references" => parts.len() == 2 && parts[1].ends_with(".json"),
         "firmware" => {
@@ -788,4 +813,380 @@ fn main() {
         Box::new(|cc| Ok(Box::new(FleetApp::new(cc)))),
     )
     .unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // ── accept_zip_entry ───────────────────────────────────────────────────
+    // Mirrors gui/test_fleet_lib.py::TestAcceptZipEntry — same cases, same
+    // shape, so the two implementations can't silently drift apart.
+
+    #[test]
+    fn accept_zip_entry_snapshot_json() {
+        assert!(accept_zip_entry("snapshots/foo.json"));
+    }
+
+    #[test]
+    fn accept_zip_entry_reference_json() {
+        assert!(accept_zip_entry("references/bar.json"));
+    }
+
+    #[test]
+    fn accept_zip_entry_firmware_bin() {
+        assert!(accept_zip_entry("firmware/Z_9/5.31/firmware.bin"));
+    }
+
+    #[test]
+    fn accept_zip_entry_firmware_metadata_json() {
+        assert!(accept_zip_entry("firmware/Z_9/5.31/metadata.json"));
+    }
+
+    #[test]
+    fn accept_zip_entry_firmware_z6iii() {
+        assert!(accept_zip_entry("firmware/Z6_3/2.00/firmware.bin"));
+    }
+
+    #[test]
+    fn accept_zip_entry_snapshot_bin_rejected() {
+        assert!(!accept_zip_entry("snapshots/foo.bin"));
+    }
+
+    #[test]
+    fn accept_zip_entry_firmware_arbitrary_json_rejected() {
+        assert!(!accept_zip_entry("firmware/Z_9/5.31/other.json"));
+    }
+
+    #[test]
+    fn accept_zip_entry_firmware_flat_bin_rejected() {
+        // Old flat layout (2-part) is no longer accepted.
+        assert!(!accept_zip_entry("firmware/Z_9_0531.bin"));
+    }
+
+    #[test]
+    fn accept_zip_entry_reference_bin_rejected() {
+        assert!(!accept_zip_entry("references/bar.bin"));
+    }
+
+    #[test]
+    fn accept_zip_entry_unknown_folder_rejected() {
+        assert!(!accept_zip_entry("other/foo.json"));
+    }
+
+    #[test]
+    fn accept_zip_entry_directory_entry_rejected() {
+        // Trailing slash → a single "snapshots" component, not 2 parts.
+        assert!(!accept_zip_entry("snapshots/"));
+    }
+
+    #[test]
+    fn accept_zip_entry_too_deep_rejected() {
+        assert!(!accept_zip_entry("snapshots/subdir/foo.json"));
+    }
+
+    #[test]
+    fn accept_zip_entry_firmware_too_shallow_rejected() {
+        // 3-part firmware path (missing version level).
+        assert!(!accept_zip_entry("firmware/Z_9/firmware.bin"));
+    }
+
+    #[test]
+    fn accept_zip_entry_firmware_too_deep_rejected() {
+        // 5-part firmware path.
+        assert!(!accept_zip_entry("firmware/Z_9/5.31/extra/firmware.bin"));
+    }
+
+    #[test]
+    fn accept_zip_entry_dotdot_in_firmware_path_rejected() {
+        assert!(!accept_zip_entry("firmware/../snapshots/metadata.json"));
+    }
+
+    #[test]
+    fn accept_zip_entry_dotdot_in_snapshots_path_rejected() {
+        assert!(!accept_zip_entry("snapshots/../etc/passwd"));
+    }
+
+    #[test]
+    fn accept_zip_entry_dotdot_as_slug_component_rejected() {
+        assert!(!accept_zip_entry("firmware/../Z_9/5.31/firmware.bin"));
+    }
+
+    #[test]
+    fn accept_zip_entry_bare_filename_rejected() {
+        assert!(!accept_zip_entry("foo.json"));
+    }
+
+    #[test]
+    fn accept_zip_entry_path_traversal_rejected() {
+        assert!(!accept_zip_entry("../etc/passwd"));
+    }
+
+    #[test]
+    fn accept_zip_entry_absolute_path_rejected() {
+        // Regression test: a prior version filter_map'd path components down
+        // to Normal only, silently dropping RootDir — so this returned true
+        // and only safe_join's separate check kept it from escaping the
+        // data dir. accept_zip_entry must reject it on its own, matching
+        // fleet_lib.py's accept_zip_entry (Path(name).parts keeps the root
+        // as a literal part, so folder == "/" fails the match there).
+        assert!(!accept_zip_entry("/snapshots/foo.json"));
+    }
+
+    // ── safe_join ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn safe_join_normal_path_joins() {
+        let base = Path::new("/data");
+        assert_eq!(
+            safe_join(base, "snapshots/foo.json"),
+            Some(base.join("snapshots").join("foo.json"))
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_dotdot() {
+        let base = Path::new("/data");
+        assert_eq!(safe_join(base, "../etc/passwd"), None);
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute_path() {
+        let base = Path::new("/data");
+        assert_eq!(safe_join(base, "/etc/passwd"), None);
+    }
+
+    #[test]
+    fn safe_join_skips_curdir() {
+        let base = Path::new("/data");
+        assert_eq!(
+            safe_join(base, "./snapshots/./foo.json"),
+            Some(base.join("snapshots").join("foo.json"))
+        );
+    }
+
+    // ── name_map_for_model ─────────────────────────────────────────────────
+
+    const DUP_CODE_SCHEMA: &str = r#"<model:Z 9>
+    <version>common</version>
+    <caplist>
+        <capability:kNkMAIDCapability_Aperture-100>
+            <description>0,0,"Aperture"</description>
+            <allowedoperation:14></allowedoperation>
+        </capability>
+    </caplist>
+</model>
+<model:Z 9>
+    <version>2.0</version>
+    <caplist>
+        <capability:kNkMAIDCapability_ApertureNew-100>
+            <description>0,0,"Aperture New"</description>
+            <allowedoperation:14></allowedoperation>
+        </capability>
+        <capability:kNkMAIDCapability_Iso-200>
+            <description>0,0,"ISO"</description>
+            <allowedoperation:14></allowedoperation>
+        </capability>
+    </caplist>
+</model>
+"#;
+
+    #[test]
+    fn name_map_first_seen_wins_on_duplicate_code() {
+        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
+        let map = name_map_for_model(&cfg, "Z 9");
+        assert_eq!(map.get(&100), Some(&"kNkMAIDCapability_Aperture".to_string()));
+    }
+
+    #[test]
+    fn name_map_unions_across_sections() {
+        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
+        let map = name_map_for_model(&cfg, "Z 9");
+        assert_eq!(map.get(&200), Some(&"kNkMAIDCapability_Iso".to_string()));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn name_map_unknown_model_is_empty() {
+        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
+        assert!(name_map_for_model(&cfg, "Z 30").is_empty());
+    }
+
+    // ── list_snapshots / set_reference ──────────────────────────────────────
+
+    fn write_snapshot(dir: &Path, filename: &str, model: &str, serial: &str, captured_at: &str) {
+        let mut s = Snapshot::new(
+            Camera { model: model.into(), serial: serial.into(), firmware: "5.00".into() },
+            Transport::Usb,
+            captured_at.into(),
+        );
+        s.label = Some("test".into());
+        s.save_to_file(dir.join(filename)).unwrap();
+    }
+
+    #[test]
+    fn list_snapshots_missing_dir_returns_empty() {
+        let data_dir = TempDir::new().unwrap();
+        assert!(list_snapshots(data_dir.path(), "ABC123").is_empty());
+    }
+
+    #[test]
+    fn list_snapshots_filters_by_serial() {
+        let data_dir = TempDir::new().unwrap();
+        let snap_dir = data_dir.path().join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        write_snapshot(&snap_dir, "a.json", "Z 9", "ABC123", "2026-01-01T00:00:00Z");
+        write_snapshot(&snap_dir, "b.json", "Z 9", "OTHER456", "2026-01-01T00:00:00Z");
+
+        let rows = list_snapshots(data_dir.path(), "ABC123");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].filename, "a.json");
+    }
+
+    #[test]
+    fn list_snapshots_sorts_newest_first() {
+        let data_dir = TempDir::new().unwrap();
+        let snap_dir = data_dir.path().join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        write_snapshot(&snap_dir, "old.json", "Z 9", "ABC123", "2026-01-01T00:00:00Z");
+        write_snapshot(&snap_dir, "new.json", "Z 9", "ABC123", "2026-06-01T00:00:00Z");
+
+        let rows = list_snapshots(data_dir.path(), "ABC123");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].filename, "new.json");
+        assert_eq!(rows[1].filename, "old.json");
+    }
+
+    #[test]
+    fn list_snapshots_skips_unparseable_json_without_panicking() {
+        let data_dir = TempDir::new().unwrap();
+        let snap_dir = data_dir.path().join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        write_snapshot(&snap_dir, "good.json", "Z 9", "ABC123", "2026-01-01T00:00:00Z");
+        fs::write(snap_dir.join("bad.json"), "not valid json").unwrap();
+
+        let rows = list_snapshots(data_dir.path(), "ABC123");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].filename, "good.json");
+    }
+
+    #[test]
+    fn set_reference_uses_canonical_model_underscore_filename() {
+        let data_dir = TempDir::new().unwrap();
+        let snap_dir = data_dir.path().join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        write_snapshot(&snap_dir, "orig.json", "Z 9", "ABC123", "2026-01-01T00:00:00Z");
+
+        set_reference(data_dir.path(), "orig.json").unwrap();
+
+        let ref_path = data_dir.path().join("references").join("Z_9_ABC123.json");
+        assert!(ref_path.exists());
+        assert_eq!(
+            fs::read_to_string(&ref_path).unwrap(),
+            fs::read_to_string(snap_dir.join("orig.json")).unwrap(),
+        );
+    }
+
+    #[test]
+    fn list_snapshots_marks_reference_by_captured_at() {
+        // Regression test: is_reference used to compare the snapshot's own
+        // filename against filenames present in references/ — but
+        // set_reference copies the file under a *different* canonical name,
+        // so that comparison could never match. Fixed to compare
+        // captured_at (mirrors fleet_gui.py's _load_snapshots), which this
+        // test pins.
+        let data_dir = TempDir::new().unwrap();
+        let snap_dir = data_dir.path().join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        write_snapshot(&snap_dir, "ref_candidate.json", "Z 9", "ABC123", "2026-01-01T00:00:00Z");
+        write_snapshot(&snap_dir, "other.json", "Z 9", "ABC123", "2026-06-01T00:00:00Z");
+
+        set_reference(data_dir.path(), "ref_candidate.json").unwrap();
+
+        let rows = list_snapshots(data_dir.path(), "ABC123");
+        let by_name = |n: &str| rows.iter().find(|r| r.filename == n).unwrap();
+        assert!(by_name("ref_candidate.json").is_reference);
+        assert!(!by_name("other.json").is_reference);
+    }
+
+    // ── do_export / do_import ───────────────────────────────────────────────
+
+    #[test]
+    fn export_import_round_trip_preserves_files() {
+        let src_dir = TempDir::new().unwrap();
+        fs::create_dir_all(src_dir.path().join("snapshots")).unwrap();
+        fs::create_dir_all(src_dir.path().join("references")).unwrap();
+        write_snapshot(
+            &src_dir.path().join("snapshots"), "a.json", "Z 9", "ABC123", "2026-01-01T00:00:00Z",
+        );
+        write_snapshot(
+            &src_dir.path().join("references"), "Z_9_ABC123.json", "Z 9", "ABC123", "2026-01-01T00:00:00Z",
+        );
+        let fw_dir = src_dir.path().join("firmware").join("Z_9").join("5.31");
+        fs::create_dir_all(&fw_dir).unwrap();
+        fs::write(fw_dir.join("firmware.bin"), b"fake-firmware-bytes").unwrap();
+        fs::write(fw_dir.join("metadata.json"), b"{}").unwrap();
+
+        let zip_path = src_dir.path().join("export.zip");
+        let export = do_export(src_dir.path(), &zip_path).unwrap();
+        match export {
+            Evt::ExportDone { count, .. } => assert_eq!(count, 4),
+            _ => panic!("expected ExportDone"),
+        }
+
+        let dst_dir = TempDir::new().unwrap();
+        let import = do_import(dst_dir.path(), &zip_path).unwrap();
+        match import {
+            Evt::ImportDone { snapshots, references } => {
+                assert_eq!(snapshots, 1);
+                assert_eq!(references, 1);
+            }
+            _ => panic!("expected ImportDone"),
+        }
+
+        assert_eq!(
+            fs::read(dst_dir.path().join("firmware/Z_9/5.31/firmware.bin")).unwrap(),
+            b"fake-firmware-bytes",
+        );
+        assert_eq!(
+            fs::read_to_string(dst_dir.path().join("snapshots/a.json")).unwrap(),
+            fs::read_to_string(src_dir.path().join("snapshots/a.json")).unwrap(),
+        );
+    }
+
+    #[test]
+    fn import_rejects_path_traversal_entries_without_escaping_data_dir() {
+        let dst_dir = TempDir::new().unwrap();
+        let zip_path = dst_dir.path().join("malicious.zip");
+
+        // Craft a zip with one legitimate entry and several traversal/absolute
+        // attempts. ZipWriter doesn't validate names, so this reaches
+        // do_import exactly as an attacker-controlled archive would.
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip.start_file("snapshots/good.json", opts).unwrap();
+        zip.write_all(b"{}").unwrap();
+        zip.start_file("../evil_sibling.txt", opts).unwrap();
+        zip.write_all(b"escaped").unwrap();
+        zip.start_file("/tmp/evil_absolute.txt", opts).unwrap();
+        zip.write_all(b"escaped").unwrap();
+        zip.finish().unwrap();
+
+        // "good.json" isn't a valid Snapshot, but do_import only counts by
+        // path prefix — it doesn't parse contents — so this still exercises
+        // the filter without needing a real snapshot body.
+        let result = do_import(dst_dir.path(), &zip_path);
+        assert!(result.is_ok());
+
+        assert!(!dst_dir.path().join("snapshots/good.json").parent().unwrap()
+            .parent().unwrap().join("evil_sibling.txt").exists());
+        assert!(!Path::new("/tmp/evil_absolute.txt").exists());
+    }
 }
