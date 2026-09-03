@@ -1,5 +1,19 @@
 import pytest
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, decode_packed_strings, fmt_cap_value
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, decode_packed_strings, fmt_cap_value, model_slug
+
+
+# ── model_slug ─────────────────────────────────────────────────────────────────
+# Parity with the Rust side's firmware::model_slug() — both must produce
+# identical filenames from the same model string, or reference/archive
+# lookups silently fail to find each other's files.
+
+class TestModelSlug:
+    def test_replaces_spaces(self):
+        assert model_slug("Z 9") == "Z_9"
+        assert model_slug("Z 6III") == "Z_6III"
+
+    def test_no_spaces_unchanged(self):
+        assert model_slug("Z6_3") == "Z6_3"
 
 
 # ── strip_sdk_prefix ──────────────────────────────────────────────────────────

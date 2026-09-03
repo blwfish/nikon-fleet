@@ -4,8 +4,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 
 use eframe::egui;
+use nikon_fleet::firmware::model_slug;
 use nikon_fleet::maid_layer::MaidLayerConfig;
-use nikon_fleet::sdk::{Sdk, OP_GET, pair_devices, usb_camera_list};
+use nikon_fleet::sdk::{DeviceInfo, Sdk, OP_GET, UsbCameraInfo, pair_devices, usb_camera_list};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -481,6 +482,26 @@ fn worker(
 
 // ── Camera operations ─────────────────────────────────────────────────────
 
+/// See src/main.rs's identical helper: `pair_devices` disambiguates
+/// same-model bodies purely by enumeration order, with no per-unit
+/// identifier to cross-check. Warn loudly whenever that's ambiguous rather
+/// than silently risking a swapped serial/firmware assignment.
+fn warn_if_ambiguous_pairing(enriched: &[(DeviceInfo, Option<UsbCameraInfo>)]) {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for (dev, _) in enriched {
+        *counts.entry(dev.name.as_str()).or_insert(0) += 1;
+    }
+    for (model, count) in counts {
+        if count > 1 {
+            eprintln!(
+                "warning: {count} \"{model}\" bodies connected — serial/firmware assignment \
+                 is based on SDK/USB enumeration order, not a per-unit identifier, and could \
+                 be swapped between them."
+            );
+        }
+    }
+}
+
 fn do_discover() -> Result<Evt, String> {
     let path = Path::new(SDK_PATH);
     if !path.exists() {
@@ -499,7 +520,9 @@ fn do_discover() -> Result<Evt, String> {
     sdk.initialize_no_usb_reset().map_err(|e| e.to_string())?;
     let devices = sdk.devices().map_err(|e| e.to_string())?;
     let usb = usb_camera_list();
-    let rows = pair_devices(devices, &usb)
+    let paired = pair_devices(devices, &usb);
+    warn_if_ambiguous_pairing(&paired);
+    let rows = paired
         .into_iter()
         .map(|(dev, usb_opt)| CameraRow {
             model: dev.name.clone(),
@@ -525,9 +548,17 @@ fn do_snapshot(data_dir: &Path, serial: &str, label: &str) -> Result<Evt, String
     let devices = sdk.devices().map_err(|e| e.to_string())?;
     let usb = usb_camera_list();
 
+    // Match the real USB serial, the bare SDK id, or the "id-{id}" fallback
+    // form do_discover uses when no USB serial is readable — without the
+    // last form, such a camera could never be re-found here (see main.rs's
+    // serial_matches, which this mirrors).
     let (dev, usb_opt) = pair_devices(devices, &usb)
         .into_iter()
-        .find(|(_, u)| u.as_ref().map(|u| u.serial.as_str()) == Some(serial))
+        .find(|(dev, u)| {
+            u.as_ref().map(|u| u.serial.as_str()) == Some(serial)
+                || dev.id.to_string() == serial
+                || format!("id-{}", dev.id) == serial
+        })
         .ok_or_else(|| format!("camera {serial} not found after re-discover"))?;
 
     let name_map = name_map_for_model(&schema, &dev.name);
@@ -607,8 +638,7 @@ fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {
             let ref_captured_at = ref_captured_at_by_model
                 .entry(model.clone())
                 .or_insert_with(|| {
-                    let model_slug = model.replace(' ', "_");
-                    let ref_path = ref_dir.join(format!("{model_slug}_{serial}.json"));
+                    let ref_path = ref_dir.join(format!("{}_{serial}.json", model_slug(&model)));
                     Snapshot::load_from_file(&ref_path).ok().map(|s| s.captured_at)
                 })
                 .clone();
@@ -634,9 +664,8 @@ fn set_reference(data_dir: &Path, filename: &str) -> Result<Evt, String> {
 
     // Canonical reference filename: {model_slug}_{serial}.json
     // Must match the convention in src/main.rs reference_filename() and
-    // gui/fleet_lib.py fmt_cap_value — all three must produce identical paths.
-    let model_slug = snap.camera.model.replace(' ', "_");
-    let canonical = format!("{model_slug}_{}.json", snap.camera.serial);
+    // gui/fleet_lib.py's model_slug — all three must produce identical paths.
+    let canonical = format!("{}_{}.json", model_slug(&snap.camera.model), snap.camera.serial);
 
     let ref_dir = data_dir.join("references");
     std::fs::create_dir_all(&ref_dir).map_err(|e| e.to_string())?;

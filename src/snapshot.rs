@@ -137,7 +137,7 @@ impl Snapshot {
     /// Suggested filename: `{model_slug}_{serial}_{label}_{timestamp}.json`.
     /// Spaces in model names become underscores. Timestamps lose colons.
     pub fn suggested_filename(&self) -> String {
-        let model = self.camera.model.replace(' ', "_");
+        let model = crate::firmware::model_slug(&self.camera.model);
         let serial = if self.camera.serial.is_empty() {
             "unknown".to_string()
         } else {

@@ -264,8 +264,7 @@ fn ensure_dir(p: &Path) -> Result<()> {
 /// Filename used for a camera's reference snapshot.
 /// Spaces in model names become underscores so the filename is shell-friendly.
 fn reference_filename(model: &str, serial: &str) -> String {
-    let model = model.replace(' ', "_");
-    format!("{model}_{serial}.json")
+    format!("{}_{serial}.json", model_slug(model))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -273,7 +272,56 @@ fn reference_filename(model: &str, serial: &str) -> String {
 // ─────────────────────────────────────────────────────────────────────────
 
 fn enrich_devices(devices: Vec<DeviceInfo>) -> Vec<(DeviceInfo, Option<UsbCameraInfo>)> {
-    pair_devices(devices, &usb_camera_list())
+    let enriched = pair_devices(devices, &usb_camera_list());
+    warn_if_ambiguous_pairing(&enriched);
+    enriched
+}
+
+/// `pair_devices` disambiguates same-model bodies purely by enumeration
+/// order between two independently-collected lists (SDK EnumDevices vs. the
+/// OS USB stack) — there is no per-unit identifier in the SDK's device info
+/// to cross-check against. That's silent and unfixable with current SDK
+/// data, so at minimum make the ambiguity loud instead of invisible: warn
+/// whenever more than one body of the same model is present, since that's
+/// exactly the condition under which order-based pairing can attach the
+/// wrong serial/firmware to a camera.
+fn warn_if_ambiguous_pairing(enriched: &[(DeviceInfo, Option<UsbCameraInfo>)]) {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for (dev, _) in enriched {
+        *counts.entry(dev.name.as_str()).or_insert(0) += 1;
+    }
+    for (model, count) in counts {
+        if count > 1 {
+            eprintln!(
+                "warning: {count} \"{model}\" bodies connected — serial/firmware assignment \
+                 is based on SDK/USB enumeration order, not a per-unit identifier, and could \
+                 be swapped between them. Verify with `fleet discover` before trusting which \
+                 serial is which."
+            );
+        }
+    }
+}
+
+/// Whether `s` identifies this device, as recorded by `cmd_snapshot`'s
+/// serial field: the real USB serial, the bare numeric SDK id, or the
+/// `"id-{id}"` fallback form written when no USB serial was readable.
+/// Without the last form, a camera snapshotted under that fallback could
+/// never be found again by --serial in any later command.
+fn serial_matches(dev: &DeviceInfo, usb: &Option<UsbCameraInfo>, s: &str) -> bool {
+    usb.as_ref().map(|u| u.serial.as_str()) == Some(s)
+        || dev.id.to_string() == s
+        || format!("id-{}", dev.id) == s
+}
+
+/// The serial to record for a captured snapshot: the real USB serial if one
+/// was read (and non-empty — the SDK/USB layer can return `Some("")` for an
+/// unreadable descriptor, which must NOT be treated as a valid serial), else
+/// the `"id-{id}"` fallback.
+fn snapshot_serial(usb_info: &Option<UsbCameraInfo>, dev_id: u32) -> String {
+    usb_info
+        .as_ref()
+        .and_then(|u| (!u.serial.is_empty()).then(|| u.serial.clone()))
+        .unwrap_or_else(|| format!("id-{dev_id}"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -360,7 +408,7 @@ fn cmd_ls(data_dir: &Path, args: &LsArgs) -> Result<()> {
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         if let Some(f) = filter {
             // Filename starts with "{model_underscored}_{serial}_..."
-            if !name.starts_with(&f.replace(' ', "_")) {
+            if !name.starts_with(&model_slug(f)) {
                 continue;
             }
         }
@@ -521,9 +569,7 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     // Pick by --serial if given (matched against USB iSerialNumber), else first available.
     let (target, usb_info) = match args.serial.as_deref() {
         Some(s) => enriched.into_iter()
-            .find(|(dev, usb)| {
-                usb.as_ref().map(|u| u.serial.as_str()) == Some(s) || dev.id.to_string() == s
-            })
+            .find(|(dev, usb)| serial_matches(dev, usb, s))
             .ok_or_else(|| anyhow::anyhow!("no device with serial {s}"))?,
         None => {
             let idx = enriched.iter().position(|(d, _)| d.available).unwrap_or(0);
@@ -546,8 +592,7 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     println!("Reading {} capabilities…", device.capabilities.len());
 
     let captured_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
-    let serial = usb_info.as_ref().map(|u| u.serial.clone())
-        .unwrap_or_else(|| format!("id-{}", target.id));
+    let serial = snapshot_serial(&usb_info, target.id);
     let firmware = usb_info.as_ref().map(|u| u.firmware.clone())
         .unwrap_or_else(|| target.version.clone());
     let mut snap = Snapshot::new(
@@ -604,9 +649,7 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     let enriched = enrich_devices(devices);
     let (target, usb_info) = match args.serial.as_deref() {
         Some(s) => enriched.into_iter()
-            .find(|(dev, usb)| {
-                usb.as_ref().map(|u| u.serial.as_str()) == Some(s) || dev.id.to_string() == s
-            })
+            .find(|(dev, usb)| serial_matches(dev, usb, s))
             .ok_or_else(|| anyhow::anyhow!("no device with serial {s}"))?,
         None => {
             let idx = enriched.iter().position(|(d, _)| d.available).unwrap_or(0);
@@ -618,8 +661,7 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     let schema = MaidLayerConfig::parse_file(schema_path)?;
     let name_lookup = name_map_for_model(&schema, &target.name);
     let device = sdk.connect(target.id)?;
-    let serial = usb_info.as_ref().map(|u| u.serial.clone())
-        .unwrap_or_else(|| format!("id-{}", target.id));
+    let serial = snapshot_serial(&usb_info, target.id);
     let firmware = usb_info.as_ref().map(|u| u.firmware.clone())
         .unwrap_or_else(|| target.version.clone());
 
@@ -772,8 +814,18 @@ fn cmd_firmware_pin(data_dir: &Path, args: &FirmwarePinArgs) -> Result<()> {
 
     let mut meta = load_meta(data_dir, &args.model, &args.version)?;
     // canonical_snapshot_path must be relative to data_dir for portability.
-    let rel = args.snapshot_path
-        .strip_prefix(data_dir)
+    // Canonicalize both sides before stripping: a plain component-wise
+    // strip_prefix fails on e.g. snapshot_path="snapshots/foo.json" against
+    // the common default data_dir="." (different path *representations* of
+    // the same location aren't a shared prefix syntactically), even though
+    // the file genuinely is inside data_dir. Canonicalizing resolves both to
+    // absolute, symlink-free paths so the comparison is representation-independent.
+    let canonical_snapshot = args.snapshot_path.canonicalize()
+        .with_context(|| format!("resolving {}", args.snapshot_path.display()))?;
+    let canonical_data_dir = data_dir.canonicalize()
+        .with_context(|| format!("resolving {}", data_dir.display()))?;
+    let rel = canonical_snapshot
+        .strip_prefix(&canonical_data_dir)
         .with_context(|| format!(
             "snapshot {} is outside data-dir {}; the canonical path must be \
              relative for portability. Move the snapshot under data-dir first.",
@@ -981,10 +1033,7 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
     let target_serial = args.serial.as_deref().unwrap_or(&snap.camera.serial);
     let (target, _usb) = enriched
         .into_iter()
-        .find(|(dev, usb)| {
-            usb.as_ref().map(|u| u.serial.as_str()) == Some(target_serial)
-                || dev.id.to_string() == target_serial
-        })
+        .find(|(dev, usb)| serial_matches(dev, usb, target_serial))
         .ok_or_else(|| anyhow::anyhow!(
             "no connected camera with serial {}  (snapshot is for {} {})",
             target_serial, snap.camera.model, snap.camera.serial
@@ -1139,6 +1188,58 @@ mod tests {
         let resolved = resolve_snapshot_path(&data_dir, Path::new("here.json"));
         std::env::set_current_dir(&prev).unwrap();
         assert_eq!(resolved, PathBuf::from("here.json"));
+    }
+
+    // ── serial_matches / snapshot_serial ───────────────────────────────────
+
+    fn dev(id: u32) -> DeviceInfo {
+        DeviceInfo { id, name: "Z 9".into(), available: true, connected_pid: 0, version: "5.31".into() }
+    }
+    fn usb(serial: &str) -> UsbCameraInfo {
+        UsbCameraInfo { product_id: 0, serial: serial.into(), firmware: "5.31".into(), model: "Z 9".into() }
+    }
+
+    #[test]
+    fn serial_matches_real_usb_serial() {
+        assert!(serial_matches(&dev(7), &Some(usb("ABC123")), "ABC123"));
+    }
+
+    #[test]
+    fn serial_matches_bare_sdk_id() {
+        assert!(serial_matches(&dev(7), &None, "7"));
+    }
+
+    #[test]
+    fn serial_matches_id_fallback_form() {
+        // Regression: a snapshot recorded under the "id-{id}" fallback
+        // (written when USB serial was unreadable) must be re-findable by
+        // that exact string — previously only the real serial or bare id
+        // were checked, so such a snapshot could never be matched again.
+        assert!(serial_matches(&dev(7), &None, "id-7"));
+    }
+
+    #[test]
+    fn serial_matches_no_match() {
+        assert!(!serial_matches(&dev(7), &Some(usb("ABC123")), "OTHER"));
+        assert!(!serial_matches(&dev(7), &None, "8"));
+    }
+
+    #[test]
+    fn snapshot_serial_uses_real_serial_when_present() {
+        assert_eq!(snapshot_serial(&Some(usb("ABC123")), 7), "ABC123");
+    }
+
+    #[test]
+    fn snapshot_serial_falls_back_to_id_when_usb_none() {
+        assert_eq!(snapshot_serial(&None, 7), "id-7");
+    }
+
+    #[test]
+    fn snapshot_serial_falls_back_to_id_when_serial_present_but_empty() {
+        // Regression: Some(UsbCameraInfo { serial: "", .. }) (a real,
+        // observed case — read_usb_string returns "" for an unreadable
+        // descriptor) must NOT be treated as a valid serial.
+        assert_eq!(snapshot_serial(&Some(usb("")), 7), "id-7");
     }
 
     // ── name_map_for_model ────────────────────────────────────────────────
@@ -1390,6 +1491,39 @@ mod tests {
 
         let meta = load_meta(data_dir.path(), "Z 9", "5.31").unwrap();
         assert_eq!(meta.canonical_snapshot_path.as_deref(), Some("snap.json"));
+    }
+
+    #[test]
+    fn cmd_firmware_pin_relative_data_dir_dot_succeeds() {
+        // Regression test: the normal-case invocation `fleet firmware pin
+        // snapshots/foo.json ...` with the default `--data-dir "."` used to
+        // fail with "outside data-dir" because a plain component-wise
+        // strip_prefix("snapshots/foo.json", ".") doesn't match even though
+        // the file genuinely is inside data_dir — only caught by canonicalizing
+        // both sides first. Uses cwd (like resolve_snapshot_path's tests)
+        // since data_dir="." is only meaningful relative to cwd.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let data_dir = Path::new(".");
+        let bin_path = PathBuf::from("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+        cmd_firmware_add(data_dir, &firmware_add_args(bin_path, "Z 9", "5.31", false)).unwrap();
+
+        fs::create_dir_all("snapshots").unwrap();
+        let snap_path = PathBuf::from("snapshots/foo.json");
+        write_snapshot(&snap_path, "Z 9", "ABC123");
+
+        let result = cmd_firmware_pin(data_dir, &FirmwarePinArgs {
+            snapshot_path: snap_path, model: "Z 9".into(), version: "5.31".into(),
+        });
+        std::env::set_current_dir(&prev).unwrap();
+
+        result.unwrap();
+        let meta = load_meta(Path::new(tmp.path()), "Z 9", "5.31").unwrap();
+        assert_eq!(meta.canonical_snapshot_path.as_deref(), Some("snapshots/foo.json"));
     }
 
     // ── cmd_firmware_rollback ─────────────────────────────────────────────

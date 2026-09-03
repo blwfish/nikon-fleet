@@ -8,9 +8,9 @@ import sys
 import zipfile
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, decode_packed_strings
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -26,10 +26,15 @@ def _fleet_bin() -> Path:
         "Run `cargo build --release` in the project root first."
     )
 
+# Settings file location must match the Rust GUI's settings_path()
+# (gui/src/main.rs), which uses dirs::config_dir() → ~/Library/Application
+# Support on macOS. The two GUIs share one settings.json so a data-dir
+# change made in either is visible to both.
+_SETTINGS_PATH = Path.home() / "Library" / "Application Support" / "net.blw.fleet" / "settings.json"
+
 def _data_dir() -> Path:
-    cfg = Path.home() / "Library" / "Preferences" / "net.blw.fleet" / "settings.json"
     try:
-        s = json.loads(cfg.read_text())
+        s = json.loads(_SETTINGS_PATH.read_text())
         if s.get("data_dir"):
             return Path(s["data_dir"])
     except Exception:
@@ -40,15 +45,13 @@ def _firmware_dir() -> Path:
     return _data_dir() / "firmware"
 
 def _save_data_dir(new_dir: str) -> None:
-    cfg_dir = Path.home() / "Library" / "Preferences" / "net.blw.fleet"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    cfg = cfg_dir / "settings.json"
+    _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
-        s = json.loads(cfg.read_text())
+        s = json.loads(_SETTINGS_PATH.read_text())
     except Exception:
         s = {}
     s["data_dir"] = new_dir or None
-    cfg.write_text(json.dumps(s, indent=2))
+    _SETTINGS_PATH.write_text(json.dumps(s, indent=2))
 
 # ── App ────────────────────────────────────────────────────────────────────
 
@@ -205,7 +208,7 @@ class FleetApp:
         # Read the reference file for this camera (CLI naming: {model_slug}_{serial}.json).
         ref_captured_at: str | None = None
         if ref_dir.exists():
-            ref_name = f"{model.replace(' ', '_')}_{serial}.json"
+            ref_name = f"{model_slug(model)}_{serial}.json"
             ref_path = ref_dir / ref_name
             if ref_path.exists():
                 try:
@@ -277,7 +280,7 @@ class FleetApp:
             snap = json.loads((dd / "snapshots" / fname).read_text())
             cam  = snap["camera"]
             # Match `fleet ref set` naming so `fleet check` finds the reference.
-            ref_fname = f"{cam['model'].replace(' ', '_')}_{cam['serial']}.json"
+            ref_fname = f"{model_slug(cam['model'])}_{cam['serial']}.json"
             shutil.copy2(dd / "snapshots" / fname, ref_dir / ref_fname)
         except OSError as e:
             messagebox.showerror("Set reference failed", str(e), parent=self.root)
@@ -337,6 +340,12 @@ class FleetApp:
                                  values=(model, version, f.name))
 
     def add_firmware(self) -> None:
+        # Delegates to `fleet firmware add` rather than copying the file
+        # directly — a prior version wrote straight into the flat legacy
+        # layout (firmware/<basename>.bin, no metadata.json), which
+        # `fleet firmware ls/pin/rollback` and export/import all silently
+        # ignore, since they only recognize the nested
+        # firmware/{model_slug}/{version}/metadata.json archive format.
         src = filedialog.askopenfilename(
             title="Add firmware to library",
             filetypes=[("Nikon firmware", "*.bin"), ("All files", "*.*")],
@@ -344,21 +353,44 @@ class FleetApp:
         )
         if not src:
             return
-        fw_dir = _firmware_dir()
-        fw_dir.mkdir(parents=True, exist_ok=True)
-        dest = fw_dir / Path(src).name
-        if dest.exists():
-            if not messagebox.askyesno("Already exists",
-                                       f"{dest.name} is already in the library. Overwrite?",
-                                       parent=self.root):
-                return
-        try:
-            shutil.copy2(src, dest)
-        except OSError as e:
-            messagebox.showerror("Add firmware failed", str(e), parent=self.root)
+
+        guess_model, guess_version = parse_fw_filename(Path(src).name)
+        model = simpledialog.askstring(
+            "Add Firmware", 'Camera model (e.g. "Z 9"):',
+            initialvalue=guess_model.replace("_", " "), parent=self.root,
+        )
+        if not model:
             return
+        version = simpledialog.askstring(
+            "Add Firmware", 'Firmware version (e.g. "5.31"):',
+            initialvalue=guess_version, parent=self.root,
+        )
+        if not version:
+            return
+
+        args = ["firmware", "add", src, "--model", model, "--version", version]
+        try:
+            self._run(*args)
+        except RuntimeError as e:
+            if "already archived" not in str(e).lower() and "already exists" not in str(e).lower():
+                self._status(f"Error: {e}")
+                messagebox.showerror("Add firmware failed", str(e), parent=self.root)
+                return
+            if not messagebox.askyesno(
+                "Already archived",
+                f"{model} {version} is already in the library. Overwrite?",
+                parent=self.root,
+            ):
+                return
+            try:
+                self._run(*args, "--force")
+            except RuntimeError as e2:
+                self._status(f"Error: {e2}")
+                messagebox.showerror("Add firmware failed", str(e2), parent=self.root)
+                return
+
         self._load_firmware()
-        self._status(f"Added {dest.name}.")
+        self._status(f"Archived {model} firmware {version}.")
 
     def remove_firmware(self) -> None:
         sel = self._fw_tree.selection()

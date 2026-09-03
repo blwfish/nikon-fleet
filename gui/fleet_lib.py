@@ -24,6 +24,16 @@ def strip_sdk_prefix(out: str) -> str:
     return out[idx + 1:]
 
 
+def model_slug(model: str) -> str:
+    """Filesystem-safe model slug: spaces become underscores.
+
+    Must match the Rust side's firmware::model_slug() exactly — both are
+    consumed by the same on-disk naming conventions (reference filenames,
+    firmware archive directories).
+    """
+    return model.replace(" ", "_")
+
+
 def accept_zip_entry(name: str) -> bool:
     """Return True if a zip archive entry should be imported.
 
