@@ -143,9 +143,11 @@ expect `git log` to have history for them.
 
 ```bash
 cargo build --release          # produces target/release/nikon-fleet
-cargo test                     # Rust unit tests (108+ across the library, run offline — no camera/SDK needed)
+cargo test --workspace         # Rust unit tests: 108+23 in the nikon-fleet lib/bin, 35+ in gui/ (all offline)
 cd gui && python3 -m pytest    # GUI helper unit tests (test_fleet_lib.py; also offline)
 ```
+
+`gui/` is a workspace member (joined 2026-09-03), not a standalone crate — `cargo test`/`cargo llvm-cov` run without `--workspace` from the repo root cover only the root `nikon-fleet` package and silently skip `gui/src/main.rs`'s tests.
 
 Running the CLI/GUI against real hardware requires:
 1. The vendor Nikon Remote SDK staged into `sdk-runtime/` — run

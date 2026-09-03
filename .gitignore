@@ -7,7 +7,6 @@
 *.swp
 .DS_Store
 
-# GUI
-/gui/target
+# GUI (Rust build output now lands in /target — gui/ joined the workspace 2026-09-03)
 /gui/__pycache__
 /gui/*.pyc
