@@ -255,6 +255,16 @@ mod tests {
         assert_eq!(model_slug("Z 30"),  "Z_30");
     }
 
+    #[test]
+    fn slug_collision_pinned() {
+        // "Z 9" and a hypothetical raw "Z_9" model string slug to the same
+        // value — pinning this as documented current behavior. Rests on
+        // every real Nikon USB product string in this codebase using
+        // spaces, never underscores; re-check if that domain assumption
+        // ever loosens (synthetic/injected model names, third-party bodies).
+        assert_eq!(model_slug("Z 9"), model_slug("Z_9"));
+    }
+
     // ── model_from_usb_product ──────────────────────────────────────────────
 
     #[test]

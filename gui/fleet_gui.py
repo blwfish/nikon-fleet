@@ -35,19 +35,37 @@ def _fleet_bin() -> Path:
 # change made in either is visible to both.
 _SETTINGS_PATH = Path.home() / "Library" / "Application Support" / "net.blw.fleet" / "settings.json"
 
+# (mtime, data_dir) — data_dir() is called on nearly every user action
+# (discover, load-snapshots, set-reference, export, import, show-prefs), but
+# the file only actually changes via _save_data_dir's Save button, or the
+# Rust GUI writing the same shared settings.json. Cache on mtime rather than
+# unconditionally, since that concurrent-writer case is real, not
+# hypothetical (both GUIs share this exact file — see settings_path() in
+# gui/src/main.rs).
+_data_dir_cache: tuple[float, Path] | None = None
+
 def _data_dir() -> Path:
+    global _data_dir_cache
+    try:
+        mtime = _SETTINGS_PATH.stat().st_mtime
+    except OSError:
+        return Path.home() / "Library" / "Application Support" / "net.blw.fleet"
+    if _data_dir_cache is not None and _data_dir_cache[0] == mtime:
+        return _data_dir_cache[1]
     try:
         s = json.loads(_SETTINGS_PATH.read_text())
-        if s.get("data_dir"):
-            return Path(s["data_dir"])
+        result = Path(s["data_dir"]) if s.get("data_dir") else Path.home() / "Library" / "Application Support" / "net.blw.fleet"
     except Exception:
-        pass
-    return Path.home() / "Library" / "Application Support" / "net.blw.fleet"
+        result = Path.home() / "Library" / "Application Support" / "net.blw.fleet"
+    _data_dir_cache = (mtime, result)
+    return result
 
 def _firmware_dir() -> Path:
     return _data_dir() / "firmware"
 
 def _save_data_dir(new_dir: str) -> None:
+    global _data_dir_cache
+    _data_dir_cache = None
     _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
         s = json.loads(_SETTINGS_PATH.read_text())

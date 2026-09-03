@@ -211,36 +211,9 @@ impl RangeValueConfig {
 
 // ─────────────────────────────────────────────────────────────────────────
 // Helpers
-// (Largely the same shape as in maid_layer.rs. When a third parser shows
-// up, we'll factor these into a shared module.)
 // ─────────────────────────────────────────────────────────────────────────
 
-fn extract_between<'a>(line: &'a str, open: &str, close: &str) -> Option<&'a str> {
-    let start = line.find(open)? + open.len();
-    let end = line[start..].find(close)? + start;
-    Some(&line[start..end])
-}
-
-fn strip_open_tag<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-    let prefix = format!("<{name}:");
-    if !line.starts_with(&prefix) {
-        return None;
-    }
-    let rest = &line[prefix.len()..];
-    let end = rest.find('>')?;
-    Some(&rest[..end])
-}
-
-fn split_name_code(payload: &str) -> Result<(String, u32), String> {
-    let dash = payload
-        .rfind('-')
-        .ok_or_else(|| format!("no '-' in {payload:?}"))?;
-    let name = &payload[..dash];
-    let code: u32 = payload[dash + 1..]
-        .parse()
-        .map_err(|_| format!("non-numeric code in {payload:?}"))?;
-    Ok((name.to_string(), code))
-}
+use crate::config_parse::{extract_between, split_name_code, strip_open_tag};
 
 /// Match `<name:TYPE>BODY</name>` on one line. Returns (TYPE, BODY).
 /// Returns None unless the closer is also on this line.
@@ -345,35 +318,6 @@ mod tests {
         assert_eq!(b, "1,32767,32767");
     }
 
-    // ── split_name_code parity with maid_layer.rs ────────────────────────
-    // Same shared-shape parser helper, hand-duplicated (not shared) between
-    // the two config parsers — these mirror maid_layer.rs's cases so a
-    // future strictness/edge-case fix applied to one copy is visible as a
-    // gap if not applied to the other.
-
-    #[test]
-    fn split_name_code_works() {
-        assert_eq!(
-            split_name_code("kNkMAIDCapability_Aperture-33285").unwrap(),
-            ("kNkMAIDCapability_Aperture".to_string(), 33285u32)
-        );
-    }
-
-    #[test]
-    fn split_name_code_hyphen_in_name() {
-        assert_eq!(
-            split_name_code("kNkMAIDCapability_Some-Name-33285").unwrap(),
-            ("kNkMAIDCapability_Some-Name".to_string(), 33285u32)
-        );
-    }
-
-    #[test]
-    fn split_name_code_no_dash_is_err() {
-        assert!(split_name_code("kNkMAIDCapability_NoDash").is_err());
-    }
-
-    #[test]
-    fn split_name_code_non_numeric_code_is_err() {
-        assert!(split_name_code("kNkMAIDCapability_Foo-BAR").is_err());
-    }
+    // split_name_code's tests now live once, canonically, in
+    // src/config_parse.rs.
 }

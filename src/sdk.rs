@@ -87,6 +87,7 @@ struct NkMAIDDeviceInfo {
     connected_pid: u32,
     version: [c_char; 64],
 }
+const _: () = assert!(std::mem::size_of::<NkMAIDDeviceInfo>() == 140);
 
 #[repr(C)]
 struct NkMAIDEnumDevices {
@@ -94,6 +95,7 @@ struct NkMAIDEnumDevices {
     ul_value: u32,
     p_device_data: *mut NkMAIDDeviceInfo,
 }
+const _: () = assert!(std::mem::size_of::<NkMAIDEnumDevices>() == 16);
 
 #[repr(C)]
 struct NkMAIDCapInfo {
@@ -103,6 +105,7 @@ struct NkMAIDCapInfo {
     ul_operations: u32,
     sz_description: [c_char; 256],
 }
+const _: () = assert!(std::mem::size_of::<NkMAIDCapInfo>() == 272);
 
 #[repr(C)]
 struct NkMAIDEnumCapInfo {
@@ -110,6 +113,7 @@ struct NkMAIDEnumCapInfo {
     ul_cap_count: u32,
     ul_allocation_size: u32,
 }
+const _: () = assert!(std::mem::size_of::<NkMAIDEnumCapInfo>() == 16);
 
 /// NkMAIDEnum — returned by GetCapability for kNkMAIDCapType_Enum capabilities.
 ///
@@ -125,6 +129,7 @@ struct NkMAIDEnum {
     // 6 bytes implicit padding so *mut c_void lands at offset 24
     p_data: *mut c_void,   // SDK-allocated element array; NULL when writing
 }
+const _: () = assert!(std::mem::size_of::<NkMAIDEnum>() == 32);
 
 /// NkMAIDRange — returned by GetCapability for kNkMAIDCapType_Range capabilities.
 #[repr(C)]
@@ -138,6 +143,13 @@ struct NkMAIDRange {
     ul_steps: u32, // 0 = continuous; ≥2 = discrete steps
     // 4 bytes implicit padding (struct alignment = 8 due to f64 fields)
 }
+const _: () = assert!(std::mem::size_of::<NkMAIDRange>() == 48);
+
+// The four `const _: () = assert!(...)` blocks above turn a silent layout
+// drift (a field reordered, resized, added, or removed relative to
+// Maid3.h) into a build failure instead of undetected memory corruption at
+// runtime — this crate has no access to the real Maid3.h header to check
+// against directly, so this is the closest available self-verification.
 
 /// InitializeSDK requires non-null callbacks even for a snapshot-only workflow.
 ///
@@ -163,7 +175,7 @@ struct NkMAIDCSCallback {
 
 // eNkMAIDDataType values (from Maid3.h eNkMAIDDataType enum).
 const DT_NULL: u32 = 0;
-#[allow(dead_code)] const DT_BOOLEAN: u32 = 1;
+const DT_BOOLEAN: u32 = 1;
 const DT_INTEGER: u32 = 2;
 const DT_UNSIGNED: u32 = 3;
 const DT_BOOLEAN_PTR: u32 = 4;
@@ -302,7 +314,11 @@ pub fn bcd_decode_version(bcd: u16) -> String {
 }
 
 fn model_from_product_string(product: &str) -> String {
-    product.strip_prefix("NIKON DSC ").unwrap_or(product).to_owned()
+    // Delegates to the canonical implementation instead of re-stripping the
+    // "NIKON DSC " prefix here — this file used to hardcode the same
+    // literal a second time, so a future change to the prefix convention
+    // only needed fixing in one copy to silently leave the other wrong.
+    crate::firmware::model_from_usb_product(product).to_owned()
 }
 
 fn nikon_usb_devices() -> Vec<rusb::Device<rusb::GlobalContext>> {
@@ -512,13 +528,7 @@ impl Sdk {
         };
         check("InitializeSDK", code)?;
         self.initialized = true;
-        if !device_list.is_null() {
-            unsafe {
-                let dl = &*device_list;
-                if !dl.p_device_data.is_null() { sdk_free(dl.p_device_data as *mut c_void); }
-                sdk_free(device_list as *mut c_void);
-            }
-        }
+        unsafe { free_device_list(device_list) };
         Ok(())
     }
 
@@ -538,17 +548,19 @@ impl Sdk {
             };
             let elements = if list.is_null() { 0 } else { unsafe { (*list).ul_elements } };
             if elements > 0 { break; }
-            if !list.is_null() {
-                unsafe {
-                    let dl = &*list;
-                    if !dl.p_device_data.is_null() { sdk_free(dl.p_device_data as *mut c_void); }
-                    sdk_free(list as *mut c_void);
-                }
-                list = ptr::null_mut();
-            }
+            unsafe { free_device_list(list) };
+            list = ptr::null_mut();
             pump_cf_runloop(std::time::Duration::from_millis(300));
         }
-        check("EnumDevices", code)?;
+        if let Err(e) = check("EnumDevices", code) {
+            // The retry loop above only frees a *rejected* (zero-element)
+            // list before looping again — the list that broke the loop
+            // (elements > 0) is still live here, and check() failing on it
+            // anyway (unconfirmed, but not ruled out) would otherwise skip
+            // freeing it via the old `?`.
+            unsafe { free_device_list(list) };
+            return Err(e);
+        }
         let mut out = Vec::new();
         if !list.is_null() {
             unsafe {
@@ -563,9 +575,8 @@ impl Sdk {
                         version: cstr_to_string(&info.version),
                     });
                 }
-                if !dl.p_device_data.is_null() { sdk_free(dl.p_device_data as *mut c_void); }
-                sdk_free(list as *mut c_void);
             }
+            unsafe { free_device_list(list) };
         }
         Ok(out)
     }
@@ -575,7 +586,13 @@ impl Sdk {
     pub fn connect(&mut self, device_id: u32) -> Result<Device<'_>, SdkError> {
         let mut cap_info: *mut NkMAIDEnumCapInfo = ptr::null_mut();
         let code = unsafe { (self.connect_device)(device_id, &mut cap_info) };
-        check("ConnectDevice", code)?;
+        if let Err(e) = check("ConnectDevice", code) {
+            // take_capabilities is a no-op on a still-null cap_info (the
+            // ordinary case), but frees it if the SDK populated the
+            // out-pointer despite returning an error code.
+            unsafe { take_capabilities(cap_info) };
+            return Err(e);
+        }
         let capabilities = unsafe { take_capabilities(cap_info) };
         Ok(Device { sdk: self, capabilities })
     }
@@ -626,7 +643,15 @@ impl<'sdk> Device<'sdk> {
         let code = unsafe {
             (self.sdk.get_capability)(capability_id, GET_VALUE, &mut data_ptr, &mut data_type)
         };
-        check("GetCapability", code)?;
+        if let Err(e) = check("GetCapability", code) {
+            // free_cap_value is a no-op on a still-null data_ptr (the
+            // ordinary case), but frees it if the SDK populated the
+            // out-pointer despite returning an error code — check() alone
+            // doesn't rule that out, and the prior `?` here would have
+            // skipped this entirely.
+            unsafe { free_cap_value(data_ptr, data_type) };
+            return Err(e);
+        }
 
         if data_type == DT_ENUM_PTR && !data_ptr.is_null() {
             return Ok(unsafe { self.read_enum_capability(capability_id, data_ptr) });
@@ -704,6 +729,19 @@ fn cstr_to_string(buf: &[c_char]) -> String {
     String::from_utf8_lossy(&bytes[..nul]).into_owned()
 }
 
+/// Free an `NkMAIDEnumDevices` list (and its device-data array), if
+/// non-null. Was hand-copied 3 times (InitializeSDK's discard, devices()'s
+/// retry-loop discard, devices()'s success-path free) with no shared
+/// implementation.
+unsafe fn free_device_list(list: *mut NkMAIDEnumDevices) {
+    if list.is_null() { return; }
+    unsafe {
+        let dl = &*list;
+        if !dl.p_device_data.is_null() { sdk_free(dl.p_device_data as *mut c_void); }
+        sdk_free(list as *mut c_void);
+    }
+}
+
 unsafe fn take_capabilities(p: *mut NkMAIDEnumCapInfo) -> Vec<CapabilityInfo> {
     if p.is_null() { return Vec::new(); }
     let info = unsafe { &*p };
@@ -746,6 +784,7 @@ unsafe fn free_cap_value(data_ptr: *mut c_void, data_type: u32) {
 unsafe fn decode_value(data_ptr: *mut c_void, data_type: u32) -> Value {
     match data_type {
         DT_NULL => Value::Null,
+        DT_BOOLEAN => json!(data_ptr as usize != 0),
         DT_INTEGER => json!(data_ptr as i64 as i32),
         DT_UNSIGNED => json!(data_ptr as usize as u32),
         DT_BOOLEAN_PTR => {
@@ -1173,6 +1212,18 @@ mod tests {
         // DT_INTEGER: the value is carried in the pointer itself, sign-extended.
         let v = unsafe { decode_value(-42i32 as i64 as *mut c_void, DT_INTEGER) };
         assert_eq!(v, json!(-42i32));
+    }
+
+    #[test]
+    fn decode_boolean_by_value_true() {
+        let v = unsafe { decode_value(1usize as *mut c_void, DT_BOOLEAN) };
+        assert_eq!(v, json!(true));
+    }
+
+    #[test]
+    fn decode_boolean_by_value_false() {
+        let v = unsafe { decode_value(0usize as *mut c_void, DT_BOOLEAN) };
+        assert_eq!(v, json!(false));
     }
 
     #[test]

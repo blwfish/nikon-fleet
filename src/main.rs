@@ -19,7 +19,7 @@ use nikon_fleet::firmware::{
     model_slug, save_meta, sha256_file,
 };
 use nikon_fleet::maid_layer::MaidLayerConfig;
-use nikon_fleet::sdk::{CapabilityInfo, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET, OP_SET};
+use nikon_fleet::sdk::{CapabilityInfo, Device, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET, OP_SET};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 
 #[cfg(target_os = "macos")]
@@ -546,7 +546,11 @@ fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs, no_usb_reset: bool) -> 
     let enriched = enrich_devices(sdk.devices()?);
     if enriched.is_empty() {
         if args.json {
-            println!("{{\"cameras\":[]}}");
+            // Built via serde like the populated-list branch below, rather
+            // than a hand-typed literal — the two used to be two different
+            // code paths producing the same logical shape with no compiler
+            // tie between them if the schema ever gains a field.
+            println!("{}", serde_json::json!({ "cameras": Vec::<serde_json::Value>::new() }));
         } else {
             println!("(no Nikon cameras detected)");
         }
@@ -563,12 +567,105 @@ fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs, no_usb_reset: bool) -> 
     } else {
         println!("{} device(s):", enriched.len());
         for (dev, usb) in &enriched {
-            let serial   = usb.as_ref().map(|u| u.serial.as_str()).unwrap_or("?");
+            // Same empty-but-present-serial fallback as the --json branch
+            // above — previously this branch only fell back to "?" when
+            // there was no USB pairing at all, so an empty (not absent)
+            // serial printed as a blank field instead of falling back.
+            let id_str   = dev.id.to_string();
+            let serial   = usb.as_ref().and_then(|u| (!u.serial.is_empty()).then_some(u.serial.as_str())).unwrap_or(id_str.as_str());
             let firmware = usb.as_ref().map(|u| u.firmware.as_str()).unwrap_or(dev.version.as_str());
             println!("  {}  serial={}  fw={}  id={}", dev.name, serial, firmware, dev.id);
         }
     }
     Ok(())
+}
+
+/// Select the target device: by --serial if given (matched against USB
+/// iSerialNumber, bare SDK id, or the "id-{id}" fallback form — see
+/// `serial_matches`), else the first available one. Shared by cmd_snapshot
+/// and cmd_check, which used to each carry an identical copy of this match.
+fn select_device(
+    enriched: Vec<(DeviceInfo, Option<UsbCameraInfo>)>,
+    serial: Option<&str>,
+) -> Result<(DeviceInfo, Option<UsbCameraInfo>)> {
+    match serial {
+        Some(s) => enriched.into_iter()
+            .find(|(dev, usb)| serial_matches(dev, usb, s))
+            .ok_or_else(|| anyhow::anyhow!("no device with serial {s}")),
+        None => {
+            let idx = enriched.iter().position(|(d, _)| d.available).unwrap_or(0);
+            Ok(enriched.into_iter().nth(idx).unwrap())
+        }
+    }
+}
+
+/// Read-capability counts from `capture_capabilities`.
+#[derive(Default)]
+struct CaptureStats {
+    read_ok: usize,
+    read_err: usize,
+    skipped_no_get: usize,
+    unknown_schema: usize,
+}
+
+/// Read every OP_GET-capable capability from `device` into `snap`, using
+/// `name_lookup` to resolve symbolic names (falling back to `cap_{:#x}` on
+/// a schema miss). Shared by cmd_snapshot and cmd_check's "live snapshot"
+/// path — cmd_check's own comment used to say "same logic as cmd_snapshot
+/// but in-memory," true only by convention (copy-paste) rather than by
+/// construction, so a fix to one could silently not apply to the other.
+fn capture_capabilities(
+    device: &Device,
+    name_lookup: &HashMap<u32, String>,
+    snap: &mut Snapshot,
+) -> CaptureStats {
+    let mut stats = CaptureStats::default();
+    for cap in &device.capabilities {
+        if cap.operations & OP_GET == 0 {
+            stats.skipped_no_get += 1;
+            continue;
+        }
+        let name = match name_lookup.get(&cap.id) {
+            Some(n) => n.clone(),
+            None => format!("cap_{:#x}", cap.id),
+        };
+        match device.read_capability(cap.id) {
+            Ok(value) => {
+                if !name_lookup.contains_key(&cap.id) {
+                    // Not folded silently into read_ok: a schema miss here
+                    // means the loaded MaidLayer.config is stale relative to
+                    // this camera's firmware, degrading readability with no
+                    // signal unless counted separately (Data-Capture
+                    // Backward-Chaining Rule).
+                    stats.unknown_schema += 1;
+                }
+                snap.insert(name, cap.id, value);
+                stats.read_ok += 1;
+            }
+            Err(e) => {
+                // Previously discarded (cmd_snapshot only counted read_err),
+                // unlike cmd_restore's structurally identical write loop,
+                // which does log each failure — same diagnostic discipline
+                // now on both sides of that read/write pair.
+                eprintln!("  warn: {name} [{:#x}]: {e}", cap.id);
+                stats.read_err += 1;
+            }
+        }
+    }
+    stats
+}
+
+/// `unknown_schema` warning shared by cmd_snapshot and cmd_check.
+fn warn_if_unknown_schema(unknown_schema: usize, schema_path: &Path) {
+    if unknown_schema > 0 {
+        eprintln!(
+            "warning: {unknown_schema} capabilit{plural} not found in the loaded schema \
+             ({schema_path}) — recorded by numeric code (cap_0x...) instead of a symbolic \
+             name. The schema may be stale relative to this camera's firmware.",
+            plural = if unknown_schema == 1 { "y is" } else { "ies are" },
+            schema_path = schema_path.display(),
+        );
+    }
 }
 
 fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &SnapshotArgs, no_usb_reset: bool) -> Result<()> {
@@ -578,16 +675,7 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
         bail!("no Nikon cameras detected");
     }
     let enriched = enrich_devices(devices);
-    // Pick by --serial if given (matched against USB iSerialNumber), else first available.
-    let (target, usb_info) = match args.serial.as_deref() {
-        Some(s) => enriched.into_iter()
-            .find(|(dev, usb)| serial_matches(dev, usb, s))
-            .ok_or_else(|| anyhow::anyhow!("no device with serial {s}"))?,
-        None => {
-            let idx = enriched.iter().position(|(d, _)| d.available).unwrap_or(0);
-            enriched.into_iter().nth(idx).unwrap()
-        }
-    };
+    let (target, usb_info) = select_device(enriched, args.serial.as_deref())?;
     println!("Connecting to {:?} (id={})…", target.name, target.id);
 
     let schema = MaidLayerConfig::parse_file(schema_path)
@@ -618,47 +706,12 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     );
     snap.label = args.label.clone();
 
-    let mut read_ok = 0usize;
-    let mut read_err = 0usize;
-    let mut skipped_no_get = 0usize;
-    let mut unknown_schema = 0usize;
-    for cap in &device.capabilities {
-        if cap.operations & OP_GET == 0 {
-            skipped_no_get += 1;
-            continue;
-        }
-        match device.read_capability(cap.id) {
-            Ok(value) => {
-                let name = match name_lookup.get(&cap.id) {
-                    Some(n) => n.clone(),
-                    None => {
-                        // Not folded silently into read_ok: a schema miss
-                        // here means the loaded MaidLayer.config is stale
-                        // relative to this camera's firmware, degrading
-                        // readability with no signal unless counted
-                        // separately (Data-Capture Backward-Chaining Rule).
-                        unknown_schema += 1;
-                        format!("cap_{:#x}", cap.id)
-                    }
-                };
-                snap.insert(name, cap.id, value);
-                read_ok += 1;
-            }
-            Err(_) => read_err += 1,
-        }
-    }
+    let stats = capture_capabilities(&device, &name_lookup, &mut snap);
     println!(
-        "  ok={read_ok}  err={read_err}  skipped(no-get-bit)={skipped_no_get}  unknown-schema={unknown_schema}"
+        "  ok={}  err={}  skipped(no-get-bit)={}  unknown-schema={}",
+        stats.read_ok, stats.read_err, stats.skipped_no_get, stats.unknown_schema
     );
-    if unknown_schema > 0 {
-        eprintln!(
-            "warning: {unknown_schema} capabilit{plural} not found in the loaded schema \
-             ({schema_path}) — recorded by numeric code (cap_0x...) instead of a symbolic \
-             name. The schema may be stale relative to this camera's firmware.",
-            plural = if unknown_schema == 1 { "y is" } else { "ies are" },
-            schema_path = schema_path.display(),
-        );
-    }
+    warn_if_unknown_schema(stats.unknown_schema, schema_path);
 
     // Save under snapshots/.
     let dir = snapshots_dir(data_dir);
@@ -667,11 +720,11 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     let path = dir.join(&filename);
     snap.save_to_file(&path)?;
     println!("Wrote {}", path.display());
-    if snapshot_capture_failed(read_ok, read_err) {
+    if snapshot_capture_failed(stats.read_ok, stats.read_err) {
         // The file is still written (matches prior behavior), but a
         // script/CI checking exit status must be able to tell this run was
         // a total failure, not a normal capture.
-        bail!("all {read_err} capability read(s) failed (see errors above); wrote an empty snapshot to {}", path.display());
+        bail!("all {} capability read(s) failed (see errors above); wrote an empty snapshot to {}", stats.read_err, path.display());
     }
     Ok(())
 }
@@ -698,17 +751,10 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
         bail!("no Nikon cameras detected");
     }
     let enriched = enrich_devices(devices);
-    let (target, usb_info) = match args.serial.as_deref() {
-        Some(s) => enriched.into_iter()
-            .find(|(dev, usb)| serial_matches(dev, usb, s))
-            .ok_or_else(|| anyhow::anyhow!("no device with serial {s}"))?,
-        None => {
-            let idx = enriched.iter().position(|(d, _)| d.available).unwrap_or(0);
-            enriched.into_iter().nth(idx).unwrap()
-        }
-    };
+    let (target, usb_info) = select_device(enriched, args.serial.as_deref())?;
 
-    // Live snapshot (same logic as cmd_snapshot but in-memory).
+    // Live snapshot — shares capture_capabilities with cmd_snapshot; this
+    // used to be an independent copy of the same loop.
     let schema = MaidLayerConfig::parse_file(schema_path)?;
     let name_lookup = schema.name_map_for_model(&target.name);
     let device = sdk.connect(target.id)?;
@@ -726,18 +772,8 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
         OffsetDateTime::now_utc().format(&Rfc3339)?,
     );
     live.label = Some("live".into());
-    for cap in &device.capabilities {
-        if cap.operations & OP_GET == 0 {
-            continue;
-        }
-        if let Ok(value) = device.read_capability(cap.id) {
-            let name = name_lookup
-                .get(&cap.id)
-                .cloned()
-                .unwrap_or_else(|| format!("cap_{:#x}", cap.id));
-            live.insert(name, cap.id, value);
-        }
-    }
+    let stats = capture_capabilities(&device, &name_lookup, &mut live);
+    warn_if_unknown_schema(stats.unknown_schema, schema_path);
 
     // Reference for this body.
     let ref_path = references_dir(data_dir).join(reference_filename(&target.name, &serial));
@@ -771,9 +807,25 @@ fn looks_like_bcd_version(version: &str) -> bool {
         && minor.len() == 2 && minor.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Whether `s` is safe to use as one component of a path this process will
+/// create/write to (as `model_slug(model)` and `version` both are, via
+/// `archive_dir`). Rejects anything that isn't a single plain path segment
+/// — a `--version` (or `--model`) of `"../../../../tmp/pwned"` would
+/// otherwise walk `archive_dir`'s `.join(...)` calls straight out of
+/// data-dir before `fs::create_dir_all`/`fs::copy`/`fs::write` ever run.
+fn is_safe_path_component(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\\')
+}
+
 fn cmd_firmware_add(data_dir: &Path, args: &FirmwareAddArgs) -> Result<()> {
     if !args.bin_path.exists() {
         bail!("firmware file not found: {}", args.bin_path.display());
+    }
+    if !is_safe_path_component(&model_slug(&args.model)) {
+        bail!("--model {:?} is not a valid single path component after slugging", args.model);
+    }
+    if !is_safe_path_component(&args.version) {
+        bail!("--version {:?} is not a valid single path component", args.version);
     }
     if !looks_like_bcd_version(&args.version) {
         // --version is free-typed, but `fleet firmware check`'s archive
@@ -1027,7 +1079,7 @@ fn cmd_firmware_rollback(data_dir: &Path, schema_path: &Path, args: &FirmwareRol
         instructions.push_str(&format!("Target camera serial: {serial}  (verified connected and {} at generation time)\n", args.model));
     }
     instructions.push_str("\nSTEP 1 — VERIFY FIRMWARE FILE\n");
-    instructions.push_str(&format!("  File:    firmware.bin\n"));
+    instructions.push_str("  File:    firmware.bin\n");
     instructions.push_str(&format!("  Size:    {} bytes\n", meta.bin_size_bytes));
     instructions.push_str(&format!("  SHA-256: {}\n", meta.bin_sha256));
     instructions.push_str("  Confirm the file is not corrupt before proceeding.\n");
@@ -1303,8 +1355,45 @@ mod tests {
     fn dev(id: u32) -> DeviceInfo {
         DeviceInfo { id, name: "Z 9".into(), available: true, connected_pid: 0, version: "5.31".into() }
     }
+    fn dev_unavailable(id: u32) -> DeviceInfo {
+        DeviceInfo { available: false, ..dev(id) }
+    }
     fn usb(serial: &str) -> UsbCameraInfo {
         UsbCameraInfo { product_id: 0, serial: serial.into(), firmware: "5.31".into(), model: "Z 9".into() }
+    }
+
+    // ── select_device ─────────────────────────────────────────────────────
+    // Shared by cmd_snapshot and cmd_check (previously two identical copies
+    // of this match).
+
+    #[test]
+    fn select_device_by_serial_finds_match() {
+        let enriched = vec![(dev(1), Some(usb("AAA"))), (dev(2), Some(usb("BBB")))];
+        let (d, _) = select_device(enriched, Some("BBB")).unwrap();
+        assert_eq!(d.id, 2);
+    }
+
+    #[test]
+    fn select_device_by_serial_no_match_errors() {
+        let enriched = vec![(dev(1), Some(usb("AAA")))];
+        assert!(select_device(enriched, Some("NOPE")).is_err());
+    }
+
+    #[test]
+    fn select_device_none_picks_first_available() {
+        // The first entry is unavailable — must skip it, not just take index 0.
+        let enriched = vec![(dev_unavailable(1), None), (dev(2), None)];
+        let (d, _) = select_device(enriched, None).unwrap();
+        assert_eq!(d.id, 2);
+    }
+
+    #[test]
+    fn select_device_none_falls_back_to_first_when_none_available() {
+        // Boundary: no available device at all — falls back to index 0
+        // rather than erroring (matches the prior inline behavior).
+        let enriched = vec![(dev_unavailable(1), None), (dev_unavailable(2), None)];
+        let (d, _) = select_device(enriched, None).unwrap();
+        assert_eq!(d.id, 1);
     }
 
     #[test]
@@ -1547,6 +1636,48 @@ mod tests {
     #[test]
     fn looks_like_bcd_version_rejects_no_dot() {
         assert!(!looks_like_bcd_version("530"));
+    }
+
+    // ── is_safe_path_component ───────────────────────────────────────────
+
+    #[test]
+    fn is_safe_path_component_accepts_plain_segment() {
+        assert!(is_safe_path_component("5.31"));
+        assert!(is_safe_path_component("Z_9"));
+    }
+
+    #[test]
+    fn is_safe_path_component_rejects_dotdot() {
+        assert!(!is_safe_path_component(".."));
+    }
+
+    #[test]
+    fn is_safe_path_component_rejects_traversal_sequence() {
+        assert!(!is_safe_path_component("../../../../tmp/pwned"));
+    }
+
+    #[test]
+    fn is_safe_path_component_rejects_embedded_separator() {
+        assert!(!is_safe_path_component("a/b"));
+        assert!(!is_safe_path_component("a\\b"));
+    }
+
+    #[test]
+    fn is_safe_path_component_rejects_empty_and_dot() {
+        assert!(!is_safe_path_component(""));
+        assert!(!is_safe_path_component("."));
+    }
+
+    #[test]
+    fn cmd_firmware_add_path_traversal_version_rejected() {
+        let data_dir = TempDir::new().unwrap();
+        let bin_path = data_dir.path().join("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+        let err = cmd_firmware_add(
+            data_dir.path(),
+            &firmware_add_args(bin_path, "Z 9", "../../../../tmp/pwned", false),
+        ).unwrap_err();
+        assert!(err.to_string().contains("not a valid single path component"));
     }
 
     // ── cmd_firmware_add ──────────────────────────────────────────────────

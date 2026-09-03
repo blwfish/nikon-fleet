@@ -235,6 +235,32 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
+    // ── is_volatile ──────────────────────────────────────────────────────
+    // Substring match against a hardcoded list — pinning both the intended
+    // matches and the false-positive shape this pattern allows, per the
+    // Syntactic-Semantic Seam Rule: a property name that merely *contains* a
+    // volatile substring, without being that property, is still flagged.
+
+    #[test]
+    fn is_volatile_matches_known_names() {
+        assert!(is_volatile("kNkMAIDCapability_BatteryLevel"));
+        assert!(is_volatile("kNkMAIDCapability_ShutterCount"));
+    }
+
+    #[test]
+    fn is_volatile_false_on_unrelated_name() {
+        assert!(!is_volatile("kNkMAIDCapability_Aperture"));
+    }
+
+    #[test]
+    fn is_volatile_false_positive_on_substring_match() {
+        // Documented current behavior, not a claim this is desirable: a
+        // hypothetical property name that merely contains "FocusPosition"
+        // as a substring is flagged volatile even though it isn't the
+        // focus-position reading the list exists to suppress noise from.
+        assert!(is_volatile("kNkMAIDCapability_AutoFocusPositionPreset"));
+    }
+
     fn snap(props: &[(&str, u32, serde_json::Value)]) -> Snapshot {
         let mut s = Snapshot::new(
             Camera { model: "Z 9".into(), serial: "X".into(), firmware: "5.00".into() },

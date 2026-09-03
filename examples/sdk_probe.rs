@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::process;
 
-use nikon_fleet::sdk::Sdk;
+use nikon_fleet::sdk::{OP_GET, Sdk};
 
 const BUNDLE_EXE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -64,8 +64,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if tried >= 5 {
             break;
         }
-        // ulOperations bit 1 (0x02) = "Get" — only try those (rough heuristic).
-        if c.operations & 0x02 == 0 {
+        // Only try capabilities with the Get bit set.
+        if c.operations & OP_GET == 0 {
             continue;
         }
         match device.read_capability(c.id) {

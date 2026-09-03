@@ -161,6 +161,42 @@ impl Snapshot {
     }
 }
 
+/// The subset of a snapshot's fields needed to list it (a GUI's snapshot
+/// list, `fleet ls`) without deserializing the full `properties` map —
+/// potentially hundreds of capability entries per file that listing never
+/// looks at. `#[serde(deny_unknown_fields)]` is deliberately NOT used: this
+/// must accept the same on-disk JSON `Snapshot::from_json` does, just
+/// ignoring fields it doesn't need.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotSummary {
+    pub format_version: u32,
+    pub camera: Camera,
+    pub captured_at: String,
+    pub label: Option<String>,
+}
+
+impl SnapshotSummary {
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, SnapshotError> {
+        let text = fs::read_to_string(path)?;
+        Self::from_json(&text)
+    }
+
+    pub fn from_json(text: &str) -> Result<Self, SnapshotError> {
+        let summary: SnapshotSummary = serde_json::from_str(text)?;
+        // Same check Snapshot::from_json makes — without it, a snapshot
+        // whose format has moved on would silently show up in a listing
+        // (which used to correctly hide it) even though loading the full
+        // Snapshot to actually use it would still fail.
+        if summary.format_version != CURRENT_FORMAT_VERSION {
+            return Err(SnapshotError::UnsupportedVersion {
+                found: summary.format_version,
+                expected: CURRENT_FORMAT_VERSION,
+            });
+        }
+        Ok(summary)
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────
@@ -257,6 +293,33 @@ mod tests {
         let name = s.suggested_filename();
         assert!(!name.contains('/'), "sanitized filename must not contain a path separator: {name}");
         assert!(name.contains("wedding_.._.._escape"));
+    }
+
+    #[test]
+    fn summary_reads_full_snapshot_json_ignoring_properties() {
+        // A full Snapshot's JSON must also parse as a SnapshotSummary
+        // (listing code reads whatever real snapshot files already exist
+        // on disk) — this pins that SnapshotSummary accepts the same shape
+        // Snapshot::from_json does, just ignoring "properties" and
+        // "format_version"/"transport".
+        let original = sample_snapshot();
+        let text = original.to_pretty_json().unwrap();
+        let summary: SnapshotSummary = serde_json::from_str(&text).unwrap();
+        assert_eq!(summary.camera, original.camera);
+        assert_eq!(summary.captured_at, original.captured_at);
+        assert_eq!(summary.label, original.label);
+    }
+
+    #[test]
+    fn summary_rejects_unsupported_format_version() {
+        // Same contract as Snapshot::from_json — a version-incompatible
+        // file must be rejected by the summary loader too, not silently
+        // listed as if it were readable.
+        let mut bad = sample_snapshot();
+        bad.format_version = 999;
+        let text = serde_json::to_string(&bad).unwrap();
+        let err = SnapshotSummary::from_json(&text).unwrap_err();
+        assert!(matches!(err, SnapshotError::UnsupportedVersion { found: 999, .. }));
     }
 
     #[test]

@@ -45,11 +45,18 @@ def accept_zip_entry(name: str) -> bool:
 
     Rejects directory entries, path-traversal attempts, unknown folders,
     and wrong extensions.
+
+    Splits on "/" directly rather than using Path(name).parts: pathlib
+    silently drops "." (current-dir) components, which let
+    "snapshots/./foo.json" diverge from gui/src/main.rs's accept_zip_entry
+    (Rust's Path::components() does NOT drop CurDir, and rejects it) even
+    though both sides are commented "must stay in sync." Manual splitting
+    treats "." as just another path segment, matching Rust's stricter
+    behavior — this repo's zip entries always use "/" as the separator
+    regardless of platform, so this isn't an OS-portability regression.
     """
-    parts = Path(name).parts
-    if not parts:
-        return False
-    if any(p == ".." for p in parts):
+    parts = name.split("/")
+    if any(p in ("", ".", "..") for p in parts):
         return False
     folder = parts[0]
     if folder not in ("snapshots", "references", "firmware"):
@@ -63,31 +70,6 @@ def accept_zip_entry(name: str) -> bool:
         return False
     filename = parts[3]
     return filename == "firmware.bin" or filename == "metadata.json"
-
-
-def decode_packed_strings(values: list) -> list[str]:
-    """Decode a Nikon SDK packed-string array into a list of option labels.
-
-    The SDK stores enum option labels as individual characters with an empty
-    string '' acting as a null-terminator between entries:
-
-        ['J','P','E','G',' ','F','i','n','e','', 'R','A','W','', ...]
-        → ['JPEG Fine', 'RAW', ...]
-
-    Used for elem_type=7 enum capabilities in snapshot values.
-    """
-    options: list[str] = []
-    current: list[str] = []
-    for ch in values:
-        if ch == "":
-            if current:
-                options.append("".join(current))
-                current = []
-        else:
-            current.append(str(ch))
-    if current:
-        options.append("".join(current))
-    return options
 
 
 def fmt_cap_value(v) -> str:
@@ -116,10 +98,21 @@ def fmt_cap_value(v) -> str:
         elem_type = v.get("elem_type")
         idx       = v.get("value_index")
         raw_vals  = v.get("values", [])
+        # decode_enum_values (Rust) falls back to a JSON *object* —
+        # {"_unsupported_enum_type": N} or {"_invalid_physical_bytes": N} —
+        # for an array-element type it doesn't decode. Guard for that shape
+        # explicitly rather than assuming "values" is always a list: a bare
+        # `raw_vals[idx]` on a dict with idx=0 raises KeyError (the only key
+        # is a string, not the int 0), not an IndexError, and used to crash
+        # the snapshot-detail window instead of rendering gracefully.
+        if not isinstance(raw_vals, list):
+            return f"[unrecognized enum data: {raw_vals}]"
 
         if elem_type == 7 and idx is not None:
-            # raw_vals is already decoded by Rust into ["JPEG Fine", "RAW", ...]
-            # decode_packed_strings() is for the raw char-by-char wire format only.
+            # raw_vals is already decoded by Rust (decode_enum_values) into
+            # ["JPEG Fine", "RAW", ...] — this file has no char-by-char
+            # packed-string decoder of its own; that logic lives once, in
+            # Rust, not duplicated here.
             if 0 <= idx < len(raw_vals):
                 return str(raw_vals[idx])
             return f"[index {idx} / {len(raw_vals)}]"

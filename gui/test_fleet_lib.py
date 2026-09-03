@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, decode_packed_strings, fmt_cap_value, model_slug
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug
 
 _FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "capability_value_shapes.json"
 
@@ -127,6 +127,13 @@ class TestAcceptZipEntry:
     def test_absolute_path_rejected(self):
         assert accept_zip_entry("/snapshots/foo.json") is False
 
+    def test_curdir_component_rejected(self):
+        # Regression: Path(name).parts silently dropped "." components,
+        # diverging from gui/src/main.rs's Rust accept_zip_entry (which
+        # rejects Component::CurDir) even though both sides are commented
+        # "must stay in sync."
+        assert accept_zip_entry("snapshots/./foo.json") is False
+
 
 # ── parse_fw_filename ─────────────────────────────────────────────────────────
 
@@ -179,35 +186,10 @@ class TestParseFwFilename:
         assert not model.endswith(".bin")
 
 
-# ── decode_packed_strings ─────────────────────────────────────────────────────
-
-class TestDecodePackedStrings:
-    def test_basic(self):
-        chars = ["R","A","W","", "J","P","E","G",""]
-        assert decode_packed_strings(chars) == ["RAW", "JPEG"]
-
-    def test_single_char_entries(self):
-        # Aperture-style: single-digit labels
-        chars = ["4","", "5","", "8",""]
-        assert decode_packed_strings(chars) == ["4", "5", "8"]
-
-    def test_multichar_entry(self):
-        chars = ["J","P","E","G"," ","F","i","n","e",""]
-        assert decode_packed_strings(chars) == ["JPEG Fine"]
-
-    def test_trailing_no_terminator(self):
-        # Last entry missing trailing ""
-        chars = ["A","u","t","o","", "M","a","n","u","a","l"]
-        assert decode_packed_strings(chars) == ["Auto", "Manual"]
-
-    def test_empty_input(self):
-        assert decode_packed_strings([]) == []
-
-    def test_real_wb_fragment(self):
-        # Fragment from WBMode: Auto / Incandescent
-        chars = ["A","u","t","o","", "I","n","c","a","n","d","e","s","c","e","n","t",""]
-        assert decode_packed_strings(chars) == ["Auto", "Incandescent"]
-
+# decode_packed_strings and its tests were removed: the function was never
+# called from fleet_gui.py's runtime path (elem_type=7 values arrive
+# already decoded from Rust's decode_enum_values), so its tests were
+# pinning a decode path that isn't wired into production.
 
 # ── fmt_cap_value ─────────────────────────────────────────────────────────────
 
@@ -242,6 +224,28 @@ class TestFmtCapValueFixtureCrossCheck:
 
 
 class TestFmtCapValue:
+    def test_unsupported_enum_type_fallback_does_not_crash(self):
+        # Regression: decode_enum_values (Rust) falls back to a JSON
+        # object — {"_unsupported_enum_type": N} — for an array-element
+        # type it doesn't decode. This used to raise KeyError (dict[0] on
+        # a dict whose only key is a string) instead of rendering
+        # gracefully.
+        v = {"elem_type": 99, "value_index": 0, "elem_count": 1,
+             "elem_bytes": 4, "default_index": 0,
+             "values": {"_unsupported_enum_type": 99}}
+        result = fmt_cap_value(v)
+        assert isinstance(result, str)
+        assert "_unsupported_enum_type" in result
+
+    def test_invalid_physical_bytes_fallback_does_not_crash(self):
+        v = {"elem_type": 7, "value_index": 0, "elem_count": 2,
+             "elem_bytes": -1, "default_index": 0,
+             "values": {"_invalid_physical_bytes": -1}}
+        result = fmt_cap_value(v)
+        assert isinstance(result, str)
+        assert "_invalid_physical_bytes" in result
+
+
     def test_scalar_int(self):
         assert fmt_cap_value(100) == "100"
 

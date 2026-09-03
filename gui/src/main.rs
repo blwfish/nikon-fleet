@@ -7,7 +7,7 @@ use eframe::egui;
 use nikon_fleet::firmware::model_slug;
 use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::sdk::{DeviceInfo, Sdk, OP_GET, UsbCameraInfo, pair_devices, usb_camera_list};
-use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
+use nikon_fleet::snapshot::{Camera, Snapshot, SnapshotSummary, Transport};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -99,7 +99,7 @@ enum Evt {
     Snapshots(Vec<SnapRow>),
     ReferenceDone,
     ExportDone { dest: PathBuf, count: usize },
-    ImportDone { snapshots: usize, references: usize },
+    ImportDone { snapshots: usize, references: usize, firmware: usize },
     Err(String),
 }
 
@@ -166,6 +166,15 @@ impl FleetApp {
         let _ = self.cmd_tx.send(cmd);
     }
 
+    /// Reload the snapshot list for the currently selected camera, if any.
+    /// This one-liner used to be copy-pasted at 6 call sites.
+    fn refresh_selected_snapshots(&mut self) {
+        if let Some(i) = self.selected {
+            let serial = self.cameras[i].serial.clone();
+            self.send(Cmd::ListSnapshots { serial });
+        }
+    }
+
     fn poll(&mut self) {
         while let Ok(evt) = self.evt_rx.try_recv() {
             self.busy = false;
@@ -175,38 +184,27 @@ impl FleetApp {
                     self.cameras = cams;
                     self.selected = (!self.cameras.is_empty()).then_some(0);
                     self.snapshots.clear();
-                    if let Some(i) = self.selected {
-                        let serial = self.cameras[i].serial.clone();
-                        self.send(Cmd::ListSnapshots { serial });
-                    }
+                    self.refresh_selected_snapshots();
                 }
                 Evt::SnapshotDone(filename) => {
                     self.status = format!("Saved: {filename}");
-                    if let Some(i) = self.selected {
-                        let serial = self.cameras[i].serial.clone();
-                        self.send(Cmd::ListSnapshots { serial });
-                    }
+                    self.refresh_selected_snapshots();
                 }
                 Evt::Snapshots(snaps) => {
                     self.snapshots = snaps;
                 }
                 Evt::ReferenceDone => {
                     self.status = "Reference set.".into();
-                    if let Some(i) = self.selected {
-                        let serial = self.cameras[i].serial.clone();
-                        self.send(Cmd::ListSnapshots { serial });
-                    }
+                    self.refresh_selected_snapshots();
                 }
                 Evt::ExportDone { dest, count } => {
                     self.status = format!("Exported {count} file(s) → {}", dest.display());
                 }
-                Evt::ImportDone { snapshots, references } => {
-                    self.status =
-                        format!("Imported {snapshots} snapshot(s), {references} reference(s).");
-                    if let Some(i) = self.selected {
-                        let serial = self.cameras[i].serial.clone();
-                        self.send(Cmd::ListSnapshots { serial });
-                    }
+                Evt::ImportDone { snapshots, references, firmware } => {
+                    self.status = format!(
+                        "Imported {snapshots} snapshot(s), {references} reference(s), {firmware} firmware file(s)."
+                    );
+                    self.refresh_selected_snapshots();
                 }
                 Evt::Err(msg) => {
                     self.status = format!("Error: {msg}");
@@ -319,10 +317,7 @@ impl eframe::App for FleetApp {
             let effective = self.settings.effective_data_dir();
             self.prefs_data_dir = effective.to_string_lossy().into_owned();
             let _ = self.cmd_tx.send(Cmd::SetDataDir(effective.clone()));
-            if let Some(i) = self.selected {
-                let serial = self.cameras[i].serial.clone();
-                self.send(Cmd::ListSnapshots { serial });
-            }
+            self.refresh_selected_snapshots();
             self.status = format!("Data dir: {}", effective.display());
             prefs_open = false;
         }
@@ -372,8 +367,7 @@ impl eframe::App for FleetApp {
         });
         if let Some(i) = cam_select {
             self.selected = Some(i);
-            let serial = self.cameras[i].serial.clone();
-            self.send(Cmd::ListSnapshots { serial });
+            self.refresh_selected_snapshots();
         }
 
         // ── Main panel ───────────────────────────────────────────────────
@@ -412,9 +406,13 @@ impl eframe::App for FleetApp {
             });
             ui.separator();
 
-            let snaps = self.snapshots.clone();
+            // No clone needed — this block only reads self.snapshots (the
+            // camera-list loop above it already iterates its own field by
+            // reference with no clone); disjoint field capture lets this
+            // borrow coexist with &mut self.label used earlier in the same
+            // closure.
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for snap in &snaps {
+                for snap in &self.snapshots {
                     ui.horizontal(|ui| {
                         let ts = snap.captured_at.get(..19).unwrap_or(&snap.captured_at);
                         let lbl = snap.label.as_deref().unwrap_or("(no label)");
@@ -629,7 +627,10 @@ fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {
                 return None;
             }
             let path = snap_dir.join(&fname);
-            let snap = match Snapshot::load_from_file(&path) {
+            // SnapshotSummary, not the full Snapshot: listing never looks
+            // at `properties` (potentially hundreds of capability entries
+            // per file), so there's no reason to deserialize it here.
+            let snap = match SnapshotSummary::load_from_file(&path) {
                 Ok(s) => s,
                 Err(err) => {
                     eprintln!("warning: skipping {}: {err}", path.display());
@@ -644,7 +645,7 @@ fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {
                 .entry(model.clone())
                 .or_insert_with(|| {
                     let ref_path = ref_dir.join(format!("{}_{serial}.json", model_slug(&model)));
-                    Snapshot::load_from_file(&ref_path).ok().map(|s| s.captured_at)
+                    SnapshotSummary::load_from_file(&ref_path).ok().map(|s| s.captured_at)
                 })
                 .clone();
             let is_reference = ref_captured_at
@@ -747,6 +748,7 @@ fn do_import(data_dir: &Path, src: &Path) -> Result<Evt, String> {
 
     let mut snap_count = 0usize;
     let mut ref_count = 0usize;
+    let mut fw_count = 0usize;
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
@@ -769,10 +771,16 @@ fn do_import(data_dir: &Path, src: &Path) -> Result<Evt, String> {
 
         let name = entry.name();
         if name.starts_with("snapshots/") { snap_count += 1; }
-        if name.starts_with("references/") { ref_count += 1; }
+        else if name.starts_with("references/") { ref_count += 1; }
+        // Firmware files ARE imported (the write above already happened
+        // for them, same as the other two categories) but were never
+        // counted — the status message silently omitted them, unlike
+        // fleet_gui.py's import_data, which reports all three categories
+        // for the same operation.
+        else if name.starts_with("firmware/") { fw_count += 1; }
     }
 
-    Ok(Evt::ImportDone { snapshots: snap_count, references: ref_count })
+    Ok(Evt::ImportDone { snapshots: snap_count, references: ref_count, firmware: fw_count })
 }
 
 /// Return true if a zip archive entry should be imported.
@@ -1128,9 +1136,12 @@ mod tests {
         let dst_dir = TempDir::new().unwrap();
         let import = do_import(dst_dir.path(), &zip_path).unwrap();
         match import {
-            Evt::ImportDone { snapshots, references } => {
+            Evt::ImportDone { snapshots, references, firmware } => {
                 assert_eq!(snapshots, 1);
                 assert_eq!(references, 1);
+                // Regression: firmware imports weren't counted at all
+                // (2 files: firmware.bin + metadata.json, both imported above).
+                assert_eq!(firmware, 2);
             }
             _ => panic!("expected ImportDone"),
         }

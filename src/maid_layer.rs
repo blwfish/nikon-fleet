@@ -307,53 +307,7 @@ impl MaidLayerConfig {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Extract the substring between `open` and `close` on the same line.
-/// Returns `None` if either marker is absent or they're out of order.
-fn extract_between<'a>(line: &'a str, open: &str, close: &str) -> Option<&'a str> {
-    let start = line.find(open)? + open.len();
-    let end = line[start..].find(close)? + start;
-    Some(&line[start..end])
-}
-
-/// Match an opening tag with embedded data: `<NAME:PAYLOAD>`. On match,
-/// return the payload string. Returns `None` if the line isn't this shape.
-///
-/// The match is strict — we anchor on `<NAME:` to avoid eating
-/// `<observercapability:...>` when we asked for `capability`.
-fn strip_open_tag<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-    let prefix = format!("<{name}:");
-    if !line.starts_with(&prefix) {
-        return None;
-    }
-    let rest = &line[prefix.len()..];
-    // The payload runs up to the next '>'. Some lines have trailing whitespace
-    // or self-close on the same line, but the opener itself ends at '>'.
-    let end = rest.find('>')?;
-    Some(&rest[..end])
-}
-
-/// Match `<NAME:VALUE></NAME>` on a single line. Returns VALUE.
-fn strip_self_tag<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-    let payload = strip_open_tag(line, name)?;
-    let closer = format!("</{name}>");
-    if line.contains(&closer) {
-        Some(payload)
-    } else {
-        None
-    }
-}
-
-/// Split "kNkMAIDCapability_Aperture-33285" into ("kNkMAIDCapability_Aperture", 33285).
-fn split_name_code(payload: &str) -> Result<(String, u32), String> {
-    let dash = payload
-        .rfind('-')
-        .ok_or_else(|| format!("no '-' in {payload:?}"))?;
-    let name = &payload[..dash];
-    let code: u32 = payload[dash + 1..]
-        .parse()
-        .map_err(|_| format!("non-numeric code in {payload:?}"))?;
-    Ok((name.to_string(), code))
-}
+use crate::config_parse::{extract_between, split_name_code, strip_open_tag, strip_self_tag};
 
 /// Pull the quoted label out of `flags,iconId,"label"`. Returns "" if no
 /// quoted string is present.
@@ -519,33 +473,10 @@ mod tests {
         assert!(matches!(err, ParseError::Malformed { what: "DeviceCommand", .. }));
     }
 
-    #[test]
-    fn split_name_code_works() {
-        assert_eq!(
-            split_name_code("kNkMAIDCapability_Aperture-33285").unwrap(),
-            ("kNkMAIDCapability_Aperture".to_string(), 33285u32)
-        );
-    }
-
-    #[test]
-    fn split_name_code_hyphen_in_name() {
-        // rfind ensures the LAST '-' is the code separator, so hyphens
-        // within the capability name are preserved.
-        assert_eq!(
-            split_name_code("kNkMAIDCapability_Some-Name-33285").unwrap(),
-            ("kNkMAIDCapability_Some-Name".to_string(), 33285u32)
-        );
-    }
-
-    #[test]
-    fn split_name_code_no_dash_is_err() {
-        assert!(split_name_code("kNkMAIDCapability_NoDash").is_err());
-    }
-
-    #[test]
-    fn split_name_code_non_numeric_code_is_err() {
-        assert!(split_name_code("kNkMAIDCapability_Foo-BAR").is_err());
-    }
+    // split_name_code's tests now live once, canonically, in
+    // src/config_parse.rs (it moved there along with extract_between,
+    // strip_open_tag, and strip_self_tag — all previously hand-duplicated
+    // between maid_layer.rs and range_value.rs).
 
     // ── name_map_for_model ────────────────────────────────────────────────
     // The single canonical implementation — previously hand-duplicated in
