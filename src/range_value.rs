@@ -345,6 +345,20 @@ mod tests {
         assert_eq!(b, "1,32767,32767");
     }
 
+    // ── split_name_code parity with maid_layer.rs ────────────────────────
+    // Same shared-shape parser helper, hand-duplicated (not shared) between
+    // the two config parsers — these mirror maid_layer.rs's cases so a
+    // future strictness/edge-case fix applied to one copy is visible as a
+    // gap if not applied to the other.
+
+    #[test]
+    fn split_name_code_works() {
+        assert_eq!(
+            split_name_code("kNkMAIDCapability_Aperture-33285").unwrap(),
+            ("kNkMAIDCapability_Aperture".to_string(), 33285u32)
+        );
+    }
+
     #[test]
     fn split_name_code_hyphen_in_name() {
         assert_eq!(
@@ -356,5 +370,10 @@ mod tests {
     #[test]
     fn split_name_code_no_dash_is_err() {
         assert!(split_name_code("kNkMAIDCapability_NoDash").is_err());
+    }
+
+    #[test]
+    fn split_name_code_non_numeric_code_is_err() {
+        assert!(split_name_code("kNkMAIDCapability_Foo-BAR").is_err());
     }
 }

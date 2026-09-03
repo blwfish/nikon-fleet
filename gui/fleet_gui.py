@@ -16,6 +16,9 @@ from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt
 
 _PROJECT = Path(__file__).resolve().parent.parent   # repo root
 
+# Must match src/firmware.rs's FIRMWARE_META_FORMAT_VERSION.
+_FIRMWARE_META_FORMAT_VERSION = 1
+
 def _fleet_bin() -> Path:
     for p in [_PROJECT / "target" / "release" / "nikon-fleet",
               _PROJECT / "target" / "debug"   / "nikon-fleet"]:
@@ -282,7 +285,14 @@ class FleetApp:
             # Match `fleet ref set` naming so `fleet check` finds the reference.
             ref_fname = f"{model_slug(cam['model'])}_{cam['serial']}.json"
             shutil.copy2(dd / "snapshots" / fname, ref_dir / ref_fname)
-        except OSError as e:
+        except Exception as e:
+            # Broadened from `except OSError`: this block now also does
+            # json.loads() and dict indexing (added when the canonical
+            # filename computation moved in-line), so a malformed or
+            # partially-written snapshot file raises JSONDecodeError or
+            # KeyError — neither is an OSError subclass, so they used to
+            # propagate uncaught out of this callback instead of showing
+            # the error dialog this except clause exists to provide.
             messagebox.showerror("Set reference failed", str(e), parent=self.root)
             return
         self._load_snapshots()
@@ -322,6 +332,18 @@ class FleetApp:
         for meta_file in sorted(fw_dir.rglob("metadata.json")):
             try:
                 meta = json.loads(meta_file.read_text())
+                # Must match src/firmware.rs's list_archives(), which skips
+                # (rather than trusts) a metadata.json whose format_version
+                # doesn't match — otherwise a future format bump is shown
+                # here as valid while the real CLI correctly hides it.
+                found = meta.get("format_version")
+                if found != _FIRMWARE_META_FORMAT_VERSION:
+                    print(
+                        f"warning: skipping {meta_file} (format_version={found}, "
+                        f"expected {_FIRMWARE_META_FORMAT_VERSION})",
+                        file=sys.stderr,
+                    )
+                    continue
                 model   = meta.get("model", "")
                 version = meta.get("firmware_version", "")
                 slug    = meta_file.parent.parent.name

@@ -178,8 +178,26 @@ pub fn list_archives(data_dir: &Path, model_filter: Option<&str>) -> Vec<Archive
         }
     }
 
-    entries.sort_by(|a, b| a.model.cmp(&b.model).then(a.version.cmp(&b.version)));
+    entries.sort_by(|a, b| {
+        a.model.cmp(&b.model).then_with(|| version_sort_key(&a.version).cmp(&version_sort_key(&b.version)))
+    });
     entries
+}
+
+/// Sort key for firmware version strings like `"5.31"` — numeric (major,
+/// minor), so `"10.00"` sorts after `"5.31"` (a plain string compare would
+/// put `"10.00"` first, since `'1' < '5'`). `firmware_version` is a
+/// free-typed CLI argument, not schema-validated, so anything that doesn't
+/// parse as `major.minor` sorts after every numeric version instead of
+/// erroring — deterministic, not a crash on unexpected input.
+fn version_sort_key(version: &str) -> (bool, u32, u32, &str) {
+    let mut parts = version.splitn(2, '.');
+    let major = parts.next().and_then(|s| s.parse::<u32>().ok());
+    let minor = parts.next().and_then(|s| s.parse::<u32>().ok());
+    match (major, minor) {
+        (Some(maj), Some(min)) => (false, maj, min, version),
+        _ => (true, 0, 0, version),
+    }
 }
 
 /// Check whether an archive entry exists for (model, version).
@@ -444,6 +462,39 @@ mod tests {
         let entries = list_archives(dir.path(), None);
         let keys: Vec<(&str, &str)> = entries.iter().map(|e| (e.model.as_str(), e.version.as_str())).collect();
         assert_eq!(keys, vec![("Z 9", "4.00"), ("Z 9", "5.31"), ("Z6_3", "2.00")]);
+    }
+
+    #[test]
+    fn list_archives_sorts_double_digit_major_numerically() {
+        // Regression: a plain string sort put "10.00" before "5.31"
+        // ('1' < '5' lexically); once any body reaches a double-digit
+        // firmware major this must sort as the newer version.
+        let dir = TempDir::new().unwrap();
+        write_meta(dir.path(), "Z 9", "10.00");
+        write_meta(dir.path(), "Z 9", "5.31");
+        write_meta(dir.path(), "Z 9", "9.00");
+
+        let entries = list_archives(dir.path(), None);
+        let versions: Vec<&str> = entries.iter().map(|e| e.version.as_str()).collect();
+        assert_eq!(versions, vec!["5.31", "9.00", "10.00"]);
+    }
+
+    #[test]
+    fn version_sort_key_unparseable_sorts_after_numeric() {
+        // firmware_version is free-typed, not schema-validated — an
+        // unparseable value must sort deterministically after every
+        // numeric version, not panic or silently misorder.
+        let mut keys = vec![
+            version_sort_key("5.31"),
+            version_sort_key("common"),
+            version_sort_key("10.00"),
+        ];
+        keys.sort();
+        assert_eq!(keys, vec![
+            version_sort_key("5.31"),
+            version_sort_key("10.00"),
+            version_sort_key("common"),
+        ]);
     }
 
     // ── capability_map_for_fw boundary ───────────────────────────────────

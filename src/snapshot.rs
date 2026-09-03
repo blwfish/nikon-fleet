@@ -88,6 +88,15 @@ pub enum SnapshotError {
     UnsupportedVersion { found: u32, expected: u32 },
 }
 
+/// Replace path-separator characters in a free-text value bound for a
+/// filename component. `/` is the dangerous one on any platform this runs
+/// on (macOS/Linux path separator; also treated as a separator by Rust's
+/// `Path` on Windows); `\` is included too since it's the Windows separator
+/// and this codebase ships a Windows SDK bundle path.
+fn sanitize_filename_component(s: &str) -> String {
+    s.replace(['/', '\\'], "_")
+}
+
 impl Snapshot {
     /// Construct an empty snapshot for a given camera + transport. Caller
     /// fills in properties before saving.
@@ -143,7 +152,10 @@ impl Snapshot {
         } else {
             self.camera.serial.clone()
         };
-        let label = self.label.as_deref().unwrap_or("snap");
+        // label is free-text (CLI --label or a GUI text field) — a "/" in it
+        // would otherwise be re-split into path components by Path::join,
+        // redirecting the write target into a different directory.
+        let label = sanitize_filename_component(self.label.as_deref().unwrap_or("snap"));
         let ts = self.captured_at.replace(':', "").replace('-', "");
         format!("{model}_{serial}_{label}_{ts}.json")
     }
@@ -185,6 +197,16 @@ mod tests {
     }
 
     #[test]
+    fn malformed_json_rejected_as_json_error() {
+        // Distinct from unsupported_version_rejected below (valid JSON,
+        // wrong format_version) — this pins genuinely truncated/malformed
+        // input, which the SnapshotError::Json variant exists for but
+        // nothing previously exercised.
+        let err = Snapshot::from_json(r#"{"camera": {"model": "Z 9""#).unwrap_err();
+        assert!(matches!(err, SnapshotError::Json(_)), "expected Json error, got {err:?}");
+    }
+
+    #[test]
     fn unsupported_version_rejected() {
         let mut bad = sample_snapshot();
         bad.format_version = 999;
@@ -223,6 +245,18 @@ mod tests {
         // Exact contract: spaces→_, no colons, no dashes in timestamp.
         // captured_at="2026-05-24T17:30:00Z" → "20260524T173000Z"
         assert_eq!(name, "Z_9_ABC123_baseline_20260524T173000Z.json");
+    }
+
+    #[test]
+    fn filename_label_with_slash_is_sanitized() {
+        // Regression: a "/" in a free-text label (CLI --label or a GUI text
+        // field) used to be embedded unsanitized, so Path::join would
+        // re-split it into path components and redirect the write target.
+        let mut s = sample_snapshot();
+        s.label = Some("wedding/../../escape".into());
+        let name = s.suggested_filename();
+        assert!(!name.contains('/'), "sanitized filename must not contain a path separator: {name}");
+        assert!(name.contains("wedding_.._.._escape"));
     }
 
     #[test]

@@ -458,6 +458,11 @@ fn worker(
     initial_data_dir: PathBuf,
 ) {
     let mut data_dir = initial_data_dir;
+    // Parsed once for the worker's lifetime: MaidLayer.config is a
+    // multi-hundred-thousand-line file whose content never changes for a
+    // running process, so re-parsing it on every "Take Snapshot" click (the
+    // prior behavior) was pure redundant work inside a UI-triggered path.
+    let schema = MaidLayerConfig::parse_file(Path::new(SCHEMA_PATH));
     for cmd in rx {
         let opt_evt: Option<Result<Evt, String>> = match cmd {
             Cmd::SetDataDir(dir) => {
@@ -465,7 +470,10 @@ fn worker(
                 None
             }
             Cmd::Discover => Some(do_discover()),
-            Cmd::Snapshot { serial, label } => Some(do_snapshot(&data_dir, &serial, &label)),
+            Cmd::Snapshot { serial, label } => Some(match &schema {
+                Ok(s) => do_snapshot(s, &data_dir, &serial, &label),
+                Err(e) => Err(e.to_string()),
+            }),
             Cmd::ListSnapshots { serial } => {
                 Some(Ok(Evt::Snapshots(list_snapshots(&data_dir, &serial))))
             }
@@ -539,10 +547,7 @@ fn do_discover() -> Result<Evt, String> {
     Ok(Evt::Cameras(rows))
 }
 
-fn do_snapshot(data_dir: &Path, serial: &str, label: &str) -> Result<Evt, String> {
-    let schema = MaidLayerConfig::parse_file(Path::new(SCHEMA_PATH))
-        .map_err(|e| e.to_string())?;
-
+fn do_snapshot(schema: &MaidLayerConfig, data_dir: &Path, serial: &str, label: &str) -> Result<Evt, String> {
     let mut sdk = Sdk::open(Path::new(SDK_PATH)).map_err(|e| e.to_string())?;
     sdk.initialize_no_usb_reset().map_err(|e| e.to_string())?;
     let devices = sdk.devices().map_err(|e| e.to_string())?;
@@ -561,7 +566,7 @@ fn do_snapshot(data_dir: &Path, serial: &str, label: &str) -> Result<Evt, String
         })
         .ok_or_else(|| format!("camera {serial} not found after re-discover"))?;
 
-    let name_map = name_map_for_model(&schema, &dev.name);
+    let name_map = schema.name_map_for_model(&dev.name);
     let camera = Camera {
         model: dev.name.clone(),
         serial: serial.to_string(),
@@ -680,6 +685,11 @@ fn do_export(data_dir: &Path, dest: &Path) -> Result<Evt, String> {
     let mut zip = ZipWriter::new(file);
     let opts = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
+    // firmware.bin is stored uncompressed, matching fleet_gui.py's
+    // export_data() — it's an already-dense binary (tens/hundreds of MiB),
+    // so Deflate burns CPU for little to no size benefit.
+    let stored_opts = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
 
     let mut count = 0usize;
 
@@ -715,9 +725,10 @@ fn do_export(data_dir: &Path, dest: &Path) -> Result<Evt, String> {
                     let fpath = ver_entry.path().join(filename);
                     if !fpath.exists() { continue; }
                     let data = std::fs::read(&fpath).map_err(|e| e.to_string())?;
+                    let file_opts = if filename == "firmware.bin" { stored_opts } else { opts };
                     zip.start_file(
                         format!("firmware/{slug_str}/{ver_str}/{filename}"),
-                        opts,
+                        file_opts,
                     ).map_err(|e| e.to_string())?;
                     zip.write_all(&data).map_err(|e| e.to_string())?;
                     count += 1;
@@ -815,17 +826,6 @@ fn safe_join(base: &Path, untrusted: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-// ── Shared helpers ────────────────────────────────────────────────────────
-
-fn name_map_for_model(schema: &MaidLayerConfig, model: &str) -> HashMap<u32, String> {
-    let mut map = HashMap::new();
-    for section in schema.sections_for_model(model) {
-        for cap in &section.capabilities {
-            map.entry(cap.code).or_insert_with(|| cap.name.clone());
-        }
-    }
-    map
-}
 
 // ── Entry point ───────────────────────────────────────────────────────────
 
@@ -1000,52 +1000,8 @@ mod tests {
         );
     }
 
-    // ── name_map_for_model ─────────────────────────────────────────────────
-
-    const DUP_CODE_SCHEMA: &str = r#"<model:Z 9>
-    <version>common</version>
-    <caplist>
-        <capability:kNkMAIDCapability_Aperture-100>
-            <description>0,0,"Aperture"</description>
-            <allowedoperation:14></allowedoperation>
-        </capability>
-    </caplist>
-</model>
-<model:Z 9>
-    <version>2.0</version>
-    <caplist>
-        <capability:kNkMAIDCapability_ApertureNew-100>
-            <description>0,0,"Aperture New"</description>
-            <allowedoperation:14></allowedoperation>
-        </capability>
-        <capability:kNkMAIDCapability_Iso-200>
-            <description>0,0,"ISO"</description>
-            <allowedoperation:14></allowedoperation>
-        </capability>
-    </caplist>
-</model>
-"#;
-
-    #[test]
-    fn name_map_first_seen_wins_on_duplicate_code() {
-        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
-        let map = name_map_for_model(&cfg, "Z 9");
-        assert_eq!(map.get(&100), Some(&"kNkMAIDCapability_Aperture".to_string()));
-    }
-
-    #[test]
-    fn name_map_unions_across_sections() {
-        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
-        let map = name_map_for_model(&cfg, "Z 9");
-        assert_eq!(map.get(&200), Some(&"kNkMAIDCapability_Iso".to_string()));
-        assert_eq!(map.len(), 2);
-    }
-
-    #[test]
-    fn name_map_unknown_model_is_empty() {
-        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
-        assert!(name_map_for_model(&cfg, "Z 30").is_empty());
-    }
+    // name_map_for_model's tests now live once, canonically, in
+    // src/maid_layer.rs (it moved there — see MaidLayerConfig::name_map_for_model).
 
     // ── list_snapshots / set_reference ──────────────────────────────────────
 

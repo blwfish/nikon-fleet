@@ -589,6 +589,20 @@ impl Drop for Sdk {
         // the OS reap the process and its USB handles is cleaner for the CLI
         // use case. The USB reset at the start of the next initialize() call
         // sidesteps this entirely.
+        //
+        // KNOWN GAP: both mitigations above assume a short-lived process —
+        // true for the CLI (one process per invocation) and the Python GUI
+        // (shells out to a fresh `fleet` subprocess per action), but NOT for
+        // the Rust egui GUI: `do_discover`/`do_snapshot` open and drop a
+        // fresh `Sdk` on every button click via `initialize_no_usb_reset()`
+        // (never resets) within one long-running process that never exits
+        // between actions. Whether this leaves that GUI's cameras
+        // unenumerable after repeated use, and what the right fix is (call
+        // FreeSDK there specifically? track init-flavor and only skip it for
+        // the reset path?), is unverified — untested here because it
+        // requires a real camera and repeated GUI interaction to observe,
+        // neither available in this environment. Flagging honestly rather
+        // than guessing at a behavior change with no way to check it.
         let _ = self.initialized;
     }
 }
@@ -795,8 +809,19 @@ unsafe fn decode_value(data_ptr: *mut c_void, data_type: u32) -> Value {
 /// Only Unsigned and Integer are common for camera settings.
 fn decode_enum_values(st: &NkMAIDEnum) -> Value {
     let n = st.ul_elements as usize;
-    let bytes = st.w_physical_bytes as usize;
     if st.p_data.is_null() || n == 0 { return Value::Array(vec![]); }
+    // w_physical_bytes (i16) must be a small positive per-element stride.
+    // Casting a negative value straight to usize sign-extends to a huge
+    // number (`-1i16 as usize` == usize::MAX), which the (7, bytes) branch
+    // below would otherwise multiply by `n` and hand to
+    // slice::from_raw_parts as the read length — an SDK-data-controlled
+    // out-of-bounds read. Mirrors the 255-byte guard already applied on the
+    // write side for CAP_TYPE_STRING.
+    const MAX_PLAUSIBLE_STRIDE: i16 = 4096;
+    if st.w_physical_bytes <= 0 || st.w_physical_bytes > MAX_PLAUSIBLE_STRIDE {
+        return json!({ "_invalid_physical_bytes": st.w_physical_bytes });
+    }
+    let bytes = st.w_physical_bytes as usize;
     match (st.ul_type, bytes) {
         (2, 4) => { // Unsigned, 4 bytes
             let s = unsafe { std::slice::from_raw_parts(st.p_data as *const u32, n) };
@@ -817,7 +842,9 @@ fn decode_enum_values(st: &NkMAIDEnum) -> Value {
         (7, bytes) if bytes > 0 => {
             // For PackedString, w_physical_bytes is the per-element stride:
             // each string occupies exactly `bytes` bytes in the SDK allocation.
-            let total = n * bytes;
+            let Some(total) = n.checked_mul(bytes) else {
+                return json!({ "_overflow_computing_packed_string_length": true });
+            };
             let raw = unsafe { std::slice::from_raw_parts(st.p_data as *const u8, total) };
             let mut out = Vec::with_capacity(n);
             for chunk in raw.chunks(bytes).take(n) {
@@ -1389,6 +1416,44 @@ mod tests {
         assert_eq!(v["_unsupported_enum_type"], json!(99u32));
     }
 
+    #[test]
+    fn enum_values_negative_physical_bytes_rejected_not_cast() {
+        // Regression: `-1i16 as usize` sign-extends to usize::MAX. Before
+        // the upfront validation this was fed straight into `n * bytes`
+        // then `slice::from_raw_parts` — an SDK-data-controlled
+        // out-of-bounds read length. Must be rejected before any pointer
+        // arithmetic, not merely produce a wrong-but-safe answer.
+        let mut data = [0u8; 8];
+        let st = NkMAIDEnum {
+            ul_type: 7, ul_elements: 2, ul_value: 0, ul_default: 0,
+            w_physical_bytes: -1, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        let v = decode_enum_values(&st);
+        assert_eq!(v["_invalid_physical_bytes"], json!(-1i16));
+    }
+
+    #[test]
+    fn enum_values_zero_physical_bytes_rejected() {
+        let mut data = [0u8; 8];
+        let st = NkMAIDEnum {
+            ul_type: 7, ul_elements: 2, ul_value: 0, ul_default: 0,
+            w_physical_bytes: 0, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        let v = decode_enum_values(&st);
+        assert_eq!(v["_invalid_physical_bytes"], json!(0i16));
+    }
+
+    #[test]
+    fn enum_values_implausibly_large_physical_bytes_rejected() {
+        let mut data = [0u8; 8];
+        let st = NkMAIDEnum {
+            ul_type: 7, ul_elements: 2, ul_value: 0, ul_default: 0,
+            w_physical_bytes: i16::MAX, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        let v = decode_enum_values(&st);
+        assert_eq!(v["_invalid_physical_bytes"], json!(i16::MAX));
+    }
+
     // ── bcd_decode_version vs Python parse_fw_filename cross-check ───────
     // Both produce "M.mm" strings from the same camera firmware version.
     // Python: f"{int(parts[1][:2])}.{parts[1][2:]}" (from filename e.g. "0531")
@@ -1403,5 +1468,79 @@ mod tests {
         assert_eq!(bcd_decode_version(0x0100), "1.00");
         // 0x1020 → "10.20"; filename "Z_9_1020.bin" → Python "10.20"
         assert_eq!(bcd_decode_version(0x1020), "10.20");
+    }
+
+    // ── capability_value_shapes.json cross-check ─────────────────────────
+    // tests/fixtures/capability_value_shapes.json is the shared fixture
+    // gui/test_fleet_lib.py's TestFmtCapValue also loads. This test proves
+    // each entry is exactly what decode_value/decode_enum_values produce
+    // for the corresponding eNkMAIDDataType/array-type branch — a mismatch
+    // here means the fixture (and therefore the Python side's coverage) no
+    // longer represents real Rust output.
+
+    fn load_fixture() -> serde_json::Map<String, Value> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/capability_value_shapes.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display()));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parsing fixture: {e}"))
+    }
+
+    #[test]
+    fn fixture_unsigned_scalar_matches_decode_unsigned_by_value() {
+        let fixture = load_fixture();
+        assert_eq!(fixture["unsigned_scalar"], json!(100u32));
+    }
+
+    #[test]
+    fn fixture_integer_scalar_matches_decode_integer_by_value() {
+        let fixture = load_fixture();
+        assert_eq!(fixture["integer_scalar"], json!(-5i32));
+    }
+
+    #[test]
+    fn fixture_unsigned_enum_matches_enum_values_unsigned4_shape() {
+        // Same shape enum_write_extracts_all_fields round-trips through
+        // enum_write_data: elem_type/value_index/elem_count/elem_bytes/
+        // default_index/values.
+        let fixture = load_fixture();
+        let mut data = [0u32, 1u32, 2u32, 3u32];
+        let st = NkMAIDEnum {
+            ul_type: 2, ul_elements: 4, ul_value: 2, ul_default: 0,
+            w_physical_bytes: 4, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        let values = decode_enum_values(&st);
+        assert_eq!(fixture["unsigned_enum"]["values"], values);
+        assert_eq!(fixture["unsigned_enum"]["elem_type"], json!(st.ul_type));
+        assert_eq!(fixture["unsigned_enum"]["value_index"], json!(st.ul_value));
+    }
+
+    #[test]
+    fn fixture_packed_string_enum_matches_enum_values_packed_string_shape() {
+        let fixture = load_fixture();
+        let mut data = *b"JPEG Basic\0\0NormalNormalNormalNormal";
+        // Only the decoded VALUES shape is cross-checked here (the fixture's
+        // hand-picked labels are illustrative, not required to match this
+        // specific packed buffer) — real coverage is that fmt_cap_value on
+        // the Python side handles a list-of-strings "values" field the same
+        // way decode_enum_values(ul_type=7) actually produces one.
+        let st = NkMAIDEnum {
+            ul_type: 7, ul_elements: 1, ul_value: 3, ul_default: 0,
+            w_physical_bytes: 12, p_data: data.as_mut_ptr() as *mut c_void,
+        };
+        let values = decode_enum_values(&st);
+        assert!(values.is_array());
+        assert!(fixture["packed_string_enum"]["values"].is_array());
+        assert_eq!(fixture["packed_string_enum"]["elem_type"], json!(st.ul_type));
+    }
+
+    #[test]
+    fn fixture_range_matches_decode_range_ptr_shape() {
+        let fixture = load_fixture();
+        let r = NkMAIDRange {
+            lf_value: 1.0, lf_default: 0.0, ul_value_index: 18, ul_default_index: 15,
+            lf_lower: -5.0, lf_upper: 5.0, ul_steps: 31,
+        };
+        let decoded = unsafe { decode_value(&r as *const _ as *mut c_void, DT_RANGE_PTR) };
+        assert_eq!(fixture["range"], decoded);
     }
 }

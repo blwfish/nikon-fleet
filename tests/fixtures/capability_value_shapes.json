@@ -1,0 +1,33 @@
+{
+  "_comment": "Shared fixture closing the gap where gui/fleet_lib.py's fmt_cap_value() hand-matched src/sdk.rs's decode_value()/decode_enum_values() output shapes with nothing to catch drift. src/sdk.rs's tests assert these are exactly what Rust produces (see decode_string_ptr / decode_integer_by_value / decode_range_ptr / enum_values_unsigned4 / enum_values_packed_string); gui/test_fleet_lib.py asserts fmt_cap_value handles every one without raising. Edit both test files together with this fixture.",
+  "unsigned_scalar": 100,
+  "integer_scalar": -5,
+  "float_scalar": 5.6,
+  "bool_scalar": true,
+  "string_scalar": "USB",
+  "unsigned_enum": {
+    "elem_type": 2,
+    "value_index": 2,
+    "elem_count": 4,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [0, 1, 2, 3]
+  },
+  "packed_string_enum": {
+    "elem_type": 7,
+    "value_index": 3,
+    "elem_count": 6,
+    "elem_bytes": 12,
+    "default_index": 0,
+    "values": ["JPEG Basic", "JPEG Normal", "JPEG Fine", "RAW", "RAW+Basic", "RAW+Fine"]
+  },
+  "range": {
+    "lower": -5.0,
+    "upper": 5.0,
+    "steps": 31,
+    "value": 1.0,
+    "value_index": 18,
+    "default": 0.0,
+    "default_index": 15
+  }
+}

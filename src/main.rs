@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use nikon_fleet::diff::{Diff, DiffOptions, diff, is_volatile};
+use nikon_fleet::diff::{Diff, DiffOptions, diff_with_schema, is_volatile};
 use nikon_fleet::firmware::{
     FirmwareError, FirmwareMeta, FIRMWARE_META_FORMAT_VERSION,
     archive_dir, archive_exists, format_size, list_archives, load_meta,
@@ -328,7 +328,7 @@ fn snapshot_serial(usb_info: &Option<UsbCameraInfo>, dev_id: u32) -> String {
 // Commands
 // ─────────────────────────────────────────────────────────────────────────
 
-fn cmd_diff(data_dir: &Path, args: &DiffArgs) -> Result<()> {
+fn cmd_diff(data_dir: &Path, schema_path: &Path, args: &DiffArgs) -> Result<()> {
     // Allow paths to be either absolute or relative to snapshots/.
     let a_path = resolve_snapshot_path(data_dir, &args.snapshot_a);
     let b_path = resolve_snapshot_path(data_dir, &args.snapshot_b);
@@ -337,7 +337,9 @@ fn cmd_diff(data_dir: &Path, args: &DiffArgs) -> Result<()> {
     let b = Snapshot::load_from_file(&b_path)
         .with_context(|| format!("loading {}", b_path.display()))?;
     let opts = DiffOptions { include_volatile: args.include_volatile };
-    let d = diff(&a, &b, &opts)?;
+    let schema = MaidLayerConfig::parse_file(schema_path)
+        .with_context(|| format!("loading schema from {}", schema_path.display()))?;
+    let d = diff_with_schema(&a, &b, &opts, &schema)?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&d)?);
@@ -378,6 +380,18 @@ fn print_diff_human(a: &Snapshot, b: &Snapshot, d: &Diff) {
             println!("  {name}");
         }
     }
+    if let Some(fa) = &d.firmware_annotation {
+        println!("\n! Firmware version boundary: {} → {}", fa.firmware_a, fa.firmware_b);
+        if !fa.schema_only_in_a.is_empty() {
+            println!("  removed in newer firmware: {}", fa.schema_only_in_a.join(", "));
+        }
+        if !fa.schema_only_in_b.is_empty() {
+            println!("  added in newer firmware: {}", fa.schema_only_in_b.join(", "));
+        }
+        if !fa.schema_changed.is_empty() {
+            println!("  allowed-ops changed across firmware: {}", fa.schema_changed.join(", "));
+        }
+    }
 }
 
 /// Snapshots are addressable by absolute path OR by basename inside snapshots/.
@@ -387,6 +401,17 @@ fn resolve_snapshot_path(data_dir: &Path, p: &Path) -> PathBuf {
     } else {
         snapshots_dir(data_dir).join(p)
     }
+}
+
+/// Whether a snapshot `name` (a filename) belongs to the camera identified
+/// by `filter` (a "{model}_{serial}" string, per `--camera`'s documented
+/// form). Matches the whole leading `{model_slug}_{serial}` component, not
+/// just a string prefix — without the trailing "_", a filter of "…_id-1"
+/// would also match "…_id-10_..." (the "id-{id}" fallback serial makes this
+/// a real, not just theoretical, collision: "id-1" is a proper string
+/// prefix of "id-10").
+fn camera_filename_matches(name: &str, filter: &str) -> bool {
+    name.starts_with(&format!("{}_", model_slug(filter)))
 }
 
 fn cmd_ls(data_dir: &Path, args: &LsArgs) -> Result<()> {
@@ -407,8 +432,7 @@ fn cmd_ls(data_dir: &Path, args: &LsArgs) -> Result<()> {
     for path in &entries {
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         if let Some(f) = filter {
-            // Filename starts with "{model_underscored}_{serial}_..."
-            if !name.starts_with(&model_slug(f)) {
+            if !camera_filename_matches(name, f) {
                 continue;
             }
         }
@@ -547,18 +571,6 @@ fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs, no_usb_reset: bool) -> 
     Ok(())
 }
 
-/// Build a map from numeric capability code → symbolic name for one model.
-/// Takes the union across all firmware versions of that model.
-fn name_map_for_model(schema: &MaidLayerConfig, model: &str) -> HashMap<u32, String> {
-    let mut map = HashMap::new();
-    for section in schema.sections_for_model(model) {
-        for cap in &section.capabilities {
-            map.entry(cap.code).or_insert_with(|| cap.name.clone());
-        }
-    }
-    map
-}
-
 fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &SnapshotArgs, no_usb_reset: bool) -> Result<()> {
     let mut sdk = open_sdk(bundle, no_usb_reset)?;
     let devices = sdk.devices()?;
@@ -580,7 +592,7 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
 
     let schema = MaidLayerConfig::parse_file(schema_path)
         .with_context(|| format!("loading schema from {}", schema_path.display()))?;
-    let name_lookup = name_map_for_model(&schema, &target.name);
+    let name_lookup = schema.name_map_for_model(&target.name);
     if name_lookup.is_empty() {
         eprintln!(
             "warning: no schema entries found for model {:?}; properties will be keyed by numeric id",
@@ -609,6 +621,7 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     let mut read_ok = 0usize;
     let mut read_err = 0usize;
     let mut skipped_no_get = 0usize;
+    let mut unknown_schema = 0usize;
     for cap in &device.capabilities {
         if cap.operations & OP_GET == 0 {
             skipped_no_get += 1;
@@ -616,10 +629,18 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
         }
         match device.read_capability(cap.id) {
             Ok(value) => {
-                let name = name_lookup
-                    .get(&cap.id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("cap_{:#x}", cap.id));
+                let name = match name_lookup.get(&cap.id) {
+                    Some(n) => n.clone(),
+                    None => {
+                        // Not folded silently into read_ok: a schema miss
+                        // here means the loaded MaidLayer.config is stale
+                        // relative to this camera's firmware, degrading
+                        // readability with no signal unless counted
+                        // separately (Data-Capture Backward-Chaining Rule).
+                        unknown_schema += 1;
+                        format!("cap_{:#x}", cap.id)
+                    }
+                };
                 snap.insert(name, cap.id, value);
                 read_ok += 1;
             }
@@ -627,8 +648,17 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
         }
     }
     println!(
-        "  ok={read_ok}  err={read_err}  skipped(no-get-bit)={skipped_no_get}"
+        "  ok={read_ok}  err={read_err}  skipped(no-get-bit)={skipped_no_get}  unknown-schema={unknown_schema}"
     );
+    if unknown_schema > 0 {
+        eprintln!(
+            "warning: {unknown_schema} capabilit{plural} not found in the loaded schema \
+             ({schema_path}) — recorded by numeric code (cap_0x...) instead of a symbolic \
+             name. The schema may be stale relative to this camera's firmware.",
+            plural = if unknown_schema == 1 { "y is" } else { "ies are" },
+            schema_path = schema_path.display(),
+        );
+    }
 
     // Save under snapshots/.
     let dir = snapshots_dir(data_dir);
@@ -637,7 +667,28 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     let path = dir.join(&filename);
     snap.save_to_file(&path)?;
     println!("Wrote {}", path.display());
+    if snapshot_capture_failed(read_ok, read_err) {
+        // The file is still written (matches prior behavior), but a
+        // script/CI checking exit status must be able to tell this run was
+        // a total failure, not a normal capture.
+        bail!("all {read_err} capability read(s) failed (see errors above); wrote an empty snapshot to {}", path.display());
+    }
     Ok(())
+}
+
+/// Whether a capture should be treated as a hard failure: zero capabilities
+/// read at all (an empty, useless snapshot), not a routine handful of
+/// per-capability read errors mixed with real successes.
+fn snapshot_capture_failed(read_ok: usize, read_err: usize) -> bool {
+    read_ok == 0 && read_err > 0
+}
+
+/// Whether a restore should be treated as a hard failure: zero writes
+/// succeeded and at least one real error occurred — not a routine skip
+/// (absent/read-only/unsupported-type capabilities are expected and don't
+/// count as errors).
+fn restore_completely_failed(written: usize, errors: usize) -> bool {
+    written == 0 && errors > 0
 }
 
 fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArgs, no_usb_reset: bool) -> Result<()> {
@@ -659,7 +710,7 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
 
     // Live snapshot (same logic as cmd_snapshot but in-memory).
     let schema = MaidLayerConfig::parse_file(schema_path)?;
-    let name_lookup = name_map_for_model(&schema, &target.name);
+    let name_lookup = schema.name_map_for_model(&target.name);
     let device = sdk.connect(target.id)?;
     let serial = snapshot_serial(&usb_info, target.id);
     let firmware = usb_info.as_ref().map(|u| u.firmware.clone())
@@ -699,7 +750,7 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     }
     let reference = Snapshot::load_from_file(&ref_path)?;
 
-    let d = diff(&reference, &live, &DiffOptions::default())?;
+    let d = diff_with_schema(&reference, &live, &DiffOptions::default(), &schema)?;
     print_diff_human(&reference, &live, &d);
     Ok(())
 }
@@ -708,9 +759,37 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
 // Firmware commands
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Whether `version` matches the exact `"{major}.{minor:02}"` shape
+/// `bcd_decode_version` always produces (e.g. `"5.30"`) — the format
+/// `fleet firmware check`'s archive lookup compares against. Deliberately
+/// permissive about `major` (single or multi-digit); the load-bearing part
+/// is `minor` being exactly 2 digits, since that's the part a human is
+/// likely to type wrong (`"5.3"` instead of `"5.30"`).
+fn looks_like_bcd_version(version: &str) -> bool {
+    let Some((major, minor)) = version.split_once('.') else { return false };
+    !major.is_empty() && major.chars().all(|c| c.is_ascii_digit())
+        && minor.len() == 2 && minor.chars().all(|c| c.is_ascii_digit())
+}
+
 fn cmd_firmware_add(data_dir: &Path, args: &FirmwareAddArgs) -> Result<()> {
     if !args.bin_path.exists() {
         bail!("firmware file not found: {}", args.bin_path.display());
+    }
+    if !looks_like_bcd_version(&args.version) {
+        // --version is free-typed, but `fleet firmware check`'s archive
+        // lookup compares it against bcd_decode_version()'s output, which
+        // is always exactly "{major}.{minor:02}" (e.g. "5.30", never
+        // "5.3"). A version that doesn't match that shape will silently
+        // never match a live camera's firmware — warn now, at archive time,
+        // instead of leaving the operator to debug a mismatch later with no
+        // diagnostic at all.
+        eprintln!(
+            "warning: {:?} doesn't look like \"{{major}}.{{minor:02}}\" (e.g. \"5.30\", not \
+             \"5.3\") — this is the exact shape `fleet firmware check` compares against a live \
+             camera's firmware, so a differently-formatted version will never be recognized as \
+             archived for that camera.",
+            args.version
+        );
     }
     let dir = archive_dir(data_dir, &args.model, &args.version);
     if dir.join("metadata.json").exists() && !args.force {
@@ -865,6 +944,29 @@ fn generate_settings_table(snap: &Snapshot, schema: &MaidLayerConfig) -> String 
 }
 
 fn cmd_firmware_rollback(data_dir: &Path, schema_path: &Path, args: &FirmwareRollbackArgs) -> Result<()> {
+    // --serial doesn't change what's IN the bundle (the firmware binary and
+    // canonical settings aren't per-camera), so its only meaningful effect
+    // is confirming, before generating anything, that the operator is
+    // targeting a camera that's actually present and of the right model —
+    // catching a copy-pasted wrong serial before the operator flashes the
+    // wrong body. Previously this flag was parsed and silently ignored.
+    if let Some(serial) = &args.serial {
+        let cameras = usb_camera_list();
+        match cameras.iter().find(|c| &c.serial == serial) {
+            Some(c) if c.model == args.model => {}
+            Some(c) => bail!(
+                "camera with serial {serial} is a {:?}, not {:?} — refusing to generate a \
+                 rollback bundle for the wrong model",
+                c.model, args.model
+            ),
+            None => bail!(
+                "no connected camera with serial {serial} (found: {}); \
+                 pass a serial from `fleet discover`, or omit --serial",
+                cameras.iter().map(|c| c.serial.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+
     let meta = load_meta(data_dir, &args.model, &args.version)?;
     let archive = archive_dir(data_dir, &args.model, &args.version);
     let bin_path = archive.join("firmware.bin");
@@ -921,6 +1023,9 @@ fn cmd_firmware_rollback(data_dir: &Path, schema_path: &Path, args: &FirmwareRol
     instructions.push_str(&format!("Rollback Procedure: {} → firmware {}\n", args.model, args.version));
     instructions.push_str(&format!("Generated: {timestamp_str}\n"));
     instructions.push_str(&format!("Bundle: {}\n", out_dir.display()));
+    if let Some(serial) = &args.serial {
+        instructions.push_str(&format!("Target camera serial: {serial}  (verified connected and {} at generation time)\n", args.model));
+    }
     instructions.push_str("\nSTEP 1 — VERIFY FIRMWARE FILE\n");
     instructions.push_str(&format!("  File:    firmware.bin\n"));
     instructions.push_str(&format!("  Size:    {} bytes\n", meta.bin_size_bytes));
@@ -1089,6 +1194,9 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
          skipped(unsupported-type)={skipped_type}  errors={errors}",
         if args.dry_run { "Dry run:" } else { "Restore complete:" }
     );
+    if !args.dry_run && restore_completely_failed(written, errors) {
+        bail!("all {errors} capability write(s) failed (see warnings above); nothing was restored");
+    }
     Ok(())
 }
 
@@ -1103,7 +1211,7 @@ fn main() -> Result<()> {
         Cmd::Discover(a) => cmd_discover(&cli.sdk_bundle, a, no_reset),
         Cmd::Snapshot(args) => cmd_snapshot(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
         Cmd::Check(args) => cmd_check(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
-        Cmd::Diff(args) => cmd_diff(&cli.data_dir, args),
+        Cmd::Diff(args) => cmd_diff(&cli.data_dir, &cli.schema, args),
         Cmd::Ls(args) => cmd_ls(&cli.data_dir, args),
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
@@ -1242,54 +1350,46 @@ mod tests {
         assert_eq!(snapshot_serial(&Some(usb("")), 7), "id-7");
     }
 
-    // ── name_map_for_model ────────────────────────────────────────────────
-    // Same contract as gui/src/main.rs's copy of this function — kept as a
-    // separate parity test since the two are hand-duplicated, not shared.
-
-    const DUP_CODE_SCHEMA: &str = r#"<model:Z 9>
-    <version>common</version>
-    <caplist>
-        <capability:kNkMAIDCapability_Aperture-100>
-            <description>0,0,"Aperture"</description>
-            <allowedoperation:14></allowedoperation>
-        </capability>
-    </caplist>
-</model>
-<model:Z 9>
-    <version>2.0</version>
-    <caplist>
-        <capability:kNkMAIDCapability_ApertureNew-100>
-            <description>0,0,"Aperture New"</description>
-            <allowedoperation:14></allowedoperation>
-        </capability>
-        <capability:kNkMAIDCapability_Iso-200>
-            <description>0,0,"ISO"</description>
-            <allowedoperation:14></allowedoperation>
-        </capability>
-    </caplist>
-</model>
-"#;
+    // ── snapshot_capture_failed / restore_completely_failed ─────────────────
 
     #[test]
-    fn name_map_first_seen_wins_on_duplicate_code() {
-        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
-        let map = name_map_for_model(&cfg, "Z 9");
-        assert_eq!(map.get(&100), Some(&"kNkMAIDCapability_Aperture".to_string()));
+    fn snapshot_capture_failed_zero_ok_zero_err_is_not_failure() {
+        // No capabilities existed to read at all (e.g. a camera with zero
+        // OP_GET capabilities) — not the same as every read failing.
+        assert!(!snapshot_capture_failed(0, 0));
     }
 
     #[test]
-    fn name_map_unions_across_sections() {
-        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
-        let map = name_map_for_model(&cfg, "Z 9");
-        assert_eq!(map.get(&200), Some(&"kNkMAIDCapability_Iso".to_string()));
-        assert_eq!(map.len(), 2);
+    fn snapshot_capture_failed_zero_ok_nonzero_err_is_failure() {
+        assert!(snapshot_capture_failed(0, 1));
     }
 
     #[test]
-    fn name_map_unknown_model_is_empty() {
-        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
-        assert!(name_map_for_model(&cfg, "Z 30").is_empty());
+    fn snapshot_capture_failed_any_ok_is_not_failure() {
+        // Boundary: even a single successful read means this isn't a total
+        // failure, regardless of how many others failed.
+        assert!(!snapshot_capture_failed(1, 99));
     }
+
+    #[test]
+    fn restore_completely_failed_zero_written_zero_errors_is_not_failure() {
+        // e.g. every capability was skipped as absent/read-only — routine,
+        // not an error.
+        assert!(!restore_completely_failed(0, 0));
+    }
+
+    #[test]
+    fn restore_completely_failed_zero_written_nonzero_errors_is_failure() {
+        assert!(restore_completely_failed(0, 1));
+    }
+
+    #[test]
+    fn restore_completely_failed_any_written_is_not_failure() {
+        assert!(!restore_completely_failed(1, 99));
+    }
+
+    // name_map_for_model's tests now live once, canonically, in
+    // maid_layer.rs (it moved there — see MaidLayerConfig::name_map_for_model).
 
     // ── generate_settings_table ───────────────────────────────────────────
 
@@ -1393,6 +1493,60 @@ mod tests {
     fn cmd_ref_list_missing_dir_ok_empty() {
         let data_dir = TempDir::new().unwrap();
         assert!(cmd_ref(data_dir.path(), &RefCmd::List).is_ok());
+    }
+
+    // ── camera_filename_matches ──────────────────────────────────────────
+
+    #[test]
+    fn camera_filename_matches_exact_camera() {
+        assert!(camera_filename_matches("Z_9_ABC123_baseline_20260101T000000Z.json", "Z 9_ABC123"));
+    }
+
+    #[test]
+    fn camera_filename_matches_rejects_prefix_collision() {
+        // Regression: "id-1" is a string prefix of "id-10" — without
+        // anchoring on the trailing "_", filtering by the id-1 fallback
+        // serial would also match id-10's snapshots.
+        assert!(!camera_filename_matches("Z_9_id-10_baseline_20260101T000000Z.json", "Z 9_id-1"));
+        assert!(camera_filename_matches("Z_9_id-1_baseline_20260101T000000Z.json", "Z 9_id-1"));
+    }
+
+    #[test]
+    fn camera_filename_matches_rejects_other_camera() {
+        assert!(!camera_filename_matches("Z_9_OTHER456_baseline_20260101T000000Z.json", "Z 9_ABC123"));
+    }
+
+    // ── looks_like_bcd_version ───────────────────────────────────────────
+
+    #[test]
+    fn looks_like_bcd_version_accepts_exact_shape() {
+        assert!(looks_like_bcd_version("5.30"));
+        assert!(looks_like_bcd_version("10.00"));
+        assert!(looks_like_bcd_version("0.01"));
+    }
+
+    #[test]
+    fn looks_like_bcd_version_rejects_unpadded_minor() {
+        // The exact typo the finding this closes was about: "5.3" instead
+        // of "5.30" silently never matches a live camera's firmware string.
+        assert!(!looks_like_bcd_version("5.3"));
+    }
+
+    #[test]
+    fn looks_like_bcd_version_rejects_three_digit_minor() {
+        assert!(!looks_like_bcd_version("5.300"));
+    }
+
+    #[test]
+    fn looks_like_bcd_version_rejects_non_numeric() {
+        assert!(!looks_like_bcd_version("common"));
+        assert!(!looks_like_bcd_version("5.3a"));
+        assert!(!looks_like_bcd_version(""));
+    }
+
+    #[test]
+    fn looks_like_bcd_version_rejects_no_dot() {
+        assert!(!looks_like_bcd_version("530"));
     }
 
     // ── cmd_firmware_add ──────────────────────────────────────────────────
@@ -1527,6 +1681,27 @@ mod tests {
     }
 
     // ── cmd_firmware_rollback ─────────────────────────────────────────────
+
+    #[test]
+    fn cmd_firmware_rollback_unknown_serial_errors() {
+        // --serial doesn't change bundle contents (not per-camera), so its
+        // only job is catching a wrong/typo'd serial before generating
+        // anything. No real camera in the test environment will ever have
+        // this made-up serial, so this deterministically hits the
+        // not-found path without needing hardware.
+        let data_dir = TempDir::new().unwrap();
+        let bin_path = data_dir.path().join("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+        cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path, "Z 9", "5.31", false)).unwrap();
+
+        let schema_path = data_dir.path().join("schema.config");
+        fs::write(&schema_path, "").unwrap();
+        let err = cmd_firmware_rollback(data_dir.path(), &schema_path, &FirmwareRollbackArgs {
+            model: "Z 9".into(), version: "5.31".into(),
+            serial: Some("NOT-A-REAL-CONNECTED-SERIAL-38fa2".into()), output_dir: None,
+        }).unwrap_err();
+        assert!(err.to_string().contains("no connected camera with serial"));
+    }
 
     #[test]
     fn cmd_firmware_rollback_checksum_mismatch_errors() {

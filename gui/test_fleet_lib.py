@@ -1,5 +1,10 @@
+import json
+from pathlib import Path
+
 import pytest
 from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, decode_packed_strings, fmt_cap_value, model_slug
+
+_FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "capability_value_shapes.json"
 
 
 # ── model_slug ─────────────────────────────────────────────────────────────────
@@ -205,6 +210,36 @@ class TestDecodePackedStrings:
 
 
 # ── fmt_cap_value ─────────────────────────────────────────────────────────────
+
+class TestFmtCapValueFixtureCrossCheck:
+    """Loads tests/fixtures/capability_value_shapes.json — the same file
+    src/sdk.rs's tests assert is exactly what decode_value()/
+    decode_enum_values() produce for each branch — and runs fmt_cap_value
+    against every entry. Closes the gap where this Python parser was
+    hand-matched to the Rust JSON shape with nothing to catch drift between
+    them; edit both test files together with the fixture.
+    """
+
+    @pytest.fixture
+    def shapes(self):
+        data = json.loads(_FIXTURE.read_text())
+        data.pop("_comment", None)
+        return data
+
+    def test_every_shape_renders_without_raising(self, shapes):
+        for name, value in shapes.items():
+            result = fmt_cap_value(value)
+            assert isinstance(result, str) and result, f"{name}: expected non-empty str, got {result!r}"
+
+    def test_unsigned_enum_shape(self, shapes):
+        assert fmt_cap_value(shapes["unsigned_enum"]) == "2"
+
+    def test_packed_string_enum_shape(self, shapes):
+        assert fmt_cap_value(shapes["packed_string_enum"]) == "RAW"
+
+    def test_range_shape(self, shapes):
+        assert fmt_cap_value(shapes["range"]) == "1.0"
+
 
 class TestFmtCapValue:
     def test_scalar_int(self):

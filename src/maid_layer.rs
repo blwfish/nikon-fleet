@@ -42,6 +42,7 @@
 //! for a future "what's locking me out" diagnostic but not needed for
 //! snapshot-and-diff.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -275,6 +276,24 @@ impl MaidLayerConfig {
             .filter(move |s| s.model == model_name)
     }
 
+    /// Build a map from numeric capability code → symbolic name for one
+    /// model. Takes the union across all firmware versions of that model
+    /// (first-seen name wins on a duplicate code).
+    ///
+    /// Single canonical implementation shared by the CLI (`src/main.rs`) and
+    /// the GUI (`gui/src/main.rs`) — those used to each hand-duplicate this
+    /// function, kept in sync only by a parity test asserting the two
+    /// bodies stayed identical rather than sharing one implementation.
+    pub fn name_map_for_model(&self, model_name: &str) -> HashMap<u32, String> {
+        let mut map = HashMap::new();
+        for section in self.sections_for_model(model_name) {
+            for cap in &section.capabilities {
+                map.entry(cap.code).or_insert_with(|| cap.name.clone());
+            }
+        }
+        map
+    }
+
     /// Distinct list of model names actually present in the file.
     pub fn known_models(&self) -> Vec<String> {
         let mut v: Vec<String> = self.sections.iter().map(|s| s.model.clone()).collect();
@@ -461,6 +480,45 @@ mod tests {
         assert_eq!(parse_description_label("0,11100,"), "");
     }
 
+    // ── DeviceCommand length boundary ────────────────────────────────────
+    // parts.len() != 5 — at/below/above the boundary.
+
+    fn schema_with_device_command(body: &str) -> Result<MaidLayerConfig, ParseError> {
+        let text = format!(
+            r#"<model:Z 9>
+    <version>common</version>
+    <caplist>
+        <capability:kNkMAIDCapability_Aperture-33285>
+            <description>0,0,"Aperture"</description>
+            <allowedoperation:14></allowedoperation>
+            <DeviceCommand>{body}</DeviceCommand>
+        </capability>
+    </caplist>
+</model>
+"#
+        );
+        MaidLayerConfig::parse(&text)
+    }
+
+    #[test]
+    fn device_command_exactly_5_is_ok() {
+        let cfg = schema_with_device_command("215,0,0,0,0").unwrap();
+        let caps = &cfg.sections_for_model("Z 9").next().unwrap().capabilities;
+        assert_eq!(caps[0].device_command, Some([215, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn device_command_4_parts_is_err() {
+        let err = schema_with_device_command("215,0,0,0").unwrap_err();
+        assert!(matches!(err, ParseError::Malformed { what: "DeviceCommand", .. }));
+    }
+
+    #[test]
+    fn device_command_6_parts_is_err() {
+        let err = schema_with_device_command("215,0,0,0,0,0").unwrap_err();
+        assert!(matches!(err, ParseError::Malformed { what: "DeviceCommand", .. }));
+    }
+
     #[test]
     fn split_name_code_works() {
         assert_eq!(
@@ -487,5 +545,54 @@ mod tests {
     #[test]
     fn split_name_code_non_numeric_code_is_err() {
         assert!(split_name_code("kNkMAIDCapability_Foo-BAR").is_err());
+    }
+
+    // ── name_map_for_model ────────────────────────────────────────────────
+    // The single canonical implementation — previously hand-duplicated in
+    // src/main.rs and gui/src/main.rs, kept in sync only by a parity test.
+
+    const DUP_CODE_SCHEMA: &str = r#"<model:Z 9>
+    <version>common</version>
+    <caplist>
+        <capability:kNkMAIDCapability_Aperture-100>
+            <description>0,0,"Aperture"</description>
+            <allowedoperation:14></allowedoperation>
+        </capability>
+    </caplist>
+</model>
+<model:Z 9>
+    <version>2.0</version>
+    <caplist>
+        <capability:kNkMAIDCapability_ApertureNew-100>
+            <description>0,0,"Aperture New"</description>
+            <allowedoperation:14></allowedoperation>
+        </capability>
+        <capability:kNkMAIDCapability_Iso-200>
+            <description>0,0,"ISO"</description>
+            <allowedoperation:14></allowedoperation>
+        </capability>
+    </caplist>
+</model>
+"#;
+
+    #[test]
+    fn name_map_first_seen_wins_on_duplicate_code() {
+        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
+        let map = cfg.name_map_for_model("Z 9");
+        assert_eq!(map.get(&100), Some(&"kNkMAIDCapability_Aperture".to_string()));
+    }
+
+    #[test]
+    fn name_map_unions_across_sections() {
+        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
+        let map = cfg.name_map_for_model("Z 9");
+        assert_eq!(map.get(&200), Some(&"kNkMAIDCapability_Iso".to_string()));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn name_map_unknown_model_is_empty() {
+        let cfg = MaidLayerConfig::parse(DUP_CODE_SCHEMA).unwrap();
+        assert!(cfg.name_map_for_model("Z 30").is_empty());
     }
 }
