@@ -106,6 +106,32 @@ for the capture session.
 
 ---
 
+## Confirm NX Tether / Camera Control Pro 2 uses the same MAID/PTP surface
+
+Low priority. Web research (2026-09-03) found no evidence that Nikon Camera
+Control Pro 2 (or its replacement, NX Tether 2.0) speaks a protocol distinct
+from what's already mapped here:
+
+- Nikon's own SDK page states the SDKs "support all cameras that can be
+  remotely controlled via NX Tether or Camera Control Pro 2" — framing the
+  third-party SDK (MAID/Remote SDK) and Nikon's own apps as the same control
+  surface, not separate ones.
+- NX Tether 2.0 (Feb 2024) absorbed CCP2's remote-control features and added
+  WiFi control via the camera's built-in WiFi + Wireless Transmitter Utility
+  on Z9/Z8 — the same PTP/IP-over-WiFi path NX Field already uses on those
+  bodies.
+- No public RE effort (NikonCSWrapper, Camera Hacker forums, etc.) has ever
+  documented a CCP-specific protocol distinct from MAID.
+
+Not proven, just inferred from marketing copy and absence of counter-evidence.
+To actually confirm: run the same MITM/capture setup used for the NX Field
+session against NX Tether (and/or CCP2 if still available) and diff the
+opcodes/property codes against what's already cataloged. Expect this to
+mostly confirm overlap rather than surface anything new — worth doing once,
+not worth prioritizing over the NX Field `[Unknown Property]` gap above.
+
+---
+
 ## MaidLayer resource strings (elem_type 2 labels)
 
 Parse the `<resourcestringList>` sections in MaidLayer.config to get
