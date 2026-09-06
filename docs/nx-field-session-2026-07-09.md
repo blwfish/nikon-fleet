@@ -139,6 +139,42 @@ Confirmed by reading `src/sdk.rs` and `docs/todo.md` directly, not assumed:
   docs already anticipated this — newly-found vendor codes just need plain `GetDevicePropValue`/
   `SetDevicePropValue`, no SDK changes needed.
 
+## USB-transport test for WiFi-discovered vendor ops (2026-09-06 follow-up)
+
+Answers the question the "MAID / SDK / PTP-IP relationship" section above left open: is the PTP
+command dispatcher transport-agnostic for `0x9413`/`0x90E8`/`0x90EE`/`0x943B`, or are they gated to
+the WiFi/PTP-IP session context? Tested directly against a Z6III on raw USB PTP (Bulk-Only
+Transport container framing, Python + `pyusb`; see `docs/handoff-usb-ptp-vendor-op-test.md`, now
+deleted, for the original task spec). macOS's `ptpcamerad`/`icdd` had to be killed (they re-claim
+the interface as soon as it's touched — SIP blocks permanently unloading their LaunchAgents, so
+this is a kill-immediately-before-claim race, not a one-time fix) and a stale open session
+(`0x201e SessionAlreadyOpen`, left over from `ptpcamerad`'s own connection) had to be closed before
+a fresh `OpenSession` would succeed.
+
+**Result: op-specific, not a blanket WiFi-only gate.**
+
+- **`0x943B` (vendor-property read wrapper) works over USB.** First attempt used `0xD0B4` (from the
+  handoff's example) and got `DevicePropNotSupported` (`0x200a`) — but `0xD0B4` isn't actually a
+  code confirmed present on the Z6III (it's Z9-only per the todo.md per-body table), so that's the
+  property being rejected, not the operation. Retried with `0xD053` (the copyright field, confirmed
+  present/working on all four fleet bodies) and got a clean `OK` (`0x2001`) with 1 byte of real data
+  back (`01`). **The dispatcher accepts and correctly executes this vendor op over USB.**
+- **`0x90E8` (FTP profile status) does not work over USB — but doesn't fail cleanly either.** The
+  command was accepted (no immediate rejection) but the camera never sent a response container; the
+  bulk-IN read timed out. The *next* transaction (a plain `GetDeviceInfo`) then failed with a pipe
+  error — the endpoint had stalled. `clear_halt()` on both bulk endpoints recovered the pipe (a
+  follow-up `GetDeviceInfo` returned `OK` normally), so no power cycle was needed and the camera
+  wasn't left in a bad state. But this is a hang/stall, not a graceful `OperationNotSupported` —
+  meaningfully different from `0x943B`'s clean success.
+
+**Implication:** at least the `0x943B` vendor-property read wrapper — and by extension whatever
+`0xD0xx`/`0x5xxx` reads it can front — is already usable from `fleet` today over the existing USB
+transport, no PTP/IP-over-WiFi adjunct client required. The adjunct client is still needed for ops
+that behave like `0x90E8` (and presumably its write counterpart `0x90EE`, not tested — see the
+original handoff's step 4 for why) — those appear to need the WiFi/PTP-IP session context
+specifically, not just "any PTP transport." `0x9413` (IPTC write) was also not tested over USB
+(state-mutating, no rollback path yet, explicitly excluded from this pass).
+
 ## Side-effect verification — current gap, and existing tooling
 
 Observed pattern across everything decoded today: fire an operation, trust the response code, at most
@@ -169,3 +205,9 @@ vendor-property space instead of just what MAID exposes.
 - [ ] Sync release mode and a real (non-status-only) FTP profile edit from NX Field's UI — both were
       attempted in the original session but never produced wire traffic distinguishable from background
       noise
+- [ ] Build a `fleet` USB code path for `0x943B` vendor-property reads (confirmed working over USB
+      2026-09-06, see above) — no WiFi adjunct client needed for this one op
+- [ ] Test `0x90E8` retry/recovery behavior more (single hang so far, n=1) and probe whether other
+      `0x9xxx` vendor ops share its stall-instead-of-reject behavior over USB
+- [ ] `0x9413` (IPTC write) and `0x90EE` (FTP write) still untested on any transport-over-USB basis —
+      need a rollback/verification path first (mutating ops)
