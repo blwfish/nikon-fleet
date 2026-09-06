@@ -218,6 +218,56 @@ wire-format bugs, not transport gating.**
   session" or "once per N writes" or something else — only tested first-write-skips-it /
   second-write-needs-it, n=1 each.
 
+## `0x90EE` FTP-profile blob — field map (2026-09-06, second pass, no new capture)
+
+Went back to the three `0x90EE` instances already in `session-20260709-204600-ftptest.pcap` (ports
+`53773`/`56171`/`54731`) and diffed them byte-for-byte instead of hand-decoding just one — the three
+aren't identical (blob lengths 325/331/317), and the differences pinpoint real field boundaries the
+first pass missed. Checked the other three pcap files for more `0x9413`/`0x90EE` examples first
+(none — see below); this is entirely from data already on disk, no new WiFi capture.
+
+Confirmed field-by-field map (offsets below are for the `53773` / 325-byte instance):
+
+| Offset (bytes) | Field | Encoding |
+|---|---|---|
+| 0–1 | fixed header `f4 01` | constant across all 3 samples; meaning unknown |
+| 2–16 | profile display name | 1-byte length (UTF-16 **code units**, incl. null) + UTF-16LE content. Varies: `"CLAUDE"` (len=7) in this sample, `"C2"` (len=3) in the other two — this is what confirmed the field, since it's the only thing that differs in the first ~100 bytes |
+| 17–98 (82 bytes) | **unresolved, byte-identical across all 3 samples** | two 16-UTF16-unit strings decoding to a repeating `"0000000T000000"`-shaped pattern, plus a 6-byte value shaped like a locally-administered MAC address (bit pattern matches a randomized/private MAC, e.g. iOS's per-network randomization) preceded by a 2-byte tag, plus 8 zero-padding bytes. Never varies in any of our 3 examples — likely tied to the specific iPad/RPi hardware from the original test rig, not something a write API needs to construct meaningfully. Can be copied verbatim from a template |
+| 99–117 | SSID (2.4GHz) | tag `03 00 01 00` (4 bytes, meaning unconfirmed) + `u32` length (**bytes, no null**) + ASCII content. `"nikon-snoop"`, len=11 |
+| 118–132 | SSID (5GHz) | tag `04 04` (2 bytes) + `u32` length (bytes, no null) + ASCII. `"nikon5ghz"`, len=9 |
+| 133–160 | host | 1-byte tag `01` + 1-byte length (UTF-16 units, **incl. null**) + UTF-16LE content+null. `"192.168.66.1"`, len=13 units (26 bytes) |
+| 161–172 | username | 3 bytes (`00 15 00`, meaning unconfirmed) + `u32` length (bytes, no null) + ASCII. `"fleet"`, len=5 |
+| 173–184 | password | **no tag bytes at all** — `u32` length (bytes, no null) immediately follows username's content + ASCII. `"12345678"`, len=8 |
+| 185–192 | port + padding | 2 bytes (`05 00`, tag?) + `u16` port **little-endian** (`90 1f` = 8080) + 4 bytes zero padding |
+| 193–324 | three IPv6-placeholder strings | each: `u32` length=39 (bytes, no null) + ASCII `"0000:0000:0000:0000:0000:0000:0000:0000"`, back-to-back three times, trailing `81` byte at the very end (unexplained, 1 byte, constant) |
+
+Every field a `fleet` write API actually needs (both SSIDs, host, port, username, password) now has
+a byte-exact offset, length-field width, and content encoding — enough to build a real constructor
+instead of same-length substitution into a captured template, *without* needing to know what the
+opaque tag bytes semantically mean (they can be copied verbatim per field position; the camera
+presumably cares about their exact value, not us). Only the 82-byte block and the trailing `81` byte
+remain genuinely unresolved, and neither looks load-bearing for a practical write API.
+
+**`0x9413` (IPTC): pcap-mining is exhausted, no further progress possible without new data.**
+Checked all three other capture files from 2026-07-09 for additional `0x9413` instances — zero
+hits. `session-20260709-193356.pcap` never touches FTP/IPTC at all (matches its own description:
+"steps 8–9 skipped"); `session-20260709-201758.pcap` and `session-20260709-203300-filtered.pcap`
+each parse cleanly (sane opcodes throughout, confirming the mid-stream TCP reassembly held up even
+without each file capturing its connection's initial handshake) but contain no `0x9413`/`0x90EE`
+at all — `203300-filtered`'s "FTP-profile-edit attempt" only got as far as a `0x90E8`→`0x90EB`→
+`0x90ED` status-check sequence (three times, byte-identical) and never reached an actual `0x90EE`
+write. The only two `0x9413` instances that exist anywhere in this capture set (both in
+`204600-ftptest.pcap`) are byte-for-byte identical, so there is nothing left to diff — the ~18-byte
+preamble before the first named field (Title/Creator presumably) cannot be decoded further from
+existing data. Would need either a new capture with Title/Creator actually filled in, or live
+USB write-and-inspect experimentation (write a test value, check whether/how it's visible via the
+camera's own Photo Shooting Menu, similar to how the FTP username mutation was verified today).
+
+New vendor opcodes surfaced by this pass, not yet investigated: `0x9412` (one below `0x9413` —
+candidate for a "select/prepare IPTC profile" step, if one exists), `0x9422`, `0x9425`, `0x9428`,
+`0x9435`, `0x943a` (all in `201758.pcap`); `0x90eb`, `0x90ed`, `0x944c` (in `203300-filtered.pcap`,
+part of the FTP status-check sequence above).
+
 **Implication (revised): the PTP command dispatcher is transport-agnostic for all four vendor ops
 tested.** There is no evidence of WiFi/PTP-IP-session gating for `0x943B`, `0x9413`, `0x90E8`, or
 `0x90EE` — every failure traced back to an incorrect param count or a missing/incomplete data phase,
@@ -266,17 +316,19 @@ vendor-property space instead of just what MAID exposes.
       USB 2026-09-06 with the corrected wire formats (see above), but not yet ported into `fleet`;
       deferred until the blob layouts below get a proper decode pass, since a write API needs to
       construct arbitrary field content, not just replay/substitute into a captured blob
-- [ ] Fully decode the `0x9413` data-blob layout (14 fields, `[uint32 len incl. null][utf8+null]`
-      each per the original notes, but there's a ~18-byte preamble before the first field that
-      doesn't fit that model cleanly — the 2026-09-06 test replayed a captured blob byte-for-byte
-      rather than fully understanding it). Needs either a second capture with deliberately-varied
-      single-field test values to isolate header from content, or careful diffing against more
-      `0x9413` instances if any other capture has them
-- [ ] Fully decode the `0x90EE` FTP-profile blob (mixed ASCII/UTF-16LE fields, some 4-byte-length-
-      prefixed with no null terminator unlike `0x9413`'s convention; SSID/host/port/username/
-      password locations found by content search, but the ~100-byte prefix before them and the
-      IPv6-placeholder tail aren't understood yet) — same "vary one field, diff the blobs" approach
-      as `0x9413` would help
+- [x] `0x90EE` FTP-profile blob — fully mapped 2026-09-06 by diffing the existing pcap's three
+      instances (no new capture needed); see the field table above. Every field a write API needs
+      (both SSIDs, host, port, username, password) has a byte-exact offset/length/encoding now. Only
+      an 82-byte block and a trailing constant byte remain unresolved, and neither looks needed for
+      a practical write API — ready to port into `src/ptp_usb.rs`
+- [ ] `0x9413` data-blob preamble (~18 bytes before the first named field, presumably Title/Creator)
+      — pcap-mining is exhausted (2026-09-06): checked all four capture files from 2026-07-09, only
+      two `0x9413` instances exist anywhere and they're byte-identical, nothing left to diff. Needs
+      either a new capture with Title/Creator actually filled in, or live USB write-and-inspect
+      experimentation (write a test value, check the camera's Photo Shooting Menu) — see above
+- [ ] New unlogged opcodes found while mining the other pcaps for `0x9413`/`0x90EE`, not yet
+      investigated: `0x9412` (candidate IPTC-profile setup/select step), `0x9422`, `0x9425`,
+      `0x9428`, `0x9435`, `0x943a`, `0x90eb`, `0x90ed`, `0x944c`
 - [x] This Z6III's FTP profile was mutated to username `FLEET`/password `87654321` on 2026-09-06,
       visually verified via the camera's Setup Menu, then reverted back to `fleet`/`12345678` via a
       second `0x90EE` write in the same session — see above for the "needs a preceding `0x90E8` on
