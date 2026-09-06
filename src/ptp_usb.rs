@@ -15,12 +15,17 @@
 //! from an NX Field WiFi/PTP-IP capture (`docs/nx-field-session-2026-07-09.md`)
 //! and originally assumed to be WiFi-only. A follow-up session on 2026-09-06
 //! confirmed all four also work over plain USB PTP once called with the
-//! correct wire format — see that doc for the full story, including two
-//! wire-format bugs the original by-eye pcap reading introduced. Only the
-//! read wrapper (`0x943B`) is wired up here so far; the write ops
-//! (`0x9413`/`0x90EE`) still need their data-blob layouts fully decoded
-//! before a general-purpose write API is safe to expose (see the doc's open
-//! items) — reads carry no risk of corrupting camera state either way.
+//! correct wire format — see that doc for the full story, including several
+//! wire-format bugs the original by-eye pcap reading introduced.
+//!
+//! Wired up here: `0x943B` (vendor-property reads) and `0x90EE` (FTP profile
+//! writes, built from scratch via [`FtpProfile`]/[`encode_ftp_profile`] —
+//! its data-blob layout was fully mapped by diffing three real captured
+//! instances, and the encoder is verified byte-for-byte against two of them
+//! in tests). `0x9413` (IPTC profile write) is not — its data-blob preamble
+//! couldn't be decoded from existing captures (only two instances exist
+//! anywhere and they're byte-identical), so there's no way to construct
+//! arbitrary IPTC content safely yet. See the doc's open items.
 //!
 //! ## macOS's own PTP claim
 //!
@@ -54,6 +59,19 @@ const OP_CLOSE_SESSION: u16 = 0x1003;
 /// `0x10000 | propcode`; response data is the property's raw bytes.
 const OP_VENDOR_PROP_READ: u16 = 0x943B;
 
+/// `0x90E8` — FTP setup/status step. Not preceded by a distinct params list;
+/// carries a fixed 3-byte data-out payload. A *second* `0x90EE` write in the
+/// same PTP session hangs without this sent immediately before it (confirmed
+/// 2026-09-06); the first write in a fresh session doesn't need it, but this
+/// module always sends it anyway rather than tracking write count.
+const OP_FTP_SETUP: u16 = 0x90E8;
+const FTP_SETUP_DATA: [u8; 3] = [0x01, 0x00, 0x00];
+
+/// `0x90EE` — FTP profile write. Two params, both `0` in every captured
+/// instance (slot index? unconfirmed — never varied). See
+/// `docs/nx-field-session-2026-07-09.md`'s field table for the data blob.
+const OP_FTP_PROFILE_WRITE: u16 = 0x90EE;
+
 const RESP_OK: u16 = 0x2001;
 const RESP_SESSION_ALREADY_OPEN: u16 = 0x201E;
 
@@ -86,6 +104,10 @@ pub enum PtpUsbError {
     OpenSessionFailed(PtpResponseCode),
     #[error("PTP operation 0x{op:04x} failed: {code}")]
     OperationFailed { op: u16, code: PtpResponseCode },
+    #[error("FTP profile field {field} is {len} bytes, exceeds the {max}-byte limit")]
+    FtpFieldTooLong { field: &'static str, len: usize, max: usize },
+    #[error("FTP profile field {field} contains non-ASCII characters, which this encoding does not support")]
+    FtpFieldNotAscii { field: &'static str },
 }
 
 /// A PTP response code, with `Display` naming the common ones.
@@ -300,6 +322,138 @@ fn decode_response_params(payload: &[u8]) -> Vec<u32> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// 0x90EE FTP-profile blob
+//
+// Field-by-field map from docs/nx-field-session-2026-07-09.md (found by
+// diffing three real captured instances, not guessed). Several structural
+// bytes (a header, a per-field "tag", an 82-byte block, a trailing byte)
+// have no known semantic meaning — they're copied verbatim from a real
+// captured template rather than reconstructed, since the camera presumably
+// cares about their exact value and we don't need to know why.
+// ─────────────────────────────────────────────────────────────────────────
+
+const FTP_BLOB_HEADER: [u8; 2] = [0xf4, 0x01];
+
+/// 82 bytes between the profile-name field and the SSID section. Contains
+/// two 16-UTF16-unit strings and a value shaped like a locally-administered
+/// (randomized) MAC address, all byte-identical across every real capture
+/// we have — never observed to vary, so treated as an opaque constant.
+const FTP_BLOB_MYSTERY_BLOCK: [u8; 82] = [
+    0x10, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30,
+    0x00, 0x54, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x00,
+    0x00, 0x10, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00,
+    0x30, 0x00, 0x54, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00,
+    0x00, 0x00, 0x02, 0x03, 0x03, 0x57, 0x42, 0xa8, 0xc0, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00,
+];
+
+const FTP_TAG_SSID_24GHZ: [u8; 4] = [0x03, 0x00, 0x01, 0x00];
+const FTP_TAG_SSID_5GHZ: [u8; 2] = [0x04, 0x04];
+const FTP_TAG_HOST: u8 = 0x01;
+const FTP_TAG_USERNAME: [u8; 3] = [0x00, 0x15, 0x00];
+const FTP_TAG_PORT_SECTION: [u8; 2] = [0x05, 0x00];
+const FTP_PORT_SECTION_PAD: [u8; 5] = [0, 0, 0, 0, 0];
+const FTP_IPV6_PLACEHOLDER: &str = "0000:0000:0000:0000:0000:0000:0000:0000";
+/// Appears once, immediately after the *first* of the three IPv6-placeholder
+/// fields only (not after the second) — asymmetric in every real capture we
+/// have. Meaning unknown; copied verbatim.
+const FTP_IPV6_FIELD1_SEPARATOR: u8 = 0x40;
+const FTP_BLOB_TRAILER: u8 = 0x81;
+
+const FTP_ASCII_FIELD_MAX: usize = 64; // generous; real SSIDs/usernames/passwords are far shorter
+const FTP_HOST_MAX_UNITS: usize = 200; // 1-byte length field caps this at 255 units anyway
+
+/// Fields for an `0x90EE` FTP profile write. All required; see the module
+/// docs for which structural bytes are opaque-but-fixed instead.
+#[derive(Debug, Clone)]
+pub struct FtpProfile {
+    /// Human-readable profile name shown in camera menus, e.g. `"CLAUDE"`.
+    pub profile_name: String,
+    pub ssid_24ghz: String,
+    pub ssid_5ghz: String,
+    /// Hostname or IP address of the FTP server.
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+}
+
+fn ascii_bytes(field: &'static str, s: &str, max: usize) -> Result<Vec<u8>, PtpUsbError> {
+    if !s.is_ascii() {
+        return Err(PtpUsbError::FtpFieldNotAscii { field });
+    }
+    if s.len() > max {
+        return Err(PtpUsbError::FtpFieldTooLong { field, len: s.len(), max });
+    }
+    Ok(s.as_bytes().to_vec())
+}
+
+/// `[u32 length in bytes, no null][ascii content]` — the convention used by
+/// SSID/username/password fields.
+fn encode_ascii_field(field: &'static str, s: &str, max: usize) -> Result<Vec<u8>, PtpUsbError> {
+    let bytes = ascii_bytes(field, s, max)?;
+    let mut out = Vec::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&bytes);
+    Ok(out)
+}
+
+/// `[u8 length in UTF-16 units incl. null][utf16le content + null]` — the
+/// host field's convention (distinct from the profile-name field, which
+/// shares this encoding but is otherwise unrelated).
+fn encode_utf16_field_1byte_len(field: &'static str, s: &str, max_units: usize) -> Result<Vec<u8>, PtpUsbError> {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let len_incl_null = units.len() + 1;
+    if len_incl_null > max_units || len_incl_null > u8::MAX as usize {
+        return Err(PtpUsbError::FtpFieldTooLong { field, len: s.len(), max: max_units });
+    }
+    let mut out = Vec::with_capacity(1 + len_incl_null * 2);
+    out.push(len_incl_null as u8);
+    for u in units {
+        out.extend_from_slice(&u.to_le_bytes());
+    }
+    out.extend_from_slice(&0u16.to_le_bytes()); // null terminator
+    Ok(out)
+}
+
+fn encode_ipv6_placeholder() -> Vec<u8> {
+    let content = FTP_IPV6_PLACEHOLDER.as_bytes();
+    let mut out = Vec::with_capacity(4 + content.len());
+    out.extend_from_slice(&(content.len() as u32).to_le_bytes());
+    out.extend_from_slice(content);
+    out
+}
+
+/// Build the `0x90EE` data-phase blob for `profile`. Reproduces the real
+/// captured wire format byte-for-byte (verified in tests against the
+/// original 2026-07-09 capture) rather than a best guess.
+pub fn encode_ftp_profile(profile: &FtpProfile) -> Result<Vec<u8>, PtpUsbError> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&FTP_BLOB_HEADER);
+    out.extend_from_slice(&encode_utf16_field_1byte_len("profile_name", &profile.profile_name, 254)?);
+    out.extend_from_slice(&FTP_BLOB_MYSTERY_BLOCK);
+    out.extend_from_slice(&FTP_TAG_SSID_24GHZ);
+    out.extend_from_slice(&encode_ascii_field("ssid_24ghz", &profile.ssid_24ghz, FTP_ASCII_FIELD_MAX)?);
+    out.extend_from_slice(&FTP_TAG_SSID_5GHZ);
+    out.extend_from_slice(&encode_ascii_field("ssid_5ghz", &profile.ssid_5ghz, FTP_ASCII_FIELD_MAX)?);
+    out.push(FTP_TAG_HOST);
+    out.extend_from_slice(&encode_utf16_field_1byte_len("host", &profile.host, FTP_HOST_MAX_UNITS)?);
+    out.extend_from_slice(&FTP_TAG_USERNAME);
+    out.extend_from_slice(&encode_ascii_field("username", &profile.username, FTP_ASCII_FIELD_MAX)?);
+    // password has no tag bytes of its own — it immediately follows username's content.
+    out.extend_from_slice(&encode_ascii_field("password", &profile.password, FTP_ASCII_FIELD_MAX)?);
+    out.extend_from_slice(&FTP_TAG_PORT_SECTION);
+    out.extend_from_slice(&profile.port.to_le_bytes());
+    out.extend_from_slice(&FTP_PORT_SECTION_PAD);
+    out.extend_from_slice(&encode_ipv6_placeholder());
+    out.push(FTP_IPV6_FIELD1_SEPARATOR);
+    out.extend_from_slice(&encode_ipv6_placeholder());
+    out.extend_from_slice(&encode_ipv6_placeholder());
+    out.push(FTP_BLOB_TRAILER);
+    Ok(out)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Session
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -425,6 +579,26 @@ impl PtpUsbSession {
         }
         Ok(data)
     }
+
+    /// Write an FTP profile via `0x90EE`. Always sends the `0x90E8` setup
+    /// call immediately before it — the first write in a fresh session
+    /// doesn't strictly need this, but a second one hangs without it
+    /// (confirmed 2026-09-06), and sending it unconditionally is simpler and
+    /// safer than tracking write count.
+    pub fn write_ftp_profile(&mut self, profile: &FtpProfile) -> Result<(), PtpUsbError> {
+        let blob = encode_ftp_profile(profile)?;
+
+        let (code, _, _) = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA))?;
+        if code != RESP_OK {
+            return Err(PtpUsbError::OperationFailed { op: OP_FTP_SETUP, code: PtpResponseCode(code) });
+        }
+
+        let (code, _, _) = self.transact(OP_FTP_PROFILE_WRITE, &[0, 0], Some(&blob))?;
+        if code != RESP_OK {
+            return Err(PtpUsbError::OperationFailed { op: OP_FTP_PROFILE_WRITE, code: PtpResponseCode(code) });
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PtpUsbSession {
@@ -441,6 +615,13 @@ impl Drop for PtpUsbSession {
 pub fn read_vendor_property(serial: Option<&str>, propcode: u16) -> Result<Vec<u8>, PtpUsbError> {
     let mut session = PtpUsbSession::open(serial)?;
     session.read_vendor_property(propcode)
+}
+
+/// Open a session, write an FTP profile via `0x90EE`, close it. Convenience
+/// wrapper for one-off writes (e.g. the CLI).
+pub fn write_ftp_profile(serial: Option<&str>, profile: &FtpProfile) -> Result<(), PtpUsbError> {
+    let mut session = PtpUsbSession::open(serial)?;
+    session.write_ftp_profile(profile)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -530,6 +711,151 @@ mod tests {
         payload.extend_from_slice(&1u32.to_le_bytes());
         payload.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
         assert_eq!(decode_response_params(&payload), vec![1, 0xDEADBEEF]);
+    }
+
+    // ── 0x90EE FTP-profile encoder ──────────────────────────────────────
+    //
+    // The critical test: reproduce the exact 325-byte blob captured live
+    // from a real NX Field session (session-20260709-204600-ftptest.pcap,
+    // command channel port 53773) byte-for-byte from just the field values.
+    // If this passes, the encoder's understanding of the wire format is
+    // provably correct for every real example we have, not just plausible.
+
+    fn reference_ftp_blob_hex() -> &'static str {
+        // Verbatim from session-20260709-204600-ftptest.pcap, command
+        // channel port 53773, request index 1069's EndData payload (minus
+        // its 4-byte PTP/IP transaction-id prefix, which is transport
+        // framing, not part of the actual 0x90EE data).
+        concat!(
+            "f4010743004c0041005500440045000000103000300030003000300030003000300054003000",
+            "3000300030003000300000001030003000300030003000300030003000540030003000300030",
+            "003000300000000203035742a8c0180000000000000000030001000b0000006e696b6f6e2d73",
+            "6e6f6f700404090000006e696b6f6e3567687a010d3100390032002e003100360038002e0036",
+            "0036002e003100000000150005000000666c6565740800000031323334353637380500901f00",
+            "0000000027000000303030303a303030303a303030303a303030303a303030303a303030303a",
+            "303030303a303030304027000000303030303a303030303a303030303a303030303a30303030",
+            "3a303030303a303030303a3030303027000000303030303a303030303a303030303a30303030",
+            "3a303030303a303030303a303030303a3030303081",
+        )
+    }
+
+    #[test]
+    fn encode_ftp_profile_matches_real_capture_byte_for_byte() {
+        let expected = hex::decode_hex(reference_ftp_blob_hex());
+
+        let profile = FtpProfile {
+            profile_name: "CLAUDE".into(),
+            ssid_24ghz: "nikon-snoop".into(),
+            ssid_5ghz: "nikon5ghz".into(),
+            host: "192.168.66.1".into(),
+            port: 8080,
+            username: "fleet".into(),
+            password: "12345678".into(),
+        };
+        let actual = encode_ftp_profile(&profile).unwrap();
+        assert_eq!(actual.len(), expected.len(), "length mismatch");
+        if actual != expected {
+            let first_diff = actual.iter().zip(expected.iter()).position(|(a, e)| a != e).unwrap();
+            panic!(
+                "byte content mismatch at offset {first_diff}\n  actual:   {:02x?}\n  expected: {:02x?}",
+                &actual[first_diff.saturating_sub(4)..(first_diff + 12).min(actual.len())],
+                &expected[first_diff.saturating_sub(4)..(first_diff + 12).min(expected.len())],
+            );
+        }
+    }
+
+    #[test]
+    fn encode_ftp_profile_third_capture_variant_byte_for_byte() {
+        // port 54731's instance (317 bytes): same as the reference capture
+        // above except profile_name "C2" instead of "CLAUDE" -- confirms the
+        // profile-name field's length actually drives the overall blob
+        // length correctly, not just in the one reference case.
+        //
+        // NOTE: port 56171's instance (331 bytes) is NOT reproducible by
+        // this encoder -- it has an extra optional UTF-16 field (content
+        // "Claude", likely a device/hostname field) between host and
+        // username that doesn't appear in this or the reference capture.
+        // Not modeled here since it isn't needed for any field this API
+        // exposes; see docs/nx-field-session-2026-07-09.md.
+        let hex = concat!(
+            "f401034300320000001030003000300030003000300030003000540030003000300030003000",
+            "3000000010300030003000300030003000300030005400300030003000300030003000000002",
+            "03035742a8c0180000000000000000030001000b0000006e696b6f6e2d736e6f6f7004040900",
+            "00006e696b6f6e3567687a010d3100390032002e003100360038002e00360036002e00310000",
+            "0000150005000000666c6565740800000031323334353637380500901f000000000027000000",
+            "303030303a303030303a303030303a303030303a303030303a303030303a303030303a303030",
+            "304027000000303030303a303030303a303030303a303030303a303030303a303030303a3030",
+            "30303a3030303027000000303030303a303030303a303030303a303030303a303030303a3030",
+            "30303a303030303a3030303081",
+        );
+        let expected = hex::decode_hex(hex);
+
+        let profile = FtpProfile {
+            profile_name: "C2".into(),
+            ssid_24ghz: "nikon-snoop".into(),
+            ssid_5ghz: "nikon5ghz".into(),
+            host: "192.168.66.1".into(),
+            port: 8080,
+            username: "fleet".into(),
+            password: "12345678".into(),
+        };
+        let actual = encode_ftp_profile(&profile).unwrap();
+        assert_eq!(actual.len(), expected.len(), "length mismatch");
+        assert_eq!(actual, expected, "byte content mismatch");
+    }
+
+    #[test]
+    fn encode_ftp_profile_rejects_non_ascii_username() {
+        let mut profile = valid_profile();
+        profile.username = "flëet".into();
+        assert!(matches!(
+            encode_ftp_profile(&profile),
+            Err(PtpUsbError::FtpFieldNotAscii { field: "username" })
+        ));
+    }
+
+    #[test]
+    fn encode_ftp_profile_rejects_oversized_password() {
+        let mut profile = valid_profile();
+        profile.password = "x".repeat(FTP_ASCII_FIELD_MAX + 1);
+        assert!(matches!(
+            encode_ftp_profile(&profile),
+            Err(PtpUsbError::FtpFieldTooLong { field: "password", .. })
+        ));
+    }
+
+    #[test]
+    fn encode_ftp_profile_port_is_little_endian() {
+        let profile = valid_profile();
+        let blob = encode_ftp_profile(&profile).unwrap();
+        // Port section starts right after password's content in this profile.
+        let port_tag_pos = blob.windows(2).rposition(|w| w == FTP_TAG_PORT_SECTION).unwrap();
+        let port_bytes = &blob[port_tag_pos + 2..port_tag_pos + 4];
+        assert_eq!(u16::from_le_bytes(port_bytes.try_into().unwrap()), profile.port);
+    }
+
+    fn valid_profile() -> FtpProfile {
+        FtpProfile {
+            profile_name: "TEST".into(),
+            ssid_24ghz: "test-ssid".into(),
+            ssid_5ghz: "test-ssid-5g".into(),
+            host: "192.168.1.1".into(),
+            port: 21,
+            username: "user".into(),
+            password: "pass".into(),
+        }
+    }
+
+    // Minimal inline hex decoder so the reference blob above can be written
+    // as a plain string literal without pulling in a crate dependency just
+    // for one test fixture.
+    mod hex {
+        pub fn decode_hex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
     }
 
     // ── PtpResponseCode ──────────────────────────────────────────────────

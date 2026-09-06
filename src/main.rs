@@ -106,6 +106,12 @@ enum Cmd {
     /// these were reverse-engineered from an NX Field WiFi capture and later
     /// confirmed to also work over plain USB.
     VendorRead(VendorReadArgs),
+
+    /// Write an FTP profile (0x90EE) over raw USB PTP, bypassing the MAID
+    /// SDK. Reverse-engineered the same way as VendorRead — see
+    /// docs/nx-field-session-2026-07-09.md for the field map and the parts
+    /// of the wire format that are still opaque-but-fixed.
+    VendorWriteFtp(VendorWriteFtpArgs),
 }
 
 #[derive(Args, Debug)]
@@ -259,6 +265,33 @@ fn parse_propcode(s: &str) -> Result<u16, String> {
     } else {
         s.parse::<u16>().map_err(|e| format!("invalid property code {s:?}: {e}"))
     }
+}
+
+#[derive(Args, Debug)]
+struct VendorWriteFtpArgs {
+    /// Profile name shown in the camera's own menus.
+    #[arg(long)]
+    profile_name: String,
+    #[arg(long)]
+    ssid_24ghz: String,
+    #[arg(long)]
+    ssid_5ghz: String,
+    /// FTP server hostname or IP address.
+    #[arg(long)]
+    host: String,
+    #[arg(long, default_value_t = 21)]
+    port: u16,
+    #[arg(long)]
+    username: String,
+    #[arg(long)]
+    password: String,
+    /// Camera serial to target. Required when more than one Nikon camera is
+    /// on USB; this command does not use --sdk-bundle/the MAID SDK at all.
+    #[arg(long)]
+    serial: Option<String>,
+    /// Print the encoded blob without sending it to the camera.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -768,6 +801,32 @@ fn cmd_vendor_read(args: &VendorReadArgs) -> Result<()> {
 
 fn hex_bytes(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+/// Write an FTP profile via raw USB PTP (`0x90EE`), bypassing the MAID SDK
+/// entirely. See `nikon_fleet::ptp_usb`.
+fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
+    let profile = nikon_fleet::ptp_usb::FtpProfile {
+        profile_name: args.profile_name.clone(),
+        ssid_24ghz: args.ssid_24ghz.clone(),
+        ssid_5ghz: args.ssid_5ghz.clone(),
+        host: args.host.clone(),
+        port: args.port,
+        username: args.username.clone(),
+        password: args.password.clone(),
+    };
+
+    if args.dry_run {
+        let blob = nikon_fleet::ptp_usb::encode_ftp_profile(&profile)
+            .context("encoding FTP profile")?;
+        println!("Would write {} byte(s): {}", blob.len(), hex_bytes(&blob));
+        return Ok(());
+    }
+
+    nikon_fleet::ptp_usb::write_ftp_profile(args.serial.as_deref(), &profile)
+        .context("writing FTP profile over USB PTP")?;
+    println!("Wrote FTP profile {:?} ({}@{}:{})", args.profile_name, args.username, args.host, args.port);
+    Ok(())
 }
 
 /// Whether a capture should be treated as a hard failure: zero capabilities
@@ -1310,6 +1369,7 @@ fn main() -> Result<()> {
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
         Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, args, no_reset),
         Cmd::VendorRead(args) => cmd_vendor_read(args),
+        Cmd::VendorWriteFtp(args) => cmd_vendor_write_ftp(args),
         Cmd::Firmware(sub) => match sub {
             FirmwareCmd::Add(args) => cmd_firmware_add(&cli.data_dir, args),
             FirmwareCmd::Ls(args) => cmd_firmware_ls(&cli.data_dir, args),

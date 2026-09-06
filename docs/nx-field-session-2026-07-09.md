@@ -312,15 +312,28 @@ vendor-property space instead of just what MAID exposes.
       `set_active_configuration` on every retry — a plain `pkill` without `-9` reliably lost the
       race in testing) and the stale-session-on-open case. Verified live: `fleet vendor-read 0xD053`
       returns the same `01` byte the Python prototype got.
-- [ ] Extend `src/ptp_usb.rs` to `0x9413`/`0x90E8`/`0x90EE` writes — all three confirmed working over
-      USB 2026-09-06 with the corrected wire formats (see above), but not yet ported into `fleet`;
-      deferred until the blob layouts below get a proper decode pass, since a write API needs to
-      construct arbitrary field content, not just replay/substitute into a captured blob
 - [x] `0x90EE` FTP-profile blob — fully mapped 2026-09-06 by diffing the existing pcap's three
       instances (no new capture needed); see the field table above. Every field a write API needs
       (both SSIDs, host, port, username, password) has a byte-exact offset/length/encoding now. Only
       an 82-byte block and a trailing constant byte remain unresolved, and neither looks needed for
-      a practical write API — ready to port into `src/ptp_usb.rs`
+      a practical write API.
+- [x] `0x90EE` ported into `fleet` — `src/ptp_usb.rs`'s `FtpProfile`/`encode_ftp_profile` builds the
+      blob from scratch (not template substitution), verified byte-for-byte against two of the three
+      real captures in tests (`encode_ftp_profile_matches_real_capture_byte_for_byte`,
+      `..._third_capture_variant_byte_for_byte`). `fleet vendor-write-ftp --profile-name ... --ssid-24ghz
+      ... --ssid-5ghz ... --host ... --port ... --username ... --password ... [--serial ...]
+      [--dry-run]`, always sends `0x90E8` first (harmless on a first write, required for a second —
+      see the wrinkle above). Not yet re-verified live against a camera (none attached when this was
+      built) — the encoder correctness is proven, but a live `fleet vendor-write-ftp` call + menu
+      check hasn't been re-run since porting from the manual Python test.
+- [ ] While porting `0x90EE`, found a fourth blob variant (capture port `56171`, 331 bytes) with an
+      extra optional UTF-16 field (content `"Claude"`, likely a device/hostname field) between `host`
+      and `username` that the other two captures don't have. Not modeled — not needed for any field
+      this API exposes — but worth understanding if a future field (e.g. a "connect via" device name)
+      turns out to matter
+- [ ] Extend `src/ptp_usb.rs` to `0x9413` writes once its blob preamble is decodable (see below) —
+      confirmed working over USB 2026-09-06 with the corrected wire format, but a write API needs to
+      construct arbitrary field content, not just replay/substitute into a captured blob
 - [ ] `0x9413` data-blob preamble (~18 bytes before the first named field, presumably Title/Creator)
       — pcap-mining is exhausted (2026-09-06): checked all four capture files from 2026-07-09, only
       two `0x9413` instances exist anywhere and they're byte-identical, nothing left to diff. Needs
