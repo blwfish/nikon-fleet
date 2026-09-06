@@ -134,10 +134,14 @@ Confirmed by reading `src/sdk.rs` and `docs/todo.md` directly, not assumed:
   principle, regardless of what the firmware supports.
 - None of today's discovered opcodes/properties (`0x9413, 0x90E8, 0x90EE, 0x943B`, and the `0xD0xx`
   behavioral notes above) appear anywhere in SDK-related files — confirmed by direct search.
-- **Conclusion**: any tool built on today's findings should be a PTP/IP-over-WiFi client that's an
-  *adjunct* alongside `src/sdk.rs`'s USB path, not a modification of the SDK/MAID layer. The project's own
-  docs already anticipated this — newly-found vendor codes just need plain `GetDevicePropValue`/
-  `SetDevicePropValue`, no SDK changes needed.
+- **Conclusion (superseded, see "USB-transport test" below)**: this originally said any tool built on
+  today's findings should be a PTP/IP-over-WiFi client, since MAID (the SDK) can't reach WiFi-only
+  vendor ops "even in principle." That's still true of *MAID specifically* — but the 2026-09-06
+  follow-up below found `0x9413`/`0x90E8`/`0x943B` all work over plain raw USB PTP (not through MAID,
+  through a separate hand-rolled PTP-over-USB client) once called with the correct wire format. The
+  vendor ops were never actually WiFi-gated; the original assumption that they were came from
+  under-tested USB attempts, not a real transport restriction. A WiFi/PTP-IP adjunct client may still
+  be worth building for convenience/parity with NX Field, but it is not required to reach these ops.
 
 ## USB-transport test for WiFi-discovered vendor ops (2026-09-06 follow-up)
 
@@ -151,42 +155,46 @@ this is a kill-immediately-before-claim race, not a one-time fix) and a stale op
 (`0x201e SessionAlreadyOpen`, left over from `ptpcamerad`'s own connection) had to be closed before
 a fresh `OpenSession` would succeed.
 
-**Result: op-specific, not a blanket WiFi-only gate.**
+**Result (revised after a second pass, same day): not gated at all — the two apparent failures were
+wire-format bugs, not transport gating.**
 
 - **`0x943B` (vendor-property read wrapper) works over USB.** First attempt used `0xD0B4` (from the
   handoff's example) and got `DevicePropNotSupported` (`0x200a`) — but `0xD0B4` isn't actually a
   code confirmed present on the Z6III (it's Z9-only per the todo.md per-body table), so that's the
   property being rejected, not the operation. Retried with `0xD053` (the copyright field, confirmed
   present/working on all four fleet bodies) and got a clean `OK` (`0x2001`) with 1 byte of real data
-  back (`01`). **The dispatcher accepts and correctly executes this vendor op over USB.**
-- **`0x90E8` (FTP profile status) does not work over USB — but doesn't fail cleanly either.** The
-  command was accepted (no immediate rejection) but the camera never sent a response container; the
-  bulk-IN read timed out. The *next* transaction (a plain `GetDeviceInfo`) then failed with a pipe
-  error — the endpoint had stalled. `clear_halt()` on both bulk endpoints recovered the pipe (a
-  follow-up `GetDeviceInfo` returned `OK` normally), so no power cycle was needed and the camera
-  wasn't left in a bad state. But this is a hang/stall, not a graceful `OperationNotSupported` —
-  meaningfully different from `0x943B`'s clean success.
+  back (`01`).
+- **`0x9413` (IPTC profile write) works over USB.** First attempt used the originally-documented
+  params `[slot, 0x14, 0x9]` (slot 1, then slot 0) and got a clean `ParameterNotSupported` both
+  times. Re-analyzed the original 2026-07-09 pcap with a proper TCP-stream reassembly (scapy,
+  sorted/deduped by sequence number — the earlier by-eye hex reading that produced `[slot, 0x14,
+  0x9]` was simply wrong) and found the real wire format takes **one param, value `1`**, with no
+  distinct "select/create profile" step beforehand — it's preceded only by NX Field's routine
+  background polling. Replayed the exact 104-byte data-phase blob captured from a real, successful
+  WiFi transaction (byte-for-byte, rather than a hand-built guess at the per-field layout) with the
+  corrected single param: **clean `OK` (`0x2001`)**. Done with the user's explicit go-ahead, on a
+  body where this camera's IPTC profile isn't part of their workflow (no revert needed/attempted;
+  Description-equivalent field now holds leftover test text — harmless, ignorable).
+- **`0x90E8` (FTP profile status) works over USB.** The very first attempt (no params, no data)
+  timed out waiting for a response and then stalled the bulk pipe (recovered cleanly with
+  `clear_halt()`, no power cycle needed) — but the same pcap re-analysis showed every real instance
+  of `0x90E8` carries `dataphase=2` with a 3-byte data-out payload (`01 00 00`). The original test
+  sent zero data, so the camera was correctly waiting for a data phase that never arrived — that's
+  the entire explanation for the hang, not a WiFi-only gate. Retried with the 3-byte payload: clean
+  `OK` (`0x2001`).
 
-**Implication:** at least the `0x943B` vendor-property read wrapper — and by extension whatever
-`0xD0xx`/`0x5xxx` reads it can front — is already usable from `fleet` today over the existing USB
-transport, no PTP/IP-over-WiFi adjunct client required. The adjunct client is still needed for ops
-that behave like `0x90E8` (and presumably its write counterpart `0x90EE`, not tested — see the
-original handoff's step 4 for why) — those appear to need the WiFi/PTP-IP session context
-specifically, not just "any PTP transport."
-
-**`0x9413` (IPTC profile write) — tested over USB same day, at the user's request, on a body with a
-confirmed-empty IPTC profile** (so a test write + immediate revert-to-empty was safe with no
-readback needed to know the "before" state). Wrote a marked test string into the Description field
-(all other 13 fields empty, matching the confirmed pre-existing state) using the wire format
-documented above, with `slot=1` (from the WiFi capture) and then `slot=0` as a fallback guess.
-**Both attempts got a clean `ParameterNotSupported` (`0x2006`) — no hang, no pipe stall, nothing
-written** (confirmed via a working `GetDeviceInfo` immediately after). This is a third distinct
-per-op behavior over USB, different from both `0x943B` (clean success) and `0x90E8` (hang/stall).
-Most likely explanation: the captured `[slot, 0x14, 0x9]` params reflect profile-selection state
-that only exists inside an active NX Field/PTP-IP session with the IPTC screen open — a cold USB
-`OpenSession` doesn't establish that context, so no slot value may work without first replicating
-whatever sets it up. Not investigated further this pass (would mean guessing at unknown setup
-opcodes with no clear candidate).
+**Implication (revised): the PTP command dispatcher is transport-agnostic for all three vendor ops
+tested.** There is no evidence of WiFi/PTP-IP-session gating for `0x943B`, `0x9413`, or `0x90E8` —
+every failure traced back to an incorrect param count or a missing/incomplete data phase, both
+fixable by re-deriving the real wire format from the existing capture rather than assuming the op
+needs WiFi. This means a `fleet` USB code path is plausible for all three, pending the same
+careful-pcap-reanalysis treatment for any other vendor op it wants to use (don't trust a
+by-eye-read param list without a proper reassembly, per the mistake above). `0x90EE` (FTP *profile*
+write, i.e. writing actual network credentials — SSID/host/port/username/password) was **not**
+attempted this pass; it's a different risk category than a stray IPTC string, wasn't covered by the
+permission given for this session, and would need its own pcap re-derivation of `0x90EE`'s exact
+params/data-phase format (same methodology, just not done yet) plus explicit sign-off before
+testing live.
 
 ## Side-effect verification — current gap, and existing tooling
 
@@ -218,12 +226,20 @@ vendor-property space instead of just what MAID exposes.
 - [ ] Sync release mode and a real (non-status-only) FTP profile edit from NX Field's UI — both were
       attempted in the original session but never produced wire traffic distinguishable from background
       noise
-- [ ] Build a `fleet` USB code path for `0x943B` vendor-property reads (confirmed working over USB
-      2026-09-06, see above) — no WiFi adjunct client needed for this one op
-- [ ] Test `0x90E8` retry/recovery behavior more (single hang so far, n=1) and probe whether other
-      `0x9xxx` vendor ops share its stall-instead-of-reject behavior over USB
-- [ ] `0x9413` over USB got clean `ParameterNotSupported` for `slot=0` and `slot=1` — find what
-      setup/selection step (if any) makes a slot valid outside an active NX Field session, or confirm
-      it's genuinely WiFi-session-gated like `0x90E8`
-- [ ] `0x90EE` (FTP write) still untested on any transport-over-USB basis — needs a rollback/
-      verification path first (mutating op, and `0x90E8`'s hang behavior makes this riskier)
+- [ ] Build a `fleet` USB code path for `0x943B` vendor-property reads, `0x9413` IPTC writes, and
+      `0x90E8` FTP-status reads — all three confirmed working over USB 2026-09-06 with the corrected
+      wire formats (see above); no WiFi adjunct client needed for any of them
+- [ ] Fully decode the `0x9413` data-blob layout (14 fields, `[uint32 len incl. null][utf8+null]`
+      each per the original notes, but there's a ~18-byte preamble before the first field that
+      doesn't fit that model cleanly — the 2026-09-06 test replayed a captured blob byte-for-byte
+      rather than fully understanding it). Needs either a second capture with deliberately-varied
+      single-field test values to isolate header from content, or careful diffing against more
+      `0x9413` instances if any other capture has them
+- [ ] `0x90EE` (FTP profile write — real network credentials, different risk category from a stray
+      IPTC string) still untested on any transport-over-USB basis. Before attempting: re-derive its
+      real params/data-phase format from the pcap the same way `0x9413`/`0x90E8` were fixed above
+      (don't reuse the original by-eye-read notes without re-verifying via proper stream reassembly),
+      and get explicit sign-off given the credential-write risk
+- [ ] Given `0x9413`/`0x90E8`'s failures were both wire-format bugs, not real gating: audit whether
+      any *other* vendor op previously assumed "WiFi-only" in this doc was also just mis-transcribed,
+      before relying on such claims elsewhere
