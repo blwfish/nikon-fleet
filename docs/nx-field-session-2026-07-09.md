@@ -204,6 +204,20 @@ wire-format bugs, not transport gating.**
   `FLEET`, password `87654321`, everything else per the values above.** Visible/resettable via the
   camera's own Setup Menu.
 
+  **Revert attempt (same session, minutes later):** wrote the original blob back (`fleet`/
+  `12345678`) to restore the pre-test state after the user visually verified the mutation on the
+  camera's own menu. **This second `0x90EE` write hung twice in a row** (bulk-IN timeout, pipe
+  stall, recovered each time with `clear_halt()`) — same failure mode as the very first `0x90E8`
+  attempt earlier in the day. Sending a standalone `0x90E8` (3-byte payload, as derived above)
+  immediately before the retry fixed it: clean `OK`. **So the original notes' "`0x90E8` is a shared
+  setup step for `0x90EE`" claim holds, but only conditionally** — the *first* `0x90EE` write in a
+  fresh PTP session can skip it (confirmed twice: the original WiFi capture's first write, and this
+  session's first USB write), but a *second* write in the same session needs `0x90E8` sent
+  immediately before it or the camera never responds. Profile now restored to `fleet`/`12345678`,
+  matching the original 2026-07-09 capture. Not yet confirmed whether the requirement is "once per
+  session" or "once per N writes" or something else — only tested first-write-skips-it /
+  second-write-needs-it, n=1 each.
+
 **Implication (revised): the PTP command dispatcher is transport-agnostic for all four vendor ops
 tested.** There is no evidence of WiFi/PTP-IP-session gating for `0x943B`, `0x9413`, `0x90E8`, or
 `0x90EE` — every failure traced back to an incorrect param count or a missing/incomplete data phase,
@@ -257,8 +271,13 @@ vendor-property space instead of just what MAID exposes.
       password locations found by content search, but the ~100-byte prefix before them and the
       IPv6-placeholder tail aren't understood yet) — same "vary one field, diff the blobs" approach
       as `0x9413` would help
-- [ ] This Z6III's FTP profile now has username `FLEET`/password `87654321` (test values from the
-      2026-09-06 `0x90EE` write, see above) — reset via Setup Menu whenever actually needed
+- [x] This Z6III's FTP profile was mutated to username `FLEET`/password `87654321` on 2026-09-06,
+      visually verified via the camera's Setup Menu, then reverted back to `fleet`/`12345678` via a
+      second `0x90EE` write in the same session — see above for the "needs a preceding `0x90E8` on
+      the second write" wrinkle this surfaced
+- [ ] Confirm whether the `0x90E8`-before-`0x90EE` requirement is strictly "every write after the
+      first" or something narrower (time-based cooldown, write-count-based, etc.) — only tested
+      first-skips-it/second-needs-it once each
 - [ ] Given `0x9413`/`0x90E8`/`0x90EE`'s failures were all wire-format bugs, not real gating: audit whether
       any *other* vendor op previously assumed "WiFi-only" in this doc was also just mis-transcribed,
       before relying on such claims elsewhere
