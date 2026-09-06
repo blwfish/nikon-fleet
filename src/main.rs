@@ -100,6 +100,12 @@ enum Cmd {
     /// Manage the firmware archive.
     #[command(subcommand)]
     Firmware(FirmwareCmd),
+
+    /// Read a vendor-only property (0xD0xx/0x5xxx) over raw USB PTP, bypassing
+    /// the MAID SDK. See docs/nx-field-session-2026-07-09.md for background —
+    /// these were reverse-engineered from an NX Field WiFi capture and later
+    /// confirmed to also work over plain USB.
+    VendorRead(VendorReadArgs),
 }
 
 #[derive(Args, Debug)]
@@ -231,6 +237,28 @@ struct FirmwareCheckArgs {
     /// Check only the camera with this serial number.
     #[arg(long)]
     serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct VendorReadArgs {
+    /// Property code, e.g. "0xD053" or "53331". Does not need the 0x10000
+    /// vendor-read flag bit — that's added internally.
+    #[arg(value_parser = parse_propcode)]
+    propcode: u16,
+    /// Camera serial to target. Required when more than one Nikon camera is
+    /// on USB; this command does not use --sdk-bundle/the MAID SDK at all.
+    #[arg(long)]
+    serial: Option<String>,
+}
+
+/// Accepts "0xD053"/"0XD053" (hex) or a plain decimal string.
+fn parse_propcode(s: &str) -> Result<u16, String> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).map_err(|e| format!("invalid hex property code {s:?}: {e}"))
+    } else {
+        s.parse::<u16>().map_err(|e| format!("invalid property code {s:?}: {e}"))
+    }
 }
 
 #[derive(Args, Debug)]
@@ -727,6 +755,19 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
         bail!("all {} capability read(s) failed (see errors above); wrote an empty snapshot to {}", stats.read_err, path.display());
     }
     Ok(())
+}
+
+/// Read one vendor-only property via raw USB PTP (`0x943B`), bypassing the
+/// MAID SDK entirely — no --sdk-bundle needed. See `nikon_fleet::ptp_usb`.
+fn cmd_vendor_read(args: &VendorReadArgs) -> Result<()> {
+    let data = nikon_fleet::ptp_usb::read_vendor_property(args.serial.as_deref(), args.propcode)
+        .with_context(|| format!("reading vendor property 0x{:04x} over USB PTP", args.propcode))?;
+    println!("0x{:04x}: {} byte(s): {}", args.propcode, data.len(), hex_bytes(&data));
+    Ok(())
+}
+
+fn hex_bytes(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
 }
 
 /// Whether a capture should be treated as a hard failure: zero capabilities
@@ -1268,6 +1309,7 @@ fn main() -> Result<()> {
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
         Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, args, no_reset),
+        Cmd::VendorRead(args) => cmd_vendor_read(args),
         Cmd::Firmware(sub) => match sub {
             FirmwareCmd::Add(args) => cmd_firmware_add(&cli.data_dir, args),
             FirmwareCmd::Ls(args) => cmd_firmware_ls(&cli.data_dir, args),

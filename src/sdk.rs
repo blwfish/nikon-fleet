@@ -321,7 +321,7 @@ fn model_from_product_string(product: &str) -> String {
     crate::firmware::model_from_usb_product(product).to_owned()
 }
 
-fn nikon_usb_devices() -> Vec<rusb::Device<rusb::GlobalContext>> {
+pub(crate) fn nikon_usb_devices() -> Vec<rusb::Device<rusb::GlobalContext>> {
     let list = match rusb::DeviceList::new() {
         Ok(l) => l,
         Err(_) => return Vec::new(),
@@ -331,7 +331,7 @@ fn nikon_usb_devices() -> Vec<rusb::Device<rusb::GlobalContext>> {
         .collect()
 }
 
-fn read_usb_string(handle: &rusb::DeviceHandle<rusb::GlobalContext>, idx: u8) -> String {
+pub(crate) fn read_usb_string(handle: &rusb::DeviceHandle<rusb::GlobalContext>, idx: u8) -> String {
     if idx == 0 { return String::new(); }
     let timeout = std::time::Duration::from_secs(1);
     let lang = match handle.read_languages(timeout).ok().and_then(|l| l.into_iter().next()) {

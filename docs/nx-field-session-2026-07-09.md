@@ -256,10 +256,16 @@ vendor-property space instead of just what MAID exposes.
 - [ ] Sync release mode and a real (non-status-only) FTP profile edit from NX Field's UI — both were
       attempted in the original session but never produced wire traffic distinguishable from background
       noise
-- [ ] Build a `fleet` USB code path for `0x943B` vendor-property reads, `0x9413` IPTC writes,
-      `0x90E8` FTP-status reads, and `0x90EE` FTP-profile writes — all four confirmed working over
-      USB 2026-09-06 with the corrected wire formats (see above); no WiFi adjunct client needed for
-      any of them
+- [x] Build a `fleet` USB code path for `0x943B` vendor-property reads — done 2026-09-06:
+      `src/ptp_usb.rs` (new module, `rusb`-based, no MAID SDK involved) + `fleet vendor-read <code>
+      [--serial <serial>]`. Handles the macOS `ptpcamerad`/`icdd` reclaim race (kill -9 + re-assert
+      `set_active_configuration` on every retry — a plain `pkill` without `-9` reliably lost the
+      race in testing) and the stale-session-on-open case. Verified live: `fleet vendor-read 0xD053`
+      returns the same `01` byte the Python prototype got.
+- [ ] Extend `src/ptp_usb.rs` to `0x9413`/`0x90E8`/`0x90EE` writes — all three confirmed working over
+      USB 2026-09-06 with the corrected wire formats (see above), but not yet ported into `fleet`;
+      deferred until the blob layouts below get a proper decode pass, since a write API needs to
+      construct arbitrary field content, not just replay/substitute into a captured blob
 - [ ] Fully decode the `0x9413` data-blob layout (14 fields, `[uint32 len incl. null][utf8+null]`
       each per the original notes, but there's a ~18-byte preamble before the first field that
       doesn't fit that model cleanly — the 2026-09-06 test replayed a captured blob byte-for-byte

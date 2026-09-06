@@ -7,6 +7,7 @@ mod config_parse;
 pub mod diff;
 pub mod firmware;
 pub mod maid_layer;
+pub mod ptp_usb;
 pub mod range_value;
 pub mod sdk;
 pub mod snapshot;
