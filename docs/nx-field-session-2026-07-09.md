@@ -137,7 +137,7 @@ Confirmed by reading `src/sdk.rs` and `docs/todo.md` directly, not assumed:
 - **Conclusion (superseded, see "USB-transport test" below)**: this originally said any tool built on
   today's findings should be a PTP/IP-over-WiFi client, since MAID (the SDK) can't reach WiFi-only
   vendor ops "even in principle." That's still true of *MAID specifically* — but the 2026-09-06
-  follow-up below found `0x9413`/`0x90E8`/`0x943B` all work over plain raw USB PTP (not through MAID,
+  follow-up below found `0x9413`/`0x90E8`/`0x90EE`/`0x943B` all work over plain raw USB PTP (not through MAID,
   through a separate hand-rolled PTP-over-USB client) once called with the correct wire format. The
   vendor ops were never actually WiFi-gated; the original assumption that they were came from
   under-tested USB attempts, not a real transport restriction. A WiFi/PTP-IP adjunct client may still
@@ -183,18 +183,34 @@ wire-format bugs, not transport gating.**
   the entire explanation for the hang, not a WiFi-only gate. Retried with the 3-byte payload: clean
   `OK` (`0x2001`).
 
-**Implication (revised): the PTP command dispatcher is transport-agnostic for all three vendor ops
-tested.** There is no evidence of WiFi/PTP-IP-session gating for `0x943B`, `0x9413`, or `0x90E8` —
-every failure traced back to an incorrect param count or a missing/incomplete data phase, both
-fixable by re-deriving the real wire format from the existing capture rather than assuming the op
-needs WiFi. This means a `fleet` USB code path is plausible for all three, pending the same
+- **`0x90EE` (FTP profile write — real network credentials) works over USB too.** Re-derived its
+  wire format the same way: `params=[0, 0]`, `dataphase=2`, a 325-byte data blob. Notably, in the
+  captured instance used as a reference, **`0x90EE` was not preceded by a distinct `0x90E8` setup
+  call at all** — just NX Field's ordinary background polling — so the "0x90E8 is a shared
+  setup/status step for 0x90EE" claim in the original notes doesn't hold for this instance either;
+  it can be sent standalone. Field boundaries for username (`fleet`, 5 ASCII bytes) and password
+  (`12345678`, 8 ASCII bytes) were identified precisely by their 4-byte length prefixes elsewhere in
+  the blob (mixed ASCII/UTF-16LE encoding, several fields still not fully mapped — SSID names,
+  device-name-like UTF-16 fields, an unexplained ~100-byte prefix before the WiFi/host section, and
+  three all-zero IPv6-string placeholder fields at the end). Rather than fully decoding all of it,
+  took the real captured blob and substituted only the username → `FLEET` and password → `87654321`
+  (both exactly the same byte length as the originals, so no other field or offset shifts) — **clean
+  `OK` (`0x2001`)**. Done with the user's explicit go-ahead ("read the credentials, then mutate them
+  in a known way, I can always re-set them"). There is no PTP-level read-back for this profile
+  anywhere in the capture, so "read" here meant the values NX Field itself wrote during the original
+  2026-07-09 session (pointing at a since-torn-down Raspberry Pi test AP: SSID `nikon-snoop`/
+  `nikon5ghz`, host `192.168.66.1`, port `8080`) — not necessarily what was actually stored on the
+  camera going into this test. **Current known state of this Z6III's FTP profile: username
+  `FLEET`, password `87654321`, everything else per the values above.** Visible/resettable via the
+  camera's own Setup Menu.
+
+**Implication (revised): the PTP command dispatcher is transport-agnostic for all four vendor ops
+tested.** There is no evidence of WiFi/PTP-IP-session gating for `0x943B`, `0x9413`, `0x90E8`, or
+`0x90EE` — every failure traced back to an incorrect param count or a missing/incomplete data phase,
+both fixable by re-deriving the real wire format from the existing capture rather than assuming the
+op needs WiFi. This means a `fleet` USB code path is plausible for all four, pending the same
 careful-pcap-reanalysis treatment for any other vendor op it wants to use (don't trust a
-by-eye-read param list without a proper reassembly, per the mistake above). `0x90EE` (FTP *profile*
-write, i.e. writing actual network credentials — SSID/host/port/username/password) was **not**
-attempted this pass; it's a different risk category than a stray IPTC string, wasn't covered by the
-permission given for this session, and would need its own pcap re-derivation of `0x90EE`'s exact
-params/data-phase format (same methodology, just not done yet) plus explicit sign-off before
-testing live.
+by-eye-read param list without a proper reassembly, per the mistakes above).
 
 ## Side-effect verification — current gap, and existing tooling
 
@@ -226,20 +242,23 @@ vendor-property space instead of just what MAID exposes.
 - [ ] Sync release mode and a real (non-status-only) FTP profile edit from NX Field's UI — both were
       attempted in the original session but never produced wire traffic distinguishable from background
       noise
-- [ ] Build a `fleet` USB code path for `0x943B` vendor-property reads, `0x9413` IPTC writes, and
-      `0x90E8` FTP-status reads — all three confirmed working over USB 2026-09-06 with the corrected
-      wire formats (see above); no WiFi adjunct client needed for any of them
+- [ ] Build a `fleet` USB code path for `0x943B` vendor-property reads, `0x9413` IPTC writes,
+      `0x90E8` FTP-status reads, and `0x90EE` FTP-profile writes — all four confirmed working over
+      USB 2026-09-06 with the corrected wire formats (see above); no WiFi adjunct client needed for
+      any of them
 - [ ] Fully decode the `0x9413` data-blob layout (14 fields, `[uint32 len incl. null][utf8+null]`
       each per the original notes, but there's a ~18-byte preamble before the first field that
       doesn't fit that model cleanly — the 2026-09-06 test replayed a captured blob byte-for-byte
       rather than fully understanding it). Needs either a second capture with deliberately-varied
       single-field test values to isolate header from content, or careful diffing against more
       `0x9413` instances if any other capture has them
-- [ ] `0x90EE` (FTP profile write — real network credentials, different risk category from a stray
-      IPTC string) still untested on any transport-over-USB basis. Before attempting: re-derive its
-      real params/data-phase format from the pcap the same way `0x9413`/`0x90E8` were fixed above
-      (don't reuse the original by-eye-read notes without re-verifying via proper stream reassembly),
-      and get explicit sign-off given the credential-write risk
-- [ ] Given `0x9413`/`0x90E8`'s failures were both wire-format bugs, not real gating: audit whether
+- [ ] Fully decode the `0x90EE` FTP-profile blob (mixed ASCII/UTF-16LE fields, some 4-byte-length-
+      prefixed with no null terminator unlike `0x9413`'s convention; SSID/host/port/username/
+      password locations found by content search, but the ~100-byte prefix before them and the
+      IPv6-placeholder tail aren't understood yet) — same "vary one field, diff the blobs" approach
+      as `0x9413` would help
+- [ ] This Z6III's FTP profile now has username `FLEET`/password `87654321` (test values from the
+      2026-09-06 `0x90EE` write, see above) — reset via Setup Menu whenever actually needed
+- [ ] Given `0x9413`/`0x90E8`/`0x90EE`'s failures were all wire-format bugs, not real gating: audit whether
       any *other* vendor op previously assumed "WiFi-only" in this doc was also just mis-transcribed,
       before relying on such claims elsewhere
