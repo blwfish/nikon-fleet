@@ -172,8 +172,21 @@ a fresh `OpenSession` would succeed.
 transport, no PTP/IP-over-WiFi adjunct client required. The adjunct client is still needed for ops
 that behave like `0x90E8` (and presumably its write counterpart `0x90EE`, not tested — see the
 original handoff's step 4 for why) — those appear to need the WiFi/PTP-IP session context
-specifically, not just "any PTP transport." `0x9413` (IPTC write) was also not tested over USB
-(state-mutating, no rollback path yet, explicitly excluded from this pass).
+specifically, not just "any PTP transport."
+
+**`0x9413` (IPTC profile write) — tested over USB same day, at the user's request, on a body with a
+confirmed-empty IPTC profile** (so a test write + immediate revert-to-empty was safe with no
+readback needed to know the "before" state). Wrote a marked test string into the Description field
+(all other 13 fields empty, matching the confirmed pre-existing state) using the wire format
+documented above, with `slot=1` (from the WiFi capture) and then `slot=0` as a fallback guess.
+**Both attempts got a clean `ParameterNotSupported` (`0x2006`) — no hang, no pipe stall, nothing
+written** (confirmed via a working `GetDeviceInfo` immediately after). This is a third distinct
+per-op behavior over USB, different from both `0x943B` (clean success) and `0x90E8` (hang/stall).
+Most likely explanation: the captured `[slot, 0x14, 0x9]` params reflect profile-selection state
+that only exists inside an active NX Field/PTP-IP session with the IPTC screen open — a cold USB
+`OpenSession` doesn't establish that context, so no slot value may work without first replicating
+whatever sets it up. Not investigated further this pass (would mean guessing at unknown setup
+opcodes with no clear candidate).
 
 ## Side-effect verification — current gap, and existing tooling
 
@@ -209,5 +222,8 @@ vendor-property space instead of just what MAID exposes.
       2026-09-06, see above) — no WiFi adjunct client needed for this one op
 - [ ] Test `0x90E8` retry/recovery behavior more (single hang so far, n=1) and probe whether other
       `0x9xxx` vendor ops share its stall-instead-of-reject behavior over USB
-- [ ] `0x9413` (IPTC write) and `0x90EE` (FTP write) still untested on any transport-over-USB basis —
-      need a rollback/verification path first (mutating ops)
+- [ ] `0x9413` over USB got clean `ParameterNotSupported` for `slot=0` and `slot=1` — find what
+      setup/selection step (if any) makes a slot valid outside an active NX Field session, or confirm
+      it's genuinely WiFi-session-gated like `0x90E8`
+- [ ] `0x90EE` (FTP write) still untested on any transport-over-USB basis — needs a rollback/
+      verification path first (mutating op, and `0x90E8`'s hang behavior makes this riskier)
