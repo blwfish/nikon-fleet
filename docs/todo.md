@@ -141,6 +141,10 @@ capabilities (e.g. `ExposureMode`: 2 → "A (Aperture priority)").
 Required for:
 - Showing full labels in the snapshot detail view (currently shows raw ints)
 - The editing/bundle-creation UI (option pickers)
+- Upgrading `fleet transplant`'s `elem_type` 2 enum matches from
+  `EnumByRawValue` (same numeric code — a guess) to `EnumByLabel` (same
+  menu-shown label — the actually-correct match, same standard already
+  used for `elem_type` 7 packed-string enums). See `src/transplant.rs`.
 
 ---
 

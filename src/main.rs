@@ -21,6 +21,7 @@ use nikon_fleet::firmware::{
 use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::sdk::{CapabilityInfo, Device, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET, OP_SET};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
+use nikon_fleet::transplant;
 
 #[cfg(target_os = "macos")]
 const DEFAULT_SDK_BUNDLE: &str = concat!(
@@ -96,6 +97,12 @@ enum Cmd {
 
     /// Restore settings from a snapshot to a live camera.
     Restore(RestoreArgs),
+
+    /// Copy settings from a snapshot onto a live camera of a possibly
+    /// *different* model, translating enum/range values into the target's
+    /// own equivalents instead of assuming the same code/index means the
+    /// same thing on both bodies. See src/transplant.rs for the strategy.
+    Transplant(TransplantArgs),
 
     /// Manage the firmware archive.
     #[command(subcommand)]
@@ -292,6 +299,26 @@ struct RestoreArgs {
     #[arg(long)]
     serial: Option<String>,
     /// Print what would be written without sending anything to the camera.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+struct TransplantArgs {
+    /// Source snapshot to copy settings FROM. May be a different camera
+    /// model than the target — that's the point of this command, unlike
+    /// `restore`. Resolved relative to snapshots/ if not absolute.
+    snapshot_path: PathBuf,
+    /// Target camera serial. Required when more than one Nikon camera is
+    /// on USB; unlike `restore`, this does NOT default to the serial
+    /// recorded in the snapshot (that camera is, by definition, a
+    /// different — often absent — body for a cross-model transplant).
+    #[arg(long)]
+    serial: Option<String>,
+    /// Report what would be written and by which strategy, without sending
+    /// anything to the camera. Still performs live reads of the target's
+    /// current enum/range values (needed to know whether a match exists at
+    /// all), so this is slower than `restore --dry-run`.
     #[arg(long)]
     dry_run: bool,
 }
@@ -1342,6 +1369,98 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
     Ok(())
 }
 
+/// Copy a snapshot's settings onto a live camera that may be a different
+/// model, translating enum/range values via `nikon_fleet::transplant`
+/// instead of `restore`'s literal same-model copy. See that module's docs
+/// for the translation strategy and why capability *codes* (not menu
+/// position, not per-model renumbering) are the right join key here.
+fn cmd_transplant(data_dir: &Path, bundle: &Path, args: &TransplantArgs, no_usb_reset: bool) -> Result<()> {
+    let snap_path = resolve_snapshot_path(data_dir, &args.snapshot_path);
+    let snap = Snapshot::load_from_file(&snap_path)
+        .with_context(|| format!("loading {}", snap_path.display()))?;
+
+    let mut sdk = open_sdk(bundle, no_usb_reset)?;
+    let devices = sdk.devices()?;
+    if devices.is_empty() {
+        bail!("no Nikon cameras detected");
+    }
+    let enriched = enrich_devices(devices);
+    let (target, _usb) = select_device(enriched, args.serial.as_deref())?;
+
+    if target.name == snap.camera.model {
+        println!(
+            "note: source and target are both {:?} — transplant works the same either way, \
+             but `fleet restore` is the simpler/faster tool for a same-model copy.",
+            target.name
+        );
+    }
+
+    println!("Connecting to {:?} (id={})…", target.name, target.id);
+    let device = sdk.connect(target.id)?;
+
+    let outcomes = transplant::transplant(&device, &snap.properties, args.dry_run);
+
+    let mut written_literal = 0usize;
+    let mut written_enum_label = 0usize;
+    let mut written_enum_raw = 0usize;
+    let mut written_range = 0usize;
+    let mut skipped_absent = 0usize;
+    let mut skipped_read_only = 0usize;
+    let mut skipped_unsupported_type = 0usize;
+    let mut skipped_no_match = 0usize;
+    let mut skipped_other = 0usize;
+    let mut errors = 0usize;
+
+    for outcome in &outcomes {
+        match &outcome.result {
+            Ok(strategy) => {
+                if args.dry_run {
+                    println!("  would write  {} [{:#x}]  via {strategy}", outcome.name, outcome.code);
+                }
+                match strategy {
+                    transplant::Strategy::Literal => written_literal += 1,
+                    transplant::Strategy::EnumByLabel => written_enum_label += 1,
+                    transplant::Strategy::EnumByRawValue => written_enum_raw += 1,
+                    transplant::Strategy::RangeClamped => written_range += 1,
+                }
+            }
+            Err(reason) => match reason {
+                transplant::SkipReason::AbsentOnTarget => skipped_absent += 1,
+                transplant::SkipReason::ReadOnly => skipped_read_only += 1,
+                transplant::SkipReason::UnsupportedWriteType => skipped_unsupported_type += 1,
+                transplant::SkipReason::NoMatchingOption => {
+                    eprintln!("  warn: {} [{:#x}]: {reason}", outcome.name, outcome.code);
+                    skipped_no_match += 1;
+                }
+                transplant::SkipReason::WriteFailed(_) => {
+                    eprintln!("  warn: {} [{:#x}]: {reason}", outcome.name, outcome.code);
+                    errors += 1;
+                }
+                transplant::SkipReason::UnsupportedValueShape
+                | transplant::SkipReason::TargetReadFailed
+                | transplant::SkipReason::MalformedSource => {
+                    eprintln!("  warn: {} [{:#x}]: {reason}", outcome.name, outcome.code);
+                    skipped_other += 1;
+                }
+            },
+        }
+    }
+
+    let written = written_literal + written_enum_label + written_enum_raw + written_range;
+    println!(
+        "{} written={written} (literal={written_literal} enum-by-label={written_enum_label} \
+         enum-by-raw-value={written_enum_raw} range-clamped={written_range})\n  \
+         skipped(absent)={skipped_absent} skipped(read-only)={skipped_read_only} \
+         skipped(unsupported-type)={skipped_unsupported_type} skipped(no-matching-option)={skipped_no_match} \
+         skipped(other)={skipped_other}  errors={errors}",
+        if args.dry_run { "Dry run:" } else { "Transplant complete:" }
+    );
+    if !args.dry_run && restore_completely_failed(written, errors) {
+        bail!("all {errors} capability write(s) failed (see warnings above); nothing was transplanted");
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────
@@ -1358,6 +1477,7 @@ fn main() -> Result<()> {
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
         Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, args, no_reset),
+        Cmd::Transplant(args) => cmd_transplant(&cli.data_dir, &cli.sdk_bundle, args, no_reset),
         Cmd::VendorRead(args) => cmd_vendor_read(args),
         Cmd::VendorWriteFtp(args) => cmd_vendor_write_ftp(args),
         Cmd::Firmware(sub) => match sub {

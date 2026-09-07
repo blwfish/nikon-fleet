@@ -17,7 +17,19 @@ Core capabilities:
 - **Snapshot** a camera's full settings state to JSON.
 - **Diff** two snapshots, or a live camera against a saved reference
   (`fleet check`), to see what's changed.
-- **Restore** settings from a snapshot back to a camera.
+- **Restore** settings from a snapshot back to a camera (same model —
+  literal value copy, keyed by capability code).
+- **Transplant** settings from a snapshot onto a *different-model* camera
+  (`src/transplant.rs`) — MAID capability IDs are a fixed SDK-wide enum
+  (confirmed against `MaidLayer.config`: e.g. `Aperture` is always id
+  33043), so "the same setting" is already the same code across bodies;
+  what differs is enum option ordering/count and range bounds, which this
+  translates via a live read of the target's own current value rather than
+  assuming the source's index/value carries over unchanged. Does not cover
+  Custom Settings menu items (Focus Peaking, etc.) that aren't in MAID's
+  capability list at all — those live in the vendor-only PTP-property
+  space (see `src/ptp_usb.rs`) and would need their own per-body discovery
+  work first.
 - **Firmware archive**: store firmware `.bin` files keyed by (model,
   version), pin a canonical settings snapshot to each version, and generate
   guided rollback bundles (manual re-flash is required — Nikon doesn't
