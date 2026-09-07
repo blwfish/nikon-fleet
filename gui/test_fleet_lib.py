@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode
 
 _FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "capability_value_shapes.json"
 
@@ -184,6 +184,46 @@ class TestParseFwFilename:
     def test_extension_not_included_in_model(self):
         model, _ = parse_fw_filename("Z_9_0531.bin")
         assert not model.endswith(".bin")
+
+
+# ── parse_propcode ────────────────────────────────────────────────────────────
+# Must accept the same forms as the Rust CLI's own parse_propcode (main.rs) —
+# both parse the same user-typed string, one from a GUI entry, one from argv.
+
+class TestParsePropcode:
+    def test_lowercase_hex(self):
+        assert parse_propcode("0xd053") == 0xD053
+
+    def test_uppercase_hex_prefix_and_digits(self):
+        assert parse_propcode("0XD053") == 0xD053
+
+    def test_decimal(self):
+        assert parse_propcode("53331") == 53331
+
+    def test_strips_whitespace(self):
+        assert parse_propcode("  0xD053  ") == 0xD053
+
+    def test_zero(self):
+        assert parse_propcode("0x0") == 0
+
+    def test_max_u16(self):
+        assert parse_propcode("0xFFFF") == 0xFFFF
+
+    def test_invalid_hex_raises(self):
+        with pytest.raises(ValueError):
+            parse_propcode("0xZZZZ")
+
+    def test_invalid_decimal_raises(self):
+        with pytest.raises(ValueError):
+            parse_propcode("not-a-number")
+
+    def test_out_of_range_raises(self):
+        with pytest.raises(ValueError):
+            parse_propcode("0x10000")
+
+    def test_negative_raises(self):
+        with pytest.raises(ValueError):
+            parse_propcode("-1")
 
 
 # decode_packed_strings and its tests were removed: the function was never

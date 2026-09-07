@@ -624,6 +624,18 @@ pub fn write_ftp_profile(serial: Option<&str>, profile: &FtpProfile) -> Result<(
     session.write_ftp_profile(profile)
 }
 
+/// Parse a vendor property code as `"0xD053"`/`"0XD053"` (hex) or a plain
+/// decimal string. Shared by the CLI and both GUIs so the accepted input
+/// format can't drift between them.
+pub fn parse_propcode(s: &str) -> Result<u16, String> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).map_err(|e| format!("invalid hex property code {s:?}: {e}"))
+    } else {
+        s.parse::<u16>().map_err(|e| format!("invalid property code {s:?}: {e}"))
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────
@@ -856,6 +868,43 @@ mod tests {
                 .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
                 .collect()
         }
+    }
+
+    // ── parse_propcode ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_propcode_lowercase_hex() {
+        assert_eq!(parse_propcode("0xd053"), Ok(0xD053));
+    }
+
+    #[test]
+    fn parse_propcode_uppercase_hex() {
+        assert_eq!(parse_propcode("0XD053"), Ok(0xD053));
+    }
+
+    #[test]
+    fn parse_propcode_decimal() {
+        assert_eq!(parse_propcode("53331"), Ok(53331));
+    }
+
+    #[test]
+    fn parse_propcode_trims_whitespace() {
+        assert_eq!(parse_propcode("  0xD053  "), Ok(0xD053));
+    }
+
+    #[test]
+    fn parse_propcode_invalid_hex_errors() {
+        assert!(parse_propcode("0xZZZZ").is_err());
+    }
+
+    #[test]
+    fn parse_propcode_invalid_decimal_errors() {
+        assert!(parse_propcode("not-a-number").is_err());
+    }
+
+    #[test]
+    fn parse_propcode_out_of_range_errors() {
+        assert!(parse_propcode("0x10000").is_err());
     }
 
     // ── PtpResponseCode ──────────────────────────────────────────────────

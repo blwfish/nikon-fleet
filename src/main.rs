@@ -249,22 +249,12 @@ struct FirmwareCheckArgs {
 struct VendorReadArgs {
     /// Property code, e.g. "0xD053" or "53331". Does not need the 0x10000
     /// vendor-read flag bit — that's added internally.
-    #[arg(value_parser = parse_propcode)]
+    #[arg(value_parser = nikon_fleet::ptp_usb::parse_propcode)]
     propcode: u16,
     /// Camera serial to target. Required when more than one Nikon camera is
     /// on USB; this command does not use --sdk-bundle/the MAID SDK at all.
     #[arg(long)]
     serial: Option<String>,
-}
-
-/// Accepts "0xD053"/"0XD053" (hex) or a plain decimal string.
-fn parse_propcode(s: &str) -> Result<u16, String> {
-    let s = s.trim();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u16::from_str_radix(hex, 16).map_err(|e| format!("invalid hex property code {s:?}: {e}"))
-    } else {
-        s.parse::<u16>().map_err(|e| format!("invalid property code {s:?}: {e}"))
-    }
 }
 
 #[derive(Args, Debug)]

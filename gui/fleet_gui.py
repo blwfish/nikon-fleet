@@ -10,7 +10,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -102,6 +102,8 @@ class FleetApp:
         self._label_entry = tk.Entry(bar, textvariable=self._label, width=18)
         self._label_entry.pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="Take Snapshot",    command=self.take_snapshot).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=4)
+        ttk.Button(bar, text="🔧  Vendor Ops",   command=self.vendor_ops).pack(side=tk.LEFT)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=4)
         ttk.Button(bar, text="⚙  Preferences",  command=self.show_prefs).pack(side=tk.LEFT)
         self._status_var = tk.StringVar()
@@ -206,6 +208,23 @@ class FleetApp:
             messagebox.showerror("Discover failed", str(e), parent=self.root)
         finally:
             self.root.config(cursor="")
+
+    # ── Vendor ops ──────────────────────────────────────────────────────
+    #
+    # Raw USB PTP vendor operations reverse-engineered from an NX Field WiFi
+    # capture (see docs/nx-field-session-2026-07-09.md) — bypass the MAID
+    # SDK entirely via `fleet vendor-read`/`fleet vendor-write-ftp`. Unlike
+    # the rest of this GUI, these don't need a prior Discover: the CLI talks
+    # straight to the USB device and only needs --serial when more than one
+    # Nikon camera is attached.
+
+    def _selected_serial(self) -> str | None:
+        if self.selected is None:
+            return None
+        return self.cameras[self.selected]["serial"]
+
+    def vendor_ops(self) -> None:
+        VendorOpsWindow(self.root, self)
 
     # ── Snapshots ───────────────────────────────────────────────────────
 
@@ -643,6 +662,166 @@ class SnapshotDetailWindow:
         filtered = [r for r in self._all_rows
                     if q in r[0].lower() or q in r[1].lower()]
         self._populate(filtered)
+
+
+# ── Vendor ops window ───────────────────────────────────────────────────────
+
+def _make_output_box(parent: tk.Widget, height: int = 3) -> tk.Text:
+    """A small read-only, word-wrapped box for command output/errors —
+    plain output can run to a few hundred characters (e.g. a dry-run's
+    encoded hex blob), too long for a Label to lay out well."""
+    box = tk.Text(parent, height=height, width=56, wrap=tk.WORD, state=tk.DISABLED,
+                  background="#f5f5f5", relief=tk.SUNKEN, borderwidth=1, font=("Menlo", 10))
+    return box
+
+
+def _set_output(box: tk.Text, text: str) -> None:
+    box.configure(state=tk.NORMAL)
+    box.delete("1.0", tk.END)
+    box.insert("1.0", text)
+    box.configure(state=tk.DISABLED)
+
+
+class VendorOpsWindow:
+    """Raw USB PTP vendor operations — reverse-engineered from an NX Field
+    WiFi capture, bypassing the MAID SDK entirely. See
+    docs/nx-field-session-2026-07-09.md for what these are and how they
+    were found.
+    """
+
+    def __init__(self, parent: tk.Tk, app: "FleetApp") -> None:
+        self.app = app
+        w = tk.Toplevel(parent)
+        w.title("Vendor Ops (raw USB PTP)")
+        w.resizable(False, False)
+        w.grab_set()
+        self._window = w
+
+        serial = app._selected_serial()
+        target = f"Target: {serial}" if serial else "Target: (auto-detected — only one Nikon camera on USB)"
+        ttk.Label(w, text=target, foreground="gray", padding=(8, 8, 8, 0)).pack(anchor=tk.W)
+
+        # ── Read ────────────────────────────────────────────────────────
+        read_f = ttk.LabelFrame(w, text="Read Vendor Property (0x943B)", padding=8)
+        read_f.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Label(read_f, text="Property code:").grid(row=0, column=0, sticky=tk.W)
+        self._code_var = tk.StringVar(value="0xD053")
+        ttk.Entry(read_f, textvariable=self._code_var, width=12).grid(row=0, column=1, padx=4, sticky=tk.W)
+        ttk.Button(read_f, text="Read", command=self._do_read).grid(row=0, column=2, padx=4)
+        self._read_box = _make_output_box(read_f, height=2)
+        self._read_box.grid(row=1, column=0, columnspan=3, sticky=tk.EW, pady=(6, 0))
+
+        # ── Write FTP profile ───────────────────────────────────────────
+        write_f = ttk.LabelFrame(w, text="Write FTP Profile (0x90EE)", padding=8)
+        write_f.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        self._fields: dict[str, tk.StringVar] = {}
+        field_specs = [
+            ("profile_name", "Profile name:", "", None),
+            ("ssid_24ghz",   "SSID (2.4GHz):", "", None),
+            ("ssid_5ghz",    "SSID (5GHz):", "", None),
+            ("host",         "FTP host:", "", None),
+            ("port",         "Port:", "21", None),
+            ("username",     "Username:", "", None),
+            ("password",     "Password:", "", "*"),
+        ]
+        for row, (key, label, default, show) in enumerate(field_specs):
+            ttk.Label(write_f, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
+            var = tk.StringVar(value=default)
+            self._fields[key] = var
+            entry_kwargs = {"show": show} if show else {}
+            ttk.Entry(write_f, textvariable=var, width=30, **entry_kwargs).grid(
+                row=row, column=1, sticky=tk.W, padx=4, pady=2)
+
+        btn_row = len(field_specs)
+        bf = ttk.Frame(write_f)
+        bf.grid(row=btn_row, column=0, columnspan=2, pady=(8, 0), sticky=tk.W)
+        ttk.Button(bf, text="Preview (dry run)", command=lambda: self._do_write(dry_run=True)).pack(
+            side=tk.LEFT, padx=(0, 4))
+        ttk.Button(bf, text="Write to Camera…", command=lambda: self._do_write(dry_run=False)).pack(side=tk.LEFT)
+
+        self._write_box = _make_output_box(write_f, height=4)
+        self._write_box.grid(row=btn_row + 1, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+
+    def _do_read(self) -> None:
+        try:
+            code = parse_propcode(self._code_var.get())
+        except ValueError as e:
+            _set_output(self._read_box, f"Invalid property code: {e}")
+            return
+        args = ["vendor-read", f"0x{code:04x}"]
+        serial = self.app._selected_serial()
+        if serial:
+            args += ["--serial", serial]
+        try:
+            out = self.app._run(*args)
+            _set_output(self._read_box, out.strip())
+        except RuntimeError as e:
+            _set_output(self._read_box, f"Error: {e}")
+
+    def _read_write_fields(self) -> dict[str, str] | None:
+        """Collect and validate the FTP-profile form fields. Returns None
+        (with an error already shown in the output box) if invalid."""
+        try:
+            port = int(self._fields["port"].get().strip())
+            if not (0 <= port <= 0xFFFF):
+                raise ValueError("out of range 0-65535")
+        except ValueError as e:
+            _set_output(self._write_box, f"Invalid port: {e}")
+            return None
+
+        values = {
+            "profile_name": self._fields["profile_name"].get().strip(),
+            "ssid_24ghz": self._fields["ssid_24ghz"].get().strip(),
+            "ssid_5ghz": self._fields["ssid_5ghz"].get().strip(),
+            "host": self._fields["host"].get().strip(),
+            "port": str(port),
+            "username": self._fields["username"].get().strip(),
+            "password": self._fields["password"].get(),  # not stripped — a leading/trailing space could be intentional
+        }
+        missing = [k for k, v in values.items() if not v]
+        if missing:
+            _set_output(self._write_box, f"Missing required field(s): {', '.join(missing)}")
+            return None
+        return values
+
+    def _do_write(self, dry_run: bool) -> None:
+        values = self._read_write_fields()
+        if values is None:
+            return
+
+        if not dry_run and not messagebox.askyesno(
+            "Write FTP Profile",
+            "This overwrites the FTP profile stored on the camera:\n\n"
+            f"  Name: {values['profile_name']}\n"
+            f"  Host: {values['host']}:{values['port']}\n"
+            f"  User: {values['username']}\n\n"
+            "Continue?",
+            parent=self._window,
+        ):
+            return
+
+        args = [
+            "vendor-write-ftp",
+            "--profile-name", values["profile_name"],
+            "--ssid-24ghz", values["ssid_24ghz"],
+            "--ssid-5ghz", values["ssid_5ghz"],
+            "--host", values["host"],
+            "--port", values["port"],
+            "--username", values["username"],
+            "--password", values["password"],
+        ]
+        serial = self.app._selected_serial()
+        if serial:
+            args += ["--serial", serial]
+        if dry_run:
+            args.append("--dry-run")
+
+        try:
+            out = self.app._run(*args)
+            _set_output(self._write_box, out.strip())
+        except RuntimeError as e:
+            _set_output(self._write_box, f"Error: {e}")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────

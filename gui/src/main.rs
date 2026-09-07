@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use eframe::egui;
 use nikon_fleet::firmware::model_slug;
 use nikon_fleet::maid_layer::MaidLayerConfig;
+use nikon_fleet::ptp_usb::{self, FtpProfile};
 use nikon_fleet::sdk::{DeviceInfo, Sdk, OP_GET, UsbCameraInfo, pair_devices, usb_camera_list};
 use nikon_fleet::snapshot::{Camera, Snapshot, SnapshotSummary, Transport};
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,8 @@ enum Cmd {
     SetDataDir(PathBuf),
     Export { dest: PathBuf },
     Import { src: PathBuf },
+    VendorRead { propcode: u16, serial: Option<String> },
+    VendorWriteFtp { profile: FtpProfile, serial: Option<String>, dry_run: bool },
 }
 
 enum Evt {
@@ -100,6 +103,8 @@ enum Evt {
     ReferenceDone,
     ExportDone { dest: PathBuf, count: usize },
     ImportDone { snapshots: usize, references: usize, firmware: usize },
+    VendorReadDone(String),
+    VendorWriteFtpDone(String),
     Err(String),
 }
 
@@ -133,6 +138,19 @@ struct FleetApp {
     settings: Settings,
     prefs_open: bool,
     prefs_data_dir: String,
+    // Vendor ops (raw USB PTP — see docs/nx-field-session-2026-07-09.md)
+    vendor_ops_open: bool,
+    vendor_propcode: String,
+    vendor_read_result: String,
+    vendor_ftp_profile_name: String,
+    vendor_ftp_ssid_24ghz: String,
+    vendor_ftp_ssid_5ghz: String,
+    vendor_ftp_host: String,
+    vendor_ftp_port: String,
+    vendor_ftp_username: String,
+    vendor_ftp_password: String,
+    vendor_ftp_confirm_pending: bool,
+    vendor_write_result: String,
 }
 
 impl FleetApp {
@@ -158,7 +176,26 @@ impl FleetApp {
             settings,
             prefs_open: false,
             prefs_data_dir,
+            vendor_ops_open: false,
+            vendor_propcode: "0xD053".to_string(),
+            vendor_read_result: String::new(),
+            vendor_ftp_profile_name: String::new(),
+            vendor_ftp_ssid_24ghz: String::new(),
+            vendor_ftp_ssid_5ghz: String::new(),
+            vendor_ftp_host: String::new(),
+            vendor_ftp_port: "21".to_string(),
+            vendor_ftp_username: String::new(),
+            vendor_ftp_password: String::new(),
+            vendor_ftp_confirm_pending: false,
+            vendor_write_result: String::new(),
         }
+    }
+
+    /// Serial of the currently selected camera, if any. Vendor ops target
+    /// this the same way Snapshot does, but don't require it — the CLI/
+    /// library auto-selects when exactly one Nikon camera is on USB.
+    fn selected_serial(&self) -> Option<String> {
+        self.selected.map(|i| self.cameras[i].serial.clone())
     }
 
     fn send(&mut self, cmd: Cmd) {
@@ -206,6 +243,12 @@ impl FleetApp {
                     );
                     self.refresh_selected_snapshots();
                 }
+                Evt::VendorReadDone(text) => {
+                    self.vendor_read_result = text;
+                }
+                Evt::VendorWriteFtpDone(text) => {
+                    self.vendor_write_result = text;
+                }
                 Evt::Err(msg) => {
                     self.status = format!("Error: {msg}");
                 }
@@ -231,6 +274,9 @@ impl eframe::App for FleetApp {
                 });
                 if ui.button("⚙ Preferences").clicked() {
                     self.prefs_open = !self.prefs_open;
+                }
+                if ui.button("🔧 Vendor Ops").clicked() {
+                    self.vendor_ops_open = !self.vendor_ops_open;
                 }
                 ui.separator();
                 if self.busy {
@@ -347,6 +393,166 @@ impl eframe::App for FleetApp {
                 .pick_file()
             {
                 self.send(Cmd::Import { src });
+            }
+        }
+
+        // ── Vendor Ops window ────────────────────────────────────────────
+        // Raw USB PTP vendor operations reverse-engineered from an NX Field
+        // WiFi capture (docs/nx-field-session-2026-07-09.md) — bypass the
+        // MAID SDK entirely via nikon_fleet::ptp_usb. Unlike the rest of
+        // this GUI these don't need a prior Discover: the library talks
+        // straight to the USB device and only needs a serial when more than
+        // one Nikon camera is attached.
+        let mut vendor_ops_open = self.vendor_ops_open;
+        let mut vendor_read_trigger = false;
+        let mut vendor_write_trigger: Option<bool> = None; // Some(dry_run)
+
+        egui::Window::new("Vendor Ops (raw USB PTP)")
+            .open(&mut vendor_ops_open)
+            .resizable(false)
+            .collapsible(false)
+            .min_width(420.0)
+            .show(ctx, |ui| {
+                let target = self
+                    .selected_serial()
+                    .map(|s| format!("Target: {s}"))
+                    .unwrap_or_else(|| {
+                        "Target: (auto-detected — only one Nikon camera on USB)".to_string()
+                    });
+                ui.label(egui::RichText::new(target).small().weak());
+                ui.add_space(6.0);
+
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Read Vendor Property (0x943B)").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Property code:");
+                        ui.add(egui::TextEdit::singleline(&mut self.vendor_propcode).desired_width(100.0));
+                        ui.add_enabled_ui(!self.busy, |ui| {
+                            if ui.button("Read").clicked() {
+                                vendor_read_trigger = true;
+                            }
+                        });
+                    });
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.vendor_read_result)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .interactive(false)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                });
+
+                ui.add_space(8.0);
+
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Write FTP Profile (0x90EE)").strong());
+                    egui::Grid::new("vendor_ftp_grid").num_columns(2).spacing([6.0, 4.0]).show(ui, |ui| {
+                        ui.label("Profile name:");
+                        ui.text_edit_singleline(&mut self.vendor_ftp_profile_name);
+                        ui.end_row();
+                        ui.label("SSID (2.4GHz):");
+                        ui.text_edit_singleline(&mut self.vendor_ftp_ssid_24ghz);
+                        ui.end_row();
+                        ui.label("SSID (5GHz):");
+                        ui.text_edit_singleline(&mut self.vendor_ftp_ssid_5ghz);
+                        ui.end_row();
+                        ui.label("FTP host:");
+                        ui.text_edit_singleline(&mut self.vendor_ftp_host);
+                        ui.end_row();
+                        ui.label("Port:");
+                        ui.text_edit_singleline(&mut self.vendor_ftp_port);
+                        ui.end_row();
+                        ui.label("Username:");
+                        ui.text_edit_singleline(&mut self.vendor_ftp_username);
+                        ui.end_row();
+                        ui.label("Password:");
+                        ui.add(egui::TextEdit::singleline(&mut self.vendor_ftp_password).password(true));
+                        ui.end_row();
+                    });
+
+                    ui.add_enabled_ui(!self.busy, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("Preview (dry run)").clicked() {
+                                vendor_write_trigger = Some(true);
+                                self.vendor_ftp_confirm_pending = false;
+                            }
+                            if !self.vendor_ftp_confirm_pending && ui.button("Write to Camera…").clicked() {
+                                self.vendor_ftp_confirm_pending = true;
+                            }
+                        });
+                    });
+
+                    if self.vendor_ftp_confirm_pending {
+                        ui.add_space(4.0);
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 120, 0),
+                            "This overwrites the FTP profile stored on the camera. Continue?",
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("Confirm Write").clicked() {
+                                vendor_write_trigger = Some(false);
+                                self.vendor_ftp_confirm_pending = false;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.vendor_ftp_confirm_pending = false;
+                            }
+                        });
+                    }
+
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.vendor_write_result)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .interactive(false)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                });
+            });
+        self.vendor_ops_open = vendor_ops_open;
+
+        if vendor_read_trigger {
+            match ptp_usb::parse_propcode(&self.vendor_propcode) {
+                Ok(propcode) => {
+                    let serial = self.selected_serial();
+                    self.send(Cmd::VendorRead { propcode, serial });
+                }
+                Err(e) => self.vendor_read_result = format!("Invalid property code: {e}"),
+            }
+        }
+
+        if let Some(dry_run) = vendor_write_trigger {
+            let missing: Vec<&str> = [
+                ("profile name", self.vendor_ftp_profile_name.trim().is_empty()),
+                ("SSID (2.4GHz)", self.vendor_ftp_ssid_24ghz.trim().is_empty()),
+                ("SSID (5GHz)", self.vendor_ftp_ssid_5ghz.trim().is_empty()),
+                ("host", self.vendor_ftp_host.trim().is_empty()),
+                ("username", self.vendor_ftp_username.trim().is_empty()),
+                ("password", self.vendor_ftp_password.is_empty()),
+            ]
+            .into_iter()
+            .filter(|(_, empty)| *empty)
+            .map(|(name, _)| name)
+            .collect();
+
+            if !missing.is_empty() {
+                self.vendor_write_result = format!("Missing required field(s): {}", missing.join(", "));
+            } else {
+                match self.vendor_ftp_port.trim().parse::<u16>() {
+                    Ok(port) => {
+                        let profile = FtpProfile {
+                            profile_name: self.vendor_ftp_profile_name.clone(),
+                            ssid_24ghz: self.vendor_ftp_ssid_24ghz.clone(),
+                            ssid_5ghz: self.vendor_ftp_ssid_5ghz.clone(),
+                            host: self.vendor_ftp_host.clone(),
+                            port,
+                            username: self.vendor_ftp_username.clone(),
+                            password: self.vendor_ftp_password.clone(),
+                        };
+                        let serial = self.selected_serial();
+                        self.send(Cmd::VendorWriteFtp { profile, serial, dry_run });
+                    }
+                    Err(e) => self.vendor_write_result = format!("Invalid port: {e}"),
+                }
             }
         }
 
@@ -478,6 +684,10 @@ fn worker(
             Cmd::SetReference { filename } => Some(set_reference(&data_dir, &filename)),
             Cmd::Export { dest } => Some(do_export(&data_dir, &dest)),
             Cmd::Import { src } => Some(do_import(&data_dir, &src)),
+            Cmd::VendorRead { propcode, serial } => Some(do_vendor_read(propcode, serial.as_deref())),
+            Cmd::VendorWriteFtp { profile, serial, dry_run } => {
+                Some(do_vendor_write_ftp(&profile, serial.as_deref(), dry_run))
+            }
         };
         if let Some(result) = opt_evt {
             let _ = tx.send(result.unwrap_or_else(Evt::Err));
@@ -601,6 +811,40 @@ fn do_snapshot(schema: &MaidLayerConfig, data_dir: &Path, serial: &str, label: &
     snap.save_to_file(&dir.join(&filename))
         .map_err(|e| e.to_string())?;
     Ok(Evt::SnapshotDone(filename))
+}
+
+fn hex_bytes(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+/// Read a vendor property via `0x943B`, bypassing the MAID SDK entirely —
+/// no Discover/connect needed first, unlike every other worker function
+/// here. See `nikon_fleet::ptp_usb`.
+fn do_vendor_read(propcode: u16, serial: Option<&str>) -> Result<Evt, String> {
+    let data = ptp_usb::read_vendor_property(serial, propcode).map_err(|e| e.to_string())?;
+    Ok(Evt::VendorReadDone(format!(
+        "0x{propcode:04x}: {} byte(s): {}",
+        data.len(),
+        hex_bytes(&data)
+    )))
+}
+
+/// Write (or preview) an FTP profile via `0x90EE`. Same no-Discover-needed
+/// property as `do_vendor_read`.
+fn do_vendor_write_ftp(profile: &FtpProfile, serial: Option<&str>, dry_run: bool) -> Result<Evt, String> {
+    if dry_run {
+        let blob = ptp_usb::encode_ftp_profile(profile).map_err(|e| e.to_string())?;
+        return Ok(Evt::VendorWriteFtpDone(format!(
+            "Would write {} byte(s): {}",
+            blob.len(),
+            hex_bytes(&blob)
+        )));
+    }
+    ptp_usb::write_ftp_profile(serial, profile).map_err(|e| e.to_string())?;
+    Ok(Evt::VendorWriteFtpDone(format!(
+        "Wrote FTP profile {:?} ({}@{}:{})",
+        profile.profile_name, profile.username, profile.host, profile.port
+    )))
 }
 
 fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {

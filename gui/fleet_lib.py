@@ -132,6 +132,26 @@ def fmt_cap_value(v) -> str:
     return str(v)
 
 
+def parse_propcode(s: str) -> int:
+    """Parse a vendor property code like the Rust CLI's parse_propcode:
+    "0xD053"/"0XD053" (hex) or a plain decimal string.
+
+    Raises ValueError if the string isn't a valid integer in either form,
+    or is out of range for a u16 property code.
+    """
+    text = s.strip()
+    hex_part = None
+    if text[:2] in ("0x", "0X"):
+        hex_part = text[2:]
+    if hex_part is not None:
+        value = int(hex_part, 16)
+    else:
+        value = int(text, 10)
+    if not (0 <= value <= 0xFFFF):
+        raise ValueError(f"property code {s!r} out of range for a u16 (0-0xFFFF)")
+    return value
+
+
 def parse_fw_filename(name: str) -> tuple[str, str]:
     """Parse a Nikon firmware filename into (model, version).
 
