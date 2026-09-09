@@ -225,6 +225,29 @@ class TestParsePropcode:
         with pytest.raises(ValueError):
             parse_propcode("-1")
 
+    # Regression tests for two confirmed divergences from the Rust CLI's
+    # own parse_propcode (src/ptp_usb.rs): this module's prior
+    # implementation used Python's int(), which tolerates both forms below
+    # even though u16::from_str_radix/str::parse do not. Pinned here (and
+    # mirrored on the Rust side) so a future edit can't silently reopen
+    # either gap between the two languages' "identical" parsers.
+
+    def test_internal_whitespace_after_hex_prefix_raises(self):
+        with pytest.raises(ValueError):
+            parse_propcode("0x 10")
+
+    def test_underscore_digit_separators_raise(self):
+        with pytest.raises(ValueError):
+            parse_propcode("0xD0_53")
+        with pytest.raises(ValueError):
+            parse_propcode("53_331")
+
+    def test_leading_plus_accepted(self):
+        # Matches Rust: u16::from_str_radix/FromStr both accept a leading
+        # '+', unlike the whitespace/underscore forms above.
+        assert parse_propcode("+53331") == 53331
+        assert parse_propcode("0x+D053") == 0xD053
+
 
 # decode_packed_strings and its tests were removed: the function was never
 # called from fleet_gui.py's runtime path (elem_type=7 values arrive

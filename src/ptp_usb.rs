@@ -75,6 +75,27 @@ const OP_FTP_PROFILE_WRITE: u16 = 0x90EE;
 const RESP_OK: u16 = 0x2001;
 const RESP_SESSION_ALREADY_OPEN: u16 = 0x201E;
 
+/// What an OpenSession response code means for `open_ptp_session`'s retry
+/// decision — pulled out as its own pure classification so it's unit
+/// testable independent of the real USB round trip. See
+/// `PtpUsbSession::open_ptp_session`'s doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenSessionResponse {
+    Ok,
+    RetryOnce,
+    Failed,
+}
+
+fn classify_open_session_response(code: u16) -> OpenSessionResponse {
+    if code == RESP_OK {
+        OpenSessionResponse::Ok
+    } else if code == RESP_SESSION_ALREADY_OPEN {
+        OpenSessionResponse::RetryOnce
+    } else {
+        OpenSessionResponse::Failed
+    }
+}
+
 /// Camera models these reverse-engineered wire formats have been confirmed
 /// against (see the module doc for the reverse-engineering history). Model
 /// strings match `firmware::model_from_usb_product`'s output exactly (e.g.
@@ -183,40 +204,97 @@ fn kill_macos_ptp_claimants() {}
 // Device discovery + interface claiming
 // ─────────────────────────────────────────────────────────────────────────
 
-fn candidate_devices() -> Vec<(rusb::Device<GlobalContext>, String, String)> {
-    nikon_usb_devices()
-        .into_iter()
-        .filter_map(|device| {
-            let desc = device.device_descriptor().ok()?;
-            let handle = device.open().ok()?;
-            let serial = read_usb_string(&handle, desc.serial_number_string_index().unwrap_or(0));
-            let product = read_usb_string(&handle, desc.product_string_index().unwrap_or(0));
-            let model = model_from_product_string(&product);
-            Some((device, serial, model))
-        })
-        .collect()
+/// The identifier `find_device` matches `--serial` against for one
+/// candidate: the real USB `iSerialNumber` string if the descriptor had one,
+/// else a fallback derived purely from USB topology (bus/address) so a
+/// camera with no readable serial string is still individually addressable
+/// instead of colliding with every other serial-less camera on `""`.
+///
+/// This is deliberately NOT the same fallback format as `main.rs`'s
+/// `snapshot_serial`'s `"id-{sdk_id}"` (used by `fleet discover`/`snapshot`
+/// output) — this module has no MAID SDK dependency at all (see the module
+/// doc), so it has no access to the SDK's device ids to reproduce that
+/// scheme. A `--serial id-5` copied from `fleet discover` output will not
+/// match here; use `--serial usb-<bus>:<addr>` (printed by this crate's own
+/// discovery, when a device has no real serial) or the real serial instead.
+fn candidate_serial(device: &rusb::Device<GlobalContext>, real_serial: &str) -> String {
+    if !real_serial.is_empty() {
+        return real_serial.to_string();
+    }
+    fallback_serial(device.bus_number(), device.address())
+}
+
+/// The `"usb-<bus>:<addr>"` fallback format itself, split out from
+/// [`candidate_serial`] so it's testable without needing a real
+/// `rusb::Device` (which nothing in this crate can construct outside live
+/// hardware) — the device-touching half of `candidate_serial` is a single
+/// pass-through call into this, not a second copy of the format string.
+fn fallback_serial(bus: u8, address: u8) -> String {
+    format!("usb-{bus}:{address}")
+}
+
+/// Returns `(candidates, skipped_count)` — `skipped_count` is how many
+/// Nikon USB devices were seen but couldn't be opened (e.g. macOS's
+/// `ptpcamerad` still holding the interface) and so couldn't be identified;
+/// they're silently absent from `candidates` otherwise, which previously
+/// gave no signal that a real second camera was skipped rather than absent.
+fn candidate_devices() -> (Vec<(rusb::Device<GlobalContext>, String, String)>, usize) {
+    let mut candidates = Vec::new();
+    let mut skipped = 0usize;
+    for device in nikon_usb_devices() {
+        let Ok(desc) = device.device_descriptor() else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(handle) = device.open() else {
+            skipped += 1;
+            continue;
+        };
+        let real_serial = read_usb_string(&handle, desc.serial_number_string_index().unwrap_or(0));
+        let serial = candidate_serial(&device, &real_serial);
+        let product = read_usb_string(&handle, desc.product_string_index().unwrap_or(0));
+        let model = model_from_product_string(&product);
+        candidates.push((device, serial, model));
+    }
+    (candidates, skipped)
+}
+
+/// Pick one item from a `(serial, item)` candidate list, by serial (exact
+/// match) or — if none given — the sole candidate. Extracted as a pure,
+/// hardware-independent function so tests exercise this exact selection
+/// logic directly instead of a hand-copied re-implementation that could
+/// silently drift from what `find_device` actually runs (confirmed to have
+/// already happened once: `find_device`'s real serial-matching didn't
+/// recognize a fallback-serial form the test suite's old parallel `select()`
+/// helper wasn't exercising either, so the mismatch went uncaught).
+fn select_candidate<T>(candidates: Vec<(String, T)>, serial: Option<&str>) -> Result<T, PtpUsbError> {
+    match serial {
+        Some(s) => candidates
+            .into_iter()
+            .find(|(ser, _)| ser == s)
+            .map(|(_, item)| item)
+            .ok_or_else(|| PtpUsbError::SerialNotFound(s.to_string())),
+        None => match candidates.len() {
+            0 => Err(PtpUsbError::NoDevice),
+            1 => Ok(candidates.into_iter().next().unwrap().1),
+            n => Err(PtpUsbError::AmbiguousDevice(n)),
+        },
+    }
 }
 
 /// Resolves a device by serial (or the sole candidate), returning it
 /// together with its model string so callers can gate on confirmed-safe
 /// models before sending reverse-engineered wire formats.
 fn find_device(serial: Option<&str>) -> Result<(rusb::Device<GlobalContext>, String), PtpUsbError> {
-    let candidates = candidate_devices();
-    match serial {
-        Some(s) => candidates
-            .into_iter()
-            .find(|(_, ser, _)| ser == s)
-            .map(|(d, _, model)| (d, model))
-            .ok_or_else(|| PtpUsbError::SerialNotFound(s.to_string())),
-        None => match candidates.len() {
-            0 => Err(PtpUsbError::NoDevice),
-            1 => {
-                let (d, _, model) = candidates.into_iter().next().unwrap();
-                Ok((d, model))
-            }
-            n => Err(PtpUsbError::AmbiguousDevice(n)),
-        },
+    let (candidates, skipped) = candidate_devices();
+    if skipped > 0 {
+        eprintln!(
+            "warning: {skipped} Nikon USB device(s) were seen but could not be opened/identified \
+             (commonly macOS's ptpcamerad/icdd still holding the interface) — not counted as candidates"
+        );
     }
+    let items = candidates.into_iter().map(|(d, ser, model)| (ser, (d, model))).collect();
+    select_candidate(items, serial)
 }
 
 /// The PTP (Still Image class) interface number and its bulk IN/OUT endpoint
@@ -411,7 +489,7 @@ const FTP_HOST_MAX_UNITS: usize = 200; // 1-byte length field caps this at 255 u
 
 /// Fields for an `0x90EE` FTP profile write. All required; see the module
 /// docs for which structural bytes are opaque-but-fixed instead.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FtpProfile {
     /// Human-readable profile name shown in camera menus, e.g. `"CLAUDE"`.
     pub profile_name: String,
@@ -422,6 +500,18 @@ pub struct FtpProfile {
     pub port: u16,
     pub username: String,
     pub password: String,
+}
+
+impl FtpProfile {
+    /// A copy of this profile with the password replaced by same-length
+    /// asterisks — for previewing the encoded blob (dry-run output) without
+    /// the plaintext password becoming readable in the hex dump, which
+    /// would defeat the password-masking on any UI field the value came
+    /// from. Same length as the real password so the previewed blob's size
+    /// and byte layout still match what an actual write would send.
+    pub fn with_password_redacted(&self) -> Self {
+        FtpProfile { password: "*".repeat(self.password.chars().count()), ..self.clone() }
+    }
 }
 
 fn ascii_bytes(field: &'static str, s: &str, max: usize) -> Result<Vec<u8>, PtpUsbError> {
@@ -612,20 +702,39 @@ impl PtpUsbSession {
         }
     }
 
+    /// Live-hardware-only from here down: `transact`/`open_ptp_session` and
+    /// everything built on them need a real USB device (`self.handle`) to
+    /// exercise at all, and this crate deliberately has no mock/fake
+    /// transport layer (see the repo's testing conventions — no mocking
+    /// anywhere in this codebase's Rust tests). The one piece of decision
+    /// logic that doesn't need real I/O — classifying an OpenSession
+    /// response — is pulled out into [`classify_open_session_response`]
+    /// below specifically so it has its own unit tests; the surrounding
+    /// retry *sequencing* (send, read, close, resend) is exercised only by
+    /// live hardware, same as `read_container`'s accumulation loop and
+    /// `claim_with_retry`'s race-retry loop.
     fn open_ptp_session(&mut self) -> Result<(), PtpUsbError> {
         let (code, _, _) = self.transact(OP_OPEN_SESSION, &[SESSION_ID], None)?;
-        if code == RESP_SESSION_ALREADY_OPEN {
-            // Leftover session from a prior claimant (typically macOS's own
-            // ptpcamerad, which we just evicted) — close it and retry once.
-            self.transaction_id = 0;
-            let _ = self.transact(OP_CLOSE_SESSION, &[], None);
-            self.transaction_id = 0;
-            let (code, _, _) = self.transact(OP_OPEN_SESSION, &[SESSION_ID], None)?;
-            if code != RESP_OK {
+        match classify_open_session_response(code) {
+            OpenSessionResponse::Ok => {}
+            OpenSessionResponse::RetryOnce => {
+                // Leftover session from a prior claimant (typically macOS's
+                // own ptpcamerad, which we just evicted) — close it and
+                // retry once.
+                self.transaction_id = 0;
+                let _ = self.transact(OP_CLOSE_SESSION, &[], None);
+                self.transaction_id = 0;
+                let (code, _, _) = self.transact(OP_OPEN_SESSION, &[SESSION_ID], None)?;
+                // Deliberately not re-matching classify_open_session_response
+                // here: a second RESP_SESSION_ALREADY_OPEN on the retry
+                // itself is treated as fatal, not looped again.
+                if code != RESP_OK {
+                    return Err(PtpUsbError::OpenSessionFailed(PtpResponseCode(code)));
+                }
+            }
+            OpenSessionResponse::Failed => {
                 return Err(PtpUsbError::OpenSessionFailed(PtpResponseCode(code)));
             }
-        } else if code != RESP_OK {
-            return Err(PtpUsbError::OpenSessionFailed(PtpResponseCode(code)));
         }
         self.session_open = true;
         Ok(())
@@ -992,6 +1101,16 @@ mod tests {
     }
 
     #[test]
+    fn encode_ftp_profile_accepts_password_at_exactly_the_max() {
+        // Kills the `s.len() > max` vs `>= max` mutant on ascii_bytes: only
+        // the above-max rejection was previously tested, not the
+        // exactly-at-max success case.
+        let mut profile = valid_profile();
+        profile.password = "x".repeat(FTP_ASCII_FIELD_MAX);
+        assert!(encode_ftp_profile(&profile).is_ok());
+    }
+
+    #[test]
     fn encode_ftp_profile_port_is_little_endian() {
         let profile = valid_profile();
         let blob = encode_ftp_profile(&profile).unwrap();
@@ -999,6 +1118,44 @@ mod tests {
         let port_tag_pos = blob.windows(2).rposition(|w| w == FTP_TAG_PORT_SECTION).unwrap();
         let port_bytes = &blob[port_tag_pos + 2..port_tag_pos + 4];
         assert_eq!(u16::from_le_bytes(port_bytes.try_into().unwrap()), profile.port);
+    }
+
+    // ── with_password_redacted ──────────────────────────────────────────
+
+    #[test]
+    fn with_password_redacted_hides_password_content() {
+        let profile = valid_profile();
+        let redacted = profile.with_password_redacted();
+        assert_ne!(redacted.password, profile.password);
+        assert!(!redacted.password.contains("pass"));
+    }
+
+    #[test]
+    fn with_password_redacted_preserves_length_and_other_fields() {
+        let profile = valid_profile();
+        let redacted = profile.with_password_redacted();
+        assert_eq!(redacted.password.len(), profile.password.len());
+        assert_eq!(redacted.username, profile.username);
+        assert_eq!(redacted.host, profile.host);
+    }
+
+    #[test]
+    fn with_password_redacted_empty_password_stays_empty() {
+        let mut profile = valid_profile();
+        profile.password = String::new();
+        assert_eq!(profile.with_password_redacted().password, "");
+    }
+
+    #[test]
+    fn encode_ftp_profile_with_redacted_password_has_same_length_as_real() {
+        // The whole point of redacting-then-encoding for a preview: the
+        // previewed blob's size/layout must still match what a real write
+        // would send, or the preview is misleading about more than the
+        // password.
+        let profile = valid_profile();
+        let real_blob = encode_ftp_profile(&profile).unwrap();
+        let redacted_blob = encode_ftp_profile(&profile.with_password_redacted()).unwrap();
+        assert_eq!(real_blob.len(), redacted_blob.len());
     }
 
     fn valid_profile() -> FtpProfile {
@@ -1022,6 +1179,144 @@ mod tests {
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
                 .collect()
+        }
+    }
+
+    // ── decode_ftp_profile_fields (test-only, verification not production) ──
+    //
+    // The encoder's only correctness protection was 2 fixed golden captures
+    // — nothing verified field combinations at OTHER lengths, where an
+    // off-by-one in a length-prefix computation could silently corrupt the
+    // blob without either golden test noticing. This decoder inverts just
+    // the variable-length value fields (skipping the opaque structural
+    // bytes, already covered by the golden-capture tests) using the same
+    // tag constants the encoder does, so `decode(encode(profile)) ==
+    // profile` can be checked across many synthesized lengths, not just the
+    // two captured ones. It shares the encoder's understanding of the wire
+    // format rather than being independently reverse-engineered — so it
+    // catches internal-consistency bugs (a length prefix that doesn't match
+    // what was actually written), not "the whole format model is wrong"
+    // bugs, which only a real capture can catch.
+
+    struct FieldReader<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> FieldReader<'a> {
+        fn new(buf: &'a [u8]) -> Self {
+            FieldReader { buf, pos: 0 }
+        }
+        fn take(&mut self, n: usize) -> &'a [u8] {
+            let s = &self.buf[self.pos..self.pos + n];
+            self.pos += n;
+            s
+        }
+        fn skip(&mut self, n: usize) {
+            self.pos += n;
+        }
+        fn u8(&mut self) -> u8 {
+            self.take(1)[0]
+        }
+        fn u16_le(&mut self) -> u16 {
+            u16::from_le_bytes(self.take(2).try_into().unwrap())
+        }
+        fn u32_le(&mut self) -> u32 {
+            u32::from_le_bytes(self.take(4).try_into().unwrap())
+        }
+        /// `[u32 len][ascii content]` — the SSID/username/password convention.
+        fn ascii_field(&mut self) -> String {
+            let len = self.u32_le() as usize;
+            String::from_utf8(self.take(len).to_vec()).unwrap()
+        }
+        /// `[u8 len incl. null][utf16le content + null]` — profile_name/host.
+        fn utf16_field_1byte_len(&mut self) -> String {
+            let len_incl_null = self.u8() as usize;
+            let content_units = len_incl_null - 1; // exclude the null terminator
+            let bytes = self.take(content_units * 2);
+            let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            self.skip(2); // null terminator
+            String::from_utf16(&units).unwrap()
+        }
+    }
+
+    /// Decode just the fields `FtpProfile` exposes, back out of an encoded
+    /// blob — see the module comment above for what this does and doesn't
+    /// verify.
+    fn decode_ftp_profile_fields(blob: &[u8]) -> FtpProfile {
+        let mut r = FieldReader::new(blob);
+        r.skip(FTP_BLOB_HEADER.len());
+        let profile_name = r.utf16_field_1byte_len();
+        r.skip(FTP_BLOB_MYSTERY_BLOCK.len());
+        r.skip(FTP_TAG_SSID_24GHZ.len());
+        let ssid_24ghz = r.ascii_field();
+        r.skip(FTP_TAG_SSID_5GHZ.len());
+        let ssid_5ghz = r.ascii_field();
+        r.skip(1); // FTP_TAG_HOST
+        let host = r.utf16_field_1byte_len();
+        r.skip(FTP_TAG_USERNAME.len());
+        let username = r.ascii_field();
+        let password = r.ascii_field(); // no tag — immediately follows username
+        r.skip(FTP_TAG_PORT_SECTION.len());
+        let port = r.u16_le();
+        // Trailing IPv6/pad/trailer bytes deliberately not decoded — none of
+        // them are FtpProfile fields, and the golden-capture tests already
+        // cover their fixed content.
+        FtpProfile { profile_name, ssid_24ghz, ssid_5ghz, host, port, username, password }
+    }
+
+    #[test]
+    fn ftp_profile_round_trips_through_encode_decode_at_golden_lengths() {
+        let profile = valid_profile();
+        let blob = encode_ftp_profile(&profile).unwrap();
+        assert_eq!(decode_ftp_profile_fields(&blob), profile.clone());
+    }
+
+    #[test]
+    fn ftp_profile_round_trips_at_varied_field_lengths() {
+        // Exactly what the encoder's golden-capture tests DON'T cover: field
+        // lengths other than the two real captures happened to use. A bug in
+        // a length-prefix computation would corrupt the blob at some lengths
+        // but not others — this sweeps several to catch that class of bug.
+        let cases: &[(&str, &str, &str, &str, u16, &str, &str)] = &[
+            ("A", "s", "s", "1.2.3.4", 1, "u", "p"),
+            ("", "", "", "", 0, "", ""),
+            ("Profile Name With Spaces", "a-longer-ssid-name", "another-5ghz-ssid", "ftp.example.com", 65535, "a-longer-username", "a-longer-password-value"),
+            ("X".repeat(50).leak(), "y".repeat(60).leak(), "z".repeat(30).leak(), "192.168.100.200", 21, "u".repeat(40).leak(), "p".repeat(55).leak()),
+        ];
+        for (profile_name, ssid_24ghz, ssid_5ghz, host, port, username, password) in cases {
+            let profile = FtpProfile {
+                profile_name: profile_name.to_string(),
+                ssid_24ghz: ssid_24ghz.to_string(),
+                ssid_5ghz: ssid_5ghz.to_string(),
+                host: host.to_string(),
+                port: *port,
+                username: username.to_string(),
+                password: password.to_string(),
+            };
+            let blob = encode_ftp_profile(&profile).unwrap();
+            assert_eq!(decode_ftp_profile_fields(&blob), profile, "round-trip mismatch for {profile:?}");
+        }
+    }
+
+    #[test]
+    fn ftp_profile_round_trips_at_every_length_from_zero_to_max() {
+        // Sweep every length for the ASCII max-64 fields specifically —
+        // the boundary this file's own ascii_bytes()'s `>` vs `>=` mutant
+        // (test review finding) makes worth covering exhaustively, not just
+        // spot-checked.
+        for len in 0..=FTP_ASCII_FIELD_MAX {
+            let profile = FtpProfile {
+                profile_name: "N".to_string(),
+                ssid_24ghz: "a".repeat(len),
+                ssid_5ghz: "test".to_string(),
+                host: "1.1.1.1".to_string(),
+                port: 21,
+                username: "u".to_string(),
+                password: "p".to_string(),
+            };
+            let blob = encode_ftp_profile(&profile).unwrap();
+            assert_eq!(decode_ftp_profile_fields(&blob).ssid_24ghz, profile.ssid_24ghz, "mismatch at len={len}");
         }
     }
 
@@ -1062,6 +1357,45 @@ mod tests {
         assert!(parse_propcode("0x10000").is_err());
     }
 
+    // Regression tests for two confirmed cross-language divergences from
+    // gui/fleet_lib.py's independent Python re-implementation (which relied
+    // on Python's int(), tolerant of both forms below) — pinned here on the
+    // Rust side too so a future edit can't silently reopen either gap.
+
+    #[test]
+    fn parse_propcode_rejects_internal_whitespace_after_hex_prefix() {
+        assert!(parse_propcode("0x 10").is_err());
+    }
+
+    #[test]
+    fn parse_propcode_rejects_underscore_digit_separators() {
+        assert!(parse_propcode("0xD0_53").is_err());
+        assert!(parse_propcode("53_331").is_err());
+    }
+
+    #[test]
+    fn parse_propcode_accepts_leading_plus() {
+        assert_eq!(parse_propcode("+53331"), Ok(53331));
+        assert_eq!(parse_propcode("0x+D053"), Ok(0xD053));
+    }
+
+    // ── classify_open_session_response ──────────────────────────────────
+
+    #[test]
+    fn open_session_ok_classified_as_ok() {
+        assert_eq!(classify_open_session_response(RESP_OK), OpenSessionResponse::Ok);
+    }
+
+    #[test]
+    fn open_session_already_open_classified_as_retry_once() {
+        assert_eq!(classify_open_session_response(RESP_SESSION_ALREADY_OPEN), OpenSessionResponse::RetryOnce);
+    }
+
+    #[test]
+    fn open_session_other_code_classified_as_failed() {
+        assert_eq!(classify_open_session_response(0x2002 /* GeneralError */), OpenSessionResponse::Failed);
+    }
+
     // ── model gate ───────────────────────────────────────────────────────
 
     #[test]
@@ -1092,43 +1426,60 @@ mod tests {
         assert_eq!(PtpResponseCode(0x1234).to_string(), "0x1234");
     }
 
-    // ── find_device selection logic ──────────────────────────────────────
-    // (candidate_devices() itself needs real USB hardware; the selection
-    // logic on top of it doesn't, so it's tested directly against a fake
-    // candidate list shape via a thin re-implementation of the match arms.)
+    // ── select_candidate (find_device's actual selection logic) ────────────
+    // (candidate_devices() itself needs real USB hardware; select_candidate
+    // is the pure, hardware-independent part find_device delegates to, so
+    // these tests call the SAME function find_device runs — not a
+    // re-implementation of it that could silently drift.)
 
-    fn select<'a>(candidates: &'a [(u32, &'a str)], serial: Option<&str>) -> Result<u32, &'static str> {
-        match serial {
-            Some(s) => candidates.iter().find(|(_, ser)| *ser == s).map(|(id, _)| *id).ok_or("not found"),
-            None => match candidates.len() {
-                0 => Err("no device"),
-                1 => Ok(candidates[0].0),
-                _ => Err("ambiguous"),
-            },
-        }
+    #[test]
+    fn select_candidate_by_serial_match() {
+        let candidates = vec![("AAA".to_string(), 1), ("BBB".to_string(), 2)];
+        assert!(matches!(select_candidate(candidates, Some("BBB")), Ok(2)));
     }
 
     #[test]
-    fn select_by_serial_match() {
-        let candidates = [(1, "AAA"), (2, "BBB")];
-        assert_eq!(select(&candidates, Some("BBB")), Ok(2));
+    fn select_candidate_by_serial_no_match_errors() {
+        let candidates = vec![("AAA".to_string(), 1)];
+        assert!(matches!(select_candidate(candidates, Some("ZZZ")), Err(PtpUsbError::SerialNotFound(_))));
     }
 
     #[test]
-    fn select_no_serial_single_candidate() {
-        let candidates = [(1, "AAA")];
-        assert_eq!(select(&candidates, None), Ok(1));
+    fn select_candidate_no_serial_single_candidate() {
+        let candidates = vec![("AAA".to_string(), 1)];
+        assert!(matches!(select_candidate(candidates, None), Ok(1)));
     }
 
     #[test]
-    fn select_no_serial_multiple_candidates_is_ambiguous() {
-        let candidates = [(1, "AAA"), (2, "BBB")];
-        assert!(select(&candidates, None).is_err());
+    fn select_candidate_no_serial_multiple_candidates_is_ambiguous() {
+        let candidates = vec![("AAA".to_string(), 1), ("BBB".to_string(), 2)];
+        assert!(matches!(select_candidate(candidates, None), Err(PtpUsbError::AmbiguousDevice(2))));
     }
 
     #[test]
-    fn select_no_candidates_errors() {
-        let candidates: [(u32, &str); 0] = [];
-        assert!(select(&candidates, None).is_err());
+    fn select_candidate_no_candidates_errors() {
+        let candidates: Vec<(String, u32)> = vec![];
+        assert!(matches!(select_candidate(candidates, None), Err(PtpUsbError::NoDevice)));
+    }
+
+    // ── fallback_serial (USB-topology fallback for a serial-less device) ──
+    // (candidate_serial's "prefer non-empty real_serial" branch needs no
+    // test of its own — it's a plain non-empty check with no rusb::Device
+    // access, and select_candidate's tests above already exercise serial
+    // matching against arbitrary string identifiers. This is the one part
+    // of candidate_serial that's real logic and doesn't need a live
+    // rusb::Device, which nothing in this crate can construct outside
+    // hardware — see candidate_devices()'s own doc for that constraint.)
+
+    #[test]
+    fn fallback_serial_format() {
+        assert_eq!(fallback_serial(20, 5), "usb-20:5");
+    }
+
+    #[test]
+    fn fallback_serial_distinguishes_different_addresses_on_same_bus() {
+        // The whole point of this fallback: two serial-less cameras on the
+        // same bus must not collide on one shared identifier.
+        assert_ne!(fallback_serial(20, 3), fallback_serial(20, 4));
     }
 }

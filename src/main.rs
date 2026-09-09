@@ -259,7 +259,11 @@ struct VendorReadArgs {
     #[arg(value_parser = nikon_fleet::ptp_usb::parse_propcode)]
     propcode: u16,
     /// Camera serial to target. Required when more than one Nikon camera is
-    /// on USB; this command does not use --sdk-bundle/the MAID SDK at all.
+    /// on USB; this command does not use --sdk-bundle/the MAID SDK at all,
+    /// so it does NOT understand the "id-N" fallback serial `fleet
+    /// discover`/`snapshot` print for a camera with no readable USB serial —
+    /// use the real serial, or the "usb-<bus>:<addr>" fallback this
+    /// command's own error/warning output uses instead for that case.
     #[arg(long)]
     serial: Option<String>,
 }
@@ -283,7 +287,11 @@ struct VendorWriteFtpArgs {
     #[arg(long)]
     password: String,
     /// Camera serial to target. Required when more than one Nikon camera is
-    /// on USB; this command does not use --sdk-bundle/the MAID SDK at all.
+    /// on USB; this command does not use --sdk-bundle/the MAID SDK at all,
+    /// so it does NOT understand the "id-N" fallback serial `fleet
+    /// discover`/`snapshot` print for a camera with no readable USB serial —
+    /// use the real serial, or the "usb-<bus>:<addr>" fallback this
+    /// command's own error/warning output uses instead for that case.
     #[arg(long)]
     serial: Option<String>,
     /// Print the encoded blob without sending it to the camera.
@@ -851,9 +859,14 @@ fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
     };
 
     if args.dry_run {
-        let blob = nikon_fleet::ptp_usb::encode_ftp_profile(&profile)
+        // Redact the password before encoding for preview: the hex dump
+        // below would otherwise make the plaintext password trivially
+        // readable byte-for-byte, defeating the CLI's own --password
+        // handling and any masked entry field a caller GUI used to collect
+        // it.
+        let blob = nikon_fleet::ptp_usb::encode_ftp_profile(&profile.with_password_redacted())
             .context("encoding FTP profile")?;
-        println!("Would write {} byte(s): {}", blob.len(), hex_bytes(&blob));
+        println!("Would write {} byte(s) (password redacted in this preview): {}", blob.len(), hex_bytes(&blob));
         return Ok(());
     }
 
@@ -1439,6 +1452,8 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, args: &TransplantArgs, no_usb_
     let mut skipped_read_only = 0usize;
     let mut skipped_unsupported_type = 0usize;
     let mut skipped_no_match = 0usize;
+    let mut skipped_type_mismatch = 0usize;
+    let mut skipped_sdk_decode_failure = 0usize;
     let mut skipped_other = 0usize;
     let mut errors = 0usize;
 
@@ -1467,8 +1482,16 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, args: &TransplantArgs, no_usb_
                     eprintln!("  warn: {} [{:#x}]: {reason}", outcome.name, outcome.code);
                     errors += 1;
                 }
+                transplant::SkipReason::EnumTypeMismatch { .. } => {
+                    eprintln!("  warn: {} [{:#x}]: {reason}", outcome.name, outcome.code);
+                    skipped_type_mismatch += 1;
+                }
+                transplant::SkipReason::EnumUndecodedBySdk { .. } => {
+                    eprintln!("  warn: {} [{:#x}]: {reason}", outcome.name, outcome.code);
+                    skipped_sdk_decode_failure += 1;
+                }
                 transplant::SkipReason::UnsupportedValueShape
-                | transplant::SkipReason::TargetReadFailed
+                | transplant::SkipReason::TargetReadFailed(_)
                 | transplant::SkipReason::MalformedSource => {
                     eprintln!("  warn: {} [{:#x}]: {reason}", outcome.name, outcome.code);
                     skipped_other += 1;
@@ -1483,6 +1506,7 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, args: &TransplantArgs, no_usb_
          enum-by-raw-value={written_enum_raw} range-clamped={written_range})\n  \
          skipped(absent)={skipped_absent} skipped(read-only)={skipped_read_only} \
          skipped(unsupported-type)={skipped_unsupported_type} skipped(no-matching-option)={skipped_no_match} \
+         skipped(type-mismatch)={skipped_type_mismatch} skipped(sdk-decode-failure)={skipped_sdk_decode_failure} \
          skipped(other)={skipped_other}  errors={errors}",
         if args.dry_run { "Dry run:" } else { "Transplant complete:" }
     );

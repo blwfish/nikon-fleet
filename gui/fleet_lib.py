@@ -132,20 +132,43 @@ def fmt_cap_value(v) -> str:
     return str(v)
 
 
+_PROPCODE_HEX_DIGITS = set("0123456789abcdefABCDEF")
+_PROPCODE_DEC_DIGITS = set("0123456789")
+
+
+def _propcode_strict_digits(body: str, allowed: set[str]) -> bool:
+    """True if `body` is a non-empty run of ONLY `allowed` characters, with
+    an optional leading '+' -- matching Rust's u16::from_str_radix/FromStr,
+    which accept a leading '+' but reject internal whitespace and '_'
+    digit-group separators. Python's own int() tolerates both of those
+    (confirmed divergence: int(" 5", 16) and int("1_0") both succeed) --
+    this exists so parse_propcode doesn't inherit that extra leniency and
+    silently accept input the Rust CLI's parser would reject.
+    """
+    if body.startswith("+"):
+        body = body[1:]
+    return len(body) > 0 and all(c in allowed for c in body)
+
+
 def parse_propcode(s: str) -> int:
     """Parse a vendor property code like the Rust CLI's parse_propcode:
     "0xD053"/"0XD053" (hex) or a plain decimal string.
 
     Raises ValueError if the string isn't a valid integer in either form,
-    or is out of range for a u16 property code.
+    or is out of range for a u16 property code. Deliberately stricter than
+    Python's own int() -- see _propcode_strict_digits -- since the Rust
+    CLI's parser is the canonical/shared definition this must match exactly,
+    not just "close enough" for the common cases.
     """
     text = s.strip()
-    hex_part = None
     if text[:2] in ("0x", "0X"):
         hex_part = text[2:]
-    if hex_part is not None:
+        if not _propcode_strict_digits(hex_part, _PROPCODE_HEX_DIGITS):
+            raise ValueError(f"invalid hex property code {s!r}")
         value = int(hex_part, 16)
     else:
+        if not _propcode_strict_digits(text, _PROPCODE_DEC_DIGITS):
+            raise ValueError(f"invalid property code {s!r}")
         value = int(text, 10)
     if not (0 <= value <= 0xFFFF):
         raise ValueError(f"property code {s!r} out of range for a u16 (0-0xFFFF)")

@@ -539,13 +539,23 @@ impl eframe::App for FleetApp {
             } else {
                 match self.vendor_ftp_port.trim().parse::<u16>() {
                     Ok(port) => {
+                        // Trim the same fields the emptiness check above
+                        // trims, matching the Python/tkinter GUI's
+                        // fleet_gui.py::_read_write_fields exactly — the
+                        // "missing field" check was previously trimmed but
+                        // the value actually sent was not, so a value with
+                        // incidental whitespace (e.g. pasted) passed
+                        // validation but landed on the camera untrimmed.
+                        // password is deliberately NOT trimmed in either
+                        // GUI — a leading/trailing space could be
+                        // intentional there.
                         let profile = FtpProfile {
-                            profile_name: self.vendor_ftp_profile_name.clone(),
-                            ssid_24ghz: self.vendor_ftp_ssid_24ghz.clone(),
-                            ssid_5ghz: self.vendor_ftp_ssid_5ghz.clone(),
-                            host: self.vendor_ftp_host.clone(),
+                            profile_name: self.vendor_ftp_profile_name.trim().to_string(),
+                            ssid_24ghz: self.vendor_ftp_ssid_24ghz.trim().to_string(),
+                            ssid_5ghz: self.vendor_ftp_ssid_5ghz.trim().to_string(),
+                            host: self.vendor_ftp_host.trim().to_string(),
                             port,
-                            username: self.vendor_ftp_username.clone(),
+                            username: self.vendor_ftp_username.trim().to_string(),
                             password: self.vendor_ftp_password.clone(),
                         };
                         let serial = self.selected_serial();
@@ -820,6 +830,21 @@ fn hex_bytes(data: &[u8]) -> String {
 /// Read a vendor property via `0x943B`, bypassing the MAID SDK entirely —
 /// no Discover/connect needed first, unlike every other worker function
 /// here. See `nikon_fleet::ptp_usb`.
+///
+/// UNVERIFIED CRASH-CLASS RISK, flagged not fixed: this (and
+/// `do_vendor_write_ftp`) run on the GUI's background worker thread and
+/// call into `ptp_usb::PtpUsbSession::open`, which — via `claim_with_retry`
+/// — SIGKILLs `ptpcamerad`/`icdd` and repeatedly calls
+/// `set_active_configuration` to win the PTP-interface claim race. This
+/// codebase already had to fix a real crash with the same *shape*: commit
+/// 48704d5 found that `reset_nikon_usb_cameras()`'s USB disconnect/
+/// reconnect events, fired from a background thread, reached the main
+/// AppKit run loop and invalidated the Metal drawing surface mid-frame,
+/// segfaulting the GUI — the fix was to keep that USB-reset path CLI-only.
+/// Whether `set_active_configuration`/interface-claim churn from this
+/// thread triggers the same class of run-loop event has NOT been verified
+/// live (no camera/display available in this pass to click-test it) — if
+/// you hit a GUI crash while using Vendor Ops, start here.
 fn do_vendor_read(propcode: u16, serial: Option<&str>) -> Result<Evt, String> {
     let data = ptp_usb::read_vendor_property(serial, propcode).map_err(|e| e.to_string())?;
     Ok(Evt::VendorReadDone(format!(
@@ -833,9 +858,12 @@ fn do_vendor_read(propcode: u16, serial: Option<&str>) -> Result<Evt, String> {
 /// property as `do_vendor_read`.
 fn do_vendor_write_ftp(profile: &FtpProfile, serial: Option<&str>, dry_run: bool) -> Result<Evt, String> {
     if dry_run {
-        let blob = ptp_usb::encode_ftp_profile(profile).map_err(|e| e.to_string())?;
+        // Redact the password before encoding for preview — the hex dump
+        // would otherwise make it trivially readable byte-for-byte, right
+        // next to the masked password entry field this value came from.
+        let blob = ptp_usb::encode_ftp_profile(&profile.with_password_redacted()).map_err(|e| e.to_string())?;
         return Ok(Evt::VendorWriteFtpDone(format!(
-            "Would write {} byte(s): {}",
+            "Would write {} byte(s) (password redacted in this preview): {}",
             blob.len(),
             hex_bytes(&blob)
         )));
