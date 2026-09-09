@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -284,8 +285,18 @@ struct VendorWriteFtpArgs {
     port: u16,
     #[arg(long)]
     username: String,
-    #[arg(long)]
-    password: String,
+    /// The FTP password as a plain CLI argument — visible to any other
+    /// local user via `ps`/`/proc/<pid>/cmdline` while this command runs.
+    /// Prefer --password-stdin.
+    #[arg(long, required_unless_present = "password_stdin")]
+    password: Option<String>,
+    /// Read the FTP password from stdin instead of an argument — not
+    /// visible in the process list. `echo -n "$PASSWORD" | fleet
+    /// vendor-write-ftp ... --password-stdin` or an interactive prompt both
+    /// work; reads until EOF and strips a single trailing newline only
+    /// (not other whitespace, which could be a real password character).
+    #[arg(long, conflicts_with = "password")]
+    password_stdin: bool,
     /// Camera serial to target. Required when more than one Nikon camera is
     /// on USB; this command does not use --sdk-bundle/the MAID SDK at all,
     /// so it does NOT understand the "id-N" fallback serial `fleet
@@ -837,17 +848,29 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
 fn cmd_vendor_read(args: &VendorReadArgs) -> Result<()> {
     let data = nikon_fleet::ptp_usb::read_vendor_property(args.serial.as_deref(), args.propcode)
         .with_context(|| format!("reading vendor property 0x{:04x} over USB PTP", args.propcode))?;
-    println!("0x{:04x}: {} byte(s): {}", args.propcode, data.len(), hex_bytes(&data));
+    println!("0x{:04x}: {} byte(s): {}", args.propcode, data.len(), nikon_fleet::ptp_usb::hex_bytes(&data));
     Ok(())
 }
 
-fn hex_bytes(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+/// Strip exactly one trailing `\n` (as `echo`/a shell heredoc would add),
+/// not general trailing whitespace — a password could legitimately end in
+/// a space or tab, and this must not silently eat that.
+fn strip_single_trailing_newline(s: String) -> String {
+    s.strip_suffix('\n').map(str::to_string).unwrap_or(s)
 }
 
 /// Write an FTP profile via raw USB PTP (`0x90EE`), bypassing the MAID SDK
 /// entirely. See `nikon_fleet::ptp_usb`.
 fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
+    let password = if args.password_stdin {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf).context("reading password from stdin")?;
+        strip_single_trailing_newline(buf)
+    } else {
+        // clap's required_unless_present guarantees this is Some when
+        // password_stdin is false.
+        args.password.clone().expect("clap guarantees --password is set when --password-stdin is not")
+    };
     let profile = nikon_fleet::ptp_usb::FtpProfile {
         profile_name: args.profile_name.clone(),
         ssid_24ghz: args.ssid_24ghz.clone(),
@@ -855,7 +878,7 @@ fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
         host: args.host.clone(),
         port: args.port,
         username: args.username.clone(),
-        password: args.password.clone(),
+        password,
     };
 
     if args.dry_run {
@@ -866,7 +889,11 @@ fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
         // it.
         let blob = nikon_fleet::ptp_usb::encode_ftp_profile(&profile.with_password_redacted())
             .context("encoding FTP profile")?;
-        println!("Would write {} byte(s) (password redacted in this preview): {}", blob.len(), hex_bytes(&blob));
+        println!(
+            "Would write {} byte(s) (password redacted in this preview): {}",
+            blob.len(),
+            nikon_fleet::ptp_usb::hex_bytes(&blob)
+        );
         return Ok(());
     }
 
@@ -1699,6 +1726,38 @@ mod tests {
     fn transplant_not_ambiguous_single_candidate_total() {
         let enriched = vec![(dev(1), None)];
         assert!(!transplant_target_ambiguous(&enriched, None));
+    }
+
+    // ── strip_single_trailing_newline ───────────────────────────────────
+
+    #[test]
+    fn strip_single_trailing_newline_removes_one() {
+        assert_eq!(strip_single_trailing_newline("hunter2\n".to_string()), "hunter2");
+    }
+
+    #[test]
+    fn strip_single_trailing_newline_removes_only_one_not_all() {
+        // A blank line before EOF is unusual but shouldn't be silently
+        // collapsed away beyond the one newline echo/heredoc would add.
+        assert_eq!(strip_single_trailing_newline("hunter2\n\n".to_string()), "hunter2\n");
+    }
+
+    #[test]
+    fn strip_single_trailing_newline_preserves_trailing_space() {
+        // A password could legitimately end in a space — must not be
+        // treated the same as a trailing newline.
+        assert_eq!(strip_single_trailing_newline("hunter2 \n".to_string()), "hunter2 ");
+    }
+
+    #[test]
+    fn strip_single_trailing_newline_no_newline_present() {
+        // e.g. `printf '%s' "$PW"` with no trailing newline at all.
+        assert_eq!(strip_single_trailing_newline("hunter2".to_string()), "hunter2");
+    }
+
+    #[test]
+    fn strip_single_trailing_newline_empty_string() {
+        assert_eq!(strip_single_trailing_newline(String::new()), "");
     }
 
     #[test]

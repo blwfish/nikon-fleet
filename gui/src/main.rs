@@ -823,10 +823,6 @@ fn do_snapshot(schema: &MaidLayerConfig, data_dir: &Path, serial: &str, label: &
     Ok(Evt::SnapshotDone(filename))
 }
 
-fn hex_bytes(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
-}
-
 /// Read a vendor property via `0x943B`, bypassing the MAID SDK entirely —
 /// no Discover/connect needed first, unlike every other worker function
 /// here. See `nikon_fleet::ptp_usb`.
@@ -850,7 +846,7 @@ fn do_vendor_read(propcode: u16, serial: Option<&str>) -> Result<Evt, String> {
     Ok(Evt::VendorReadDone(format!(
         "0x{propcode:04x}: {} byte(s): {}",
         data.len(),
-        hex_bytes(&data)
+        ptp_usb::hex_bytes(&data)
     )))
 }
 
@@ -865,7 +861,7 @@ fn do_vendor_write_ftp(profile: &FtpProfile, serial: Option<&str>, dry_run: bool
         return Ok(Evt::VendorWriteFtpDone(format!(
             "Would write {} byte(s) (password redacted in this preview): {}",
             blob.len(),
-            hex_bytes(&blob)
+            ptp_usb::hex_bytes(&blob)
         )));
     }
     // No GUI control for force_unconfirmed_model yet — always false, so the

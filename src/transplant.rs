@@ -56,6 +56,27 @@ const PACKED_STRING_ELEM_TYPE: u64 = 7;
 /// `value_index`.
 const KNOWN_ELEM_TYPES: &[u64] = &[0, 1, 2, 3, 7, 8];
 
+/// Cap on how much of an external error message (SDK error text, captured
+/// via `SdkError::to_string()`) is kept in a `SkipReason` — an unusually
+/// verbose or malformed error string shouldn't be able to bloat the
+/// transplant summary/log output without bound.
+const MAX_ERROR_MESSAGE_LEN: usize = 500;
+
+/// Truncate `s` to at most `max` bytes (on a char boundary, never splitting
+/// a UTF-8 sequence), appending a marker with the original length so
+/// truncation is visible rather than silent — never a bare cap with no
+/// signal that anything was cut.
+fn truncate_with_marker(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [truncated, {} bytes total]", &s[..end], s.len())
+}
+
 /// How a property's value was translated for the target camera.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -266,10 +287,25 @@ fn translate_range(source: &Value, target_live: &Value) -> Result<(Value, Strate
     };
     let lower = target_live.get("lower").and_then(Value::as_f64).ok_or_else(shape_mismatch)?;
     let upper = target_live.get("upper").and_then(Value::as_f64).ok_or_else(shape_mismatch)?;
-    let steps = target_live.get("steps").and_then(Value::as_u64).unwrap_or(0);
+    // Same strict treatment as lower/upper above, not a silent
+    // unwrap_or(0): sdk::decode_value's DT_RANGE_PTR branch always
+    // populates all three together on a real live read, so a genuinely
+    // range-shaped target_live missing just `steps` would itself be a
+    // signal something's wrong, not an ordinary "continuous range" case
+    // (which is instead steps PRESENT with value 0 — as_u64() still
+    // returns Some(0) for that, so this doesn't affect the normal
+    // continuous-range path at all).
+    let steps = target_live.get("steps").and_then(Value::as_u64).ok_or_else(shape_mismatch)?;
 
     let (lo, hi) = (lower.min(upper), lower.max(upper));
     let clamped = src_value.clamp(lo, hi);
+    // steps>=2 guards against a divide-by-(steps-1)-that's-zero — but note
+    // steps==1 degenerates to the same value_index=0 either way (the
+    // formula's own `*(steps-1.0)` term already zeroes out at steps==1),
+    // so this guard's exact boundary (>=2 vs >=1) has no observable effect
+    // on output; kept at >=2 because it states the real invariant clearly
+    // ("need at least 2 positions for an index to mean anything") rather
+    // than relying on the formula's incidental degeneracy.
     let value_index = if steps >= 2 && upper != lower {
         (((clamped - lower) / (upper - lower)) * (steps as f64 - 1.0))
             .round()
@@ -350,7 +386,7 @@ fn transplant_one(
 
     let needs_live_read = is_enum_shape(&prop.value) || is_range_shape(&prop.value);
     let live = if needs_live_read {
-        Some(device.read_capability(prop.code).map_err(|e| SkipReason::TargetReadFailed(e.to_string()))?)
+        Some(device.read_capability(prop.code).map_err(|e| SkipReason::TargetReadFailed(truncate_with_marker(e.to_string(), MAX_ERROR_MESSAGE_LEN)))?)
     } else {
         None
     };
@@ -361,7 +397,7 @@ fn transplant_one(
         match device.write_capability(prop.code, cap.kind, &translated) {
             Ok(()) => {}
             Err(SdkError::UnsupportedWrite(_)) => return Err(SkipReason::UnsupportedWriteType),
-            Err(e) => return Err(SkipReason::WriteFailed(e.to_string())),
+            Err(e) => return Err(SkipReason::WriteFailed(truncate_with_marker(e.to_string(), MAX_ERROR_MESSAGE_LEN))),
         }
         if strategy == Strategy::RangeClamped {
             verify_range_write(device, prop.code, &translated)?;
@@ -727,6 +763,47 @@ mod tests {
     }
 
     #[test]
+    fn range_steps_at_zero_is_continuous_index_zero() {
+        let source = range_value(2.0, -5.0, 5.0, 0);
+        let target_live = range_value(0.0, -3.0, 3.0, 0);
+        let (translated, _) = translate_value(&source, Some(&target_live)).unwrap();
+        assert_eq!(translated["value_index"], json!(0));
+    }
+
+    #[test]
+    fn range_steps_at_exactly_one_is_index_zero() {
+        // Threshold-boundary pin for the steps>=2 guard: at exactly one
+        // step there's only one possible position, index 0 — verified to
+        // be the same result the >=2 guard's formula would itself compute
+        // if it ran (multiplying by (steps-1)=(1-1)=0), so this also pins
+        // that the guard's exact boundary doesn't change observable output.
+        let source = range_value(2.0, -5.0, 5.0, 0);
+        let target_live = range_value(0.0, -3.0, 3.0, 1);
+        let (translated, _) = translate_value(&source, Some(&target_live)).unwrap();
+        assert_eq!(translated["value_index"], json!(0));
+    }
+
+    #[test]
+    fn range_steps_at_exactly_two_snaps_between_the_two_positions() {
+        // Threshold-boundary pin just above the guard: 2 steps means
+        // exactly 2 valid positions (0 and 1), unlike steps=1 above.
+        let source = range_value(5.0, -5.0, 5.0, 0); // clamps to upper (3.0)
+        let target_live = range_value(0.0, -3.0, 3.0, 2);
+        let (translated, _) = translate_value(&source, Some(&target_live)).unwrap();
+        assert_eq!(translated["value_index"], json!(1)); // clamped to upper -> last index
+    }
+
+    #[test]
+    fn range_missing_steps_on_target_is_treated_as_shape_mismatch() {
+        // steps ABSENT (not present-with-value-0) on an otherwise
+        // range-shaped target_live — same strict treatment as missing
+        // lower/upper, not silently defaulted to continuous.
+        let source = range_value(1.0, -5.0, 5.0, 0);
+        let target_live = json!({"value": 0.0, "lower": -3.0, "upper": 3.0});
+        assert!(matches!(translate_value(&source, Some(&target_live)), Err(SkipReason::TargetReadFailed(_))));
+    }
+
+    #[test]
     fn range_preserves_target_bounds_not_sources() {
         let source = range_value(1.0, -5.0, 5.0, 0);
         let target_live = range_value(0.0, -3.0, 3.0, 4);
@@ -766,5 +843,36 @@ mod tests {
     fn skip_reason_write_failed_includes_message() {
         let reason = SkipReason::WriteFailed("SDK call `SetCapability` returned error code -1".to_string());
         assert!(reason.to_string().contains("SetCapability"));
+    }
+
+    // ── truncate_with_marker ─────────────────────────────────────────────
+
+    #[test]
+    fn truncate_with_marker_leaves_short_strings_alone() {
+        assert_eq!(truncate_with_marker("short".to_string(), 500), "short");
+    }
+
+    #[test]
+    fn truncate_with_marker_at_exactly_the_limit_is_unchanged() {
+        let s = "x".repeat(500);
+        assert_eq!(truncate_with_marker(s.clone(), 500), s);
+    }
+
+    #[test]
+    fn truncate_with_marker_truncates_and_marks_over_the_limit() {
+        let s = "x".repeat(501);
+        let out = truncate_with_marker(s, 500);
+        assert!(out.starts_with(&"x".repeat(500)));
+        assert!(out.contains("truncated"));
+        assert!(out.contains("501 bytes total"));
+    }
+
+    #[test]
+    fn truncate_with_marker_never_splits_a_utf8_char() {
+        // A multi-byte character sitting right at the cut point must not
+        // panic (byte-slicing mid-character) or produce invalid UTF-8.
+        let s = format!("{}€", "x".repeat(499)); // € is 3 bytes, cut point lands inside it
+        let out = truncate_with_marker(s, 500);
+        assert!(out.starts_with(&"x".repeat(499)));
     }
 }

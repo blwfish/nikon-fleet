@@ -75,6 +75,43 @@ const OP_FTP_PROFILE_WRITE: u16 = 0x90EE;
 const RESP_OK: u16 = 0x2001;
 const RESP_SESSION_ALREADY_OPEN: u16 = 0x201E;
 
+/// One fact this module's iterative reverse-engineering effort (see module
+/// doc) has established about a vendor PTP operation. Previously this
+/// knowledge lived only as prose scattered across per-const doc comments
+/// and `docs/nx-field-session-2026-07-09.md`, with no single place to check
+/// "is op X confirmed over USB" as more ops get added — this table is that
+/// place.
+#[derive(Debug, Clone, Copy)]
+struct VendorOpInfo {
+    code: u16,
+    name: &'static str,
+    /// Confirmed to work over plain USB PTP, not just WiFi/PTP-IP (the
+    /// 2026-09-06 follow-up session — see module doc).
+    usb_confirmed: bool,
+    /// Whether this crate currently exposes a way to call it.
+    wired_up: bool,
+}
+
+const VENDOR_OPS: &[VendorOpInfo] = &[
+    VendorOpInfo { code: OP_GET_DEVICE_INFO, name: "GetDeviceInfo", usb_confirmed: true, wired_up: true },
+    VendorOpInfo { code: OP_OPEN_SESSION, name: "OpenSession", usb_confirmed: true, wired_up: true },
+    VendorOpInfo { code: OP_CLOSE_SESSION, name: "CloseSession", usb_confirmed: true, wired_up: true },
+    VendorOpInfo { code: OP_VENDOR_PROP_READ, name: "VendorPropRead", usb_confirmed: true, wired_up: true },
+    VendorOpInfo { code: OP_FTP_SETUP, name: "FtpSetup", usb_confirmed: true, wired_up: true },
+    VendorOpInfo { code: OP_FTP_PROFILE_WRITE, name: "FtpProfileWrite", usb_confirmed: true, wired_up: true },
+    // 0x9413 (IPTC profile write): confirmed to work over USB PTP alongside
+    // the ops above, but not wired up here — its data-blob preamble
+    // couldn't be decoded from existing captures (only two byte-identical
+    // instances exist anywhere). See the module doc's open items.
+    VendorOpInfo { code: 0x9413, name: "IptcProfileWrite", usb_confirmed: true, wired_up: false },
+];
+
+/// Look up what's confirmed about vendor op `code`, if this module knows
+/// anything about it at all.
+fn vendor_op_info(code: u16) -> Option<&'static VendorOpInfo> {
+    VENDOR_OPS.iter().find(|op| op.code == code)
+}
+
 /// What an OpenSession response code means for `open_ptp_session`'s retry
 /// decision — pulled out as its own pure classification so it's unit
 /// testable independent of the real USB round trip. See
@@ -114,6 +151,24 @@ const CLAIM_RETRY_DELAY: Duration = Duration::from_millis(50);
 const BULK_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_ID: u32 = 1;
 
+/// Aggregate ceiling on one `transact()` call's whole read loop. Each
+/// individual `read_bulk` is already capped at `BULK_TIMEOUT`, but the loop
+/// around it (waiting for a Response container amid Data/Event containers)
+/// previously had no bound of its own — a malfunctioning device, or a
+/// misparsed stream, could hang it indefinitely. Generous relative to real
+/// transactions (a handful of `BULK_TIMEOUT`-capped reads at most) so it
+/// only ever fires on a genuinely stuck transaction.
+const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling on one `transact()` call's total accumulated Data-phase payload.
+/// Nothing in the PTP container format itself bounds how many Data
+/// containers a misbehaving/malicious device could send before ever sending
+/// a Response — without this, `data_in` would grow unboundedly. Generous
+/// relative to anything this module's own vendor ops actually transfer
+/// (the FTP profile blob is a few hundred bytes; even an unusually large
+/// vendor-property read is expected to be well under this).
+const MAX_TRANSACTION_DATA_BYTES: usize = 16 * 1024 * 1024;
+
 // ─────────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────────
@@ -138,6 +193,10 @@ pub enum PtpUsbError {
     TruncatedContainer { declared: usize, got: usize },
     #[error("PTP response params ({0} bytes) are not a whole number of 4-byte words")]
     MisalignedResponseParams(usize),
+    #[error("PTP transaction did not complete within {0:?}")]
+    TransactionTimedOut(Duration),
+    #[error("PTP transaction's accumulated data ({got} bytes) exceeds the {limit}-byte limit")]
+    TransactionDataTooLarge { got: usize, limit: usize },
     #[error("OpenSession failed: {0}")]
     OpenSessionFailed(PtpResponseCode),
     #[error("PTP operation 0x{op:04x} failed: {code}")]
@@ -604,6 +663,11 @@ pub struct PtpUsbSession {
     transaction_id: u32,
     session_open: bool,
     model: String,
+    /// Reused scratch buffer for `read_container`'s bulk-IN reads, so a
+    /// session doing many reads (every PTP transaction needs at least one,
+    /// often more for a Data phase) doesn't allocate+zero a fresh 16384-byte
+    /// `Vec` on every single one.
+    read_scratch: Vec<u8>,
 }
 
 impl PtpUsbSession {
@@ -624,6 +688,7 @@ impl PtpUsbSession {
             transaction_id: 0,
             session_open: false,
             model,
+            read_scratch: vec![0u8; 16384],
         };
         session.open_ptp_session()?;
         Ok(session)
@@ -648,9 +713,9 @@ impl PtpUsbSession {
     }
 
     fn read_container(&mut self) -> Result<Container, PtpUsbError> {
-        let mut chunk = vec![0u8; 16384];
-        let n = self.handle.read_bulk(self.ep_in, &mut chunk, BULK_TIMEOUT)?;
-        let mut buf = chunk[..n].to_vec();
+        self.read_scratch.resize(16384, 0); // no-op after the first call — reuses existing capacity
+        let n = self.handle.read_bulk(self.ep_in, &mut self.read_scratch, BULK_TIMEOUT)?;
+        let mut buf = self.read_scratch[..n].to_vec();
         if buf.len() < 12 {
             return decode_container(&buf); // let decode_container report ShortContainer
         }
@@ -662,12 +727,11 @@ impl PtpUsbSession {
         // decode_container() still errors instead of silently truncating if
         // the device stops sending before that (n == 0 breaks out early).
         while buf.len() < declared_length {
-            let mut chunk = vec![0u8; 16384];
-            let n = self.handle.read_bulk(self.ep_in, &mut chunk, BULK_TIMEOUT)?;
+            let n = self.handle.read_bulk(self.ep_in, &mut self.read_scratch, BULK_TIMEOUT)?;
             if n == 0 {
                 break;
             }
-            buf.extend_from_slice(&chunk[..n]);
+            buf.extend_from_slice(&self.read_scratch[..n]);
         }
         decode_container(&buf)
     }
@@ -687,17 +751,36 @@ impl PtpUsbSession {
             self.send_data(op, data)?;
         }
         let mut data_in = Vec::new();
+        let deadline = std::time::Instant::now() + TRANSACTION_TIMEOUT;
         loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(PtpUsbError::TransactionTimedOut(TRANSACTION_TIMEOUT));
+            }
             let container = self.read_container()?;
             match container.kind {
-                CONTAINER_DATA => data_in.extend(container.payload),
+                CONTAINER_DATA => {
+                    data_in.extend(container.payload);
+                    if data_in.len() > MAX_TRANSACTION_DATA_BYTES {
+                        return Err(PtpUsbError::TransactionDataTooLarge {
+                            got: data_in.len(),
+                            limit: MAX_TRANSACTION_DATA_BYTES,
+                        });
+                    }
+                }
                 CONTAINER_RESPONSE => {
                     let resp_params = decode_response_params(&container.payload)?;
                     self.transaction_id += 1;
                     return Ok((container.code, resp_params, data_in));
                 }
                 CONTAINER_EVENT => continue, // shouldn't arrive on the bulk pipe; ignore defensively
-                _ => continue,
+                other => {
+                    // An unrecognized container kind is a protocol violation
+                    // (or a misparse — see decode_container's own
+                    // truncation/desync guards). Previously silently looped
+                    // forever; now at least visible, and bounded by the
+                    // deadline check above regardless.
+                    eprintln!("warning: PTP transaction received unrecognized container kind 0x{other:04x}, ignoring");
+                }
             }
         }
     }
@@ -740,14 +823,24 @@ impl PtpUsbSession {
         Ok(())
     }
 
+    /// `Err(OperationFailed)` if `code` isn't `RESP_OK`, else `Ok(())`.
+    /// Centralizes the response-code check every op below needs, instead of
+    /// each hand-copying the same `if code != RESP_OK { ... }` — this
+    /// module is an explicitly-growing reverse-engineering effort (more ops
+    /// expected per the module doc), so a shared check is one less place
+    /// for a future op to get the check wrong or skip it.
+    fn require_ok(op: u16, code: u16) -> Result<(), PtpUsbError> {
+        if code != RESP_OK {
+            return Err(PtpUsbError::OperationFailed { op, code: PtpResponseCode(code) });
+        }
+        Ok(())
+    }
+
     /// Confirm the session/pipe is still responsive. Exposed mainly for
     /// tests/diagnostics — `read_vendor_property` doesn't need this itself.
     pub fn ping(&mut self) -> Result<(), PtpUsbError> {
         let (code, _, _) = self.transact(OP_GET_DEVICE_INFO, &[], None)?;
-        if code != RESP_OK {
-            return Err(PtpUsbError::OperationFailed { op: OP_GET_DEVICE_INFO, code: PtpResponseCode(code) });
-        }
-        Ok(())
+        Self::require_ok(OP_GET_DEVICE_INFO, code)
     }
 
     /// Read a vendor property via the `0x943B` wrapper. `propcode` is the
@@ -763,9 +856,7 @@ impl PtpUsbSession {
         }
         let param = 0x10000 | propcode as u32;
         let (code, _, data) = self.transact(OP_VENDOR_PROP_READ, &[param], None)?;
-        if code != RESP_OK {
-            return Err(PtpUsbError::OperationFailed { op: OP_VENDOR_PROP_READ, code: PtpResponseCode(code) });
-        }
+        Self::require_ok(OP_VENDOR_PROP_READ, code)?;
         Ok(data)
     }
 
@@ -789,14 +880,10 @@ impl PtpUsbSession {
         let blob = encode_ftp_profile(profile)?;
 
         let (code, _, _) = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA))?;
-        if code != RESP_OK {
-            return Err(PtpUsbError::OperationFailed { op: OP_FTP_SETUP, code: PtpResponseCode(code) });
-        }
+        Self::require_ok(OP_FTP_SETUP, code)?;
 
         let (code, _, _) = self.transact(OP_FTP_PROFILE_WRITE, &[0, 0], Some(&blob))?;
-        if code != RESP_OK {
-            return Err(PtpUsbError::OperationFailed { op: OP_FTP_PROFILE_WRITE, code: PtpResponseCode(code) });
-        }
+        Self::require_ok(OP_FTP_PROFILE_WRITE, code)?;
         Ok(())
     }
 }
@@ -827,6 +914,15 @@ pub fn write_ftp_profile(
 ) -> Result<(), PtpUsbError> {
     let mut session = PtpUsbSession::open(serial)?;
     session.write_ftp_profile(profile, force_unconfirmed_model)
+}
+
+/// Format `data` as lowercase space-separated hex byte pairs, e.g.
+/// `"de ad be ef"`. Shared by the CLI and the egui GUI (previously defined
+/// identically in both `src/main.rs` and `gui/src/main.rs` despite both
+/// already depending on this crate) so there's one definition, not two that
+/// could silently diverge.
+pub fn hex_bytes(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
 }
 
 /// Parse a vendor property code as `"0xD053"`/`"0XD053"` (hex) or a plain
@@ -1394,6 +1490,36 @@ mod tests {
     #[test]
     fn open_session_other_code_classified_as_failed() {
         assert_eq!(classify_open_session_response(0x2002 /* GeneralError */), OpenSessionResponse::Failed);
+    }
+
+    // ── VENDOR_OPS ───────────────────────────────────────────────────────
+
+    #[test]
+    fn every_wired_up_op_const_has_a_vendor_ops_entry() {
+        // Catches the table drifting out of sync with the actual OP_*
+        // consts as this module grows (its own stated expectation — more
+        // ops are planned per the module doc's open items).
+        for code in [OP_GET_DEVICE_INFO, OP_OPEN_SESSION, OP_CLOSE_SESSION, OP_VENDOR_PROP_READ, OP_FTP_SETUP, OP_FTP_PROFILE_WRITE] {
+            let info = vendor_op_info(code).unwrap_or_else(|| panic!("0x{code:04x} has no VENDOR_OPS entry"));
+            assert!(info.wired_up, "0x{code:04x} is a real OP_* const but VENDOR_OPS says wired_up=false");
+        }
+    }
+
+    #[test]
+    fn vendor_op_info_unknown_code_returns_none() {
+        assert!(vendor_op_info(0xFFFF).is_none());
+    }
+
+    // ── hex_bytes ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_bytes_formats_lowercase_space_separated() {
+        assert_eq!(hex_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]), "de ad be ef");
+    }
+
+    #[test]
+    fn hex_bytes_empty_input() {
+        assert_eq!(hex_bytes(&[]), "");
     }
 
     // ── model gate ───────────────────────────────────────────────────────

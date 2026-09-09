@@ -29,7 +29,7 @@ fn vendor_write_ftp_accepts_every_flag_fleet_gui_py_sends() {
         "--host",
         "--port",
         "--username",
-        "--password",
+        "--password-stdin",
         "--serial",
         "--dry-run",
     ] {

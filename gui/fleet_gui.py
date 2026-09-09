@@ -180,9 +180,9 @@ class FleetApp:
 
     # ── CLI bridge ──────────────────────────────────────────────────────
 
-    def _run(self, *args: str) -> str:
+    def _run(self, *args: str, stdin_data: str | None = None) -> str:
         cmd = [str(_fleet_bin()), "--no-usb-reset", "--data-dir", str(_data_dir())] + list(args)
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, input=stdin_data)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip() or f"fleet exited {r.returncode}")
         return r.stdout
@@ -809,7 +809,11 @@ class VendorOpsWindow:
             "--host", values["host"],
             "--port", values["port"],
             "--username", values["username"],
-            "--password", values["password"],
+            # Piped via stdin, not passed as a plain argument — the CLI's
+            # own process-list (`ps`/`/proc/<pid>/cmdline`) would otherwise
+            # make the password visible to any other local user while this
+            # subprocess runs.
+            "--password-stdin",
         ]
         serial = self.app._selected_serial()
         if serial:
@@ -818,7 +822,7 @@ class VendorOpsWindow:
             args.append("--dry-run")
 
         try:
-            out = self.app._run(*args)
+            out = self.app._run(*args, stdin_data=values["password"])
             _set_output(self._write_box, out.strip())
         except RuntimeError as e:
             _set_output(self._write_box, f"Error: {e}")
