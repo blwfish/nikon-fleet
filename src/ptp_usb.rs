@@ -39,7 +39,7 @@ use std::time::Duration;
 use rusb::{Direction, GlobalContext, TransferType};
 use thiserror::Error;
 
-use crate::sdk::{nikon_usb_devices, read_usb_string};
+use crate::sdk::{model_from_product_string, nikon_usb_devices, read_usb_string};
 
 // USB Still Image class (PIMA 15740): class 0x06, subclass 0x01, protocol 0x01.
 const STILL_IMAGE_CLASS: u8 = 0x06;
@@ -75,6 +75,19 @@ const OP_FTP_PROFILE_WRITE: u16 = 0x90EE;
 const RESP_OK: u16 = 0x2001;
 const RESP_SESSION_ALREADY_OPEN: u16 = 0x201E;
 
+/// Camera models these reverse-engineered wire formats have been confirmed
+/// against (see the module doc for the reverse-engineering history). Model
+/// strings match `firmware::model_from_usb_product`'s output exactly (e.g.
+/// `"Z 9"`, `"Z6_3"` for Z6III — space vs. underscore is not a typo, it's
+/// this codebase's existing inconsistent USB product-string convention).
+/// Sending an unconfirmed model a vendor write risks writing a malformed
+/// blob to hardware whose exact protocol implementation was never checked.
+const CONFIRMED_MODELS: &[&str] = &["Z 9", "Z6_3"];
+
+fn model_confirmed(model: &str) -> bool {
+    CONFIRMED_MODELS.contains(&model)
+}
+
 const CLAIM_RETRY_ATTEMPTS: u32 = 40;
 const CLAIM_RETRY_DELAY: Duration = Duration::from_millis(50);
 const BULK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -100,6 +113,10 @@ pub enum PtpUsbError {
     ClaimFailed(u32),
     #[error("PTP container too short ({0} bytes)")]
     ShortContainer(usize),
+    #[error("PTP container declared {declared} bytes but only {got} were received")]
+    TruncatedContainer { declared: usize, got: usize },
+    #[error("PTP response params ({0} bytes) are not a whole number of 4-byte words")]
+    MisalignedResponseParams(usize),
     #[error("OpenSession failed: {0}")]
     OpenSessionFailed(PtpResponseCode),
     #[error("PTP operation 0x{op:04x} failed: {code}")]
@@ -108,6 +125,8 @@ pub enum PtpUsbError {
     FtpFieldTooLong { field: &'static str, len: usize, max: usize },
     #[error("FTP profile field {field} contains non-ASCII characters, which this encoding does not support")]
     FtpFieldNotAscii { field: &'static str },
+    #[error("camera model {0:?} is not in this module's confirmed-safe list for vendor writes; wire format may not match")]
+    UnconfirmedModel(String),
 }
 
 /// A PTP response code, with `Display` naming the common ones.
@@ -164,29 +183,37 @@ fn kill_macos_ptp_claimants() {}
 // Device discovery + interface claiming
 // ─────────────────────────────────────────────────────────────────────────
 
-fn candidate_devices() -> Vec<(rusb::Device<GlobalContext>, String)> {
+fn candidate_devices() -> Vec<(rusb::Device<GlobalContext>, String, String)> {
     nikon_usb_devices()
         .into_iter()
         .filter_map(|device| {
             let desc = device.device_descriptor().ok()?;
             let handle = device.open().ok()?;
             let serial = read_usb_string(&handle, desc.serial_number_string_index().unwrap_or(0));
-            Some((device, serial))
+            let product = read_usb_string(&handle, desc.product_string_index().unwrap_or(0));
+            let model = model_from_product_string(&product);
+            Some((device, serial, model))
         })
         .collect()
 }
 
-fn find_device(serial: Option<&str>) -> Result<rusb::Device<GlobalContext>, PtpUsbError> {
+/// Resolves a device by serial (or the sole candidate), returning it
+/// together with its model string so callers can gate on confirmed-safe
+/// models before sending reverse-engineered wire formats.
+fn find_device(serial: Option<&str>) -> Result<(rusb::Device<GlobalContext>, String), PtpUsbError> {
     let candidates = candidate_devices();
     match serial {
         Some(s) => candidates
             .into_iter()
-            .find(|(_, ser)| ser == s)
-            .map(|(d, _)| d)
+            .find(|(_, ser, _)| ser == s)
+            .map(|(d, _, model)| (d, model))
             .ok_or_else(|| PtpUsbError::SerialNotFound(s.to_string())),
         None => match candidates.len() {
             0 => Err(PtpUsbError::NoDevice),
-            1 => Ok(candidates.into_iter().next().unwrap().0),
+            1 => {
+                let (d, _, model) = candidates.into_iter().next().unwrap();
+                Ok((d, model))
+            }
             n => Err(PtpUsbError::AmbiguousDevice(n)),
         },
     }
@@ -306,19 +333,38 @@ fn decode_container(raw: &[u8]) -> Result<Container, PtpUsbError> {
         return Err(PtpUsbError::ShortContainer(raw.len()));
     }
     let length = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+    // The declared length is wire-controlled data (a malformed/corrupt
+    // response is a real input on this reverse-engineered, live-hardware
+    // path, not theoretical) — floor it at the header size before using it
+    // to index, or a declared length under 12 panics the slice below.
+    if length < 12 {
+        return Err(PtpUsbError::ShortContainer(length));
+    }
     let kind = u16::from_le_bytes(raw[4..6].try_into().unwrap());
     let code = u16::from_le_bytes(raw[6..8].try_into().unwrap());
     let transaction_id = u32::from_le_bytes(raw[8..12].try_into().unwrap());
-    let end = length.min(raw.len());
-    let payload = raw[12..end].to_vec();
+    // `raw` may legitimately be longer than `length` (a single bulk read can
+    // capture more than one container's worth of bytes) — that's fine, only
+    // the declared portion is the payload. But `raw` being *shorter* than
+    // declared means the caller didn't actually receive the full container
+    // (e.g. a >16KB response needing more than one bulk read) — silently
+    // truncating that down to what's on hand would desync every subsequent
+    // read on this connection, so it must be a hard error instead.
+    if raw.len() < length {
+        return Err(PtpUsbError::TruncatedContainer { declared: length, got: raw.len() });
+    }
+    let payload = raw[12..length].to_vec();
     Ok(Container { kind, code, transaction_id, payload })
 }
 
-fn decode_response_params(payload: &[u8]) -> Vec<u32> {
-    payload
+fn decode_response_params(payload: &[u8]) -> Result<Vec<u32>, PtpUsbError> {
+    if !payload.len().is_multiple_of(4) {
+        return Err(PtpUsbError::MisalignedResponseParams(payload.len()));
+    }
+    Ok(payload
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
+        .collect())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -467,6 +513,7 @@ pub struct PtpUsbSession {
     ep_in: u8,
     transaction_id: u32,
     session_open: bool,
+    model: String,
 }
 
 impl PtpUsbSession {
@@ -474,7 +521,7 @@ impl PtpUsbSession {
     /// attached), claim its PTP interface (racing macOS's own claimants),
     /// and open a PTP session.
     pub fn open(serial: Option<&str>) -> Result<Self, PtpUsbError> {
-        let device = find_device(serial)?;
+        let (device, model) = find_device(serial)?;
         let endpoints = find_ptp_endpoints(&device)?;
         let handle = device.open()?;
         claim_with_retry(&handle, endpoints.interface)?;
@@ -486,9 +533,16 @@ impl PtpUsbSession {
             ep_in: endpoints.ep_in,
             transaction_id: 0,
             session_open: false,
+            model,
         };
         session.open_ptp_session()?;
         Ok(session)
+    }
+
+    /// The connected camera's model string (e.g. `"Z 9"`, `"Z6_3"`), as read
+    /// from the USB product-string descriptor.
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     fn send_command(&mut self, code: u16, params: &[u32]) -> Result<(), PtpUsbError> {
@@ -504,9 +558,28 @@ impl PtpUsbSession {
     }
 
     fn read_container(&mut self) -> Result<Container, PtpUsbError> {
-        let mut buf = vec![0u8; 16384];
-        let n = self.handle.read_bulk(self.ep_in, &mut buf, BULK_TIMEOUT)?;
-        decode_container(&buf[..n])
+        let mut chunk = vec![0u8; 16384];
+        let n = self.handle.read_bulk(self.ep_in, &mut chunk, BULK_TIMEOUT)?;
+        let mut buf = chunk[..n].to_vec();
+        if buf.len() < 12 {
+            return decode_container(&buf); // let decode_container report ShortContainer
+        }
+        let declared_length = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        // A single 16384-byte bulk read isn't guaranteed to capture the whole
+        // logical container — this camera's own protocol family has vendor
+        // ops documented (docs/nx-field-session-2026-07-09.md) needing more
+        // than one chunk. Keep reading until the declared length is on hand;
+        // decode_container() still errors instead of silently truncating if
+        // the device stops sending before that (n == 0 breaks out early).
+        while buf.len() < declared_length {
+            let mut chunk = vec![0u8; 16384];
+            let n = self.handle.read_bulk(self.ep_in, &mut chunk, BULK_TIMEOUT)?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        decode_container(&buf)
     }
 
     /// Send a command (with an optional data-out phase), collect any
@@ -529,7 +602,7 @@ impl PtpUsbSession {
             match container.kind {
                 CONTAINER_DATA => data_in.extend(container.payload),
                 CONTAINER_RESPONSE => {
-                    let resp_params = decode_response_params(&container.payload);
+                    let resp_params = decode_response_params(&container.payload)?;
                     self.transaction_id += 1;
                     return Ok((container.code, resp_params, data_in));
                 }
@@ -572,6 +645,13 @@ impl PtpUsbSession {
     /// raw `0xD0xx`/`0x5xxx` property code (without the `0x10000` flag —
     /// this adds it). Returns the property's raw bytes on success.
     pub fn read_vendor_property(&mut self, propcode: u16) -> Result<Vec<u8>, PtpUsbError> {
+        if !model_confirmed(&self.model) {
+            eprintln!(
+                "warning: camera model {:?} is not in this module's confirmed-safe list ({:?}) \
+                 for vendor-property reads; wire format may not match",
+                self.model, CONFIRMED_MODELS
+            );
+        }
         let param = 0x10000 | propcode as u32;
         let (code, _, data) = self.transact(OP_VENDOR_PROP_READ, &[param], None)?;
         if code != RESP_OK {
@@ -585,7 +665,18 @@ impl PtpUsbSession {
     /// doesn't strictly need this, but a second one hangs without it
     /// (confirmed 2026-09-06), and sending it unconditionally is simpler and
     /// safer than tracking write count.
-    pub fn write_ftp_profile(&mut self, profile: &FtpProfile) -> Result<(), PtpUsbError> {
+    ///
+    /// Refuses to write to a camera model outside [`CONFIRMED_MODELS`] unless
+    /// `force_unconfirmed_model` is set — see the module doc and
+    /// [`PtpUsbError::UnconfirmedModel`].
+    pub fn write_ftp_profile(
+        &mut self,
+        profile: &FtpProfile,
+        force_unconfirmed_model: bool,
+    ) -> Result<(), PtpUsbError> {
+        if !force_unconfirmed_model && !model_confirmed(&self.model) {
+            return Err(PtpUsbError::UnconfirmedModel(self.model.clone()));
+        }
         let blob = encode_ftp_profile(profile)?;
 
         let (code, _, _) = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA))?;
@@ -618,10 +709,15 @@ pub fn read_vendor_property(serial: Option<&str>, propcode: u16) -> Result<Vec<u
 }
 
 /// Open a session, write an FTP profile via `0x90EE`, close it. Convenience
-/// wrapper for one-off writes (e.g. the CLI).
-pub fn write_ftp_profile(serial: Option<&str>, profile: &FtpProfile) -> Result<(), PtpUsbError> {
+/// wrapper for one-off writes (e.g. the CLI). See
+/// [`PtpUsbSession::write_ftp_profile`] for `force_unconfirmed_model`.
+pub fn write_ftp_profile(
+    serial: Option<&str>,
+    profile: &FtpProfile,
+    force_unconfirmed_model: bool,
+) -> Result<(), PtpUsbError> {
     let mut session = PtpUsbSession::open(serial)?;
-    session.write_ftp_profile(profile)
+    session.write_ftp_profile(profile, force_unconfirmed_model)
 }
 
 /// Parse a vendor property code as `"0xD053"`/`"0XD053"` (hex) or a plain
@@ -680,6 +776,53 @@ mod tests {
     }
 
     #[test]
+    fn decode_container_accepts_exactly_12_bytes() {
+        // The `<` vs `<=` boundary on the raw.len() < 12 guard: exactly 12
+        // bytes is a completely normal zero-payload PTP response (e.g. an
+        // OpenSession/CloseSession ack) and must succeed, not be rejected.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&12u32.to_le_bytes());
+        raw.extend_from_slice(&CONTAINER_RESPONSE.to_le_bytes());
+        raw.extend_from_slice(&RESP_OK.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+
+        let c = decode_container(&raw).unwrap();
+        assert!(c.payload.is_empty());
+    }
+
+    #[test]
+    fn decode_container_rejects_declared_length_below_header_size() {
+        // A malformed/corrupt response could declare a length under 12 even
+        // though the actual read is >= 12 bytes — must error, not panic via
+        // an out-of-range slice (raw[12..end] with end < 12).
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&5u32.to_le_bytes()); // declared length: 5, below the 12-byte header floor
+        raw.extend_from_slice(&CONTAINER_RESPONSE.to_le_bytes());
+        raw.extend_from_slice(&RESP_OK.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+
+        let err = decode_container(&raw).unwrap_err();
+        assert!(matches!(err, PtpUsbError::ShortContainer(5)));
+    }
+
+    #[test]
+    fn decode_container_errors_instead_of_silently_truncating_short_buffer() {
+        // Declared length exceeds what's actually in the buffer (e.g. a
+        // >16KB response that needed more than one bulk read) — must error,
+        // not silently hand back a truncated payload that would desync the
+        // next container parse.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&100u32.to_le_bytes()); // declares 100 bytes total
+        raw.extend_from_slice(&CONTAINER_RESPONSE.to_le_bytes());
+        raw.extend_from_slice(&RESP_OK.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&[0xAB; 10]); // only 10 payload bytes actually present, not 88
+
+        let err = decode_container(&raw).unwrap_err();
+        assert!(matches!(err, PtpUsbError::TruncatedContainer { declared: 100, got: 22 }));
+    }
+
+    #[test]
     fn decode_container_response_with_one_param() {
         // A minimal Response container: OK (0x2001), txn=1, one param (0x2A).
         let mut raw = Vec::new();
@@ -693,14 +836,17 @@ mod tests {
         assert_eq!(c.kind, CONTAINER_RESPONSE);
         assert_eq!(c.code, RESP_OK);
         assert_eq!(c.transaction_id, 1);
-        assert_eq!(decode_response_params(&c.payload), vec![0x2A]);
+        assert_eq!(decode_response_params(&c.payload).unwrap(), vec![0x2A]);
     }
 
     #[test]
     fn decode_container_truncates_to_declared_length() {
         // Declared length is 12 (no payload) but the buffer has trailing
         // garbage (e.g. leftover bytes from a larger read) — must not leak
-        // into the payload.
+        // into the payload. This is distinct from the "buffer is SHORTER
+        // than declared" case above: here raw is longer than declared, which
+        // is legitimate (a single bulk read can capture more than one
+        // container's worth of bytes) and must still just cap at `length`.
         let mut raw = Vec::new();
         raw.extend_from_slice(&12u32.to_le_bytes());
         raw.extend_from_slice(&CONTAINER_RESPONSE.to_le_bytes());
@@ -714,7 +860,16 @@ mod tests {
 
     #[test]
     fn decode_response_params_empty_payload() {
-        assert_eq!(decode_response_params(&[]), Vec::<u32>::new());
+        assert_eq!(decode_response_params(&[]).unwrap(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn decode_response_params_rejects_misaligned_payload() {
+        // 5 bytes: not a whole number of 4-byte u32 params. Silently
+        // dropping the trailing byte via chunks_exact would lose data with
+        // no signal — must error instead.
+        let err = decode_response_params(&[0, 0, 0, 0, 0xFF]).unwrap_err();
+        assert!(matches!(err, PtpUsbError::MisalignedResponseParams(5)));
     }
 
     #[test]
@@ -722,7 +877,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&1u32.to_le_bytes());
         payload.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
-        assert_eq!(decode_response_params(&payload), vec![1, 0xDEADBEEF]);
+        assert_eq!(decode_response_params(&payload).unwrap(), vec![1, 0xDEADBEEF]);
     }
 
     // ── 0x90EE FTP-profile encoder ──────────────────────────────────────
@@ -905,6 +1060,22 @@ mod tests {
     #[test]
     fn parse_propcode_out_of_range_errors() {
         assert!(parse_propcode("0x10000").is_err());
+    }
+
+    // ── model gate ───────────────────────────────────────────────────────
+
+    #[test]
+    fn model_confirmed_recognizes_confirmed_models() {
+        assert!(model_confirmed("Z 9"));
+        assert!(model_confirmed("Z6_3"));
+    }
+
+    #[test]
+    fn model_confirmed_rejects_unconfirmed_models() {
+        assert!(!model_confirmed("Z 5"));
+        assert!(!model_confirmed(""));
+        // Not a fuzzy/prefix match — trailing whitespace is a different string.
+        assert!(!model_confirmed("Z6_3 "));
     }
 
     // ── PtpResponseCode ──────────────────────────────────────────────────

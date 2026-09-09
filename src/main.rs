@@ -289,6 +289,12 @@ struct VendorWriteFtpArgs {
     /// Print the encoded blob without sending it to the camera.
     #[arg(long)]
     dry_run: bool,
+    /// Send this reverse-engineered write even if the connected camera's
+    /// model isn't in ptp_usb's confirmed-safe list. Only pass this once
+    /// you've independently verified the wire format on that model — see
+    /// nikon_fleet::ptp_usb's module doc.
+    #[arg(long)]
+    force_unconfirmed_model: bool,
 }
 
 #[derive(Args, Debug)]
@@ -677,6 +683,17 @@ fn select_device(
     }
 }
 
+/// Whether `cmd_transplant` should refuse to guess a target rather than
+/// call `select_device` — no `--serial` given, and more than one candidate
+/// is actually available to write to. Unlike `select_device`'s other
+/// callers (read-only commands, where "pick the first available one" is a
+/// reasonable default), transplant performs a destructive cross-model write
+/// to physical hardware, so silently picking one of several real candidates
+/// is exactly the wrong default.
+fn transplant_target_ambiguous(enriched: &[(DeviceInfo, Option<UsbCameraInfo>)], serial: Option<&str>) -> bool {
+    serial.is_none() && enriched.iter().filter(|(d, _)| d.available).count() > 1
+}
+
 /// Read-capability counts from `capture_capabilities`.
 #[derive(Default)]
 struct CaptureStats {
@@ -840,7 +857,7 @@ fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
         return Ok(());
     }
 
-    nikon_fleet::ptp_usb::write_ftp_profile(args.serial.as_deref(), &profile)
+    nikon_fleet::ptp_usb::write_ftp_profile(args.serial.as_deref(), &profile, args.force_unconfirmed_model)
         .context("writing FTP profile over USB PTP")?;
     println!("Wrote FTP profile {:?} ({}@{}:{})", args.profile_name, args.username, args.host, args.port);
     Ok(())
@@ -1385,6 +1402,20 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, args: &TransplantArgs, no_usb_
         bail!("no Nikon cameras detected");
     }
     let enriched = enrich_devices(devices);
+    // Unlike cmd_snapshot/cmd_check (select_device's other callers, where
+    // "just pick the first available one" is a reasonable default for a
+    // read-only command), transplant is a destructive cross-model write —
+    // select_device's own --serial-omitted behavior of silently picking the
+    // first available device is exactly wrong here when there's more than
+    // one real candidate. Reject the ambiguity explicitly instead of
+    // silently guessing which physical camera gets written to.
+    if transplant_target_ambiguous(&enriched, args.serial.as_deref()) {
+        let available = enriched.iter().filter(|(d, _)| d.available).count();
+        bail!(
+            "{available} Nikon cameras are available; pass --serial to choose the transplant \
+             target (transplant writes to physical camera hardware — refusing to guess which one)"
+        );
+    }
     let (target, _usb) = select_device(enriched, args.serial.as_deref())?;
 
     if target.name == snap.camera.model {
@@ -1606,6 +1637,44 @@ mod tests {
         let enriched = vec![(dev_unavailable(1), None), (dev_unavailable(2), None)];
         let (d, _) = select_device(enriched, None).unwrap();
         assert_eq!(d.id, 1);
+    }
+
+    // ── transplant_target_ambiguous ──────────────────────────────────────
+
+    #[test]
+    fn transplant_ambiguous_two_available_no_serial() {
+        let enriched = vec![(dev(1), None), (dev(2), None)];
+        assert!(transplant_target_ambiguous(&enriched, None));
+    }
+
+    #[test]
+    fn transplant_not_ambiguous_at_exactly_one_available() {
+        // Boundary: exactly 1 available candidate (plus an unavailable one)
+        // is NOT ambiguous — there's only one real target to pick.
+        let enriched = vec![(dev_unavailable(1), None), (dev(2), None)];
+        assert!(!transplant_target_ambiguous(&enriched, None));
+    }
+
+    #[test]
+    fn transplant_not_ambiguous_with_zero_available() {
+        // Boundary: zero available — not "ambiguous" in the sense this check
+        // guards against; select_device's own no-device-available fallback
+        // behavior is unchanged by this check.
+        let enriched = vec![(dev_unavailable(1), None), (dev_unavailable(2), None)];
+        assert!(!transplant_target_ambiguous(&enriched, None));
+    }
+
+    #[test]
+    fn transplant_not_ambiguous_when_serial_given_even_with_multiple_available() {
+        // An explicit --serial disambiguates regardless of candidate count.
+        let enriched = vec![(dev(1), None), (dev(2), None)];
+        assert!(!transplant_target_ambiguous(&enriched, Some("AAA")));
+    }
+
+    #[test]
+    fn transplant_not_ambiguous_single_candidate_total() {
+        let enriched = vec![(dev(1), None)];
+        assert!(!transplant_target_ambiguous(&enriched, None));
     }
 
     #[test]

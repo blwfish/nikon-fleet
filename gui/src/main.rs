@@ -840,7 +840,11 @@ fn do_vendor_write_ftp(profile: &FtpProfile, serial: Option<&str>, dry_run: bool
             hex_bytes(&blob)
         )));
     }
-    ptp_usb::write_ftp_profile(serial, profile).map_err(|e| e.to_string())?;
+    // No GUI control for force_unconfirmed_model yet — always false, so the
+    // GUI can only write to models ptp_usb's confirmed-safe list covers.
+    // Use the CLI's --force-unconfirmed-model if you've independently
+    // verified the wire format on an unconfirmed model.
+    ptp_usb::write_ftp_profile(serial, profile, false).map_err(|e| e.to_string())?;
     Ok(Evt::VendorWriteFtpDone(format!(
         "Wrote FTP profile {:?} ({}@{}:{})",
         profile.profile_name, profile.username, profile.host, profile.port

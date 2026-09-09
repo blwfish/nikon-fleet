@@ -313,7 +313,7 @@ pub fn bcd_decode_version(bcd: u16) -> String {
     format!("{major}.{minor:02}")
 }
 
-fn model_from_product_string(product: &str) -> String {
+pub(crate) fn model_from_product_string(product: &str) -> String {
     // Delegates to the canonical implementation instead of re-stripping the
     // "NIKON DSC " prefix here — this file used to hardcode the same
     // literal a second time, so a future change to the prefix convention
