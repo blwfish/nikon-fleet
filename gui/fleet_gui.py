@@ -10,7 +10,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode, is_valid_u16
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -764,12 +764,17 @@ class VendorOpsWindow:
         (with an error already shown in the output box) if invalid."""
         try:
             port = int(self._fields["port"].get().strip())
-            if not (0 <= port <= 0xFFFF):
+            if not is_valid_u16(port):
                 raise ValueError("out of range 0-65535")
         except ValueError as e:
             _set_output(self._write_box, f"Invalid port: {e}")
             return None
 
+        # Keep this field list (which fields, trimmed vs not) in sync with
+        # the egui GUI's call to ptp_usb::ftp_profile_missing_fields (Rust,
+        # gui/src/main.rs) -- Python can't call into that crate directly, so
+        # this is a hand-copy of the same required-field list, not a shared
+        # definition.
         values = {
             "profile_name": self._fields["profile_name"].get().strip(),
             "ssid_24ghz": self._fields["ssid_24ghz"].get().strip(),

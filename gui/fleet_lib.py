@@ -150,6 +150,14 @@ def _propcode_strict_digits(body: str, allowed: set[str]) -> bool:
     return len(body) > 0 and all(c in allowed for c in body)
 
 
+def is_valid_u16(value: int) -> bool:
+    """Whether `value` fits in a u16 (0-0xFFFF) -- the same range Rust's
+    u16 type enforces. Shared so the port-range check in fleet_gui.py's
+    _read_write_fields doesn't hand-copy this literal range a second time.
+    """
+    return 0 <= value <= 0xFFFF
+
+
 def parse_propcode(s: str) -> int:
     """Parse a vendor property code like the Rust CLI's parse_propcode:
     "0xD053"/"0XD053" (hex) or a plain decimal string.
@@ -170,7 +178,7 @@ def parse_propcode(s: str) -> int:
         if not _propcode_strict_digits(text, _PROPCODE_DEC_DIGITS):
             raise ValueError(f"invalid property code {s!r}")
         value = int(text, 10)
-    if not (0 <= value <= 0xFFFF):
+    if not is_valid_u16(value):
         raise ValueError(f"property code {s!r} out of range for a u16 (0-0xFFFF)")
     return value
 

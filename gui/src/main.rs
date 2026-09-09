@@ -521,18 +521,14 @@ impl eframe::App for FleetApp {
         }
 
         if let Some(dry_run) = vendor_write_trigger {
-            let missing: Vec<&str> = [
-                ("profile name", self.vendor_ftp_profile_name.trim().is_empty()),
-                ("SSID (2.4GHz)", self.vendor_ftp_ssid_24ghz.trim().is_empty()),
-                ("SSID (5GHz)", self.vendor_ftp_ssid_5ghz.trim().is_empty()),
-                ("host", self.vendor_ftp_host.trim().is_empty()),
-                ("username", self.vendor_ftp_username.trim().is_empty()),
-                ("password", self.vendor_ftp_password.is_empty()),
-            ]
-            .into_iter()
-            .filter(|(_, empty)| *empty)
-            .map(|(name, _)| name)
-            .collect();
+            let missing = ptp_usb::ftp_profile_missing_fields(
+                &self.vendor_ftp_profile_name,
+                &self.vendor_ftp_ssid_24ghz,
+                &self.vendor_ftp_ssid_5ghz,
+                &self.vendor_ftp_host,
+                &self.vendor_ftp_username,
+                &self.vendor_ftp_password,
+            );
 
             if !missing.is_empty() {
                 self.vendor_write_result = format!("Missing required field(s): {}", missing.join(", "));

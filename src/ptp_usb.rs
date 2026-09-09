@@ -51,7 +51,6 @@ const CONTAINER_DATA: u16 = 2;
 const CONTAINER_RESPONSE: u16 = 3;
 const CONTAINER_EVENT: u16 = 4;
 
-const OP_GET_DEVICE_INFO: u16 = 0x1001;
 const OP_OPEN_SESSION: u16 = 0x1002;
 const OP_CLOSE_SESSION: u16 = 0x1003;
 
@@ -93,7 +92,6 @@ struct VendorOpInfo {
 }
 
 const VENDOR_OPS: &[VendorOpInfo] = &[
-    VendorOpInfo { code: OP_GET_DEVICE_INFO, name: "GetDeviceInfo", usb_confirmed: true, wired_up: true },
     VendorOpInfo { code: OP_OPEN_SESSION, name: "OpenSession", usb_confirmed: true, wired_up: true },
     VendorOpInfo { code: OP_CLOSE_SESSION, name: "CloseSession", usb_confirmed: true, wired_up: true },
     VendorOpInfo { code: OP_VENDOR_PROP_READ, name: "VendorPropRead", usb_confirmed: true, wired_up: true },
@@ -185,8 +183,11 @@ pub enum PtpUsbError {
     Usb(#[from] rusb::Error),
     #[error("could not find a Still Image (PTP) class interface on this device")]
     NoPtpInterface,
-    #[error("could not claim the PTP USB interface after {0} attempts (macOS's ptpcamerad/icdd may be holding it)")]
-    ClaimFailed(u32),
+    #[error(
+        "could not claim the PTP USB interface after {attempts} attempts (macOS's ptpcamerad/icdd may be \
+         holding it); last error: {last_error}"
+    )]
+    ClaimFailed { attempts: u32, last_error: String },
     #[error("PTP container too short ({0} bytes)")]
     ShortContainer(usize),
     #[error("PTP container declared {declared} bytes but only {got} were received")]
@@ -297,7 +298,18 @@ fn fallback_serial(bus: u8, address: u8) -> String {
 /// `ptpcamerad` still holding the interface) and so couldn't be identified;
 /// they're silently absent from `candidates` otherwise, which previously
 /// gave no signal that a real second camera was skipped rather than absent.
-fn candidate_devices() -> (Vec<(rusb::Device<GlobalContext>, String, String)>, usize) {
+/// A discovered Nikon USB device, already opened (identifying it needs an
+/// open handle to read its string descriptors) — carried forward so
+/// `PtpUsbSession::open` can reuse this same handle instead of opening the
+/// device a second time once one candidate is selected.
+struct Candidate {
+    device: rusb::Device<GlobalContext>,
+    handle: rusb::DeviceHandle<GlobalContext>,
+    serial: String,
+    model: String,
+}
+
+fn candidate_devices() -> (Vec<Candidate>, usize) {
     let mut candidates = Vec::new();
     let mut skipped = 0usize;
     for device in nikon_usb_devices() {
@@ -313,7 +325,7 @@ fn candidate_devices() -> (Vec<(rusb::Device<GlobalContext>, String, String)>, u
         let serial = candidate_serial(&device, &real_serial);
         let product = read_usb_string(&handle, desc.product_string_index().unwrap_or(0));
         let model = model_from_product_string(&product);
-        candidates.push((device, serial, model));
+        candidates.push(Candidate { device, handle, serial, model });
     }
     (candidates, skipped)
 }
@@ -343,8 +355,10 @@ fn select_candidate<T>(candidates: Vec<(String, T)>, serial: Option<&str>) -> Re
 
 /// Resolves a device by serial (or the sole candidate), returning it
 /// together with its model string so callers can gate on confirmed-safe
-/// models before sending reverse-engineered wire formats.
-fn find_device(serial: Option<&str>) -> Result<(rusb::Device<GlobalContext>, String), PtpUsbError> {
+/// models before sending reverse-engineered wire formats. Carries forward
+/// the handle `candidate_devices` already opened to identify it, so the
+/// caller doesn't need to open the device a second time.
+fn find_device(serial: Option<&str>) -> Result<Candidate, PtpUsbError> {
     let (candidates, skipped) = candidate_devices();
     if skipped > 0 {
         eprintln!(
@@ -352,7 +366,7 @@ fn find_device(serial: Option<&str>) -> Result<(rusb::Device<GlobalContext>, Str
              (commonly macOS's ptpcamerad/icdd still holding the interface) — not counted as candidates"
         );
     }
-    let items = candidates.into_iter().map(|(d, ser, model)| (ser, (d, model))).collect();
+    let items = candidates.into_iter().map(|c| (c.serial.clone(), c)).collect();
     select_candidate(items, serial)
 }
 
@@ -421,36 +435,39 @@ fn claim_with_retry(
             }
         }
     }
-    let _ = last_err;
-    Err(PtpUsbError::ClaimFailed(CLAIM_RETRY_ATTEMPTS))
+    Err(PtpUsbError::ClaimFailed {
+        attempts: CLAIM_RETRY_ATTEMPTS,
+        last_error: last_err.map(|e| e.to_string()).unwrap_or_else(|| "no attempt recorded".to_string()),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Container framing
 // ─────────────────────────────────────────────────────────────────────────
 
-fn encode_command(code: u16, transaction_id: u32, params: &[u32]) -> Vec<u8> {
-    let length = 12 + 4 * params.len() as u32;
+/// The 12-byte container header (length, kind, code, transaction id)
+/// shared by every container this module encodes, followed by `payload`.
+/// `encode_command`/`encode_data` differ only in which `kind` they use and
+/// how their payload gets built (params-as-le-u32 vs. raw bytes) — this is
+/// the one place the header-assembly bytes are written.
+fn encode_container(kind: u16, code: u16, transaction_id: u32, payload: &[u8]) -> Vec<u8> {
+    let length = 12 + payload.len() as u32;
     let mut buf = Vec::with_capacity(length as usize);
     buf.extend_from_slice(&length.to_le_bytes());
-    buf.extend_from_slice(&CONTAINER_COMMAND.to_le_bytes());
+    buf.extend_from_slice(&kind.to_le_bytes());
     buf.extend_from_slice(&code.to_le_bytes());
     buf.extend_from_slice(&transaction_id.to_le_bytes());
-    for p in params {
-        buf.extend_from_slice(&p.to_le_bytes());
-    }
+    buf.extend_from_slice(payload);
     buf
 }
 
+fn encode_command(code: u16, transaction_id: u32, params: &[u32]) -> Vec<u8> {
+    let payload: Vec<u8> = params.iter().flat_map(|p| p.to_le_bytes()).collect();
+    encode_container(CONTAINER_COMMAND, code, transaction_id, &payload)
+}
+
 fn encode_data(code: u16, transaction_id: u32, data: &[u8]) -> Vec<u8> {
-    let length = 12 + data.len() as u32;
-    let mut buf = Vec::with_capacity(length as usize);
-    buf.extend_from_slice(&length.to_le_bytes());
-    buf.extend_from_slice(&CONTAINER_DATA.to_le_bytes());
-    buf.extend_from_slice(&code.to_le_bytes());
-    buf.extend_from_slice(&transaction_id.to_le_bytes());
-    buf.extend_from_slice(data);
-    buf
+    encode_container(CONTAINER_DATA, code, transaction_id, data)
 }
 
 /// A parsed container header + whatever payload followed it (params for
@@ -458,9 +475,11 @@ fn encode_data(code: u16, transaction_id: u32, data: &[u8]) -> Vec<u8> {
 #[derive(Debug)]
 struct Container {
     kind: u16,
-    #[allow(dead_code)] // code/txn round-trip for future ops; not needed by read_vendor_property yet
+    // Read in transact()'s CONTAINER_RESPONSE arm (the op's response code) —
+    // no #[allow(dead_code)] needed; a prior comment here claiming it
+    // wasn't read yet was stale.
     code: u16,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // parsed for completeness; nothing currently reads it back out of a Container
     transaction_id: u32,
     payload: Vec<u8>,
 }
@@ -521,6 +540,14 @@ const FTP_BLOB_HEADER: [u8; 2] = [0xf4, 0x01];
 /// two 16-UTF16-unit strings and a value shaped like a locally-administered
 /// (randomized) MAC address, all byte-identical across every real capture
 /// we have — never observed to vary, so treated as an opaque constant.
+///
+/// No live-drift check exists for this assumption, and none is practical
+/// from this module alone: `0x90EE` has no documented read/query
+/// counterpart to read a profile back and compare, so validating this
+/// against a *different* firmware/device would need a fresh capture from
+/// that device, not something this code can check at write time. If a
+/// future capture ever disagrees with this constant, that's the signal
+/// this assumption needs revisiting — see docs/nx-field-session-2026-07-09.md.
 const FTP_BLOB_MYSTERY_BLOCK: [u8; 82] = [
     0x10, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30,
     0x00, 0x54, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x00,
@@ -675,9 +702,8 @@ impl PtpUsbSession {
     /// attached), claim its PTP interface (racing macOS's own claimants),
     /// and open a PTP session.
     pub fn open(serial: Option<&str>) -> Result<Self, PtpUsbError> {
-        let (device, model) = find_device(serial)?;
+        let Candidate { device, handle, model, .. } = find_device(serial)?;
         let endpoints = find_ptp_endpoints(&device)?;
-        let handle = device.open()?;
         claim_with_retry(&handle, endpoints.interface)?;
 
         let mut session = PtpUsbSession {
@@ -836,13 +862,6 @@ impl PtpUsbSession {
         Ok(())
     }
 
-    /// Confirm the session/pipe is still responsive. Exposed mainly for
-    /// tests/diagnostics — `read_vendor_property` doesn't need this itself.
-    pub fn ping(&mut self) -> Result<(), PtpUsbError> {
-        let (code, _, _) = self.transact(OP_GET_DEVICE_INFO, &[], None)?;
-        Self::require_ok(OP_GET_DEVICE_INFO, code)
-    }
-
     /// Read a vendor property via the `0x943B` wrapper. `propcode` is the
     /// raw `0xD0xx`/`0x5xxx` property code (without the `0x10000` flag —
     /// this adds it). Returns the property's raw bytes on success.
@@ -923,6 +942,37 @@ pub fn write_ftp_profile(
 /// could silently diverge.
 pub fn hex_bytes(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+/// Which required FTP-profile fields are empty, as display names for a
+/// "missing field(s)" message — checked before a caller GUI has enough to
+/// construct an actual [`FtpProfile`]. All fields are trimmed before the
+/// emptiness check except `password` (a leading/trailing space could be a
+/// real password character, so it's checked as-is). Centralizes this list
+/// so the egui GUI doesn't hand-copy it; `gui/fleet_gui.py`'s independent
+/// Python reimplementation still has to hand-copy this list itself — same
+/// cross-language limitation as `parse_propcode`, since Python can't call
+/// into this crate directly.
+pub fn ftp_profile_missing_fields<'a>(
+    profile_name: &str,
+    ssid_24ghz: &str,
+    ssid_5ghz: &str,
+    host: &str,
+    username: &str,
+    password: &str,
+) -> Vec<&'a str> {
+    [
+        ("profile name", profile_name.trim().is_empty()),
+        ("SSID (2.4GHz)", ssid_24ghz.trim().is_empty()),
+        ("SSID (5GHz)", ssid_5ghz.trim().is_empty()),
+        ("host", host.trim().is_empty()),
+        ("username", username.trim().is_empty()),
+        ("password", password.is_empty()),
+    ]
+    .into_iter()
+    .filter(|(_, empty)| *empty)
+    .map(|(name, _)| name)
+    .collect()
 }
 
 /// Parse a vendor property code as `"0xD053"`/`"0XD053"` (hex) or a plain
@@ -1216,6 +1266,36 @@ mod tests {
         assert_eq!(u16::from_le_bytes(port_bytes.try_into().unwrap()), profile.port);
     }
 
+    // ── ftp_profile_missing_fields ──────────────────────────────────────
+
+    #[test]
+    fn ftp_profile_missing_fields_all_present_is_empty() {
+        assert!(ftp_profile_missing_fields("N", "s24", "s5", "h", "u", "p").is_empty());
+    }
+
+    #[test]
+    fn ftp_profile_missing_fields_reports_each_empty_field() {
+        let missing = ftp_profile_missing_fields("", "", "s5", "h", "u", "p");
+        assert_eq!(missing, vec!["profile name", "SSID (2.4GHz)"]);
+    }
+
+    #[test]
+    fn ftp_profile_missing_fields_whitespace_only_counts_as_empty() {
+        // Matches the .trim().is_empty() convention used for every field
+        // except password.
+        let missing = ftp_profile_missing_fields("   ", "s24", "s5", "h", "u", "p");
+        assert_eq!(missing, vec!["profile name"]);
+    }
+
+    #[test]
+    fn ftp_profile_missing_fields_password_not_trimmed() {
+        // A password of just whitespace is NOT reported missing — password
+        // is deliberately excluded from trimming (a leading/trailing space
+        // could be a real character), unlike every other field.
+        let missing = ftp_profile_missing_fields("N", "s24", "s5", "h", "u", "   ");
+        assert!(missing.is_empty());
+    }
+
     // ── with_password_redacted ──────────────────────────────────────────
 
     #[test]
@@ -1416,6 +1496,59 @@ mod tests {
         }
     }
 
+    // ── encode_utf16_field_1byte_len boundaries (host/profile_name caps) ──
+
+    #[test]
+    fn encode_utf16_field_accepts_content_at_exactly_max_units_minus_one() {
+        // len_incl_null (content + 1 for the null terminator) must be
+        // <= max_units; only the above-limit rejection was previously
+        // tested, not this exactly-at-the-limit success case.
+        let s = "a".repeat(FTP_HOST_MAX_UNITS - 1); // len_incl_null == FTP_HOST_MAX_UNITS
+        assert!(encode_utf16_field_1byte_len("host", &s, FTP_HOST_MAX_UNITS).is_ok());
+    }
+
+    #[test]
+    fn encode_utf16_field_rejects_content_one_over_max_units() {
+        let s = "a".repeat(FTP_HOST_MAX_UNITS); // len_incl_null == FTP_HOST_MAX_UNITS + 1
+        assert!(matches!(
+            encode_utf16_field_1byte_len("host", &s, FTP_HOST_MAX_UNITS),
+            Err(PtpUsbError::FtpFieldTooLong { field: "host", .. })
+        ));
+    }
+
+    #[test]
+    fn encode_utf16_field_u8_max_guard_fires_when_max_units_exceeds_u8() {
+        // len_incl_null > u8::MAX is a distinct guard from len_incl_null >
+        // max_units — for every real caller in this module max_units is
+        // already <= 255, so max_units is always the binding constraint in
+        // practice. This directly exercises the u8::MAX guard on its own
+        // (max_units deliberately set above 255) so it's not dead-but-
+        // untested latent protection against a future caller's length
+        // prefix silently truncating via `as u8`.
+        let s = "a".repeat(300); // len_incl_null = 301, > u8::MAX (255) but <= max_units (1000)
+        assert!(matches!(
+            encode_utf16_field_1byte_len("test", &s, 1000),
+            Err(PtpUsbError::FtpFieldTooLong { field: "test", .. })
+        ));
+    }
+
+    #[test]
+    fn encode_ftp_profile_accepts_profile_name_at_exactly_the_max() {
+        let mut profile = valid_profile();
+        profile.profile_name = "a".repeat(253); // len_incl_null == 254, the literal cap encode_ftp_profile passes
+        assert!(encode_ftp_profile(&profile).is_ok());
+    }
+
+    #[test]
+    fn encode_ftp_profile_rejects_profile_name_one_over_the_max() {
+        let mut profile = valid_profile();
+        profile.profile_name = "a".repeat(254); // len_incl_null == 255, one over
+        assert!(matches!(
+            encode_ftp_profile(&profile),
+            Err(PtpUsbError::FtpFieldTooLong { field: "profile_name", .. })
+        ));
+    }
+
     // ── parse_propcode ───────────────────────────────────────────────────
 
     #[test]
@@ -1499,7 +1632,7 @@ mod tests {
         // Catches the table drifting out of sync with the actual OP_*
         // consts as this module grows (its own stated expectation — more
         // ops are planned per the module doc's open items).
-        for code in [OP_GET_DEVICE_INFO, OP_OPEN_SESSION, OP_CLOSE_SESSION, OP_VENDOR_PROP_READ, OP_FTP_SETUP, OP_FTP_PROFILE_WRITE] {
+        for code in [OP_OPEN_SESSION, OP_CLOSE_SESSION, OP_VENDOR_PROP_READ, OP_FTP_SETUP, OP_FTP_PROFILE_WRITE] {
             let info = vendor_op_info(code).unwrap_or_else(|| panic!("0x{code:04x} has no VENDOR_OPS entry"));
             assert!(info.wired_up, "0x{code:04x} is a real OP_* const but VENDOR_OPS says wired_up=false");
         }

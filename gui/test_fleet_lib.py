@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode, is_valid_u16
 
 _FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "capability_value_shapes.json"
 
@@ -189,6 +189,20 @@ class TestParseFwFilename:
 # ── parse_propcode ────────────────────────────────────────────────────────────
 # Must accept the same forms as the Rust CLI's own parse_propcode (main.rs) —
 # both parse the same user-typed string, one from a GUI entry, one from argv.
+
+class TestIsValidU16:
+    def test_zero_is_valid(self):
+        assert is_valid_u16(0)
+
+    def test_max_is_valid(self):
+        assert is_valid_u16(0xFFFF)
+
+    def test_one_over_max_is_invalid(self):
+        assert not is_valid_u16(0x10000)
+
+    def test_negative_is_invalid(self):
+        assert not is_valid_u16(-1)
+
 
 class TestParsePropcode:
     def test_lowercase_hex(self):
