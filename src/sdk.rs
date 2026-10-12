@@ -145,33 +145,58 @@ struct NkMAIDRange {
 }
 const _: () = assert!(std::mem::size_of::<NkMAIDRange>() == 48);
 
-// The four `const _: () = assert!(...)` blocks above turn a silent layout
-// drift (a field reordered, resized, added, or removed relative to
-// Maid3.h) into a build failure instead of undetected memory corruption at
-// runtime — this crate has no access to the real Maid3.h header to check
-// against directly, so this is the closest available self-verification.
+// The `const _: () = assert!(...)` blocks above turn a silent layout drift
+// (a field reordered, resized, added, or removed relative to Maid3.h) into a
+// build failure instead of undetected memory corruption at runtime. They check
+// sizes only, so they are a backstop and not a substitute for comparing
+// against the header (shipped in the SDK package under Module/*/HeaderFile/).
+
+// Callback typedefs mirror MAIDUIRequestProc, MAIDEventProc, MAIDProgressProc,
+// MAIDDataProc and LiveViewDataProc in Maid3.h. NKREF is a pointer; NKPARAM is
+// a 64-bit integer on the 64-bit targets this crate supports (hence `usize`);
+// ULONG is `u32` and NKERROR is `i32`.
+
+/// Leading fields of `NkMAIDUIRequestInfo` — only what `cb_ui_request` reads.
+/// Always accessed through a pointer the SDK owns; never constructed here.
+#[repr(C)]
+struct NkMAIDUIRequestInfoPrefix {
+    ul_type: u32,
+    /// Default answer, one of eNkMAIDUIRequestResult.
+    ul_default: u32,
+}
+
+type UiRequestProc =
+    unsafe extern "C" fn(ref_proc: *mut c_void, info: *const NkMAIDUIRequestInfoPrefix) -> u32;
+type EventProc = unsafe extern "C" fn(ref_client: *mut c_void, event: u32, data: usize);
+type ProgressProc = unsafe extern "C" fn(
+    command: u32,
+    param: u32,
+    ref_complete: *mut c_void,
+    done: u32,
+    total: u32,
+);
+type DataProc = unsafe extern "C" fn(
+    ref_client: *mut c_void,
+    data_info: *mut c_void,
+    data: *mut c_void,
+) -> i32;
+type LiveViewDataProc = unsafe extern "C" fn(ref_client: *mut c_void, live_view: *const c_void);
 
 /// InitializeSDK requires non-null callbacks even for a snapshot-only workflow.
-///
-/// # ABI note
-/// `cb_noop` below has the wrong signature for all five slots — it takes no
-/// parameters, but the SDK calls these with arguments (device IDs, status codes,
-/// data pointers, etc.). If the SDK fires any of these callbacks during
-/// `InitializeSDK`, `EnumDevices`, or `ConnectDevice`, the stack is corrupted
-/// (arguments pushed by the caller are not consumed). In practice the
-/// snapshot-only workflow has not triggered synchronous callbacks, but this
-/// assumption is unverified and could break under future SDK versions or
-/// different camera states. Fixing it requires the exact SDK callback typedefs
-/// from Maid3.h, which are not currently available.
+/// Each slot gets a correctly typed no-op (`cb_*` below), so that if the SDK
+/// does fire one during `InitializeSDK`, `EnumDevices`, or `ConnectDevice` it
+/// receives a defined return value rather than whatever was left in the
+/// return register.
 #[repr(C)]
 struct NkMAIDCSCallback {
-    p_ui_req_proc: *mut c_void,
-    p_event_proc: *mut c_void,
-    p_progress_proc: *mut c_void,
-    p_data_proc: *mut c_void,
-    p_live_view_data_proc: *mut c_void,
+    p_ui_req_proc: UiRequestProc,
+    p_event_proc: EventProc,
+    p_progress_proc: ProgressProc,
+    p_data_proc: DataProc,
+    p_live_view_data_proc: LiveViewDataProc,
     ref_proc: *mut c_void,
 }
+const _: () = assert!(std::mem::size_of::<NkMAIDCSCallback>() == 6 * std::mem::size_of::<usize>());
 
 // eNkMAIDDataType values (from Maid3.h eNkMAIDDataType enum).
 const DT_NULL: u32 = 0;
@@ -254,7 +279,37 @@ unsafe extern "C" fn sdk_free(ptr: *mut c_void) {
     unsafe { libc::free(ptr) }
 }
 
-unsafe extern "C" fn cb_noop() {}
+/// UI request: answer with the SDK's own default (eNkMAIDUIRequestResult),
+/// which is valid even when the request is synchronous. `kNkMAIDUIRequestResult_None`
+/// (0) is the fallback if the SDK passes no info pointer.
+unsafe extern "C" fn cb_ui_request(
+    _ref_proc: *mut c_void,
+    info: *const NkMAIDUIRequestInfoPrefix,
+) -> u32 {
+    if info.is_null() { 0 } else { unsafe { (*info).ul_default } }
+}
+
+unsafe extern "C" fn cb_event(_ref_client: *mut c_void, _event: u32, _data: usize) {}
+
+unsafe extern "C" fn cb_progress(
+    _command: u32,
+    _param: u32,
+    _ref_complete: *mut c_void,
+    _done: u32,
+    _total: u32,
+) {
+}
+
+/// Data delivery is not used by this tool; report success (kNkMAIDResult_NoError = 0).
+unsafe extern "C" fn cb_data(
+    _ref_client: *mut c_void,
+    _data_info: *mut c_void,
+    _data: *mut c_void,
+) -> i32 {
+    0
+}
+
+unsafe extern "C" fn cb_live_view(_ref_client: *mut c_void, _live_view: *const c_void) {}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Errors
@@ -513,13 +568,12 @@ impl Sdk {
     }
 
     fn initialize_sdk(&mut self) -> Result<(), SdkError> {
-        let stub: *mut c_void = cb_noop as *mut c_void;
         let callback = NkMAIDCSCallback {
-            p_ui_req_proc: stub,
-            p_event_proc: stub,
-            p_progress_proc: stub,
-            p_data_proc: stub,
-            p_live_view_data_proc: stub,
+            p_ui_req_proc: cb_ui_request,
+            p_event_proc: cb_event,
+            p_progress_proc: cb_progress,
+            p_data_proc: cb_data,
+            p_live_view_data_proc: cb_live_view,
             ref_proc: ptr::null_mut(),
         };
         let mut device_list: *mut NkMAIDEnumDevices = ptr::null_mut();
@@ -994,6 +1048,29 @@ unsafe fn write_cap_value(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── callback stubs ───────────────────────────────────────────────────
+    // The SDK reads the return value of the UI-request and data stubs, so pin
+    // what they return (a `void` stub would leave the register undefined).
+
+    #[test]
+    fn ui_request_stub_returns_sdk_default() {
+        let info = NkMAIDUIRequestInfoPrefix { ul_type: 0, ul_default: 3 };
+        let r = unsafe { cb_ui_request(ptr::null_mut(), &info) };
+        assert_eq!(r, 3, "must echo ulDefault (valid for sync requests)");
+    }
+
+    #[test]
+    fn ui_request_stub_null_info_returns_none() {
+        let r = unsafe { cb_ui_request(ptr::null_mut(), ptr::null()) };
+        assert_eq!(r, 0, "null info → kNkMAIDUIRequestResult_None");
+    }
+
+    #[test]
+    fn data_stub_reports_no_error() {
+        let r = unsafe { cb_data(ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) };
+        assert_eq!(r, 0, "kNkMAIDResult_NoError is 0");
+    }
 
     // ── check ────────────────────────────────────────────────────────────
     // Critical: the < 0 vs <= 0 choice is contract — code 0 is MAID3 success.
