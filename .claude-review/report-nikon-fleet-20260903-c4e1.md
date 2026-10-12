@@ -99,3 +99,19 @@ None.
 
 ## Skipped
 - **Phase 2 (Inventory)** — `--skip-inventory` flag, per explicit user decision: the code delta since the 2026-06-11 review was entirely test code, so no new data-capture modules exist to inventory this pass.
+
+## Remediation — nikon-fleet-remediate-20261012-8acb (2026-10-12)
+
+Finding `nikon-fleet-20260903-c4e1#50` (src/sdk.rs `cb_noop`, wrong signature for callback slots) was
+deferred in `nikon-fleet-20260903-lows` because the exact `Maid3.h` callback typedefs were believed
+unavailable. They are shipped in the SDK package (`Module/*/HeaderFile/`), so the deferral reason no
+longer held.
+
+- **Disposition:** fixed in `e809640` — 1 of 1 targets. Five typed no-op callbacks replace the single
+  zero-arg stub; the UI-request stub echoes the SDK's `ulDefault` and the data stub returns 0.
+- **Verified:** `cargo test --workspace` 341 passed. Mutation check: data stub returning 1, and the UI
+  stub ignoring `ulDefault`, each fail their pinning test. `tautology_sweep` clean.
+- **Unverified:** behavior against a live camera. No callback is known to fire in the snapshot-only
+  workflow, so the live path is untested.
+- **Note:** `e809640` was already pushed when the ledger was updated, so it has no `Review-Pass` trailer;
+  the ledger entry is the record.
