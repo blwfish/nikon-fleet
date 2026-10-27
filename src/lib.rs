@@ -11,6 +11,7 @@ pub mod firmware_source;
 #[cfg(feature = "webview")]
 pub mod firmware_webview;
 pub mod maid_layer;
+pub mod ops;
 pub mod ptp_usb;
 pub mod range_value;
 pub mod sdk;

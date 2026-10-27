@@ -346,7 +346,7 @@ fn check(call: &'static str, code: i32) -> Result<(), SdkError> {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Camera identity read from USB device descriptors.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsbCameraInfo {
     pub product_id: u16,
     /// `iSerialNumber` string descriptor, e.g. `"0000003023668"`.
