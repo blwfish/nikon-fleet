@@ -41,6 +41,7 @@ finding led to a code change, the commit is named.
 | F12 | Two bodies attached together | verified for selection; concurrency inconclusive |
 | F13 | Still unverified after all of the above | open |
 | F15 | Phase 0 live checks: another teardown hang, then the SDK stopped enumerating a bus-visible body | open |
+| F17 | The `worker` subcommand live: result delivered before a teardown hang; one SIGSEGV after a result | verified (one body) |
 | F16 | Targeted undo (`restore --only`) on the Z 9: restores the named property, leaves a later change alone | verified (two enum properties) |
 | F14 | Spike B: worker-style spawn, fd cleanliness, SIGKILL of a capture child | verified (small samples) |
 
@@ -449,6 +450,29 @@ including all three that wrote to the body, exited normally.
 
 Not covered: ranges, literals and strings; a cross-model undo; a write that changes another
 property; the MCP's own sequence (digest, restore point, baseline gate, read-back) end to end.
+
+## F17. The `worker` subcommand on the Z 9 (2026-10-27)
+
+`nikon-fleet worker --result-fd 3 capture --serial 0000003023668 --label worker-live`, with fd 3
+redirected to a file by the shell (so the "channel" is a file, not a pipe), stdout discarded.
+
+- **Success run.** Progress `starting`, `sdk_ready`, `connected`, `captured`, `written`, then an ok
+  result: `property_count=196`, `read_ok=196 read_err=11`, `gate: passed`, a new file with the label
+  `mcp-worker-live` (snapshot count 5 to 6). **The process then hung in teardown** and was still running
+  4 s after the result line, so the harness killed it (exit 137). The result had already been written and
+  flushed: this is the F3 hang happening for real, with the protocol's "result before teardown" rule
+  doing its job. It is the first run in which the worker, not a script, was the thing that hung.
+- **Typed errors.** A serial that no body has: `not_found`. `id-1`: `no_usb_serial`, before the SDK was
+  opened (progress was only `starting`). Both were exit status 1.
+- **One SIGSEGV after a result.** The `not_found` run exited **139 (SIGSEGV)** after it had delivered its
+  error result, while the SDK session was being dropped without a device ever having been connected. Three
+  repeats of the same command exited 1, and the plain CLI `snapshot --serial <wrong>` exited 1 three times,
+  so it is intermittent and was not reproduced. No heimdall integration exists in this project to check
+  (CLAUDE.md crash-diagnosis rule: a no-op here). Consequence for the design is the same as for the hang:
+  the result line, not the exit status, is the answer, and a crash after it is not a failure.
+
+Not covered: a worker killed before its result; two workers racing for the lock on real hardware (the busy
+path is tested without hardware); the Z6III; the MCP server as the parent.
 
 ## F13. Still unverified
 
