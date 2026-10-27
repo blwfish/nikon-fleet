@@ -30,7 +30,8 @@ use nikon_fleet::firmware_source::{
 };
 use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::ops::list::{EntryState, Listing, list_dir, reference_filename};
-use nikon_fleet::sdk::{CapabilityInfo, Device, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET, OP_SET};
+use nikon_fleet::ops::restore;
+use nikon_fleet::sdk::{CapabilityInfo, Device, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use nikon_fleet::transplant;
 
@@ -425,6 +426,14 @@ struct RestoreArgs {
     /// Print what would be written without sending anything to the camera.
     #[arg(long)]
     dry_run: bool,
+    /// Restore only this property and leave everything else on the camera as
+    /// it is (a targeted undo). Repeatable; accepts the name with or without
+    /// the kNkMAIDCapability_ prefix. A name that is not in the snapshot is an
+    /// error, and so is a named property that cannot be written (state
+    /// property, absent or read-only on this body, or a failed write): the
+    /// command exits non-zero rather than report a partial undo as done.
+    #[arg(long = "only", value_name = "PROPERTY")]
+    only: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1134,45 +1143,32 @@ fn ensure_capabilities_present(count: usize) -> Result<()> {
     Ok(())
 }
 
-/// Why a snapshot property is not written back by `restore`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RestoreSkip {
-    /// On [`transplant::NEVER_TRANSPLANT`]: it reports body/session state (or
-    /// locks it) rather than holding a setting. The same table `transplant`
-    /// uses, so the two commands cannot disagree about what is state. A
-    /// restore point must not generate errors for properties the camera
-    /// refuses to set (`CurrentItemID` and `LiveViewStatus` failed -125 on
-    /// every full restore of a Z6III), or `errors == 0` stops meaning anything.
-    NeverCopied,
-    /// Capability code not present on this camera.
-    Absent,
-    /// Present but `OP_SET` is not allowed.
-    ReadOnly,
-}
-
-/// The device-free checks `restore` applies before writing a property, in
-/// order: the policy skip first (so a state property is reported as such even
-/// on a body that lacks it), then presence, then writability.
-fn restore_precheck<'a>(
-    cap_map: &HashMap<u32, &'a CapabilityInfo>,
-    code: u32,
-) -> std::result::Result<&'a CapabilityInfo, RestoreSkip> {
-    if transplant::never_copied(code).is_some() {
-        return Err(RestoreSkip::NeverCopied);
-    }
-    let cap = *cap_map.get(&code).ok_or(RestoreSkip::Absent)?;
-    if cap.operations & OP_SET == 0 {
-        return Err(RestoreSkip::ReadOnly);
-    }
-    Ok(cap)
-}
-
 /// Whether a restore should be treated as a hard failure: zero writes
 /// succeeded and at least one real error occurred — not a routine skip
 /// (absent/read-only/unsupported-type capabilities are expected and don't
 /// count as errors).
 fn restore_completely_failed(written: usize, errors: usize) -> bool {
     written == 0 && errors > 0
+}
+
+/// The error for a targeted restore that did not write everything it was
+/// asked to: `named` is how many properties `--only` selected (`None` for a
+/// full restore, which skips many properties routinely and never fails for
+/// that), `unrestored` each named property that was not written (or, in a dry
+/// run, would not be) with a closed reason tag. `None` when everything named
+/// was (or would be) written.
+fn unrestored_error(named: Option<usize>, unrestored: &[(String, &'static str)]) -> Option<String> {
+    let named = named?;
+    if unrestored.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = unrestored.iter().map(|(n, why)| format!("{n} ({why})")).collect();
+    Some(format!(
+        "targeted restore incomplete: {} of {named} named propert{} not written: {}",
+        unrestored.len(),
+        if unrestored.len() == 1 { "y was" } else { "ies were" },
+        list.join(", ")
+    ))
 }
 
 fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArgs, no_usb_reset: bool) -> Result<()> {
@@ -2024,6 +2020,14 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
     let snap = Snapshot::load_from_file(&snap_path)
         .with_context(|| format!("loading {}", snap_path.display()))?;
 
+    // Validated before the camera is touched: a mistyped --only must fail here,
+    // not run as a restore that quietly had nothing to do.
+    let only = if args.only.is_empty() {
+        None
+    } else {
+        Some(restore::resolve_only(&args.only, &snap.properties)?)
+    };
+
     let mut sdk = open_sdk(bundle, no_usb_reset)?;
     let devices = sdk.devices()?;
     if devices.is_empty() {
@@ -2061,47 +2065,56 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
     let mut skipped_read_only = 0usize; // present but OP_SET not allowed
     let mut skipped_type = 0usize;
     let mut skipped_never = 0usize;     // state/lock properties (transplant::NEVER_TRANSPLANT)
+    let mut not_selected = 0usize;      // excluded by --only
     let mut errors = 0usize;
+    // Named by --only but not written (or not writable, in a dry run).
+    let mut unrestored: Vec<(String, &'static str)> = Vec::new();
 
-    for (name, prop) in &snap.properties {
-        let cap = match restore_precheck(&cap_map, prop.code) {
-            Ok(cap) => cap,
-            Err(RestoreSkip::NeverCopied) => {
-                skipped_never += 1;
-                continue;
+    for step in restore::plan(&snap.properties, only.as_ref(), &cap_map) {
+        let (name, code) = (step.name, step.code);
+        match step.decision {
+            restore::Decision::NotSelected => not_selected += 1,
+            restore::Decision::Skip(skip) => {
+                match skip {
+                    restore::RestoreSkip::NeverCopied => skipped_never += 1,
+                    restore::RestoreSkip::Absent => skipped_absent += 1,
+                    restore::RestoreSkip::ReadOnly => skipped_read_only += 1,
+                }
+                unrestored.push((name.to_string(), skip.tag()));
             }
-            Err(RestoreSkip::Absent) => {
-                skipped_absent += 1;
-                continue;
-            }
-            Err(RestoreSkip::ReadOnly) => {
-                skipped_read_only += 1;
-                continue;
-            }
-        };
-        if args.dry_run {
-            println!("  would write  {} [{:#x}]", name, prop.code);
-            written += 1;
-            continue;
-        }
-        match device.write_capability(prop.code, cap.kind, &prop.value) {
-            Ok(()) => written += 1,
-            Err(SdkError::UnsupportedWrite(_)) => skipped_type += 1,
-            Err(e) => {
-                eprintln!("  warn: {} [{:#x}]: {}", name, prop.code, e);
-                errors += 1;
+            restore::Decision::Write(cap) => {
+                if args.dry_run {
+                    println!("  would write  {} [{:#x}]", name, code);
+                    written += 1;
+                    continue;
+                }
+                match device.write_capability(code, cap.kind, &snap.properties[name].value) {
+                    Ok(()) => written += 1,
+                    Err(SdkError::UnsupportedWrite(_)) => {
+                        skipped_type += 1;
+                        unrestored.push((name.to_string(), "unsupported_write_type"));
+                    }
+                    Err(e) => {
+                        eprintln!("  warn: {} [{:#x}]: {}", name, code, e);
+                        errors += 1;
+                        unrestored.push((name.to_string(), "write_failed"));
+                    }
+                }
             }
         }
     }
-
+    let not_selected_note = if only.is_some() { format!("  skipped(not-selected)={not_selected}") } else { String::new() };
     println!(
         "{} written={written}  skipped(absent)={skipped_absent}  \
          skipped(read-only)={skipped_read_only}  \
-         skipped(unsupported-type)={skipped_type}  skipped(never-copied)={skipped_never}  errors={errors}",
+         skipped(unsupported-type)={skipped_type}  skipped(never-copied)={skipped_never}{not_selected_note}  errors={errors}",
         if args.dry_run { "Dry run:" } else { "Restore complete:" }
     );
     if !args.dry_run && restore_completely_failed(written, errors) {
         bail!("all {errors} capability write(s) failed (see warnings above); nothing was restored");
+    }
+    if let Some(msg) = unrestored_error(only.as_ref().map(|o| o.len()), &unrestored) {
+        bail!("{msg}");
     }
     Ok(())
 }
@@ -2714,62 +2727,6 @@ mod tests {
         assert!(!snapshot_capture_failed(1)); // 99 failed reads alongside don't matter
     }
 
-    // ── restore_precheck (shares transplant::NEVER_TRANSPLANT) ───────────
-
-    fn cap(id: u32, operations: u32) -> CapabilityInfo {
-        CapabilityInfo { id, kind: 0, visibility: 0, operations, description: String::new() }
-    }
-
-    #[test]
-    fn restore_precheck_skips_every_never_transplant_code_even_when_writable() {
-        for (code, name, _) in transplant::NEVER_TRANSPLANT {
-            let c = cap(*code, OP_GET | OP_SET);
-            let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(*code, &c)]);
-            assert_eq!(restore_precheck(&caps, *code), Err(RestoreSkip::NeverCopied), "{name}");
-        }
-    }
-
-    #[test]
-    fn restore_precheck_skips_shoot_no_card() {
-        // Restore shares the table, so a restore point no longer rewrites it (F10).
-        let c = cap(33108, OP_GET | OP_SET);
-        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(33108, &c)]);
-        assert_eq!(restore_precheck(&caps, 33108), Err(RestoreSkip::NeverCopied));
-        let neighbour = cap(33109, OP_GET | OP_SET);
-        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(33109, &neighbour)]);
-        assert_eq!(restore_precheck(&caps, 33109).unwrap().id, 33109);
-    }
-
-    #[test]
-    fn restore_precheck_policy_skip_wins_over_absent_and_read_only() {
-        let code = transplant::NEVER_TRANSPLANT[0].0;
-        // Absent from the camera entirely.
-        let empty: HashMap<u32, &CapabilityInfo> = HashMap::new();
-        assert_eq!(restore_precheck(&empty, code), Err(RestoreSkip::NeverCopied));
-        // Present but not settable.
-        let ro = cap(code, OP_GET);
-        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(code, &ro)]);
-        assert_eq!(restore_precheck(&caps, code), Err(RestoreSkip::NeverCopied));
-    }
-
-    #[test]
-    fn restore_precheck_ordinary_codes_keep_their_existing_behaviour() {
-        // Neighbours of denylisted codes, a plain writable code, a read-only
-        // one and an absent one: only the denylist changed.
-        let denied: std::collections::BTreeSet<u32> = transplant::NEVER_TRANSPLANT.iter().map(|(c, _, _)| *c).collect();
-        let near: Vec<u32> = denied.iter().flat_map(|c| [c - 1, c + 1]).filter(|c| !denied.contains(c)).collect();
-        assert!(!near.is_empty());
-        for code in near {
-            let rw = cap(code, OP_GET | OP_SET);
-            let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(code, &rw)]);
-            assert_eq!(restore_precheck(&caps, code).unwrap().id, code, "{code} must still be restored");
-        }
-        let ro = cap(7, OP_GET);
-        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(7, &ro)]);
-        assert_eq!(restore_precheck(&caps, 7), Err(RestoreSkip::ReadOnly));
-        assert_eq!(restore_precheck(&caps, 8), Err(RestoreSkip::Absent));
-    }
-
     #[test]
     fn restore_completely_failed_zero_written_zero_errors_is_not_failure() {
         // e.g. every capability was skipped as absent/read-only — routine,
@@ -2892,6 +2849,26 @@ mod tests {
     fn cmd_ref_list_missing_dir_ok_empty() {
         let data_dir = TempDir::new().unwrap();
         assert!(cmd_ref(data_dir.path(), &RefCmd::List { json: false }).is_ok());
+    }
+
+    // ── targeted restore verdict ─────────────────────────────────────────
+
+    #[test]
+    fn unrestored_error_is_none_only_when_everything_named_was_written() {
+        assert_eq!(unrestored_error(Some(3), &[]), None);
+        let one = unrestored_error(Some(1), &[("ISO".into(), "read_only")]).unwrap();
+        assert!(one.contains("1 of 1 named property was not written") && one.contains("ISO (read_only)"), "{one}");
+        let two = unrestored_error(Some(5), &[("A".into(), "never_copied"), ("B".into(), "write_failed")]).unwrap();
+        assert!(two.contains("2 of 5 named properties were not written"), "{two}");
+        assert!(two.contains("A (never_copied), B (write_failed)"), "{two}");
+    }
+
+    #[test]
+    fn a_full_restore_never_fails_for_routine_skips() {
+        // Without --only a restore skips absent, read-only and state properties
+        // all the time; that must not become an error.
+        let skips = [("A".to_string(), "read_only"), ("B".to_string(), "never_copied")];
+        assert_eq!(unrestored_error(None, &skips), None);
     }
 
     // ── capture gate and baseline seeding ────────────────────────────────

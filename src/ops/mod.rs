@@ -7,4 +7,5 @@
 
 pub mod baseline;
 pub mod list;
+pub mod restore;
 pub mod target;
