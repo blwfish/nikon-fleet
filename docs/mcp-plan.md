@@ -446,13 +446,13 @@ snapshot" as meaningful, or filter them from the default lists.
 | Add `ShootNoCard` to `NEVER_TRANSPLANT` (and its real-config name check) | todo |
 | `Serialize` on `Strategy`/`SkipReason` as closed tags (exhaustive match) and on outcomes | todo |
 | `--json` on `ls`, `ref list`, `check`, `snapshot`, `transplant`, `restore`; `discover --json` gains `available`/`connected_pid` | todo |
-| `ops::capture` returns `read_ok`/`read_err`/failed codes, uses create-new writes | todo |
+| `ops::capture` returns `read_ok`/`read_err`/failed codes, uses create-new writes | create-new writes **done** (`e50e43c`: `Snapshot::save_new`, used by the CLI and GUI captures); the returned stats are todo |
 | Per-model baseline file (readable-capability sets, seeded from F5) and the superset gate (also useful to the CLI: a partial capture still exits 0) | todo |
 | One `ops::list` byte-identity rule, new for the CLI. The GUIs keep their copies; parity test only (§2) | todo |
-| Cross-process `flock` on an open fd at a fixed per-user local path (not `--data-dir`), taken by CLI, GUI and MCP worker (§3) | todo |
+| Cross-process `flock` on an open fd at a fixed per-user local path (not `--data-dir`), taken by CLI, GUI and MCP worker (§3) | **done** (`a8b5c95`): `nikon_fleet::camera_lock`, taken in the CLI's `open_sdk` and the Rust GUI's discover and snapshot; the MCP worker takes it the same way once it exists. `vendor-read`/`vendor-write-ftp` are raw USB PTP and do not take it |
 | A small camera-port trait (`capabilities`/`read_capability`/`write_capability`) so plan/apply and the restore-point logic are testable without a `Device` (`plan_property` covers translate+gate only) | todo |
 | Lift `firmware latest --json`'s types out of `main.rs` | todo |
-| Strict USB-serial matcher in `ops` (refuses `id-N` and bare SDK ids, `no_usb_serial`); the CLI keeps `serial_matches` (§3) | todo |
+| Strict USB-serial matcher in `ops` (refuses `id-N` and bare SDK ids, `no_usb_serial`); the CLI keeps `serial_matches` (§3) | matcher **done** (`638c23c`, `ops::target`); no caller yet, the MCP tools will be the first |
 | `mcp-` / `mcp-restore-` label prefixes and the two per-camera caps (§3) | todo |
 | Read-back in `ops`: transplant returns `side_effects`, restore returns `residual` (§5.5-5.6) | todo |
 | Capture gate evaluated in memory before the file is written (a failed gate leaves no file) | todo |
