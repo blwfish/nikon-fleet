@@ -401,7 +401,12 @@ The Z6III was not attached during this session.
   SIGKILL of the hung process (the capture after that kill worked, and so did one more run).
   **A replug or power cycle of the body cleared it:** the next `discover` (no USB reset) listed the
   Z 9 at once and the following dry run completed with no hang. One observation, so a correlation,
-  not a diagnosis. The practical rule stands: when the SDK reports no cameras for a body the USB bus
+  not a diagnosis.
+- **Second occurrence, with no kill involved.** Later the same day, after the last successful run
+  (a dry run that exited normally) and some idle time, `discover` again found no cameras while
+  `system_profiler` listed the Z 9 and no fleet process was running. Nothing had been killed or hung
+  since the replug, so the SIGKILL of the hung process is not the trigger. An idle or sleeping body is
+  the obvious suspect and is untested. The practical rule stands: when the SDK reports no cameras for a body the USB bus
   still lists, no software step tried here (waiting, the USB reset) helped; the user has to replug.
 
 ## F13. Still unverified
