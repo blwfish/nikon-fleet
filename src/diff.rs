@@ -115,7 +115,7 @@ pub struct DiffOptions {
 /// comparable and nothing is lost); it is only left out of the comparison.
 /// Range values also carry a `default_index`, but no garbage has been observed
 /// there, so they are compared in full until it is.
-fn values_differ(a: &serde_json::Value, b: &serde_json::Value, opts: &DiffOptions) -> bool {
+pub fn values_differ(a: &serde_json::Value, b: &serde_json::Value, opts: &DiffOptions) -> bool {
     if opts.include_volatile || !(is_enum_shape(a) || is_enum_shape(b)) {
         return a != b;
     }

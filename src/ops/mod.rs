@@ -9,6 +9,7 @@ pub mod baseline;
 pub mod cameras;
 pub mod firmware_latest;
 pub mod list;
+pub mod readback;
 pub mod restore;
 pub mod retention;
 pub mod target;
