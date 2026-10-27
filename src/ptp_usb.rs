@@ -234,6 +234,11 @@ pub enum PtpUsbError {
     OpenSessionFailed(PtpResponseCode),
     #[error("PTP operation 0x{op:04x} failed: {code}")]
     OperationFailed { op: u16, code: PtpResponseCode },
+    #[error(
+        "PTP operation 0x{op:04x}: camera answered with transaction id {got}, expected {expected} \
+         (a stale or out-of-order reply)"
+    )]
+    TransactionIdMismatch { op: u16, expected: u32, got: u32 },
     #[error("FTP profile field {field} is {len} bytes, exceeds the {max}-byte limit")]
     FtpFieldTooLong { field: &'static str, len: usize, max: usize },
     #[error("FTP profile field {field} contains non-ASCII characters, which this encoding does not support")]
@@ -502,6 +507,26 @@ fn encode_data(code: u16, transaction_id: u32, data: &[u8]) -> Vec<u8> {
     encode_container(CONTAINER_DATA, code, transaction_id, data)
 }
 
+/// Whether [`PtpUsbSession::transact`] requires the camera's data and
+/// response containers to carry the transaction id of the command.
+///
+/// Enforcement was added after live captures on a Z6_3 (fw 2.00), Z 5
+/// (fw 1.43) and Z 9 (fw 5.31) showed every reply echoing its command's id
+/// for OpenSession, CloseSession and `0x943B` vendor reads (including the
+/// already-open retry and the Z 5's OperationNotSupported reply).
+///
+/// The FTP write ops (`0x90E8` setup and `0x90EE` profile write) are
+/// deliberately [`TxidCheck::Unchecked`]: no capture of them exists on any
+/// body, and a write has already changed camera state by the time its reply
+/// arrives, so a wrongly strict check there would report failure for a
+/// write that took effect. Move them to `Enforce` once their replies have
+/// been captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxidCheck {
+    Enforce,
+    Unchecked,
+}
+
 /// A parsed container header + whatever payload followed it (params for
 /// Command/Response, raw bytes for Data).
 #[derive(Debug)]
@@ -511,7 +536,6 @@ struct Container {
     // no #[allow(dead_code)] needed; a prior comment here claiming it
     // wasn't read yet was stale.
     code: u16,
-    #[allow(dead_code)] // parsed for completeness; nothing currently reads it back out of a Container
     transaction_id: u32,
     payload: Vec<u8>,
 }
@@ -817,11 +841,17 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// data-in, and return `(response_code, response_params, data)`.
     /// Advances the transaction ID only after a full round trip completes,
     /// matching the reference Python prototype's behavior.
+    ///
+    /// With [`TxidCheck::Enforce`], a data or response container whose id
+    /// differs from the command's fails with
+    /// [`PtpUsbError::TransactionIdMismatch`] (the id is not consumed).
+    /// Event containers and unrecognized kinds are ignored before the check.
     fn transact(
         &mut self,
         op: u16,
         params: &[u32],
         data_out: Option<&[u8]>,
+        check: TxidCheck,
     ) -> Result<(u16, Vec<u32>, Vec<u8>), PtpUsbError> {
         self.send_command(op, params)?;
         if let Some(data) = data_out {
@@ -834,6 +864,16 @@ impl<T: BulkTransport> PtpUsbSession<T> {
                 return Err(PtpUsbError::TransactionTimedOut(TRANSACTION_TIMEOUT));
             }
             let container = self.read_container()?;
+            if check == TxidCheck::Enforce
+                && matches!(container.kind, CONTAINER_DATA | CONTAINER_RESPONSE)
+                && container.transaction_id != self.transaction_id
+            {
+                return Err(PtpUsbError::TransactionIdMismatch {
+                    op,
+                    expected: self.transaction_id,
+                    got: container.transaction_id,
+                });
+            }
             match container.kind {
                 CONTAINER_DATA => {
                     data_in.extend(container.payload);
@@ -873,7 +913,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// 2026-09-06 interactive session confirmed, but is not re-checked by
     /// the test suite.
     fn open_ptp_session(&mut self) -> Result<(), PtpUsbError> {
-        let (code, _, _) = self.transact(OP_OPEN_SESSION, &[SESSION_ID], None)?;
+        let (code, _, _) = self.transact(OP_OPEN_SESSION, &[SESSION_ID], None, TxidCheck::Enforce)?;
         match classify_open_session_response(code) {
             OpenSessionResponse::Ok => {}
             OpenSessionResponse::RetryOnce => {
@@ -881,9 +921,9 @@ impl<T: BulkTransport> PtpUsbSession<T> {
                 // own ptpcamerad, which we just evicted) — close it and
                 // retry once.
                 self.transaction_id = 0;
-                let _ = self.transact(OP_CLOSE_SESSION, &[], None);
+                let _ = self.transact(OP_CLOSE_SESSION, &[], None, TxidCheck::Enforce);
                 self.transaction_id = 0;
-                let (code, _, _) = self.transact(OP_OPEN_SESSION, &[SESSION_ID], None)?;
+                let (code, _, _) = self.transact(OP_OPEN_SESSION, &[SESSION_ID], None, TxidCheck::Enforce)?;
                 // Deliberately not re-matching classify_open_session_response
                 // here: a second RESP_SESSION_ALREADY_OPEN on the retry
                 // itself is treated as fatal, not looped again.
@@ -924,7 +964,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
             );
         }
         let param = 0x10000 | propcode as u32;
-        let (code, _, data) = self.transact(OP_VENDOR_PROP_READ, &[param], None)?;
+        let (code, _, data) = self.transact(OP_VENDOR_PROP_READ, &[param], None, TxidCheck::Enforce)?;
         Self::require_ok(OP_VENDOR_PROP_READ, code)?;
         Ok(data)
     }
@@ -948,10 +988,10 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         }
         let blob = encode_ftp_profile(profile)?;
 
-        let (code, _, _) = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA))?;
+        let (code, _, _) = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
         Self::require_ok(OP_FTP_SETUP, code)?;
 
-        let (code, _, _) = self.transact(OP_FTP_PROFILE_WRITE, &[0, 0], Some(&blob))?;
+        let (code, _, _) = self.transact(OP_FTP_PROFILE_WRITE, &[0, 0], Some(&blob), TxidCheck::Unchecked)?;
         Self::require_ok(OP_FTP_PROFILE_WRITE, code)?;
         Ok(())
     }
@@ -960,7 +1000,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
 impl<T: BulkTransport> Drop for PtpUsbSession<T> {
     fn drop(&mut self) {
         if self.session_open {
-            let _ = self.transact(OP_CLOSE_SESSION, &[], None);
+            let _ = self.transact(OP_CLOSE_SESSION, &[], None, TxidCheck::Enforce);
         }
         let _ = self.handle.release_interface(self.interface);
     }
@@ -1969,30 +2009,30 @@ mod tests {
     #[test]
     fn transact_collects_data_phase_then_response() {
         let (mut s, _t) = session(vec![data_c(0x943B, &[1, 2, 3]), resp(RESP_OK)], "Z 9");
-        let (code, params, data) = s.transact(0x943B, &[], None).unwrap();
+        let (code, params, data) = s.transact(0x943B, &[], None, TxidCheck::Unchecked).unwrap();
         assert_eq!((code, params, data), (RESP_OK, vec![], vec![1, 2, 3]));
     }
 
     #[test]
     fn transact_concatenates_multiple_data_containers() {
         let (mut s, _t) = session(vec![data_c(0x943B, &[1, 2]), data_c(0x943B, &[3]), resp(RESP_OK)], "Z 9");
-        assert_eq!(s.transact(0x943B, &[], None).unwrap().2, vec![1, 2, 3]);
+        assert_eq!(s.transact(0x943B, &[], None, TxidCheck::Unchecked).unwrap().2, vec![1, 2, 3]);
     }
 
     #[test]
     fn transact_decodes_response_params() {
         let raw = encode_container(CONTAINER_RESPONSE, RESP_OK, 0, &[7, 0, 0, 0, 9, 0, 0, 0]);
         let (mut s, _t) = session(vec![Step::Bytes(raw)], "Z 9");
-        assert_eq!(s.transact(0x1001, &[], None).unwrap().1, vec![7, 9]);
+        assert_eq!(s.transact(0x1001, &[], None, TxidCheck::Unchecked).unwrap().1, vec![7, 9]);
     }
 
     #[test]
     fn transact_advances_transaction_id_only_after_a_full_round_trip() {
         let (mut s, t) = session(vec![Step::Err(rusb::Error::Timeout), resp(RESP_OK)], "Z 9");
         s.transaction_id = 5;
-        assert!(s.transact(0x1001, &[], None).is_err());
+        assert!(s.transact(0x1001, &[], None, TxidCheck::Unchecked).is_err());
         assert_eq!(s.transaction_id, 5, "an I/O failure must not consume the id");
-        s.transact(0x1001, &[], None).unwrap();
+        s.transact(0x1001, &[], None, TxidCheck::Unchecked).unwrap();
         assert_eq!(s.transaction_id, 6);
         // Both attempts were sent under id 5.
         assert_eq!(t.sent().iter().map(|f| f.2).collect::<Vec<_>>(), vec![5, 5]);
@@ -2003,7 +2043,7 @@ mod tests {
         let raw = encode_container(CONTAINER_RESPONSE, RESP_OK, 0, &[1, 2, 3]);
         let (mut s, _t) = session(vec![Step::Bytes(raw)], "Z 9");
         s.transaction_id = 4;
-        let err = s.transact(0x1001, &[], None).unwrap_err();
+        let err = s.transact(0x1001, &[], None, TxidCheck::Unchecked).unwrap_err();
         assert!(matches!(err, PtpUsbError::MisalignedResponseParams(3)), "{err:?}");
         assert_eq!(s.transaction_id, 4);
     }
@@ -2013,26 +2053,107 @@ mod tests {
         let event = Step::Bytes(encode_container(CONTAINER_EVENT, 0x4006, 0, &[]));
         let weird = Step::Bytes(encode_container(9, 0, 0, &[]));
         let (mut s, _t) = session(vec![event, weird, resp(RESP_OK)], "Z 9");
-        assert_eq!(s.transact(0x1001, &[], None).unwrap().0, RESP_OK);
+        assert_eq!(s.transact(0x1001, &[], None, TxidCheck::Unchecked).unwrap().0, RESP_OK);
     }
 
     #[test]
     fn transact_sends_command_then_data_out_under_the_same_transaction_id() {
         let (mut s, t) = session(vec![resp(RESP_OK)], "Z 9");
-        s.transact(0x90EE, &[7], Some(&[9, 9])).unwrap();
+        s.transact(0x90EE, &[7], Some(&[9, 9]), TxidCheck::Unchecked).unwrap();
         assert_eq!(
             t.sent(),
             vec![(CONTAINER_COMMAND, 0x90EE, 0, le(7)), (CONTAINER_DATA, 0x90EE, 0, vec![9, 9])]
         );
     }
 
+    // ── response transaction-id enforcement (7b2e N1) ──────────────────────
+
     #[test]
-    fn transact_does_not_validate_the_response_transaction_id() {
-        // Pins current behavior, not an endorsement: a response carrying a
-        // different transaction id than the command is accepted.
+    fn enforce_accepts_a_matching_response_id() {
+        let raw = encode_container(CONTAINER_RESPONSE, RESP_OK, 0, &[]);
+        let (mut s, _t) = session(vec![Step::Bytes(raw)], "Z 9");
+        assert_eq!(s.transact(0x1001, &[], None, TxidCheck::Enforce).unwrap().0, RESP_OK);
+    }
+
+    #[test]
+    fn enforce_rejects_a_response_with_a_different_id_both_directions() {
+        // One above and one below the expected id (3): the contract is
+        // equality, not ordering.
+        for got in [4u32, 2u32] {
+            let raw = encode_container(CONTAINER_RESPONSE, RESP_OK, got, &[]);
+            let (mut s, _t) = session(vec![Step::Bytes(raw)], "Z 9");
+            s.transaction_id = 3;
+            let err = s.transact(0x1001, &[], None, TxidCheck::Enforce).unwrap_err();
+            assert!(
+                matches!(err, PtpUsbError::TransactionIdMismatch { op: 0x1001, expected: 3, got: g } if g == got),
+                "{err:?}"
+            );
+            assert_eq!(s.transaction_id, 3, "a rejected reply must not consume the id");
+        }
+    }
+
+    #[test]
+    fn enforce_rejects_a_data_container_with_a_different_id() {
+        let (mut s, _t) = session(
+            vec![Step::Bytes(encode_data(0x943B, 9, &[1])), Step::Bytes(encode_container(CONTAINER_RESPONSE, RESP_OK, 0, &[]))],
+            "Z 9",
+        );
+        let err = s.transact(0x943B, &[], None, TxidCheck::Enforce).unwrap_err();
+        assert!(matches!(err, PtpUsbError::TransactionIdMismatch { expected: 0, got: 9, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn enforce_ignores_the_id_on_event_and_unrecognized_containers() {
+        // Events carry their own ids (often 0xFFFFFFFF); they are skipped
+        // before the check, as they were before enforcement existed.
+        let event = Step::Bytes(encode_container(CONTAINER_EVENT, 0x4006, 0xFFFF_FFFF, &[]));
+        let weird = Step::Bytes(encode_container(9, 0, 77, &[]));
+        let (mut s, _t) = session(vec![event, weird, resp(RESP_OK)], "Z 9");
+        assert_eq!(s.transact(0x1001, &[], None, TxidCheck::Enforce).unwrap().0, RESP_OK);
+    }
+
+    #[test]
+    fn unchecked_accepts_a_mismatched_response_id() {
         let raw = encode_container(CONTAINER_RESPONSE, RESP_OK, 999, &[]);
         let (mut s, _t) = session(vec![Step::Bytes(raw)], "Z 9");
-        assert_eq!(s.transact(0x1001, &[], None).unwrap().0, RESP_OK);
+        assert_eq!(s.transact(0x1001, &[], None, TxidCheck::Unchecked).unwrap().0, RESP_OK);
+    }
+
+    #[test]
+    fn read_path_enforces_the_id_end_to_end() {
+        // OpenSession ok (id 0), then the vendor read's reply carries the
+        // wrong id: the caller must see the mismatch, not a value.
+        let steps = vec![
+            resp(RESP_OK),
+            Step::Bytes(encode_data(OP_VENDOR_PROP_READ, 7, &[1])),
+            Step::Bytes(encode_container(CONTAINER_RESPONSE, RESP_OK, 7, &[])),
+        ];
+        let (mut s, _t) = session(steps, "Z 9");
+        s.open_ptp_session().unwrap();
+        s.session_open = true;
+        let err = s.read_vendor_property(0xD053).unwrap_err();
+        assert!(matches!(err, PtpUsbError::TransactionIdMismatch { op: OP_VENDOR_PROP_READ, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn open_session_enforces_the_id() {
+        let raw = encode_container(CONTAINER_RESPONSE, RESP_OK, 5, &[]);
+        let (mut s, _t) = session(vec![Step::Bytes(raw)], "Z 9");
+        let err = s.open_ptp_session().unwrap_err();
+        assert!(matches!(err, PtpUsbError::TransactionIdMismatch { op: OP_OPEN_SESSION, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn ftp_write_path_stays_unchecked_with_mismatched_ids() {
+        // Deliberate (see TxidCheck): no live capture of the write ops
+        // exists, so their replies are not id-validated. Pinned so that
+        // tightening it is a conscious change made alongside a capture.
+        let steps = vec![
+            Step::Bytes(encode_container(CONTAINER_RESPONSE, RESP_OK, 41, &[])),
+            Step::Bytes(encode_container(CONTAINER_RESPONSE, RESP_OK, 42, &[])),
+        ];
+        let (mut s, _t) = session(steps, "Z 9");
+        s.write_ftp_profile(&valid_profile(), false).unwrap();
     }
 
     #[test]
@@ -2040,7 +2161,7 @@ mod tests {
         let mut steps = chunked(encode_data(0x943B, 0, &vec![0u8; MAX_TRANSACTION_DATA_BYTES]));
         steps.push(resp(RESP_OK));
         let (mut s, _t) = session(steps, "Z 9");
-        assert_eq!(s.transact(0x943B, &[], None).unwrap().2.len(), MAX_TRANSACTION_DATA_BYTES);
+        assert_eq!(s.transact(0x943B, &[], None, TxidCheck::Unchecked).unwrap().2.len(), MAX_TRANSACTION_DATA_BYTES);
     }
 
     #[test]
@@ -2048,7 +2169,7 @@ mod tests {
         let mut steps = chunked(encode_data(0x943B, 0, &vec![0u8; MAX_TRANSACTION_DATA_BYTES + 1]));
         steps.push(resp(RESP_OK));
         let (mut s, _t) = session(steps, "Z 9");
-        let err = s.transact(0x943B, &[], None).unwrap_err();
+        let err = s.transact(0x943B, &[], None, TxidCheck::Unchecked).unwrap_err();
         assert!(
             matches!(err, PtpUsbError::TransactionDataTooLarge { got, limit }
                 if got == MAX_TRANSACTION_DATA_BYTES + 1 && limit == MAX_TRANSACTION_DATA_BYTES),
@@ -2063,7 +2184,7 @@ mod tests {
         assert_eq!(steps.len(), 2, "20 KB payload must span two 16 KB bulk reads");
         steps.push(resp(RESP_OK));
         let (mut s, _t) = session(steps, "Z 9");
-        assert_eq!(s.transact(0x943B, &[], None).unwrap().2, payload);
+        assert_eq!(s.transact(0x943B, &[], None, TxidCheck::Unchecked).unwrap().2, payload);
     }
 
     #[test]
@@ -2071,14 +2192,14 @@ mod tests {
         let full = encode_data(0x943B, 0, &[0u8; 88]); // declares 100 bytes
         assert_eq!(full.len(), 100);
         let (mut s, _t) = session(vec![Step::Bytes(full[..20].to_vec()), Step::Bytes(vec![])], "Z 9");
-        let err = s.transact(0x943B, &[], None).unwrap_err();
+        let err = s.transact(0x943B, &[], None, TxidCheck::Unchecked).unwrap_err();
         assert!(matches!(err, PtpUsbError::TruncatedContainer { declared: 100, got: 20 }), "{err:?}");
     }
 
     #[test]
     fn read_container_short_first_read_is_a_short_container_error() {
         let (mut s, _t) = session(vec![Step::Bytes(vec![1, 2, 3])], "Z 9");
-        let err = s.transact(0x1001, &[], None).unwrap_err();
+        let err = s.transact(0x1001, &[], None, TxidCheck::Unchecked).unwrap_err();
         assert!(matches!(err, PtpUsbError::ShortContainer(3)), "{err:?}");
     }
 
