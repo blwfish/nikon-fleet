@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use eframe::egui;
 use nikon_fleet::firmware::model_slug;
 use nikon_fleet::maid_layer::MaidLayerConfig;
+use nikon_fleet::ops::list::is_plain_name_component;
 use nikon_fleet::ptp_usb::{self, FtpProfile};
 use nikon_fleet::camera_lock::CameraLock;
 use nikon_fleet::sdk::{DeviceInfo, Sdk, OP_GET, UsbCameraInfo, pair_devices, usb_camera_list};
@@ -1016,10 +1017,17 @@ fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {
             }
             let model = snap.camera.model.clone();
             let ref_text = ref_text_by_model.entry(model.clone()).or_insert_with(|| {
+                if !(is_plain_name_component(&model) && is_plain_name_component(serial)) {
+                    return None;
+                }
                 let ref_path = ref_dir.join(format!("{}_{serial}.json", model_slug(&model)));
                 std::fs::read_to_string(&ref_path).ok()
             });
-            let is_reference = ref_text.as_deref() == Some(text.as_str());
+            // Model and serial come from a data file: they must not steer the
+            // reference lookup out of references/ (same guard as ops::list).
+            let is_reference = is_plain_name_component(&model)
+                && is_plain_name_component(serial)
+                && ref_text.as_deref() == Some(text.as_str());
             Some(SnapRow {
                 is_reference,
                 filename: fname,
@@ -1501,6 +1509,21 @@ mod tests {
         let by_name = |n: &str| rows.iter().find(|r| r.filename == n).unwrap();
         assert!(by_name("b.json").is_reference);
         assert!(!by_name("a.json").is_reference);
+    }
+
+    #[test]
+    fn list_snapshots_matches_the_shared_reference_parity_fixture() {
+        // Same directory and expectations as nikon_fleet::ops::list's test and
+        // gui/test_fleet_lib.py: all three must agree on "is the reference".
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/reference_parity");
+        let expected: HashMap<String, HashMap<String, bool>> =
+            serde_json::from_str(&fs::read_to_string(fx.join("expected.json")).unwrap()).unwrap();
+        assert!(!expected.is_empty());
+        for (serial, want) in &expected {
+            let rows = list_snapshots(&fx, serial);
+            let got: HashMap<String, bool> = rows.iter().map(|r| (r.filename.clone(), r.is_reference)).collect();
+            assert_eq!(&got, want, "serial {serial:?}");
+        }
     }
 
     #[test]

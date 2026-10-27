@@ -204,6 +204,12 @@ def parse_fw_filename(name: str) -> tuple[str, str]:
     return stem, ""
 
 
+def _plain_name_component(s) -> bool:
+    """A value safe to splice into a file name (mirrors ops::list in Rust)."""
+    return (isinstance(s, str) and s not in ("", ".", "..")
+            and not any(c in s for c in ("/", "\\", "\0")))
+
+
 def snapshot_rows(data_dir: Path, model: str, serial: str, warn=None) -> list[tuple]:
     """Rows for one camera's snapshots, newest first.
 
@@ -214,7 +220,14 @@ def snapshot_rows(data_dir: Path, model: str, serial: str, warn=None) -> list[tu
     reference exactly when its file is byte-identical to the reference file.
     This replaced a ``captured_at[:19]`` comparison, which mis-flagged every
     snapshot taken in the same second as the reference. The Rust GUI's
-    ``list_snapshots`` applies the same rule.
+    ``list_snapshots`` and ``nikon_fleet::ops::list`` apply the same rule, and
+    all three are pinned to the fixture in ``tests/fixtures/reference_parity``.
+
+    Rows are selected by *serial*; the reference for each row is looked up by
+    that snapshot's **own** model and serial, not by the caller's *model*
+    (kept in the signature for existing callers). The ``id-N`` fallback serial
+    can be shared by two models, and using the caller's model marked the other
+    model's promoted snapshot as not-the-reference.
 
     Unreadable or malformed snapshot files are skipped and reported through
     *warn* (default: stderr), never silently dropped.
@@ -225,24 +238,34 @@ def snapshot_rows(data_dir: Path, model: str, serial: str, warn=None) -> list[tu
     snap_dir = Path(data_dir) / "snapshots"
     if not snap_dir.exists():
         return []
-    ref_bytes = None
-    ref_path = Path(data_dir) / "references" / f"{model_slug(model)}_{serial}.json"
-    if ref_path.exists():
-        try:
-            ref_bytes = ref_path.read_bytes()
-        except OSError as e:
-            warn(f"warning: could not read reference {ref_path}: {e}")
+    ref_cache: dict = {}
+
+    def reference_bytes(row_model, row_serial):
+        if not (_plain_name_component(row_model) and _plain_name_component(row_serial)):
+            return None
+        key = (row_model, row_serial)
+        if key not in ref_cache:
+            ref_path = Path(data_dir) / "references" / f"{model_slug(row_model)}_{row_serial}.json"
+            ref_cache[key] = None
+            if ref_path.exists():
+                try:
+                    ref_cache[key] = ref_path.read_bytes()
+                except OSError as e:
+                    warn(f"warning: could not read reference {ref_path}: {e}")
+        return ref_cache[key]
+
     rows = []
     for f in snap_dir.glob("*.json"):
         try:
             raw = f.read_bytes()
             d = json.loads(raw)
             if d["camera"]["serial"] == serial:
+                ref = reference_bytes(d["camera"].get("model"), serial)
                 rows.append((d.get("captured_at", "")[:19],
                              d.get("label") or "",
                              d["camera"].get("firmware", ""),
                              f.name,
-                             ref_bytes is not None and raw == ref_bytes))
+                             ref is not None and raw == ref))
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
             warn(f"warning: could not read snapshot {f}: {e}")
     rows.sort(reverse=True)

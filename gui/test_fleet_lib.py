@@ -464,6 +464,36 @@ class TestSnapshotRows:
         assert len(warnings) == 2
 
 
+class TestReferenceParityFixture:
+    """Same directory and expectations as the Rust library and the Rust GUI
+    (tests/fixtures/reference_parity): all three must agree on which
+    snapshots are "the reference"."""
+
+    FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "reference_parity"
+
+    def test_matches_the_shared_fixture(self):
+        expected = json.loads((self.FIXTURE / "expected.json").read_text(encoding="utf-8"))
+        assert expected
+        for serial, want in expected.items():
+            warnings = []
+            rows = snapshot_rows(self.FIXTURE, "Z 9", serial, warn=warnings.append)
+            assert {r[3]: r[4] for r in rows} == want, f"serial {serial!r}"
+
+    def test_hostile_serial_cannot_steer_the_lookup_into_a_subdirectory(self, tmp_path):
+        _write_snap(tmp_path / "snapshots", "h.json", serial="x/y")
+        sub = tmp_path / "references" / "Z_9_x"
+        sub.mkdir(parents=True)
+        (sub / "y.json").write_bytes((tmp_path / "snapshots" / "h.json").read_bytes())
+        assert [r[4] for r in snapshot_rows(tmp_path, "Z 9", "x/y")] == [False]
+
+    def test_is_independent_of_the_model_the_caller_passes(self):
+        # The reference is looked up by each snapshot's own model, as the
+        # Rust implementations do; the caller's model must not change it.
+        for model in ("Z 9", "Z6_3", "Z 5"):
+            rows = snapshot_rows(self.FIXTURE, model, "id-1", warn=lambda m: None)
+            assert {r[3]: r[4] for r in rows} == {"id1_z9.json": False, "id1_z6.json": True}, model
+
+
 class TestBrowseOutcome:
     def test_success_shows_stdout(self):
         ok, text = browse_outcome(0, "  archived Z 9 5.33\n", "")
