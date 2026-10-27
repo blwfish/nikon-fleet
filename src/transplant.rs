@@ -859,6 +859,19 @@ fn literal_gate(
     }
 }
 
+/// What a copied property writes, and whether that alters the target.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedWrite {
+    /// The value handed to `write_capability` (for enums and ranges, the
+    /// target's own live value with the index/value replaced).
+    pub value: Value,
+    /// Whether writing it changes what the target has now: `Some(true)` or
+    /// `Some(false)` when the target's current value is known, `None` when it
+    /// was not read (strings and booleans are written without a read) or not
+    /// readable. Callers count `None` as a possible change.
+    pub changes: Option<bool>,
+}
+
 pub struct TransplantOutcome {
     pub name: String,
     pub code: u32,
@@ -867,6 +880,34 @@ pub struct TransplantOutcome {
     /// was picked and what the target has now. `None` for scalars, ranges and
     /// skipped properties.
     pub choice: Option<ResolvedChoice>,
+    /// For a copied property (written, or in a dry run would be): the value
+    /// and whether it changes the target. `None` for skipped properties.
+    pub planned: Option<PlannedWrite>,
+}
+
+/// Whether writing `translated` alters the target, given its live value.
+fn write_changes(
+    strategy: Strategy,
+    translated: &Value,
+    live: Option<&Value>,
+    choice: Option<&ResolvedChoice>,
+) -> Option<bool> {
+    match strategy {
+        Strategy::EnumByLabel | Strategy::EnumByRawValue => choice.map(|c| !c.is_unchanged()),
+        Strategy::RangeClamped => {
+            let want = translated.get("value")?.as_f64()?;
+            let have = live?.get("value")?.as_f64()?;
+            Some((want - have).abs() > 1e-6)
+        }
+        Strategy::Literal => match (translated, live?) {
+            (Value::Number(a), Value::Number(b)) => Some(!numbers_equal(a, b)),
+            // A number onto a target that holds something else is a change, as
+            // the literal gate also treats it.
+            (Value::Number(_), _) => Some(true),
+            // Strings and booleans are written without a read.
+            _ => None,
+        },
+    }
 }
 
 /// The option an enum translation resolved to, in terms a person can check
@@ -911,6 +952,9 @@ impl Serialize for TransplantOutcome {
                 m.insert("status".into(), json!("skipped"));
                 m.insert("reason".into(), json!(reason));
             }
+        }
+        if let Some(planned) = &self.planned {
+            m.insert("changes".into(), json!(planned.changes));
         }
         if let Some(choice) = &self.choice {
             m.insert("choice".into(), json!(choice));
@@ -988,8 +1032,20 @@ pub fn transplant<P: CameraPort + ?Sized>(
         .map(|(name, prop)| {
             let opted_in = options.allow_raw_code.contains(name);
             match transplant_one(device, &cap_map, guard, prop, opted_in, dry_run) {
-                Ok((strategy, choice)) => TransplantOutcome { name: name.clone(), code: prop.code, result: Ok(strategy), choice },
-                Err(reason) => TransplantOutcome { name: name.clone(), code: prop.code, result: Err(reason), choice: None },
+                Ok((strategy, choice, planned)) => TransplantOutcome {
+                    name: name.clone(),
+                    code: prop.code,
+                    result: Ok(strategy),
+                    choice,
+                    planned: Some(planned),
+                },
+                Err(reason) => TransplantOutcome {
+                    name: name.clone(),
+                    code: prop.code,
+                    result: Err(reason),
+                    choice: None,
+                    planned: None,
+                },
             }
         })
         .collect()
@@ -1040,7 +1096,7 @@ fn transplant_one<P: CameraPort + ?Sized>(
     prop: &PropertyEntry,
     opted_in: bool,
     dry_run: bool,
-) -> Result<(Strategy, Option<ResolvedChoice>), SkipReason> {
+) -> Result<(Strategy, Option<ResolvedChoice>, PlannedWrite), SkipReason> {
     let cap = precheck(cap_map, guard, prop)?;
 
     let needs_live_read = is_enum_shape(&prop.value) || is_range_shape(&prop.value);
@@ -1067,7 +1123,8 @@ fn transplant_one<P: CameraPort + ?Sized>(
             verify_range_write(device, prop.code, &translated)?;
         }
     }
-    Ok((strategy, choice))
+    let changes = write_changes(strategy, &translated, live.as_ref(), choice.as_ref());
+    Ok((strategy, choice, PlannedWrite { value: translated, changes }))
 }
 
 /// Read a just-written range capability back and confirm it landed close to
@@ -1764,12 +1821,13 @@ mod tests {
                 current_index: Some(0),
                 current: Some("AE & Flash".into()),
             }),
+            planned: Some(PlannedWrite { value: json!({"value_index": 1}), changes: Some(true) }),
         };
         assert_eq!(
             serde_json::to_value(&copied).unwrap(),
             json!({
                 "name": "kNkMAIDCapability_BracketingVary", "code": 0x8029, "status": "copied",
-                "strategy": "enum_by_label",
+                "strategy": "enum_by_label", "changes": true,
                 "choice": {"target_index": 1, "choice": "AE Only", "current_index": 0,
                            "current": "AE & Flash", "unchanged": false}
             })
@@ -1779,11 +1837,21 @@ mod tests {
             code: 33089,
             result: Err(SkipReason::NeverCopied { reason: "lock state" }),
             choice: None,
+            planned: None,
         };
         let v = serde_json::to_value(&skipped).unwrap();
         assert_eq!(v["status"], json!("skipped"));
         assert_eq!(v["reason"]["tag"], json!("never_copied"));
-        assert!(v.get("strategy").is_none() && v.get("choice").is_none(), "{v}");
+        assert!(v.get("strategy").is_none() && v.get("choice").is_none() && v.get("changes").is_none(), "{v}");
+        // Unknown current value serialises as null, not false.
+        let unknown = TransplantOutcome {
+            name: "kNkMAIDCapability_Copyright".into(),
+            code: 1,
+            result: Ok(Strategy::Literal),
+            choice: None,
+            planned: Some(PlannedWrite { value: json!("me"), changes: None }),
+        };
+        assert_eq!(serde_json::to_value(&unknown).unwrap()["changes"], json!(null));
     }
 
     // ── numeric-literal gate ─────────────────────────────────────────────
@@ -2805,5 +2873,71 @@ mod tests {
         let cam = FakeCamera::new().with(1, RW, json!("a")).with(2, RW, json!("b"));
         let out = run(&cam, &[("Zeta", 1, json!("x")), ("Alpha", 2, json!("y"))], &[], false);
         assert_eq!(out.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["kNkMAIDCapability_Alpha", "kNkMAIDCapability_Zeta"]);
+    }
+    // ── PlannedWrite: the value written and whether it changes the target ─
+
+    fn planned(o: &TransplantOutcome) -> &PlannedWrite {
+        o.planned.as_ref().expect("a copied outcome carries its planned write")
+    }
+
+    #[test]
+    fn a_numeric_literal_reports_whether_it_changes_the_target() {
+        let cam = FakeCamera::new().with(100, RW, json!(3)).with(101, RW, json!(5));
+        let out = run(&cam, &[("Differs", 100, json!(4)), ("Same", 101, json!(5))], &["Differs"], true);
+        assert_eq!(planned(&out[0]).changes, Some(true));
+        assert_eq!(planned(&out[0]).value, json!(4));
+        assert_eq!(planned(&out[1]).changes, Some(false));
+    }
+
+    #[test]
+    fn a_literal_whose_current_value_is_not_known_has_unknown_change() {
+        // Strings and booleans are written without a read; numbers without a get bit cannot be read.
+        let cam = FakeCamera::new().with(1, RW, json!("old")).with(2, OP_SET, json!(0));
+        let out = run(&cam, &[("S", 1, json!("new")), ("N", 2, json!(7))], &["N"], true);
+        assert_eq!(planned(&out[0]).changes, None);
+        assert_eq!(planned(&out[1]).changes, None);
+    }
+
+    #[test]
+    fn an_enum_reports_change_from_its_resolved_choice() {
+        let en = |idx: u64, vals: &[u64]| json!({"value_index": idx, "default_index": 0, "elem_count": vals.len(), "elem_type": 2, "elem_bytes": 4, "values": vals});
+        let cam = FakeCamera::new().with(10, RW, en(0, &[5, 3])).with(11, RW, en(1, &[5, 3]));
+        // Source wants code 5 on both; the first target is already on it, the second is on code 3.
+        // (Source index 1 of [3, 5] is code 5; the planned value uses the TARGET's index for it: 0.)
+        let out = run(&cam, &[("A", 10, en(1, &[3, 5])), ("B", 11, en(1, &[3, 5]))], &["A", "B"], true);
+        assert_eq!(planned(&out[0]).changes, Some(false));
+        assert_eq!(planned(&out[1]).changes, Some(true));
+        assert_eq!(planned(&out[1]).value["value_index"], json!(0), "the target's index, not the source's 1");
+    }
+
+    #[test]
+    fn a_range_reports_change_by_value_with_a_tolerance_below_which_it_is_the_same() {
+        let range = |v: f64| json!({"value": v, "default": 0.0, "value_index": 0, "default_index": 0, "lower": 0.0, "upper": 10.0, "steps": 0});
+        let cam = FakeCamera::new().with(10, RW, range(2.0)).with(11, RW, range(2.0)).with(12, RW, range(2.0));
+        let out = run(&cam, &[("Same", 10, range(2.0)), ("Tiny", 11, range(2.0000001)), ("Moved", 12, range(2.5))], &[], true);
+        // Outcomes are in name order: Moved, Same, Tiny.
+        let by_name: Vec<(&str, Option<bool>)> = out.iter().map(|o| (o.name.as_str(), planned(o).changes)).collect();
+        assert_eq!(
+            by_name,
+            [
+                ("kNkMAIDCapability_Moved", Some(true)),
+                ("kNkMAIDCapability_Same", Some(false)),
+                ("kNkMAIDCapability_Tiny", Some(false)), // 1e-7 away: inside the 1e-6 tolerance
+            ]
+        );
+    }
+
+    #[test]
+    fn a_number_onto_a_target_holding_something_else_is_a_change() {
+        let cam = FakeCamera::new().with(1, RW, json!("not a number"));
+        let out = run(&cam, &[("N", 1, json!(7))], &["N"], true);
+        assert_eq!(planned(&out[0]).changes, Some(true));
+    }
+
+    #[test]
+    fn skipped_properties_have_no_planned_write() {
+        let cam = FakeCamera::new();
+        let out = run(&cam, &[("Absent", 99, json!(1))], &[], true);
+        assert!(out[0].planned.is_none());
     }
 }
