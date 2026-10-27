@@ -41,7 +41,7 @@ finding led to a code change, the commit is named.
 | F12 | Two bodies attached together | verified for selection; concurrency inconclusive |
 | F13 | Still unverified after all of the above | open |
 | F15 | Phase 0 live checks: another teardown hang, then the SDK stopped enumerating a bus-visible body | open |
-| F18 | Stepped ranges read `value` 0.0; the position is `value_index` (a transplant would have zeroed 33 settings) | fixed, unwritten to hardware |
+| F18 | Stepped ranges read `value` 0.0; the position is `value_index` (a transplant would have zeroed 33 settings); a blind range write is ignored | fixed; one stepped range written and undone on a Z 9 |
 | F17 | The `worker` subcommand live: result delivered before a teardown hang; one SIGSEGV after a result | verified (one body) |
 | F16 | Targeted undo (`restore --only`) on the Z 9: restores the named property, leaves a later change alone | verified (two enum properties) |
 | F14 | Spike B: worker-style spawn, fd cleanliness, SIGKILL of a capture child | verified (small samples) |
@@ -501,6 +501,45 @@ Found by the first live `transplant-plan`, a read-only dry run of the F16 snapsh
   `lfValue` and `ulValueIndex`). The fix writes them coherently, which is correct either way, but a real range
   write has not been run. This is the first thing to confirm on hardware, with a restore point and a
   one-property plan, before any broad apply.
+
+### F18 addendum: the first range write, and the undo that did not take (2026-10-27, Z 9 A, fw 5.31)
+
+Run with the user's go-ahead. Property: `WBTuneAuto` (code 0x8119, 612 of 0..1224 in 1225 steps). Scratch
+data directory, release binary, worker ops with their result channel on a file.
+
+1. **Pre-check.** `check` against the old F16 baseline showed one difference: `LiveViewZoomArea`'s option
+   list, `[0,256,512,1024,2048]` in the reference and `[0,320,640,1280,2560]` live, same selection (F3 (3)
+   saw the same variation). Not a setting. A fresh baseline (196 properties, gate passed) was captured and
+   used as the reference for the rest of the test.
+2. **Plan.** A source snapshot holding only `WBTuneAuto` at index 613. `transplant-plan`: copied 1,
+   `changes: true`, summary `Z 9 0000003023668: 1 property would change; opted in: none`.
+3. **Apply** (`transplant-apply` with the digest and summary): phases `plan_verified`,
+   `restore_point_written`, `writing`, `read_back`; **`applied_verified`**, written `[WBTuneAuto]`, no write
+   errors, no side effects, `not_taken` and `unverifiable` empty. The restore point (196 properties) holds
+   index 612. An independent CLI capture diffed against the baseline showed exactly one change, `WBTuneAuto`
+   612 to 613.
+4. **Undo through `restore --only WBTuneAuto` from the restore point: no effect.** Both runs printed
+   `written=1 errors=0`, and a following capture still read 613. So a restore of a range can report success
+   and do nothing.
+5. **Isolating it.** The same change in the other direction through the worker's `transplant-apply`
+   (`applied_verified`, 613 to 612) took effect. `nikon-fleet transplant` (612 to 613) took effect. Both of
+   those *read the capability before writing it*; `restore` wrote blind. After `restore` was changed to read
+   a stepped range first (`626950c`), `restore --only` took effect (613 to 612). A read before the write is
+   sufficient; why is unknown.
+6. **End state.** A capture diffed against the pre-test baseline: `(no differences)`; with volatile
+   properties only `AngleLevel` and `AngleLevelPitch`. 20 snapshot files in the scratch directory, two of
+   them restore points.
+
+Writes to the body in this test: five that took effect (612 to 613 by apply, 613 to 612 by apply, 612 to 613
+by `transplant`, 613 to 612 by the primed `restore`, plus the final state) and two `restore` writes that were
+accepted and ignored. No session hung at teardown.
+
+What this settles and what it does not: a stepped range write through the SDK struct, with `value` and
+`value_index` coherent, changes the setting, and the read-back and an independent capture agree. It does not
+say which field the camera reads (both were always coherent). Continuous ranges, other stepped ranges, a
+cross-model range translation and ranges with a dependent effect are still unwritten. The ignored blind
+write is a general warning: **success from a write call proves nothing; only a read-back does**, which is why
+`restore_apply` must report `residual` (`ops::readback::residual`, not yet wired into the CLI's restore).
 
 Also from the same runs: the digest of two real plans taken minutes apart was identical, and the summary
 counts three boolean/string-valued properties as "would change" because they are written without a read

@@ -473,8 +473,9 @@ below the MCP server exists and is tested on an in-memory body: capture (`ops::c
 baseline gate, read-back and the four statuses), restore decisions and execution (`ops::restore`), the
 retention rules, the read-back comparisons, names-not-paths, the camera lock and the worker protocol. The
 hidden `worker` subcommand runs `capture`, `check`, `transplant-plan` and `transplant-apply`; the first
-three have been run read-only on a Z 9. **No transplant has been applied to hardware by this code, and
-no range has ever been written (F18).** Not written yet: worker ops for `restore_plan` / `restore_apply`
+three have been run read-only on a Z 9. **One transplant (a single stepped range, `WBTuneAuto` 612 to 613) has been applied to hardware by this code
+and undone, with a restore point and a verified read-back (F18); nothing larger has, and it also showed that a
+blind range write is silently ignored, so `restore` now reads a stepped range first.** Not written yet: worker ops for `restore_plan` / `restore_apply`
 and `list_cameras`, the `mcp/` crate and the parent-side watchdog.
 
 Phase 0 touches `src/main.rs`, `lib.rs` and `gui/`; the firmware session's earlier edits there are
@@ -632,8 +633,8 @@ To write for the MCP:
   was attached or woken" (replug or power-cycle, then capture several times).
 - Whether a **per-camera** lock is enough (F12 is inconclusive).
 - A reset-initialised open while another process is mid-*write* (not attempted).
-- Restore and transplant fidelity beyond one enum property (F18: ranges were mistranslated until `2068310`, and a
-  real range write has never been run); restore after a power cycle; range,
+- Restore and transplant fidelity beyond one enum property (F18: ranges were mistranslated until `2068310`; one stepped
+  range has been written and undone on a Z 9, continuous ranges and cross-model range writes have not); restore after a power cycle; range,
   string and boolean property round trips.
 - The Z 9 B, and same-model pairs (`warn_if_ambiguous_pairing` says serial pairing there is by
   enumeration order). Until a way to verify pairing exists, the MCP refuses these (`ambiguous_pairing`, §3), so
