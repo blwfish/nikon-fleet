@@ -68,6 +68,17 @@ pub struct FakeCamera {
     write_failures: BTreeMap<u32, Failure>,
     /// code written -> (other code, value it takes) applied after that write succeeds.
     dependents: BTreeMap<u32, Vec<(u32, Value)>>,
+    /// Writes to these codes are accepted and have no effect.
+    ignoring_all: BTreeSet<u32>,
+    /// Writes to these codes are accepted and have no effect unless the code was
+    /// read earlier (a read attempt, successful or not): the Z 9's behaviour for
+    /// stepped ranges (F18).
+    ignoring_blind: BTreeSet<u32>,
+    primed: RefCell<BTreeSet<u32>>,
+    /// Behave like the real SDK on stepped ranges: store the position but read
+    /// `value` back as 0.0 (F18).
+    zero_range_value: bool,
+    ignored: RefCell<Vec<(u32, Value)>>,
     reads: RefCell<Vec<u32>>,
     writes: RefCell<Vec<(u32, Value)>>,
     /// Every read attempt and every write attempt, in the order they happened.
@@ -114,6 +125,24 @@ impl FakeCamera {
         self
     }
 
+    /// Writes to `id` return success and change nothing.
+    pub fn ignoring_writes(mut self, id: u32) -> Self {
+        self.ignoring_all.insert(id);
+        self
+    }
+
+    /// Writes to `id` return success and change nothing unless `id` was read first.
+    pub fn ignoring_blind_writes(mut self, id: u32) -> Self {
+        self.ignoring_blind.insert(id);
+        self
+    }
+
+    /// Read stepped ranges back with `value` 0.0 whatever was written, as the real SDK does.
+    pub fn with_sdk_range_quirk(mut self) -> Self {
+        self.zero_range_value = true;
+        self
+    }
+
     /// After a successful write of `id`, `other` takes `value`.
     pub fn with_dependent(mut self, id: u32, other: u32, value: Value) -> Self {
         self.dependents.entry(id).or_default().push((other, value));
@@ -135,6 +164,11 @@ impl FakeCamera {
         self.reads.borrow().clone()
     }
 
+    /// Writes that returned success but were ignored, in order.
+    pub fn ignored_writes(&self) -> Vec<(u32, Value)> {
+        self.ignored.borrow().clone()
+    }
+
     /// Reads and writes in the order they were attempted (failed ones included).
     pub fn events(&self) -> Vec<Event> {
         self.events.borrow().clone()
@@ -152,6 +186,7 @@ impl CameraPort for FakeCamera {
 
     fn read_capability(&self, id: u32) -> Result<Value, SdkError> {
         self.reads.borrow_mut().push(id);
+        self.primed.borrow_mut().insert(id);
         self.events.borrow_mut().push(Event::Read(id));
         if let Some(f) = self.read_failures.get(&id) {
             return Err(f.error("GetCapability", 0));
@@ -169,7 +204,21 @@ impl CameraPort for FakeCamera {
         if let Some(f) = self.write_failures.get(&id) {
             return Err(f.error("SetCapability", kind));
         }
-        self.values.borrow_mut().insert(id, value.clone());
+        if self.ignoring_all.contains(&id) || (self.ignoring_blind.contains(&id) && !self.primed.borrow().contains(&id)) {
+            self.ignored.borrow_mut().push((id, value.clone()));
+            return Ok(());
+        }
+        let stored = if self.zero_range_value
+            && value.get("lower").is_some()
+            && value.get("steps").and_then(Value::as_u64).unwrap_or(0) >= 2
+        {
+            let mut v = value.clone();
+            v["value"] = serde_json::json!(0.0);
+            v
+        } else {
+            value.clone()
+        };
+        self.values.borrow_mut().insert(id, stored);
         self.writes.borrow_mut().push((id, value.clone()));
         if let Some(deps) = self.dependents.get(&id) {
             for (other, v) in deps {
@@ -258,5 +307,49 @@ mod tests {
         c.write_capability(1, 0, &json!(11)).unwrap();
         assert!(matches!(c.read_capability(2), Err(SdkError::SdkCall { code: -126, .. })));
         assert!(c.read_capability(1).is_ok(), "other codes unaffected");
+    }
+    #[test]
+    fn a_body_can_accept_and_ignore_every_write_to_a_code() {
+        let c = cam().ignoring_writes(1);
+        c.write_capability(1, 0, &json!(99)).unwrap();
+        assert_eq!(c.value(1), Some(json!(10)), "unchanged");
+        assert!(c.writes().is_empty());
+        assert_eq!(c.ignored_writes(), [(1, json!(99))]);
+        c.write_capability(2, 0, &json!("y")).unwrap();
+        assert_eq!(c.value(2), Some(json!("y")), "other codes are unaffected");
+    }
+
+    #[test]
+    fn a_blind_write_is_ignored_but_a_write_after_a_read_takes() {
+        let c = cam().ignoring_blind_writes(1).with_dependent(1, 2, json!("dep"));
+        c.write_capability(1, 0, &json!(11)).unwrap();
+        assert_eq!(c.value(1), Some(json!(10)), "blind: accepted and ignored");
+        assert_eq!(c.value(2), Some(json!("x")), "an ignored write has no dependent effect either");
+        let _ = c.read_capability(1);
+        c.write_capability(1, 0, &json!(12)).unwrap();
+        assert_eq!(c.value(1), Some(json!(12)), "after a read it takes");
+        assert_eq!(c.value(2), Some(json!("dep")));
+        assert_eq!(c.ignored_writes(), [(1, json!(11))]);
+        assert_eq!(c.writes(), [(1, json!(12))]);
+    }
+
+    #[test]
+    fn a_failed_read_still_primes_the_code() {
+        let c = cam().ignoring_blind_writes(1).failing_read(1, Failure::Call(-106));
+        let _ = c.read_capability(1);
+        c.write_capability(1, 0, &json!(13)).unwrap();
+        assert_eq!(c.value(1), Some(json!(13)));
+    }
+
+    #[test]
+    fn the_sdk_range_quirk_reads_a_stepped_range_back_with_a_zero_value_but_keeps_the_position() {
+        let st = |v: f64, i: u64| json!({"value": v, "value_index": i, "lower": 0.0, "upper": 10.0, "steps": 11});
+        let c = FakeCamera::new().with(1, OP_GET | OP_SET, st(0.0, 0)).with(2, OP_GET | OP_SET, json!({"value": 2.5, "value_index": 0, "lower": 0.0, "upper": 10.0, "steps": 0})).with_sdk_range_quirk();
+        c.write_capability(1, 0, &st(7.0, 7)).unwrap();
+        assert_eq!(c.value(1), Some(st(0.0, 7)));
+        // Continuous ranges, enums and scalars are stored exactly as written.
+        let cont = json!({"value": 3.5, "value_index": 0, "lower": 0.0, "upper": 10.0, "steps": 0});
+        c.write_capability(2, 0, &cont).unwrap();
+        assert_eq!(c.value(2), Some(cont));
     }
 }

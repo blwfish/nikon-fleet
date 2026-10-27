@@ -13,9 +13,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
+use crate::ops::baseline::{GateOutcome, gate};
+use crate::ops::capture::{CaptureStats, capture};
 use crate::ops::port::CameraPort;
+use crate::ops::readback::{Residual, residual};
 use crate::sdk::{CapabilityInfo, OP_SET, SdkError};
-use crate::snapshot::PropertyEntry;
+use crate::snapshot::{Camera, PropertyEntry, Snapshot, Transport};
 use crate::transplant;
 
 /// Why a snapshot property is not written back by `restore`.
@@ -321,6 +324,78 @@ pub fn execute<P: CameraPort + ?Sized>(
         })
         .collect();
     RestoreRun { steps }
+}
+
+/// What a read-back after a restore showed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Every written property reads back as the snapshot says.
+    Verified,
+    /// At least one written property does not read back as restored: the body
+    /// accepted the write and did not keep it (F18), or changed it.
+    ResidualFound,
+    /// The read-back was too incomplete to judge, so nothing is claimed.
+    ReadbackIncomplete,
+    /// Nothing was written, so there was nothing to check.
+    NothingWritten,
+}
+
+impl Verdict {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Verdict::Verified => "verified",
+            Verdict::ResidualFound => "residual_found",
+            Verdict::ReadbackIncomplete => "readback_incomplete",
+            Verdict::NothingWritten => "nothing_written",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Verification {
+    pub verdict: Verdict,
+    /// The read-back held to the baseline gate. `None` if it was not taken or read nothing.
+    pub gate: Option<GateOutcome>,
+    pub stats: Option<CaptureStats>,
+    /// Written properties that did not end up as the snapshot says. `None` when
+    /// the read-back was not good enough to compare.
+    pub residual: Option<Residual>,
+}
+
+/// Read the body back after a restore and compare what was written with the
+/// snapshot it was restored from. A write call that returned success proves
+/// nothing (F18): only this does. `written` is [`RestoreRun::written_names`].
+pub fn verify<P: CameraPort + ?Sized>(
+    port: &P,
+    name_lookup: &HashMap<u32, String>,
+    camera: &Camera,
+    source: &Snapshot,
+    written: &BTreeSet<String>,
+    captured_at: &str,
+) -> Verification {
+    if written.is_empty() {
+        return Verification { verdict: Verdict::NothingWritten, gate: None, stats: None, residual: None };
+    }
+    let mut after = Snapshot::new(camera.clone(), Transport::Usb, captured_at.to_string());
+    after.label = Some("readback".into());
+    let stats = capture(port, name_lookup, &mut after);
+    if stats.read_ok == 0 {
+        return Verification { verdict: Verdict::ReadbackIncomplete, gate: None, stats: Some(stats), residual: None };
+    }
+    let verdict_gate = gate(&after);
+    if matches!(verdict_gate, GateOutcome::Failed { .. }) {
+        return Verification { verdict: Verdict::ReadbackIncomplete, gate: Some(verdict_gate), stats: Some(stats), residual: None };
+    }
+    match residual(source, &after, written) {
+        Ok(r) => Verification {
+            verdict: if r.is_empty() { Verdict::Verified } else { Verdict::ResidualFound },
+            gate: Some(verdict_gate),
+            stats: Some(stats),
+            residual: Some(r),
+        },
+        Err(_) => Verification { verdict: Verdict::ReadbackIncomplete, gate: Some(verdict_gate), stats: Some(stats), residual: None },
+    }
 }
 
 #[cfg(test)]
@@ -804,5 +879,148 @@ mod tests {
         snap.insert("A_Cont", 1, cont);
         execute(&cam, &snap.properties, None, false);
         assert!(cam.reads().is_empty());
+    }
+    // ── verify: read the body back after a restore ───────────────────────
+
+    fn lookup_for(entries: &[(&str, u32)]) -> HashMap<u32, String> {
+        entries.iter().map(|(n, c)| (*c, n.to_string())).collect()
+    }
+
+    fn cam_id() -> Camera {
+        Camera { model: "Z 5".into(), serial: "1".into(), firmware: "1.00".into() }
+    }
+
+    fn snap_z5(entries: &[(&str, u32, Value)]) -> Snapshot {
+        let mut s = Snapshot::new(cam_id(), Transport::Usb, "2026-10-27T12:00:00Z".into());
+        for (n, c, v) in entries {
+            s.insert(*n, *c, v.clone());
+        }
+        s
+    }
+
+    fn written(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_restore_that_took_is_verified() {
+        let cam = FakeCamera::new().with(1, RW, json!(0)).with(2, RW, json!(0));
+        let source = snap_z5(&[("A", 1, json!(10)), ("B", 2, json!(20))]);
+        let run = execute(&cam, &source.properties, None, false);
+        let v = verify(&cam, &lookup_for(&[("A", 1), ("B", 2)]), &cam_id(), &source, &run.written_names(), "t");
+        assert_eq!(v.verdict, Verdict::Verified);
+        assert!(v.residual.as_ref().unwrap().is_empty());
+        assert!(matches!(v.gate, Some(GateOutcome::NoBaseline(_))), "Z 5 has no baseline: compared, not judged for completeness");
+    }
+
+    #[test]
+    fn a_body_that_accepts_and_ignores_the_write_is_reported_not_verified() {
+        // The F18 failure: written=1 errors=0, and nothing changed.
+        let cam = FakeCamera::new().with(1, RW, json!(0)).with(2, RW, json!(0)).ignoring_writes(2);
+        let source = snap_z5(&[("A", 1, json!(10)), ("B", 2, json!(20))]);
+        let run = execute(&cam, &source.properties, None, false);
+        assert_eq!(run.counts().errors, 0, "the write call said success");
+        assert_eq!(run.counts().written, 2);
+        let v = verify(&cam, &lookup_for(&[("A", 1), ("B", 2)]), &cam_id(), &source, &run.written_names(), "t");
+        assert_eq!(v.verdict, Verdict::ResidualFound);
+        assert_eq!(v.residual.unwrap().changed, ["B"]);
+    }
+
+    #[test]
+    fn a_stepped_range_survives_a_body_that_ignores_blind_range_writes_because_it_is_read_first() {
+        let cam = FakeCamera::new().with(1, RW, stepped(613)).ignoring_blind_writes(1).with_sdk_range_quirk();
+        let source = {
+            let mut s = snap_z5(&[]);
+            s.insert("WBTuneAuto", 1, stepped(612));
+            s
+        };
+        let run = execute(&cam, &source.properties, None, false);
+        assert_eq!(cam.ignored_writes().len(), 0, "the priming read means no write was blind");
+        let v = verify(&cam, &lookup_for(&[("WBTuneAuto", 1)]), &cam_id(), &source, &run.written_names(), "t");
+        assert_eq!(v.verdict, Verdict::Verified);
+        assert_eq!(cam.value(1).unwrap()["value_index"], json!(612));
+    }
+
+    #[test]
+    fn without_the_priming_read_the_same_body_is_caught_by_the_verification() {
+        // Drive the blind write by hand (what restore did before 626950c) and verify.
+        let cam = FakeCamera::new().with(1, RW, stepped(613)).ignoring_blind_writes(1).with_sdk_range_quirk();
+        let source = {
+            let mut s = snap_z5(&[]);
+            s.insert("WBTuneAuto", 1, stepped(612));
+            s
+        };
+        cam.write_capability(1, 0, &coherent_for_write(&source.properties["WBTuneAuto"].value)).unwrap();
+        let v = verify(&cam, &lookup_for(&[("WBTuneAuto", 1)]), &cam_id(), &source, &written(&["WBTuneAuto"]), "t");
+        assert_eq!(v.verdict, Verdict::ResidualFound, "success from the write call was not trusted");
+        assert_eq!(v.residual.unwrap().changed, ["WBTuneAuto"]);
+    }
+
+    #[test]
+    fn nothing_written_means_nothing_to_check_and_the_body_is_not_read() {
+        let cam = FakeCamera::new().with(1, RW, json!(0));
+        let source = snap_z5(&[("A", 1, json!(10))]);
+        let v = verify(&cam, &lookup_for(&[("A", 1)]), &cam_id(), &source, &written(&[]), "t");
+        assert_eq!(v.verdict, Verdict::NothingWritten);
+        assert!(cam.reads().is_empty() && v.stats.is_none() && v.gate.is_none() && v.residual.is_none());
+    }
+
+    #[test]
+    fn a_read_back_that_reads_nothing_claims_nothing() {
+        let cam = FakeCamera::new().with_unreadable(1, OP_GET);
+        let source = snap_z5(&[("A", 1, json!(10))]);
+        let v = verify(&cam, &lookup_for(&[("A", 1)]), &cam_id(), &source, &written(&["A"]), "t");
+        assert_eq!(v.verdict, Verdict::ReadbackIncomplete);
+        assert!(v.residual.is_none() && v.gate.is_none());
+        assert_eq!(v.stats.unwrap().read_ok, 0);
+    }
+
+    #[test]
+    fn an_incomplete_read_back_on_a_baselined_model_claims_nothing() {
+        // A Z 9 read back with most of its capabilities missing: comparing would be meaningless.
+        let b = crate::ops::baseline::baseline_for("Z 9").unwrap();
+        let mut cam = FakeCamera::new();
+        let mut names = HashMap::new();
+        for c in b.readable.iter().take(18) {
+            cam = cam.with(c.code, RW, json!(1));
+            names.insert(c.code, c.name.clone());
+        }
+        let z9 = Camera { model: "Z 9".into(), serial: "S".into(), firmware: "5.31".into() };
+        let mut source = Snapshot::new(z9.clone(), Transport::Usb, "t".into());
+        source.insert(b.readable[0].name.clone(), b.readable[0].code, json!(1));
+        let v = verify(&cam, &names, &z9, &source, &written(&[&b.readable[0].name]), "t");
+        assert_eq!(v.verdict, Verdict::ReadbackIncomplete);
+        assert!(matches!(v.gate, Some(GateOutcome::Failed { .. })));
+        assert!(v.residual.is_none(), "an incomplete read-back is never compared");
+    }
+
+    #[test]
+    fn a_snapshot_of_another_model_cannot_be_judged_against_this_body() {
+        let cam = FakeCamera::new().with(1, RW, json!(10));
+        let mut source = snap_z5(&[("A", 1, json!(10))]);
+        source.camera.model = "Z6_3".into();
+        let v = verify(&cam, &lookup_for(&[("A", 1)]), &cam_id(), &source, &written(&["A"]), "t");
+        assert_eq!(v.verdict, Verdict::ReadbackIncomplete, "never reported as verified");
+        assert!(v.residual.is_none());
+    }
+
+    #[test]
+    fn only_written_properties_are_judged() {
+        // B differs from the snapshot but was not written (read-only on the body): not residual.
+        let cam = FakeCamera::new().with(1, RW, json!(0)).with(2, OP_GET, json!(999));
+        let source = snap_z5(&[("A", 1, json!(10)), ("B", 2, json!(20))]);
+        let run = execute(&cam, &source.properties, None, false);
+        let v = verify(&cam, &lookup_for(&[("A", 1), ("B", 2)]), &cam_id(), &source, &run.written_names(), "t");
+        assert_eq!(v.verdict, Verdict::Verified);
+    }
+
+    #[test]
+    fn verdict_tags_are_closed_and_distinct() {
+        let all = [Verdict::Verified, Verdict::ResidualFound, Verdict::ReadbackIncomplete, Verdict::NothingWritten];
+        let tags: BTreeSet<_> = all.iter().map(Verdict::tag).collect();
+        assert_eq!(tags.len(), 4);
+        for v in all {
+            assert_eq!(serde_json::to_value(v).unwrap(), json!(v.tag()));
+        }
     }
 }

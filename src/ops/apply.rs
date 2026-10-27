@@ -846,6 +846,34 @@ mod tests {
         assert_eq!(r2.readback.unwrap().not_taken, [n2]);
     }
 
+    #[test]
+    fn a_stepped_range_is_applied_and_verified_against_a_body_that_reads_its_value_back_as_zero() {
+        // The real SDK shape (F18): the position is right, the `value` field reads 0.0.
+        let st = |i: u64| json!({"value": 0.0, "default": 0.0, "value_index": i, "default_index": 612, "lower": 0.0, "upper": 1224.0, "steps": 1225});
+        let w = world_with(|c, codes| c.with(codes[0].1, RW, st(612)).with_sdk_range_quirk(), 0);
+        let mut f = fixture(&w, true);
+        let (name, code) = w.codes[0].clone();
+        f.source.insert(name.clone(), code, st(613));
+        f.bytes = f.source.to_pretty_json().unwrap().into_bytes();
+        let r = apply_planned(&w, &f).unwrap();
+        assert_eq!(r.status, ApplyStatus::AppliedVerified, "{:?}", r.readback.as_ref().map(|rb| (&rb.not_taken, &rb.unverifiable)));
+        assert_eq!(w.cam.value(code).unwrap()["value_index"], json!(613));
+        // A body that ignores the write is caught even though the call said success.
+        let w2 = world_with(|c, codes| c.with(codes[0].1, RW, st(612)).with_sdk_range_quirk().ignoring_writes(codes[0].1), 0);
+        let mut f2 = fixture(&w2, true);
+        let (n2, c2) = w2.codes[0].clone();
+        f2.source.insert(n2.clone(), c2, st(613));
+        f2.bytes = f2.source.to_pretty_json().unwrap().into_bytes();
+        let r2 = apply_planned(&w2, &f2).unwrap();
+        // Ranges are checked twice: the per-write read-back inside the transplant already turns an
+        // ignored write into a write failure, before the overall read-back runs.
+        assert_eq!(r2.status, ApplyStatus::Failed);
+        assert_eq!(r2.write_errors.len(), 1);
+        assert_eq!(r2.write_errors[0].name, n2);
+        assert!(r2.write_errors[0].message.contains("reports"), "{}", r2.write_errors[0].message);
+        assert!(r2.written.iter().all(|w| *w != n2), "an ignored write is not counted as written");
+    }
+
     // ── took_effect ──────────────────────────────────────────────────────
 
     #[test]
