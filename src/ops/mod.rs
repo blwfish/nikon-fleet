@@ -21,4 +21,5 @@ pub mod restore;
 pub mod restore_flow;
 pub mod retention;
 pub mod target;
+pub mod views;
 pub mod worker;
