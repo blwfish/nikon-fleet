@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::sdk::{DeviceInfo, UsbCameraInfo, usb_camera_list};
+use crate::sdk::{DeviceInfo, UsbCameraInfo, UsbScan, UsbUnreadable, usb_camera_scan};
 
 /// Model names whose USB spelling is verified to equal the SDK/schema spelling.
 pub const KNOWN_MODELS: &[&str] = &["Z 5", "Z6_3", "Z 9"];
@@ -79,7 +79,36 @@ pub fn describe(usb: &[UsbCameraInfo]) -> Vec<UsbCamera> {
 
 /// The attached cameras, from USB alone.
 pub fn list_usb() -> Vec<UsbCamera> {
-    describe(&usb_camera_list())
+    describe(&usb_camera_scan().cameras)
+}
+
+/// `list_cameras`: the bodies read, the ones that could not be, and whether the
+/// list can be taken as everything that is attached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CameraList {
+    pub cameras: Vec<UsbCamera>,
+    /// Nikon devices that are attached but whose identity could not be read.
+    pub unreadable: Vec<UsbUnreadable>,
+    /// The USB bus could not be enumerated at all; `cameras` being empty then
+    /// says nothing about what is attached.
+    pub enumeration_error: Option<String>,
+    /// No device was dropped and enumeration worked.
+    pub complete: bool,
+}
+
+/// Describe one USB pass. Pure.
+pub fn describe_scan(scan: &UsbScan) -> CameraList {
+    CameraList {
+        cameras: describe(&scan.cameras),
+        unreadable: scan.unreadable.clone(),
+        enumeration_error: scan.enumeration_error.clone(),
+        complete: scan.unreadable.is_empty() && scan.enumeration_error.is_none(),
+    }
+}
+
+/// Scan the bus and describe it. No SDK session, no lock, no reset.
+pub fn list_cameras() -> CameraList {
+    describe_scan(&usb_camera_scan())
 }
 
 /// More than one attached body shares the target's model.
@@ -246,5 +275,58 @@ mod tests {
         assert_eq!(e.tag(), "ambiguous_pairing");
         let s = e.to_string();
         assert!(s.contains("2") && s.contains("Z 9") && s.contains("one at a time"), "{s}");
+    }
+
+    // ── list_cameras ─────────────────────────────────────────────────────
+
+    use crate::sdk::UsbStage;
+
+    fn unreadable() -> UsbUnreadable {
+        UsbUnreadable { bus: 1, address: 4, stage: UsbStage::Open, error: "Access denied".into() }
+    }
+
+    #[test]
+    fn a_clean_scan_is_complete() {
+        let l = describe_scan(&UsbScan { cameras: vec![usb("Z 9", "S1")], ..UsbScan::default() });
+        assert!(l.complete && l.unreadable.is_empty() && l.enumeration_error.is_none());
+        assert_eq!(l.cameras.len(), 1);
+    }
+
+    #[test]
+    fn nothing_attached_is_complete_and_empty() {
+        let l = describe_scan(&UsbScan::default());
+        assert!(l.complete && l.cameras.is_empty());
+    }
+
+    #[test]
+    fn a_body_that_could_not_be_read_makes_the_list_incomplete_and_is_named() {
+        let l = describe_scan(&UsbScan { cameras: vec![usb("Z 9", "S1")], unreadable: vec![unreadable()], enumeration_error: None });
+        assert!(!l.complete);
+        assert_eq!(l.cameras.len(), 1, "the readable one is still listed");
+        assert_eq!(l.unreadable, vec![unreadable()]);
+    }
+
+    #[test]
+    fn a_failure_to_enumerate_is_not_reported_as_no_cameras() {
+        let l = describe_scan(&UsbScan { enumeration_error: Some("no libusb".into()), ..UsbScan::default() });
+        assert!(!l.complete);
+        assert!(l.cameras.is_empty());
+        assert_eq!(l.enumeration_error.as_deref(), Some("no libusb"));
+    }
+
+    #[test]
+    fn the_list_serialises_with_closed_stage_tags() {
+        let l = describe_scan(&UsbScan { unreadable: vec![unreadable(), UsbUnreadable { stage: UsbStage::Descriptor, ..unreadable() }], ..UsbScan::default() });
+        let v = serde_json::to_value(&l).unwrap();
+        assert_eq!(v["unreadable"][0]["stage"], json!("open"));
+        assert_eq!(v["unreadable"][1]["stage"], json!("descriptor"));
+        assert_eq!(v["complete"], json!(false));
+    }
+
+    #[test]
+    fn same_model_bodies_in_a_scan_are_flagged_and_unknown_models_are_not_passed_through() {
+        let l = describe_scan(&UsbScan { cameras: vec![usb("Z 9", "A"), usb("Z 9", "B"), usb("Z 99", "C")], ..UsbScan::default() });
+        assert!(l.cameras[0].pairing_ambiguous && l.cameras[1].pairing_ambiguous && !l.cameras[2].pairing_ambiguous);
+        assert!(!l.cameras[2].known_model);
     }
 }

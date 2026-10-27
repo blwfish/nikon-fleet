@@ -396,28 +396,80 @@ pub(crate) fn read_usb_string(handle: &rusb::DeviceHandle<rusb::GlobalContext>, 
     handle.read_string_descriptor(lang, idx, timeout).unwrap_or_default()
 }
 
-/// List all Nikon cameras visible on USB with firmware version and serial number.
-pub fn usb_camera_list() -> Vec<UsbCameraInfo> {
-    let mut out = Vec::new();
-    for device in nikon_usb_devices() {
-        let desc = match device.device_descriptor() { Ok(d) => d, Err(_) => continue };
-        let handle = match device.open() { Ok(h) => h, Err(_) => continue };
-        let serial = read_usb_string(&handle, desc.serial_number_string_index().unwrap_or(0));
-        let product = read_usb_string(&handle, desc.product_string_index().unwrap_or(0));
-        let v = desc.device_version();
-        // rusb splits bcdDevice into (high_byte, upper_nibble, lower_nibble).
-        // Reconstruct the raw BCD u16 so bcd_decode_version handles both
-        // single- and two-digit majors correctly.
-        let raw_bcd: u16 = (v.0 as u16) << 8 | (v.1 as u16) << 4 | (v.2 as u16);
-        let firmware = bcd_decode_version(raw_bcd);
-        out.push(UsbCameraInfo {
-            product_id: desc.product_id(),
-            serial,
-            firmware,
-            model: model_from_product_string(&product),
-        });
+/// Where reading a Nikon USB device's identity stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsbStage {
+    /// The device descriptor could not be read.
+    Descriptor,
+    /// The device could not be opened to read its string descriptors.
+    Open,
+}
+
+/// A Nikon USB device that is attached but whose identity could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UsbUnreadable {
+    pub bus: u8,
+    pub address: u8,
+    pub stage: UsbStage,
+    /// libusb's error text, for a human.
+    pub error: String,
+}
+
+/// Everything one pass over the USB bus found: the bodies read, the ones that
+/// could not be, and a failure to enumerate at all (which is not "no cameras").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsbScan {
+    pub cameras: Vec<UsbCameraInfo>,
+    pub unreadable: Vec<UsbUnreadable>,
+    pub enumeration_error: Option<String>,
+}
+
+fn read_usb_identity(device: &rusb::Device<rusb::GlobalContext>) -> Result<UsbCameraInfo, UsbUnreadable> {
+    let unreadable = |stage, e: rusb::Error| UsbUnreadable {
+        bus: device.bus_number(),
+        address: device.address(),
+        stage,
+        error: e.to_string(),
+    };
+    let desc = device.device_descriptor().map_err(|e| unreadable(UsbStage::Descriptor, e))?;
+    let handle = device.open().map_err(|e| unreadable(UsbStage::Open, e))?;
+    let serial = read_usb_string(&handle, desc.serial_number_string_index().unwrap_or(0));
+    let product = read_usb_string(&handle, desc.product_string_index().unwrap_or(0));
+    let v = desc.device_version();
+    // rusb splits bcdDevice into (high_byte, upper_nibble, lower_nibble).
+    // Reconstruct the raw BCD u16 so bcd_decode_version handles both
+    // single- and two-digit majors correctly.
+    let raw_bcd: u16 = (v.0 as u16) << 8 | (v.1 as u16) << 4 | (v.2 as u16);
+    Ok(UsbCameraInfo {
+        product_id: desc.product_id(),
+        serial,
+        firmware: bcd_decode_version(raw_bcd),
+        model: model_from_product_string(&product),
+    })
+}
+
+/// One pass over the USB bus, reporting what could not be read instead of
+/// dropping it.
+pub fn usb_camera_scan() -> UsbScan {
+    let list = match rusb::DeviceList::new() {
+        Ok(l) => l,
+        Err(e) => return UsbScan { enumeration_error: Some(e.to_string()), ..UsbScan::default() },
+    };
+    let mut scan = UsbScan::default();
+    for device in list.iter().filter(|d| d.device_descriptor().map(|desc| desc.vendor_id() == NIKON_VID).unwrap_or(false)) {
+        match read_usb_identity(&device) {
+            Ok(info) => scan.cameras.push(info),
+            Err(u) => scan.unreadable.push(u),
+        }
     }
-    out
+    scan
+}
+
+/// List all Nikon cameras visible on USB with firmware version and serial number.
+/// Bodies that cannot be read are omitted; use [`usb_camera_scan`] to see them.
+pub fn usb_camera_list() -> Vec<UsbCameraInfo> {
+    usb_camera_scan().cameras
 }
 
 /// Pair SDK devices to USB camera info by model + position within same-model group.

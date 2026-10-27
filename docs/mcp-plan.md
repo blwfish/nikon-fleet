@@ -473,15 +473,19 @@ below the MCP server exists and is tested on an in-memory body: capture (`ops::c
 (`ops::restore_flow`: same shape, same-body only, its own `mcp-restore-pre-restore-<ts>` restore point,
 read-back judged by `ops::readback::residual`), restore decisions and execution (`ops::restore`), the
 retention rules, the read-back comparisons, names-not-paths, the camera lock and the worker protocol. The
-hidden `worker` subcommand runs `capture`, `check`, `transplant-plan`, `transplant-apply`, `restore-plan`
-and `restore-apply`; the first three have been run read-only on a Z 9, the two restore ops have only been
+hidden `worker` subcommand runs `list-cameras`, `capture`, `check`, `transplant-plan`, `transplant-apply`,
+`restore-plan` and `restore-apply`; the first three have been run read-only on a Z 9, the two restore ops have only been
 run against fake bodies and the binary's no-hardware refusals. **One transplant (a single stepped range,
 `WBTuneAuto` 612 to 613) has been applied to hardware by this code and undone, with a restore point and a
 verified read-back (F18); nothing larger has, and it also showed that a blind range write is silently
 ignored, so `restore` now reads a stepped range first.** The CLI's `restore` also reads the body back and
 reports a residual as unverified (exit status non-zero), so a restore the camera ignores is no longer
-reported as done. Not written yet: the `list_cameras` worker op, the `mcp/` crate and the parent-side
-watchdog.
+reported as done. `list_cameras` (`ops::cameras::list_cameras`, also the worker's `list-cameras`) reads USB
+descriptors only: no SDK, no lock, no bundle, and it ran against the Z 9 with no teardown hang. It reports,
+besides the bodies, `unreadable` (a Nikon device that is attached but whose descriptor or open failed) and
+`enumeration_error` (the bus could not be listed), and `complete` is false for either, because
+`usb_camera_list` used to drop both silently and an agent would have read an empty list as "nothing
+attached". Not written yet: the `mcp/` crate and the parent-side watchdog.
 
 **Restore flow decisions (as built).** A restore that changes nothing (every selected property already
 holds the stored value) is a `no_op`: no restore point, no write, `applied_verified`, so a retry after

@@ -66,6 +66,9 @@ pub enum WorkerOp {
         #[arg(long, default_value_t = 0)]
         exit_code: i32,
     },
+    /// List the attached bodies from the USB descriptors. No SDK, no lock, no
+    /// camera session: works with no SDK bundle installed.
+    ListCameras,
     /// Capture one body and write a new snapshot (`mcp-` label, cap, baseline gate).
     Capture {
         /// USB serial of the body. `id-N` forms and SDK ids are refused.
@@ -149,6 +152,11 @@ pub fn run(data_dir: &Path, bundle: &Path, schema: &Path, args: &WorkerArgs) -> 
     match &args.op {
         WorkerOp::Selftest { fail, hang_after_result, exit_code } => {
             selftest(&mut em, *fail, *hang_after_result, *exit_code)
+        }
+        WorkerOp::ListCameras => {
+            progress(&mut em, "starting");
+            let list = nikon_fleet::ops::cameras::list_cameras();
+            finish(&mut em, Outcome::ok(serde_json::to_value(&list).unwrap_or(json!(null))))
         }
         WorkerOp::Capture { serial, label } => capture(&mut em, data_dir, bundle, schema, serial, label.as_deref()),
         WorkerOp::Check { serial } => op_check(&mut em, data_dir, bundle, schema, serial),

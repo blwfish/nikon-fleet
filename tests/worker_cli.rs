@@ -431,3 +431,27 @@ fn restore_ops_refuse_a_serial_that_cannot_name_a_body_before_the_sdk() {
         assert_eq!(err_tag(&w.read()), "no_usb_serial", "{op:?}");
     }
 }
+
+// ── list-cameras ──
+
+#[test]
+fn list_cameras_needs_no_sdk_bundle_and_no_lock_and_keeps_stdout_empty() {
+    let d = tempfile::tempdir().unwrap();
+    let lock_dir = tempfile::tempdir().unwrap();
+    let lock_path = lock_dir.path().join("camera.lock");
+    let _held = CameraLock::acquire_at(&lock_path).unwrap();
+    let env = [("NIKON_FLEET_CAMERA_LOCK", lock_path.to_str().unwrap())];
+    let mut w = spawn(&g(d.path()), &["list-cameras"], &env);
+    let r = w.read();
+    assert_eq!(r.progress, ["starting"], "no SDK phases: the SDK is never loaded");
+    let ReadEnd::Result(Outcome::Ok { data, .. }) = &r.end else { panic!("expected ok, got {:?}", r.end) };
+    assert!(data["cameras"].is_array() && data["unreadable"].is_array(), "{data}");
+    assert!(data["complete"].is_boolean() && data.get("enumeration_error").is_some(), "{data}");
+    for c in data["cameras"].as_array().unwrap() {
+        for k in ["model", "serial", "firmware", "known_model", "serial_readable", "pairing_ambiguous"] {
+            assert!(c.get(k).is_some(), "{k} missing from {c}");
+        }
+    }
+    let (code, stdout, _) = w.finish();
+    assert_eq!((code, stdout.as_str()), (Some(0), ""));
+}
