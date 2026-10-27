@@ -546,10 +546,37 @@ fn translate_enum(source: &Value, target_live: &Value) -> Result<(Value, Strateg
     Ok((out, strategy))
 }
 
+/// The number a range value actually holds.
+///
+/// The SDK fills `value` (`lfValue`) only for continuous ranges. On every
+/// stepped range (`steps >= 2`) read from a Z 9 it is `0.0` whatever the
+/// setting is, and the position is in `value_index` (docs/mcp-hardware-findings.md
+/// F18: 33 of 39 ranges, among them every `WBTune*`). So a stepped range's
+/// value is derived from its index: `lower + index * (upper - lower) / (steps - 1)`.
+/// A continuous range, or one with no usable index, is its `value` field.
+pub(crate) fn range_value(v: &Value) -> Option<f64> {
+    let steps = v.get("steps").and_then(Value::as_u64).unwrap_or(0);
+    if steps >= 2 {
+        if let (Some(lo), Some(hi), Some(idx)) = (
+            v.get("lower").and_then(Value::as_f64),
+            v.get("upper").and_then(Value::as_f64),
+            v.get("value_index").and_then(Value::as_u64),
+        ) {
+            if hi != lo {
+                return Some(lo + idx.min(steps - 1) as f64 * (hi - lo) / (steps as f64 - 1.0));
+            }
+        }
+    }
+    v.get("value").and_then(Value::as_f64)
+}
+
 /// Clamp a range value from `source` into the target's `[lower, upper]`,
-/// snapping to the target's own step count if it has discrete steps.
+/// snapping to the target's own step count if it has discrete steps. The source's
+/// number is [`range_value`], not its raw `value` field (which is `0.0` on a
+/// stepped range); the result carries the target's index and the value at that
+/// index, so the two fields agree.
 fn translate_range(source: &Value, target_live: &Value) -> Result<(Value, Strategy), SkipReason> {
-    let src_value = source.get("value").and_then(Value::as_f64).ok_or(SkipReason::MalformedSource)?;
+    let src_value = range_value(source).ok_or(SkipReason::MalformedSource)?;
     // A missing lower/upper here means the read itself succeeded but the
     // target's live value isn't actually range-shaped (e.g. this capability
     // is an enum on the target but a range on the source) — a structural
@@ -590,8 +617,14 @@ fn translate_range(source: &Value, target_live: &Value) -> Result<(Value, Strate
         0
     };
 
+    // What the target holds at that index (stepped), or the clamped number (continuous).
+    let value = if steps >= 2 && upper != lower {
+        lower + value_index as f64 * (upper - lower) / (steps as f64 - 1.0)
+    } else {
+        clamped
+    };
     let mut out = target_live.clone();
-    out["value"] = json!(clamped);
+    out["value"] = json!(value);
     out["value_index"] = json!(value_index);
     Ok((out, Strategy::RangeClamped))
 }
@@ -896,8 +929,8 @@ fn write_changes(
     match strategy {
         Strategy::EnumByLabel | Strategy::EnumByRawValue => choice.map(|c| !c.is_unchanged()),
         Strategy::RangeClamped => {
-            let want = translated.get("value")?.as_f64()?;
-            let have = live?.get("value")?.as_f64()?;
+            let want = range_value(translated)?;
+            let have = range_value(live?)?;
             Some((want - have).abs() > 1e-6)
         }
         Strategy::Literal => match (translated, live?) {
@@ -1138,12 +1171,12 @@ fn transplant_one<P: CameraPort + ?Sized>(
 /// intended, that's surfaced as a write failure instead of a silent,
 /// possibly-wrong success.
 fn verify_range_write<P: CameraPort + ?Sized>(device: &P, code: u32, translated: &Value) -> Result<(), SkipReason> {
-    let intended = translated.get("value").and_then(Value::as_f64);
+    let intended = range_value(translated);
     let Some(intended) = intended else { return Ok(()) }; // translate_range always sets this; defensive only
     let readback = device.read_capability(code).map_err(|e| {
         SkipReason::WriteFailed(format!("write succeeded but read-back verification failed: {e}"))
     })?;
-    let Some(actual) = readback.get("value").and_then(Value::as_f64) else {
+    let Some(actual) = range_value(&readback) else {
         return Err(SkipReason::WriteFailed(
             "write succeeded but read-back value was not the expected range shape".to_string(),
         ));
@@ -2920,5 +2953,116 @@ mod tests {
         let cam = FakeCamera::new();
         let out = run(&cam, &[("Absent", 99, json!(1))], &[], true);
         assert!(out[0].planned.is_none());
+    }
+    // ── stepped ranges: the position is value_index, `value` is 0.0 (F18) ──
+
+    /// Shaped like a real Z 9 `WBTuneAuto`: value 0.0, index 612 of 1225 steps over [0, 1224].
+    fn stepped(index: u64, lower: f64, upper: f64, steps: u64) -> Value {
+        json!({"value": 0.0, "default": 0.0, "value_index": index, "default_index": 612,
+               "lower": lower, "upper": upper, "steps": steps})
+    }
+
+    #[test]
+    fn range_value_of_a_stepped_range_comes_from_its_index_not_its_zero_value_field() {
+        assert_eq!(super::range_value(&stepped(612, 0.0, 1224.0, 1225)), Some(612.0));
+        assert_eq!(super::range_value(&stepped(250, 2500.0, 10000.0, 751)), Some(5000.0));
+        assert_eq!(super::range_value(&stepped(0, 2500.0, 10000.0, 751)), Some(2500.0));
+        assert_eq!(super::range_value(&stepped(750, 2500.0, 10000.0, 751)), Some(10000.0));
+    }
+
+    #[test]
+    fn range_value_boundaries() {
+        // steps 0 and 1: no usable index, use `value`.
+        let cont = |steps: u64| json!({"value": 3.5, "value_index": 7, "lower": 0.0, "upper": 10.0, "steps": steps});
+        assert_eq!(super::range_value(&cont(0)), Some(3.5));
+        assert_eq!(super::range_value(&cont(1)), Some(3.5));
+        // steps 2 is the first stepped case: the index picks an end.
+        assert_eq!(super::range_value(&json!({"value": 0.0, "value_index": 1, "lower": 0.0, "upper": 10.0, "steps": 2})), Some(10.0));
+        assert_eq!(super::range_value(&json!({"value": 9.0, "value_index": 0, "lower": 0.0, "upper": 10.0, "steps": 2})), Some(0.0));
+        // lower == upper: nothing to interpolate.
+        assert_eq!(super::range_value(&json!({"value": 4.0, "value_index": 3, "lower": 2.0, "upper": 2.0, "steps": 5})), Some(4.0));
+        // an index past the last step is held at the last step.
+        assert_eq!(super::range_value(&json!({"value": 0.0, "value_index": 99, "lower": 0.0, "upper": 10.0, "steps": 3})), Some(10.0));
+        // a missing index falls back to value; a missing value is None.
+        assert_eq!(super::range_value(&json!({"value": 6.0, "lower": 0.0, "upper": 10.0, "steps": 3})), Some(6.0));
+        assert_eq!(super::range_value(&json!({"lower": 0.0, "upper": 10.0, "steps": 3})), None);
+        // reversed bounds interpolate downwards.
+        assert_eq!(super::range_value(&json!({"value": 0.0, "value_index": 1, "lower": 10.0, "upper": 0.0, "steps": 3})), Some(5.0));
+    }
+
+    #[test]
+    fn a_same_range_keeps_its_position_instead_of_collapsing_to_the_lower_bound() {
+        // The bug: `value` is 0.0 on a stepped range, so the old code clamped 0.0 into [0, 1224]
+        // and wrote index 0 over a setting at index 612.
+        let (out, st) = translate_range(&stepped(612, 0.0, 1224.0, 1225), &stepped(100, 0.0, 1224.0, 1225)).unwrap();
+        assert_eq!(st, Strategy::RangeClamped);
+        assert_eq!(out["value_index"], json!(612));
+        assert_eq!(out["value"], json!(612.0), "the value at that index, so the two fields agree");
+    }
+
+    #[test]
+    fn a_kelvin_range_is_translated_by_what_the_index_means_not_by_the_raw_index() {
+        // 5000 K (index 250 of [2500, 10000] in 751 steps) onto a body whose range is [2500, 8000] in 551 steps.
+        let (out, _) = translate_range(&stepped(250, 2500.0, 10000.0, 751), &stepped(0, 2500.0, 8000.0, 551)).unwrap();
+        assert_eq!(out["value_index"], json!(250));
+        assert_eq!(out["value"], json!(5000.0));
+        // 10000 K does not exist there: it is held at the upper bound, the last index.
+        let (out, _) = translate_range(&stepped(750, 2500.0, 10000.0, 751), &stepped(0, 2500.0, 8000.0, 551)).unwrap();
+        assert_eq!(out["value_index"], json!(550));
+        assert_eq!(out["value"], json!(8000.0));
+    }
+
+    #[test]
+    fn a_continuous_range_is_still_translated_by_its_value() {
+        let cont = |v: f64, lo: f64, hi: f64| json!({"value": v, "default": 0.0, "value_index": 0, "default_index": 0, "lower": lo, "upper": hi, "steps": 0});
+        let (out, _) = translate_range(&cont(7.25, 0.0, 10.0), &cont(1.0, 0.0, 5.0)).unwrap();
+        assert_eq!(out["value"], json!(5.0), "clamped to the target's upper bound");
+        let (out, _) = translate_range(&cont(2.5, 0.0, 10.0), &cont(1.0, 0.0, 5.0)).unwrap();
+        assert_eq!(out["value"], json!(2.5));
+    }
+
+    #[test]
+    fn copying_a_stepped_range_onto_itself_is_unchanged_and_the_write_verifies() {
+        let live = stepped(612, 0.0, 1224.0, 1225);
+        let cam = FakeCamera::new().with(10, RW, live.clone());
+        let out = run(&cam, &[("WBTuneAuto", 10, live)], &[], false);
+        assert_eq!(out[0].result, Ok(Strategy::RangeClamped), "the read-back check must not mistake the zero value field for a failure");
+        let p = planned(&out[0]);
+        assert_eq!(p.changes, Some(false));
+        assert_eq!(p.value["value_index"], json!(612));
+    }
+
+    #[test]
+    fn a_stepped_range_at_a_different_position_is_a_change_to_the_sources_position() {
+        let cam = FakeCamera::new().with(10, RW, stepped(100, 0.0, 1224.0, 1225));
+        let out = run(&cam, &[("WBTuneAuto", 10, stepped(612, 0.0, 1224.0, 1225))], &[], true);
+        let p = planned(&out[0]);
+        assert_eq!((p.changes, p.value["value_index"].clone()), (Some(true), json!(612)));
+    }
+    #[test]
+    fn the_translated_value_is_the_value_at_the_target_index_not_the_unsnapped_number() {
+        // 3.0 of [0, 10] in 11 steps onto a 4-step range (0, 3.33, 6.67, 10): the nearest step is index 1.
+        let src = json!({"value": 0.0, "value_index": 3, "lower": 0.0, "upper": 10.0, "steps": 11});
+        let tgt = json!({"value": 0.0, "value_index": 0, "lower": 0.0, "upper": 10.0, "steps": 4});
+        let (out, _) = translate_range(&src, &tgt).unwrap();
+        assert_eq!(out["value_index"], json!(1));
+        let v = out["value"].as_f64().unwrap();
+        assert!((v - 10.0 / 3.0).abs() < 1e-9, "{v}: the value the camera will hold, not 3.0");
+    }
+
+    #[test]
+    fn the_write_check_trusts_the_index_when_the_body_reads_back_its_zero_value_field() {
+        // After the write the body reports the right position but `value` 0.0, as a real Z 9 does.
+        let cam = FakeCamera::new()
+            .with(10, RW, stepped(100, 0.0, 1224.0, 1225))
+            .with_dependent(10, 10, stepped(612, 0.0, 1224.0, 1225));
+        let out = run(&cam, &[("WBTuneAuto", 10, stepped(612, 0.0, 1224.0, 1225))], &[], false);
+        assert_eq!(out[0].result, Ok(Strategy::RangeClamped), "{:?}", out[0].result);
+        // And a body that lands on the wrong position is still caught.
+        let bad = FakeCamera::new()
+            .with(10, RW, stepped(100, 0.0, 1224.0, 1225))
+            .with_dependent(10, 10, stepped(0, 0.0, 1224.0, 1225));
+        let out = run(&bad, &[("WBTuneAuto", 10, stepped(612, 0.0, 1224.0, 1225))], &[], false);
+        assert!(matches!(&out[0].result, Err(SkipReason::WriteFailed(m)) if m.contains("reports")), "{:?}", out[0].result);
     }
 }

@@ -44,7 +44,7 @@ use crate::ops::port::CameraPort;
 use crate::ops::readback::{SideEffects, side_effects};
 use crate::ops::retention::{self, DataDirFull, LabelError, RestoreOp};
 use crate::snapshot::{Camera, Snapshot, SnapshotError, Transport};
-use crate::transplant::{CodeNameGuard, SkipReason, TransplantOutcome, numbers_equal, transplant};
+use crate::transplant::{CodeNameGuard, SkipReason, TransplantOutcome, numbers_equal, range_value, transplant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -200,7 +200,7 @@ pub fn require_confirmation(digest: &str, summary: &str) -> Result<(), ApplyErro
 fn took_effect(planned: &Value, got: &Value) -> bool {
     if planned.get("lower").is_some() {
         // A range: the value, within the tolerance the per-write check uses.
-        return match (planned.get("value").and_then(Value::as_f64), got.get("value").and_then(Value::as_f64)) {
+        return match (range_value(planned), range_value(got)) {
             (Some(a), Some(b)) => (a - b).abs() <= 1e-6_f64.max(a.abs() * 1e-3),
             _ => false,
         };
@@ -858,6 +858,10 @@ mod tests {
         let rg = |v: f64| json!({"value": v, "lower": 0.0, "upper": 10.0, "steps": 0, "value_index": 0});
         assert!(took_effect(&rg(5.0), &rg(5.0000001)));
         assert!(!took_effect(&rg(5.0), &rg(5.1)));
+        // a stepped range: the position (its `value` field is 0.0 on the SDK), not the junk field
+        let st = |i: u64| json!({"value": 0.0, "value_index": i, "lower": 0.0, "upper": 1224.0, "steps": 1225});
+        assert!(took_effect(&st(612), &st(612)));
+        assert!(!took_effect(&st(612), &st(0)), "index 0 is not 612 even though both `value` fields read 0.0");
         // numbers: 3 is 3.0
         assert!(took_effect(&json!(3), &json!(3.0)));
         assert!(!took_effect(&json!(3), &json!(4)));
