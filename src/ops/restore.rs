@@ -10,7 +10,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::sdk::{CapabilityInfo, OP_SET};
+use serde::{Serialize, Serializer};
+use serde_json::{Value, json};
+
+use crate::ops::port::CameraPort;
+use crate::sdk::{CapabilityInfo, OP_SET, SdkError};
 use crate::snapshot::PropertyEntry;
 use crate::transplant;
 
@@ -154,6 +158,139 @@ pub fn plan<'a>(
             PlannedRestore { name: name.as_str(), code: prop.code, decision }
         })
         .collect()
+}
+
+/// What happened to one property.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepOutcome {
+    NotSelected,
+    Skipped(RestoreSkip),
+    /// Dry run: it would be written.
+    WouldWrite,
+    Written,
+    /// The SDK rejected the capability kind for writing.
+    UnsupportedWriteType,
+    /// The write failed; carries the SDK's error text for a human.
+    WriteFailed(String),
+}
+
+impl StepOutcome {
+    /// Closed machine-readable tag. Exhaustive match.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            StepOutcome::NotSelected => "not_selected",
+            StepOutcome::Skipped(s) => s.tag(),
+            StepOutcome::WouldWrite => "would_write",
+            StepOutcome::Written => "written",
+            StepOutcome::UnsupportedWriteType => "unsupported_write_type",
+            StepOutcome::WriteFailed(_) => "write_failed",
+        }
+    }
+}
+
+impl Serialize for StepOutcome {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = serde_json::Map::new();
+        m.insert("tag".into(), json!(self.tag()));
+        if let StepOutcome::WriteFailed(msg) = self {
+            m.insert("detail".into(), json!({ "message": msg }));
+        }
+        Value::Object(m).serialize(s)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StepResult {
+    pub name: String,
+    pub code: u32,
+    pub outcome: StepOutcome,
+}
+
+/// Tallies over a run. `written` counts would-writes in a dry run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct Counts {
+    pub written: usize,
+    pub skipped_absent: usize,
+    pub skipped_read_only: usize,
+    pub skipped_type: usize,
+    pub skipped_never: usize,
+    pub not_selected: usize,
+    pub errors: usize,
+}
+
+/// One restore, property by property, in the snapshot's name order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RestoreRun {
+    pub steps: Vec<StepResult>,
+}
+
+impl RestoreRun {
+    pub fn counts(&self) -> Counts {
+        let mut c = Counts::default();
+        for s in &self.steps {
+            match &s.outcome {
+                StepOutcome::NotSelected => c.not_selected += 1,
+                StepOutcome::Skipped(RestoreSkip::NeverCopied) => c.skipped_never += 1,
+                StepOutcome::Skipped(RestoreSkip::Absent) => c.skipped_absent += 1,
+                StepOutcome::Skipped(RestoreSkip::ReadOnly) => c.skipped_read_only += 1,
+                StepOutcome::WouldWrite | StepOutcome::Written => c.written += 1,
+                StepOutcome::UnsupportedWriteType => c.skipped_type += 1,
+                StepOutcome::WriteFailed(_) => c.errors += 1,
+            }
+        }
+        c
+    }
+
+    /// Properties actually written (not would-writes): what `readback::residual`
+    /// should judge and what an undo of this restore would have to put back.
+    pub fn written_names(&self) -> BTreeSet<String> {
+        self.steps
+            .iter()
+            .filter(|s| s.outcome == StepOutcome::Written)
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
+    /// Selected properties that were not (or, in a dry run, would not be)
+    /// written, with a closed reason tag. Meaningful for a targeted restore.
+    pub fn unrestored(&self) -> Vec<(String, &'static str)> {
+        self.steps
+            .iter()
+            .filter(|s| {
+                !matches!(s.outcome, StepOutcome::NotSelected | StepOutcome::Written | StepOutcome::WouldWrite)
+            })
+            .map(|s| (s.name.clone(), s.outcome.tag()))
+            .collect()
+    }
+}
+
+/// Run a restore of `properties` onto `port`: [`plan`], then write each
+/// `Write` decision (or only report it, if `dry_run`). A failed write does not
+/// stop the rest.
+pub fn execute<P: CameraPort + ?Sized>(
+    port: &P,
+    properties: &BTreeMap<String, PropertyEntry>,
+    only: Option<&BTreeSet<String>>,
+    dry_run: bool,
+) -> RestoreRun {
+    let cap_map: HashMap<u32, &CapabilityInfo> = port.capabilities().iter().map(|c| (c.id, c)).collect();
+    let steps = plan(properties, only, &cap_map)
+        .into_iter()
+        .map(|step| {
+            let outcome = match step.decision {
+                Decision::NotSelected => StepOutcome::NotSelected,
+                Decision::Skip(skip) => StepOutcome::Skipped(skip),
+                Decision::Write(_) if dry_run => StepOutcome::WouldWrite,
+                Decision::Write(cap) => match port.write_capability(step.code, cap.kind, &properties[step.name].value) {
+                    Ok(()) => StepOutcome::Written,
+                    Err(SdkError::UnsupportedWrite(_)) => StepOutcome::UnsupportedWriteType,
+                    Err(e) => StepOutcome::WriteFailed(e.to_string()),
+                },
+            };
+            StepResult { name: step.name.to_string(), code: step.code, outcome }
+        })
+        .collect();
+    RestoreRun { steps }
 }
 
 #[cfg(test)]
@@ -366,5 +503,177 @@ mod tests {
         let map: HashMap<u32, &CapabilityInfo> = caps.iter().map(|c| (c.id, c)).collect();
         let none = BTreeSet::new();
         assert!(plan(&p, Some(&none), &map).iter().all(|x| matches!(x.decision, Decision::NotSelected)));
+    }
+    // ── execute, on an in-memory body ────────────────────────────────────
+
+    use crate::ops::capture::capture;
+    use crate::ops::port::{Failure, FakeCamera};
+    use crate::ops::readback::{residual, side_effects};
+    use crate::snapshot::{Camera, Snapshot, Transport};
+
+    const RW: u32 = OP_GET | OP_SET;
+
+    fn snapshot_of(entries: &[(&str, u32, i64)]) -> Snapshot {
+        let mut s = Snapshot::new(
+            Camera { model: "Z 9".into(), serial: "1".into(), firmware: "5.31".into() },
+            Transport::Usb,
+            "2026-10-27T12:00:00Z".into(),
+        );
+        for (n, c, v) in entries {
+            s.insert(*n, *c, json!(*v));
+        }
+        s
+    }
+
+    fn lookup(entries: &[(&str, u32)]) -> HashMap<u32, String> {
+        entries.iter().map(|(n, c)| (*c, n.to_string())).collect()
+    }
+
+    fn outcomes(run: &RestoreRun) -> Vec<(&str, &'static str)> {
+        run.steps.iter().map(|s| (s.name.as_str(), s.outcome.tag())).collect()
+    }
+
+    #[test]
+    fn a_full_restore_writes_every_writable_property_and_only_those() {
+        let never = transplant::NEVER_TRANSPLANT[0].0;
+        let cam = FakeCamera::new()
+            .with(1, RW, json!(0))
+            .with(2, RW, json!(0))
+            .with(3, OP_GET, json!(0))
+            .with(never, RW, json!(0));
+        let snap = snapshot_of(&[("A", 1, 10), ("B", 2, 20), ("C", 3, 30), ("D", 4, 40), ("L", never, 50)]);
+        let run = execute(&cam, &snap.properties, None, false);
+        assert_eq!(
+            outcomes(&run),
+            [("A", "written"), ("B", "written"), ("C", "read_only"), ("D", "absent_on_target"), ("L", "never_copied")]
+        );
+        assert_eq!(cam.writes(), [(1, json!(10)), (2, json!(20))]);
+        assert_eq!(cam.value(never), Some(json!(0)), "state property untouched");
+        let c = run.counts();
+        assert_eq!((c.written, c.skipped_read_only, c.skipped_absent, c.skipped_never, c.not_selected, c.errors), (2, 1, 1, 1, 0, 0));
+    }
+
+    #[test]
+    fn a_targeted_restore_leaves_every_other_value_exactly_as_it_is() {
+        let cam = FakeCamera::new().with(1, RW, json!(0)).with(2, RW, json!(0));
+        let snap = snapshot_of(&[("A", 1, 10), ("B", 2, 20)]);
+        let only = BTreeSet::from(["A".to_string()]);
+        let run = execute(&cam, &snap.properties, Some(&only), false);
+        assert_eq!(cam.writes(), [(1, json!(10))]);
+        assert_eq!(cam.value(2), Some(json!(0)), "B differs from the snapshot and is left alone");
+        assert_eq!(run.counts().not_selected, 1);
+        assert!(run.unrestored().is_empty());
+    }
+
+    #[test]
+    fn a_dry_run_writes_nothing_counts_would_writes_and_has_no_written_names() {
+        let cam = FakeCamera::new().with(1, RW, json!(0));
+        let snap = snapshot_of(&[("A", 1, 10)]);
+        let run = execute(&cam, &snap.properties, None, true);
+        assert!(cam.writes().is_empty() && cam.reads().is_empty());
+        assert_eq!(outcomes(&run), [("A", "would_write")]);
+        assert_eq!(run.counts().written, 1);
+        assert!(run.written_names().is_empty(), "nothing was actually written");
+    }
+
+    #[test]
+    fn a_failed_write_is_an_error_but_the_rest_still_run() {
+        let cam = FakeCamera::new()
+            .with(1, RW, json!(0))
+            .with(2, RW, json!(0))
+            .with(3, RW, json!(0))
+            .failing_write(1, Failure::Call(-125))
+            .failing_write(2, Failure::UnsupportedWrite);
+        let snap = snapshot_of(&[("A", 1, 10), ("B", 2, 20), ("C", 3, 30)]);
+        let run = execute(&cam, &snap.properties, None, false);
+        assert_eq!(outcomes(&run), [("A", "write_failed"), ("B", "unsupported_write_type"), ("C", "written")]);
+        let c = run.counts();
+        assert_eq!((c.written, c.errors, c.skipped_type), (1, 1, 1));
+        assert_eq!(run.written_names(), BTreeSet::from(["C".to_string()]), "a failed write is not written");
+        assert_eq!(run.unrestored(), [("A".to_string(), "write_failed"), ("B".to_string(), "unsupported_write_type")]);
+    }
+
+    #[test]
+    fn unrestored_lists_selected_skips_but_not_unselected_ones() {
+        let cam = FakeCamera::new().with(1, RW, json!(0)).with(3, OP_GET, json!(0));
+        let snap = snapshot_of(&[("A", 1, 10), ("C", 3, 30), ("D", 4, 40)]);
+        let only = BTreeSet::from(["A".to_string(), "C".to_string()]);
+        let run = execute(&cam, &snap.properties, Some(&only), false);
+        assert_eq!(run.unrestored(), [("C".to_string(), "read_only")], "D was not asked for");
+    }
+
+    #[test]
+    fn step_outcome_json_shapes() {
+        let ok = serde_json::to_value(StepOutcome::Written).unwrap();
+        assert_eq!(ok, json!({"tag": "written"}));
+        let failed = serde_json::to_value(StepOutcome::WriteFailed("-125".into())).unwrap();
+        assert_eq!(failed, json!({"tag": "write_failed", "detail": {"message": "-125"}}));
+        assert_eq!(serde_json::to_value(StepOutcome::Skipped(RestoreSkip::Absent)).unwrap(), json!({"tag": "absent_on_target"}));
+    }
+
+    /// The plan's apply and undo sequence (docs/mcp-plan.md §5.5-5.6) on an
+    /// in-memory body in which writing A also changes B.
+    #[test]
+    fn apply_then_targeted_undo_restores_the_written_and_indirect_changes_but_not_later_edits() {
+        let names = [("A", 1u32), ("B", 2), ("C", 3)];
+        let cam = FakeCamera::new()
+            .with(1, RW, json!(1))
+            .with(2, RW, json!(2))
+            .with(3, RW, json!(3))
+            .with_dependent(1, 2, json!(222)); // writing A moves B as a side effect
+        let lk = lookup(&names);
+
+        // 1. Restore point.
+        let mut restore_point = snapshot_of(&[]);
+        capture(&cam, &lk, &mut restore_point);
+
+        // 2. The apply: set A to 100.
+        let source = snapshot_of(&[("A", 1, 100)]);
+        let only = BTreeSet::from(["A".to_string()]);
+        let run = execute(&cam, &source.properties, Some(&only), false);
+        let written = run.written_names();
+        assert_eq!(written, BTreeSet::from(["A".to_string()]));
+
+        // 3. Read back: B changed though nobody wrote it.
+        let mut readback = snapshot_of(&[]);
+        capture(&cam, &lk, &mut readback);
+        let se = side_effects(&restore_point, &readback, &written).unwrap();
+        assert_eq!(se.changed, ["B"]);
+
+        // 4. The user changes C after the apply.
+        cam.write_capability(3, 0, &json!(333)).unwrap();
+
+        // 5. Undo A alone: B stays at its side-effect value. This is why the
+        //    default undo set is written + side effects.
+        let undo_a_only = execute(&cam, &restore_point.properties, Some(&written), false);
+        assert_eq!(undo_a_only.written_names(), written);
+        assert_eq!(cam.value(1), Some(json!(1)));
+        assert_ne!(cam.value(2), Some(json!(2)), "the dependent change would have been left behind");
+
+        // 6. Undo with written + side effects: A and B return, C (the user's edit) is left alone.
+        let mut undo_set = written.clone();
+        undo_set.extend(se.names());
+        let undo = execute(&cam, &restore_point.properties, Some(&undo_set), false);
+        assert_eq!(cam.value(1), Some(json!(1)));
+        assert_eq!(cam.value(2), Some(json!(2)));
+        assert_eq!(cam.value(3), Some(json!(333)), "a later edit outside the undo set is not overwritten");
+
+        // 7. The undo reports no residual.
+        let mut after_undo = snapshot_of(&[]);
+        capture(&cam, &lk, &mut after_undo);
+        assert!(residual(&restore_point, &after_undo, &undo.written_names()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn residual_catches_a_restore_that_did_not_take() {
+        // The body writes A, but a dependent override puts it back: the write "succeeded".
+        let cam = FakeCamera::new().with(1, RW, json!(1)).with_dependent(1, 1, json!(1));
+        let lk = lookup(&[("A", 1)]);
+        let snap = snapshot_of(&[("A", 1, 100)]);
+        let run = execute(&cam, &snap.properties, None, false);
+        assert_eq!(run.counts().errors, 0, "the write call reported success");
+        let mut readback = snapshot_of(&[]);
+        capture(&cam, &lk, &mut readback);
+        assert_eq!(residual(&snap, &readback, &run.written_names()).unwrap().changed, ["A"]);
     }
 }

@@ -33,7 +33,7 @@ use nikon_fleet::ops::capture::{self as ops_capture, CaptureStats};
 use nikon_fleet::ops::firmware_latest::{LatestReport, ModelSurvey, survey_json};
 use nikon_fleet::ops::list::{EntryState, Listing, list_dir, reference_filename};
 use nikon_fleet::ops::restore;
-use nikon_fleet::sdk::{CapabilityInfo, Device, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list};
+use nikon_fleet::sdk::{Device, DeviceInfo, Sdk, UsbCameraInfo, pair_devices, usb_camera_list};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use nikon_fleet::transplant;
 
@@ -1871,53 +1871,18 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
     let device = sdk.connect(target.id)?;
     ensure_capabilities_present(device.capabilities.len())?;
 
-    // Index capabilities by code for O(1) lookup.
-    let cap_map: HashMap<u32, &CapabilityInfo> =
-        device.capabilities.iter().map(|c| (c.id, c)).collect();
-
-    let mut written = 0usize;
-    let mut skipped_absent = 0usize;   // cap code not present in this camera
-    let mut skipped_read_only = 0usize; // present but OP_SET not allowed
-    let mut skipped_type = 0usize;
-    let mut skipped_never = 0usize;     // state/lock properties (transplant::NEVER_TRANSPLANT)
-    let mut not_selected = 0usize;      // excluded by --only
-    let mut errors = 0usize;
-    // Named by --only but not written (or not writable, in a dry run).
-    let mut unrestored: Vec<(String, &'static str)> = Vec::new();
-
-    for step in restore::plan(&snap.properties, only.as_ref(), &cap_map) {
-        let (name, code) = (step.name, step.code);
-        match step.decision {
-            restore::Decision::NotSelected => not_selected += 1,
-            restore::Decision::Skip(skip) => {
-                match skip {
-                    restore::RestoreSkip::NeverCopied => skipped_never += 1,
-                    restore::RestoreSkip::Absent => skipped_absent += 1,
-                    restore::RestoreSkip::ReadOnly => skipped_read_only += 1,
-                }
-                unrestored.push((name.to_string(), skip.tag()));
-            }
-            restore::Decision::Write(cap) => {
-                if args.dry_run {
-                    println!("  would write  {} [{:#x}]", name, code);
-                    written += 1;
-                    continue;
-                }
-                match device.write_capability(code, cap.kind, &snap.properties[name].value) {
-                    Ok(()) => written += 1,
-                    Err(SdkError::UnsupportedWrite(_)) => {
-                        skipped_type += 1;
-                        unrestored.push((name.to_string(), "unsupported_write_type"));
-                    }
-                    Err(e) => {
-                        eprintln!("  warn: {} [{:#x}]: {}", name, code, e);
-                        errors += 1;
-                        unrestored.push((name.to_string(), "write_failed"));
-                    }
-                }
-            }
+    let run = restore::execute(&device, &snap.properties, only.as_ref(), args.dry_run);
+    for step in &run.steps {
+        match &step.outcome {
+            restore::StepOutcome::WouldWrite => println!("  would write  {} [{:#x}]", step.name, step.code),
+            restore::StepOutcome::WriteFailed(msg) => eprintln!("  warn: {} [{:#x}]: {}", step.name, step.code, msg),
+            _ => {}
         }
     }
+    let restore::Counts { written, skipped_absent, skipped_read_only, skipped_type, skipped_never, not_selected, errors } =
+        run.counts();
+    let unrestored = run.unrestored();
+
     let not_selected_note = if only.is_some() { format!("  skipped(not-selected)={not_selected}") } else { String::new() };
     println!(
         "{} written={written}  skipped(absent)={skipped_absent}  \
