@@ -114,3 +114,28 @@ fn ref_list_text_and_json() {
     assert_eq!(v["entries"][0]["serial"], json!("1"));
     assert_eq!(v["entries"][1]["status"], json!("unreadable"));
 }
+
+#[test]
+fn ls_json_marks_the_snapshot_promoted_by_ref_set_and_only_that_one() {
+    let d = setup();
+    let snaps = d.path().join("snapshots");
+    // Two readable Z 9 snapshots with the same serial; promote one through the real CLI.
+    snap("Z 9", "1", Some("second")).save_to_file(snaps.join("Z_9_1_snap_c.json")).unwrap();
+    let set = run(d.path(), &["ref", "set", snaps.join("Z_9_1_snap_c.json").to_str().unwrap()]);
+    assert!(set.status.success(), "{}", String::from_utf8_lossy(&set.stderr));
+
+    let v = json_of(&run(d.path(), &["ls", "--json"]));
+    let flag = |file: &str| {
+        v["entries"].as_array().unwrap().iter().find(|e| e["file"] == json!(file)).map(|e| e.get("is_reference").cloned())
+    };
+    assert_eq!(flag("Z_9_1_snap_c.json"), Some(Some(json!(true))));
+    assert_eq!(flag("Z_9_1_snap_a.json"), Some(Some(json!(false))));
+    assert_eq!(flag("Z6_3_2_snap_b.json"), Some(Some(json!(false))));
+    // An unreadable file has no verdict at all.
+    assert_eq!(flag("Z_9_1_snap_broken.json"), Some(None));
+    assert_eq!(v["reference_read_failures"], json!(0));
+
+    // `ref list --json` lists the reference file itself and carries no marker.
+    let r = json_of(&run(d.path(), &["ref", "list", "--json"]));
+    assert!(r["entries"][0].get("is_reference").is_none());
+}

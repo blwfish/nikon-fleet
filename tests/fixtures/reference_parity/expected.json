@@ -1,0 +1,26 @@
+{
+  "ABC123": {
+    "abc_ref_source.json": true,
+    "abc_ref_twin.json": true,
+    "abc_same_second.json": false,
+    "abc_reordered.json": false,
+    "abc_no_newline.json": false,
+    "abc_older.json": false
+  },
+  "XYZ789": {
+    "xyz_no_reference.json": false
+  },
+  "id-1": {
+    "id1_z9.json": false,
+    "id1_z6.json": true
+  },
+  "UNI1": {
+    "uni.json": true
+  },
+  "../snapshots/abc_ref_source": {
+    "trav.json": false
+  },
+  "x/y": {
+    "hostile_subdir.json": false
+  }
+}

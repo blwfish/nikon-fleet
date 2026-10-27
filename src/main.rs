@@ -29,7 +29,7 @@ use nikon_fleet::firmware_source::{
     Release, SourceError, UreqHttp, assess, camera_relation, fetch_direct,
 };
 use nikon_fleet::maid_layer::MaidLayerConfig;
-use nikon_fleet::ops::list::{EntryState, Listing, list_dir};
+use nikon_fleet::ops::list::{EntryState, Listing, list_dir, reference_filename};
 use nikon_fleet::sdk::{CapabilityInfo, Device, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET, OP_SET};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use nikon_fleet::transplant;
@@ -441,12 +441,6 @@ fn ensure_dir(p: &Path) -> Result<()> {
     fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))
 }
 
-/// Filename used for a camera's reference snapshot.
-/// Spaces in model names become underscores so the filename is shell-friendly.
-fn reference_filename(model: &str, serial: &str) -> String {
-    format!("{}_{serial}.json", model_slug(model))
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // USB enrichment
 // ─────────────────────────────────────────────────────────────────────────
@@ -584,7 +578,11 @@ fn resolve_snapshot_path(data_dir: &Path, p: &Path) -> PathBuf {
 }
 
 fn cmd_ls(data_dir: &Path, args: &LsArgs) -> Result<()> {
-    let listing = list_dir(&snapshots_dir(data_dir), args.camera.as_deref())?;
+    let listing = list_dir(
+        &snapshots_dir(data_dir),
+        args.camera.as_deref(),
+        Some(&references_dir(data_dir)),
+    )?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&listing)?);
         return Ok(());
@@ -662,7 +660,7 @@ fn cmd_ref(data_dir: &Path, sub: &RefCmd) -> Result<()> {
             );
         }
         RefCmd::List { json } => {
-            let listing = list_dir(&refs, None)?;
+            let listing = list_dir(&refs, None, None)?;
             if *json {
                 println!("{}", serde_json::to_string_pretty(&listing)?);
                 return Ok(());

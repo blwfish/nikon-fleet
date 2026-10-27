@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "camera": {
+    "model": "Z6_3",
+    "serial": "id-1",
+    "firmware": "5.31"
+  },
+  "captured_at": "2026-03-02T00:00:00Z",
+  "label": "z6 fallback serial",
+  "transport": "usb",
+  "properties": {
+    "kNkMAIDCapability_Aperture": {
+      "code": 33285,
+      "value": 56
+    }
+  }
+}

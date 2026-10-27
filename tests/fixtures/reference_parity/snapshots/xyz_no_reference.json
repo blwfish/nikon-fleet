@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "camera": {
+    "model": "Z 9",
+    "serial": "XYZ789",
+    "firmware": "5.31"
+  },
+  "captured_at": "2026-02-01T00:00:00Z",
+  "label": "no reference",
+  "transport": "usb",
+  "properties": {
+    "kNkMAIDCapability_Aperture": {
+      "code": 33285,
+      "value": 56
+    }
+  }
+}
