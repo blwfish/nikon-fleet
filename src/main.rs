@@ -1829,7 +1829,7 @@ fn ingest_user_file(data_dir: &Path, source_id: &str, release: &Release, file: &
     Ok(())
 }
 
-fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset: bool) -> Result<()> {
+fn cmd_restore(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &RestoreArgs, no_usb_reset: bool) -> Result<()> {
     let snap_path = resolve_snapshot_path(data_dir, &args.snapshot_path);
     let snap = Snapshot::load_from_file(&snap_path)
         .with_context(|| format!("loading {}", snap_path.display()))?;
@@ -1851,7 +1851,7 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
 
     // Match by --serial override, or by the serial embedded in the snapshot.
     let target_serial = args.serial.as_deref().unwrap_or(&snap.camera.serial);
-    let (target, _usb) = enriched
+    let (target, usb_info) = enriched
         .into_iter()
         .find(|(dev, usb)| serial_matches(dev, usb, target_serial))
         .ok_or_else(|| anyhow::anyhow!(
@@ -1895,7 +1895,64 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
     if let Some(msg) = unrestored_error(only.as_ref().map(|o| o.len()), &unrestored) {
         bail!("{msg}");
     }
+
+    // A write call that returns success proves nothing (F18): read the body back and
+    // compare what was written with the snapshot. Not for a dry run, which wrote nothing.
+    if !args.dry_run {
+        let schema = MaidLayerConfig::parse_file(schema_path)
+            .with_context(|| format!("loading schema from {}", schema_path.display()))?;
+        let name_lookup = schema.name_map_for_model(&target.name);
+        let identity = Camera {
+            model: target.name.clone(),
+            serial: usb_info.as_ref().map(|u| u.serial.clone()).unwrap_or_else(|| snap.camera.serial.clone()),
+            firmware: usb_info.as_ref().map(|u| u.firmware.clone()).unwrap_or_else(|| snap.camera.firmware.clone()),
+        };
+        let captured_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let v = restore::verify(&device, &name_lookup, &identity, &snap, &run.written_names(), &captured_at);
+        let (line, failing) = restore_verification_text(&v);
+        println!("{line}");
+        if failing {
+            bail!("the restore did not take effect as reported; see the read-back above");
+        }
+    }
     Ok(())
+}
+
+/// The one-line read-back report for the CLI, and whether it is a failure.
+/// `residual_found` fails; an incomplete read-back is a warning: nothing is
+/// claimed either way, and the command's other checks have already passed.
+fn restore_verification_text(v: &restore::Verification) -> (String, bool) {
+    match v.verdict {
+        restore::Verdict::Verified => (
+            "Read-back: verified — every written property reads back as restored".to_string(),
+            false,
+        ),
+        restore::Verdict::NothingWritten => ("Read-back: nothing was written, nothing to verify".to_string(), false),
+        restore::Verdict::ReadbackIncomplete => (
+            "Read-back: INCOMPLETE — the camera could not be read back well enough to verify the writes; \
+             nothing is claimed"
+                .to_string(),
+            false,
+        ),
+        restore::Verdict::ResidualFound => {
+            let r = v.residual.clone().unwrap_or_default();
+            let mut names: Vec<String> = r.changed.iter().map(|n| format!("{n} (differs)")).collect();
+            names.extend(r.missing.iter().map(|n| format!("{n} (not readable)")));
+            (
+                format!(
+                    "Read-back: UNVERIFIED — {} not read back as restored: {}. \
+                     The camera accepted the write and did not keep it.",
+                    if names.len() == 1 {
+                        "1 written property does".to_string()
+                    } else {
+                        format!("{} written properties do", names.len())
+                    },
+                    names.join(", ")
+                ),
+                true,
+            )
+        }
+    }
 }
 
 /// Copy a snapshot's settings onto a live camera that may be a different
@@ -2119,7 +2176,7 @@ fn main() -> Result<()> {
             let code = worker_cmd::run(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args);
             std::process::exit(code)
         }
-        Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, args, no_reset),
+        Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
         Cmd::Transplant(args) => cmd_transplant(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
         Cmd::VendorRead(args) => cmd_vendor_read(args),
         Cmd::VendorWriteFtp(args) => cmd_vendor_write_ftp(args),
@@ -2525,6 +2582,37 @@ mod tests {
     fn cmd_ref_list_missing_dir_ok_empty() {
         let data_dir = TempDir::new().unwrap();
         assert!(cmd_ref(data_dir.path(), &RefCmd::List { json: false }).is_ok());
+    }
+
+    // ── restore read-back report ─────────────────────────────────────────
+
+    fn verification(verdict: restore::Verdict, changed: &[&str], missing: &[&str]) -> restore::Verification {
+        restore::Verification {
+            verdict,
+            gate: None,
+            stats: None,
+            residual: Some(nikon_fleet::ops::readback::Residual {
+                changed: changed.iter().map(|s| s.to_string()).collect(),
+                missing: missing.iter().map(|s| s.to_string()).collect(),
+            }),
+        }
+    }
+
+    #[test]
+    fn restore_verification_text_fails_only_when_a_written_property_did_not_take() {
+        let (ok, fail) = restore_verification_text(&verification(restore::Verdict::Verified, &[], &[]));
+        assert!(!fail && ok.contains("verified"), "{ok}");
+        let (none, fail) = restore_verification_text(&verification(restore::Verdict::NothingWritten, &[], &[]));
+        assert!(!fail && none.contains("nothing to verify"));
+        let (inc, fail) = restore_verification_text(&verification(restore::Verdict::ReadbackIncomplete, &[], &[]));
+        assert!(!fail, "an incomplete read-back claims nothing and is not a failure");
+        assert!(inc.contains("INCOMPLETE") && inc.contains("nothing is claimed"), "{inc}");
+        let (bad, fail) = restore_verification_text(&verification(restore::Verdict::ResidualFound, &["WBTuneAuto"], &["Gone"]));
+        assert!(fail);
+        assert!(bad.contains("UNVERIFIED") && bad.contains("WBTuneAuto (differs)") && bad.contains("Gone (not readable)"), "{bad}");
+        assert!(bad.contains("2 written properties do not"), "{bad}");
+        let (one, _) = restore_verification_text(&verification(restore::Verdict::ResidualFound, &["A"], &[]));
+        assert!(one.contains("1 written property does not read back"), "{one}");
     }
 
     // ── targeted restore verdict ─────────────────────────────────────────
