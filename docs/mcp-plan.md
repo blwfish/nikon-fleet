@@ -448,8 +448,8 @@ snapshot" as meaningful, or filter them from the default lists.
 | `restore --only <property>` (repeatable) and the `ops` equivalent, for the targeted undo (§5.6) | todo |
 | Gate numeric literal scalars like raw codes: `SkipReason::literal_unconfirmed`, same opt-in list (§5.3) | **done** (`6d412c7`); the opt-in was confirmed in a live dry run (F15), but the opted-in write itself has not been run on hardware |
 | Add `ShootNoCard` to `NEVER_TRANSPLANT` (and its real-config name check) | **done** (`c619f23`); the table has 10 entries |
-| `Serialize` on `Strategy`/`SkipReason` as closed tags (exhaustive match) and on outcomes | todo |
-| `--json` on `ls`, `ref list`, `check`, `snapshot`, `transplant`, `restore`; `discover --json` gains `available`/`connected_pid` | todo |
+| `Serialize` on `Strategy`/`SkipReason` as closed tags (exhaustive match) and on outcomes | **done** (`8b2bcd7`): `tag()` and a new `Severity` (`routine`/`policy`/`warn`/`error`, the table's column); `{tag, severity, detail?}` with `detail` omitted when empty; outcomes are `{name, code, status: copied\|skipped, strategy\|reason, choice?}`; the CLI's warn decision now reads `severity()` |
+| `--json` on `ls`, `ref list`, `check`, `snapshot`, `transplant`, `restore`; `discover --json` gains `available`/`connected_pid` | `ls` and `ref list` **done** (`0c551a7`, through `ops::list::list_dir`; entries have no `is_reference` until the byte-identity rule lands); the rest todo |
 | `ops::capture` returns `read_ok`/`read_err`/failed codes, uses create-new writes | create-new writes **done** (`e50e43c`: `Snapshot::save_new`, used by the CLI and GUI captures); the returned stats are todo |
 | Per-model baseline file (readable-capability sets, seeded from F5) and the superset gate (also useful to the CLI: a partial capture still exits 0) | todo |
 | One `ops::list` byte-identity rule, new for the CLI. The GUIs keep their copies; parity test only (§2) | todo |
