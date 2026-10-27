@@ -549,6 +549,26 @@ Also from the same runs: the digest of two real plans taken minutes apart was id
 counts three boolean/string-valued properties as "would change" because they are written without a read
 (their current value is unknown), so it says 5 when the real number is 2.
 
+## F19. `restore-plan` / `restore-apply` on the Z 9 (2026-10-27)
+
+First run of the worker's restore ops on hardware, with permission, one harmless stepped range
+(`WBTuneAuto`, 33049; index 612 to 613 and back). A fresh baseline was captured (gate `passed`, 196
+properties); a source snapshot was made from it with `value_index` 613; then:
+
+1. `restore-plan --only WBTuneAuto`: `would_change` 1, one step `would_write` with `changes: true`.
+2. `restore-apply` with that digest and summary: phases `plan_verified`, `restore_point_written`, `writing`,
+   `read_back`; `applied_verified`, `residual` empty, no side effects; restore point
+   `mcp-restore-pre-restore-20261027T223626.793299Z`.
+3. The undo went through the same ops, `restore-plan` then `restore-apply` on that restore point with
+   `--only WBTuneAuto`: `applied_verified`, empty residual, its own restore point.
+4. A final capture diffed against the baseline: no differences.
+
+What this settles: the restore flow's priming read works against the real body (the write took, where a blind
+range write would have been ignored, F18), the read-back agrees with an independent capture, and an undo is
+itself a restore. Two writes in all, both on this one property. The residual path for an ignored write is
+still only tested on a fake body (nothing on this camera ignored a primed write). The worker again hit the
+post-result teardown hang on the apply (killed after the result line was read, F3).
+
 ## F13. Still unverified
 
 - Whether `available` / `connected_pid` can be obtained, and what they mean while another process
