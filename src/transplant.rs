@@ -872,6 +872,7 @@ pub struct PlannedWrite {
     pub changes: Option<bool>,
 }
 
+#[derive(Debug)]
 pub struct TransplantOutcome {
     pub name: String,
     pub code: u32,
@@ -1167,6 +1168,7 @@ fn verify_range_write<P: CameraPort + ?Sized>(device: &P, code: u32, translated:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{config_text, parse_config};
     use serde_json::json;
 
     // ── shape detection ──────────────────────────────────────────────────
@@ -2403,27 +2405,6 @@ mod tests {
     }
 
     // ── Z-series scope + capability-name guard ───────────────────────────
-
-    /// Build a MaidLayer.config text: one section per `(model, caps)`, each
-    /// cap `(symbolic name without prefix, code)`.
-    fn config_text(models: &[(&str, &[(&str, u32)])]) -> String {
-        let mut out = String::from("<ProfileVersion>9.0.3000</ProfileVersion>\n");
-        for (model, caps) in models {
-            out.push_str(&format!("<model:{model}>\n<version>common</version>\n<caplist>\n"));
-            for (name, code) in *caps {
-                out.push_str(&format!(
-                    "<capability:kNkMAIDCapability_{name}-{code}>\n<description>0,0,\"{name}\"</description>\n\
-                     <allowedoperation:14></allowedoperation>\n<DeviceCommand>1,0,0,0,0</DeviceCommand>\n</capability>\n"
-                ));
-            }
-            out.push_str("</caplist>\n</model>\n");
-        }
-        out
-    }
-
-    fn parse_config(models: &[(&str, &[(&str, u32)])]) -> MaidLayerConfig {
-        MaidLayerConfig::parse(&config_text(models)).expect("fixture config parses")
-    }
 
     fn names(ns: &[&str]) -> BTreeSet<String> {
         ns.iter().map(|n| format!("kNkMAIDCapability_{n}")).collect()
