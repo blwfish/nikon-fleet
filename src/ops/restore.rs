@@ -264,6 +264,23 @@ impl RestoreRun {
     }
 }
 
+/// The struct to hand to the SDK for `stored`. A stepped range's `value` field is
+/// `0.0` in every snapshot (F18), so writing it back as stored would send a
+/// position of `value_index` and a number of 0; which of the two the camera honours
+/// is not known. The number is therefore rewritten to the one the index means, so
+/// the struct is coherent either way. Everything else is written as stored.
+pub(crate) fn coherent_for_write(stored: &Value) -> Value {
+    let stepped = stored.get("lower").is_some() && stored.get("steps").and_then(Value::as_u64).unwrap_or(0) >= 2;
+    if !stepped {
+        return stored.clone();
+    }
+    let mut out = stored.clone();
+    if let Some(v) = transplant::range_value(stored) {
+        out["value"] = json!(v);
+    }
+    out
+}
+
 /// Run a restore of `properties` onto `port`: [`plan`], then write each
 /// `Write` decision (or only report it, if `dry_run`). A failed write does not
 /// stop the rest.
@@ -281,7 +298,7 @@ pub fn execute<P: CameraPort + ?Sized>(
                 Decision::NotSelected => StepOutcome::NotSelected,
                 Decision::Skip(skip) => StepOutcome::Skipped(skip),
                 Decision::Write(_) if dry_run => StepOutcome::WouldWrite,
-                Decision::Write(cap) => match port.write_capability(step.code, cap.kind, &properties[step.name].value) {
+                Decision::Write(cap) => match port.write_capability(step.code, cap.kind, &coherent_for_write(&properties[step.name].value)) {
                     Ok(()) => StepOutcome::Written,
                     Err(SdkError::UnsupportedWrite(_)) => StepOutcome::UnsupportedWriteType,
                     Err(e) => StepOutcome::WriteFailed(e.to_string()),
@@ -675,5 +692,46 @@ mod tests {
         let mut readback = snapshot_of(&[]);
         capture(&cam, &lk, &mut readback);
         assert_eq!(residual(&snap, &readback, &run.written_names()).unwrap().changed, ["A"]);
+    }
+    // ── ranges are written coherently (F18) ──────────────────────────────
+
+    fn stepped(index: u64) -> Value {
+        json!({"value": 0.0, "default": 0.0, "value_index": index, "default_index": 612,
+               "lower": 0.0, "upper": 1224.0, "steps": 1225})
+    }
+
+    #[test]
+    fn a_stepped_range_is_written_with_the_value_its_index_means() {
+        let cam = FakeCamera::new().with(1, RW, stepped(100));
+        let snap = {
+            let mut s = snapshot_of(&[]);
+            s.insert("WBTuneAuto", 1, stepped(612));
+            s
+        };
+        let run = execute(&cam, &snap.properties, None, false);
+        assert_eq!(run.counts().written, 1);
+        let written = &cam.writes()[0].1;
+        assert_eq!(written["value_index"], json!(612), "the position is untouched");
+        assert_eq!(written["value"], json!(612.0), "the junk 0.0 is replaced by the value at that index");
+        assert_eq!(written["lower"], json!(0.0));
+    }
+
+    #[test]
+    fn coherent_for_write_leaves_everything_else_as_stored() {
+        let cont = json!({"value": 3.5, "value_index": 0, "lower": 0.0, "upper": 10.0, "steps": 0});
+        let one = json!({"value": 3.5, "value_index": 0, "lower": 0.0, "upper": 10.0, "steps": 1});
+        let en = json!({"value_index": 1, "default_index": 0, "elem_count": 2, "elem_type": 2, "elem_bytes": 4, "values": [5, 3]});
+        for v in [cont, one, en, json!(7), json!("text"), json!(true), json!(null)] {
+            assert_eq!(coherent_for_write(&v), v);
+        }
+        // steps 2 is the first stepped case.
+        let two = json!({"value": 0.0, "value_index": 1, "lower": 0.0, "upper": 10.0, "steps": 2});
+        assert_eq!(coherent_for_write(&two)["value"], json!(10.0));
+        // A stepped range already coherent stays so; the input is never mutated.
+        let ok = json!({"value": 612.0, "value_index": 612, "lower": 0.0, "upper": 1224.0, "steps": 1225});
+        assert_eq!(coherent_for_write(&ok), ok);
+        let before = stepped(5);
+        let _ = coherent_for_write(&before);
+        assert_eq!(before["value"], json!(0.0));
     }
 }
