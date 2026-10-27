@@ -449,7 +449,7 @@ snapshot" as meaningful, or filter them from the default lists.
 | Hidden `nikon-fleet worker` subcommand: runs one `ops` call on the process main thread; JSON lines on a dedicated fd (`progress` lines, then one `result` line flushed before the SDK is torn down); stdout discarded (§3) | todo |
 | Same-model refusal (`ambiguous_pairing`) in `ops` for capture/check/plan/apply; CLI keeps its warning | todo |
 | USB-only camera listing (no SDK) with the USB-name to SDK-model-name mapping, and a test of the mapping | todo |
-| `restore --only <property>` (repeatable) and the `ops` equivalent, for the targeted undo (§5.6) | todo |
+| `restore --only <property>` (repeatable) and the `ops` equivalent, for the targeted undo (§5.6) | **done** (`ops::restore`: `resolve_only`, `plan`; CLI exits non-zero if a named property is not written). Dry runs verified on the Z 9; the real targeted undo on hardware is still the §7 live test |
 | Gate numeric literal scalars like raw codes: `SkipReason::literal_unconfirmed`, same opt-in list (§5.3) | **done** (`6d412c7`); the opt-in was confirmed in a live dry run (F15), but the opted-in write itself has not been run on hardware |
 | Add `ShootNoCard` to `NEVER_TRANSPLANT` (and its real-config name check) | **done** (`c619f23`); the table has 10 entries |
 | `Serialize` on `Strategy`/`SkipReason` as closed tags (exhaustive match) and on outcomes | **done** (`8b2bcd7`): `tag()` and a new `Severity` (`routine`/`policy`/`warn`/`error`, the table's column); `{tag, severity, detail?}` with `detail` omitted when empty; outcomes are `{name, code, status: copied\|skipped, strategy\|reason, choice?}`; the CLI's warn decision now reads `severity()` |
