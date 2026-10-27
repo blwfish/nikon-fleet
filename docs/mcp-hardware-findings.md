@@ -40,6 +40,7 @@ finding led to a code change, the commit is named.
 | F11 | `restore` stops attempting state properties | fixed (`08db008`) |
 | F12 | Two bodies attached together | verified for selection; concurrency inconclusive |
 | F13 | Still unverified after all of the above | open |
+| F15 | Phase 0 live checks: another teardown hang, then the SDK stopped enumerating a bus-visible body | open |
 | F14 | Spike B: worker-style spawn, fd cleanliness, SIGKILL of a capture child | verified (small samples) |
 
 ---
@@ -375,6 +376,28 @@ with a minimal environment (`PATH=/usr/bin:/bin`, `HOME`), cwd `/`, a new sessio
   so "read the result, then kill a hung worker" was exercised only as the file-written kills.
   A kill during a *write* was deliberately not tried. The parent was a script, not an MCP client.
   Phase timing of the kills is inferred from elapsed time, not from the child's progress.
+
+## F15. Phase 0 live checks (2026-10-27, Z 9 A only)
+
+The Z6III was not attached during this session.
+
+- **Numeric-literal gate, live.** A read-only `transplant --dry-run` of the Z 9 baseline onto the
+  Z 9 itself: 16 literals, none blocked (all equal to the camera's value), `never-copied=10`. With
+  `WBAutoType` edited from 2 to 3 in a scratch copy of the snapshot, the dry run blocked exactly that
+  property: `would set 3, was 2`, where 2 is the value the camera really holds. The opted-in run was
+  not obtained (see below).
+- **Another teardown hang (F3).** The first dry run completed its work and then sat in
+  `DisconnectDevice` (same stack as F3) for over five minutes, consuming CPU, after a **read-only**
+  run with no other process using the camera. It was ended with SIGKILL; the next capture was at
+  baseline (`ok=196 err=11`). Its output was lost because it sat in a pipe buffer: a caller must
+  read results from a file or fd as they are produced, as the worker protocol does (mcp-plan §3).
+- **Enumeration stopped.** After that, one more dry run completed normally, and the next run
+  found `no Nikon cameras detected`, as did every later `discover`, with and without the USB
+  reset, over several minutes, while `system_profiler` still listed the Z 9 (version 5.31, serial
+  0000003023668). No fleet process was running. `ptpcamerad`, `icdd` and Photos were running; they
+  were running before and I did not stop them. Cause unproven: it may or may not be related to the
+  SIGKILL of the hung process (the capture after that kill worked, and so did one more run).
+  Needs a replug or power cycle to clear; whether that is what clears it is the next observation.
 
 ## F13. Still unverified
 

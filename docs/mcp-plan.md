@@ -271,7 +271,7 @@ compile until mapped.
 | `ambiguous_label` | **warn** | the chosen label repeats in either body's option list (e.g. `ISOControlSensitivity` lists most ISO values twice) |
 | `never_copied` | routine (policy) | on the never-copy table (§5.2); no override |
 | `raw_code_unconfirmed` | policy | matched only by raw numeric code, would change the target, and was not opted in (§5.3) |
-| `literal_unconfirmed` | policy | **planned, not in the code yet:** a numeric literal scalar would change the target and was not opted in (§5.3) |
+| `literal_unconfirmed` | policy | a numeric literal scalar would change the target and was not opted in (§5.3); in the code since `6d412c7` |
 
 Report shape: counts per tag first, then the per-property list grouped by tag with the warn-worthy
 tags first; each written or would-write enum carries its `ResolvedChoice` (option label or `code
@@ -311,7 +311,11 @@ not a raw-code enum, is an error, so a typo cannot masquerade as a safe run.
 `ElectronicVR`, ...; an integer is no more self-describing than a raw code). A literal that would
 change the target is skipped as `literal_unconfirmed` unless named in the same `allow_raw_code`
 list. A literal equal to the target's current value is a no-op and passes. The plan already reads
-the target live, so telling the two apart costs nothing extra. Not implemented yet (§6, Phase 0).
+the target live, so telling the two apart costs nothing extra. **Implemented in `6d412c7`.** Only numbers
+are gated: strings and booleans describe themselves. Equality is by numeric value (`3` equals `3.0`),
+with integers compared exactly. If the current value cannot be read (no get bit, or a failed read) the
+gate treats it as a change, but an opted-in write still goes ahead. The opt-in flag keeps the name
+`--allow-raw-code` and also validates numeric scalars.
 
 ### 5.4 What a plan promises
 
@@ -442,8 +446,8 @@ snapshot" as meaningful, or filter them from the default lists.
 | Same-model refusal (`ambiguous_pairing`) in `ops` for capture/check/plan/apply; CLI keeps its warning | todo |
 | USB-only camera listing (no SDK) with the USB-name to SDK-model-name mapping, and a test of the mapping | todo |
 | `restore --only <property>` (repeatable) and the `ops` equivalent, for the targeted undo (§5.6) | todo |
-| Gate numeric literal scalars like raw codes: `SkipReason::literal_unconfirmed`, same opt-in list (§5.3) | todo |
-| Add `ShootNoCard` to `NEVER_TRANSPLANT` (and its real-config name check) | todo |
+| Gate numeric literal scalars like raw codes: `SkipReason::literal_unconfirmed`, same opt-in list (§5.3) | **done** (`6d412c7`); the opted-in write path has not been run on hardware |
+| Add `ShootNoCard` to `NEVER_TRANSPLANT` (and its real-config name check) | **done** (`c619f23`); the table has 10 entries |
 | `Serialize` on `Strategy`/`SkipReason` as closed tags (exhaustive match) and on outcomes | todo |
 | `--json` on `ls`, `ref list`, `check`, `snapshot`, `transplant`, `restore`; `discover --json` gains `available`/`connected_pid` | todo |
 | `ops::capture` returns `read_ok`/`read_err`/failed codes, uses create-new writes | create-new writes **done** (`e50e43c`: `Snapshot::save_new`, used by the CLI and GUI captures); the returned stats are todo |
@@ -635,9 +639,9 @@ To write for the MCP:
 ### 8.3 Known defects and gaps accepted for now
 
 - The CLI `snapshot` still accepts a *partial* capture (e.g. `ok=18 err=194`) with exit 0 (F2).
-- Numeric **literal** scalars (`WBAutoType`, `MovieRecMicrophone`, `ElectronicVR`, ...) are copied
-  as-is today, with the same unverified-meaning risk as raw codes and no gate (F9). The gate is
-  decided (§5.3) and is Phase 0 work; until it lands, the MCP does not ship `*_apply`.
+- Numeric **literal** scalars (`WBAutoType`, `MovieRecMicrophone`, `ElectronicVR`, ...) used to be
+  copied as-is with the same unverified-meaning risk as raw codes (F9). The gate landed in `6d412c7`
+  (§5.3), so this no longer blocks `*_apply`; the opted-in write is untested on hardware.
 - `restore --dry-run` reports counts that real runs can miss (F4).
 
 ## 9. Decisions
