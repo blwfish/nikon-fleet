@@ -405,12 +405,14 @@ The Z6III was not attached during this session.
 - **Second occurrence, with no kill involved.** Later the same day, after the last successful run
   (a dry run that exited normally) and some idle time, `discover` again found no cameras while
   `system_profiler` listed the Z 9 and no fleet process was running. Nothing had been killed or hung
-  since the replug, so the SIGKILL of the hung process is not the trigger. An idle or sleeping body is
-  the obvious suspect and is untested. The practical rule stands: when the SDK reports no cameras for a body the USB bus
+  since the replug, so the SIGKILL of the hung process is not the trigger. An idle body is a suspect but
+  unproven; the second clearance was a physical replug, so sleep was neither confirmed nor ruled out. The practical rule stands: when the SDK reports no cameras for a body the USB bus
   still lists, no software step tried here (waiting, the USB reset) helped; the user has to replug.
 
 - **Wake or replug cleared it again, and the baseline gate ran live.** The user reported "woke/replugged"
-  the Z 9 without saying which, so **asleep versus unplugged is not distinguished**; both clear it.
+  the Z 9 without saying which; the user then confirmed it was **physically replugged / power-cycled**,
+  not merely woken from sleep. So a replug is what cleared it both times; whether waking a sleeping body
+  would also clear it is untested.
   Afterwards `discover` (no USB reset) listed the Z 9 at once. A capture through the gate
   (`ok=196 err=11`, the baseline's own numbers) passed silently and was written. To exercise the
   failure path on the same body, a throwaway binary (built in a scratch target dir, file restored
