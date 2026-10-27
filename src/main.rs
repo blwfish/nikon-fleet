@@ -2591,6 +2591,7 @@ mod tests {
             verdict,
             gate: None,
             stats: None,
+            readback: None,
             residual: Some(nikon_fleet::ops::readback::Residual {
                 changed: changed.iter().map(|s| s.to_string()).collect(),
                 missing: missing.iter().map(|s| s.to_string()).collect(),

@@ -361,6 +361,9 @@ pub struct Verification {
     /// Written properties that did not end up as the snapshot says. `None` when
     /// the read-back was not good enough to compare.
     pub residual: Option<Residual>,
+    /// The read-back itself, when it was complete enough to compare. Not serialised.
+    #[serde(skip)]
+    pub readback: Option<Snapshot>,
 }
 
 /// Read the body back after a restore and compare what was written with the
@@ -375,17 +378,17 @@ pub fn verify<P: CameraPort + ?Sized>(
     captured_at: &str,
 ) -> Verification {
     if written.is_empty() {
-        return Verification { verdict: Verdict::NothingWritten, gate: None, stats: None, residual: None };
+        return Verification { verdict: Verdict::NothingWritten, gate: None, stats: None, residual: None, readback: None };
     }
     let mut after = Snapshot::new(camera.clone(), Transport::Usb, captured_at.to_string());
     after.label = Some("readback".into());
     let stats = capture(port, name_lookup, &mut after);
     if stats.read_ok == 0 {
-        return Verification { verdict: Verdict::ReadbackIncomplete, gate: None, stats: Some(stats), residual: None };
+        return Verification { verdict: Verdict::ReadbackIncomplete, gate: None, stats: Some(stats), residual: None, readback: None };
     }
     let verdict_gate = gate(&after);
     if matches!(verdict_gate, GateOutcome::Failed { .. }) {
-        return Verification { verdict: Verdict::ReadbackIncomplete, gate: Some(verdict_gate), stats: Some(stats), residual: None };
+        return Verification { verdict: Verdict::ReadbackIncomplete, gate: Some(verdict_gate), stats: Some(stats), residual: None, readback: None };
     }
     match residual(source, &after, written) {
         Ok(r) => Verification {
@@ -393,8 +396,9 @@ pub fn verify<P: CameraPort + ?Sized>(
             gate: Some(verdict_gate),
             stats: Some(stats),
             residual: Some(r),
+            readback: Some(after),
         },
-        Err(_) => Verification { verdict: Verdict::ReadbackIncomplete, gate: Some(verdict_gate), stats: Some(stats), residual: None },
+        Err(_) => Verification { verdict: Verdict::ReadbackIncomplete, gate: Some(verdict_gate), stats: Some(stats), residual: None, readback: None },
     }
 }
 

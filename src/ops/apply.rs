@@ -197,7 +197,7 @@ pub fn require_confirmation(digest: &str, summary: &str) -> Result<(), ApplyErro
 }
 
 /// Does `got` (read back) show the effect of writing `planned`?
-fn took_effect(planned: &Value, got: &Value) -> bool {
+pub(crate) fn took_effect(planned: &Value, got: &Value) -> bool {
     if planned.get("lower").is_some() {
         // A range: the value, within the tolerance the per-write check uses.
         return match (range_value(planned), range_value(got)) {

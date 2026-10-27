@@ -18,6 +18,7 @@ pub mod plan;
 pub mod port;
 pub mod readback;
 pub mod restore;
+pub mod restore_flow;
 pub mod retention;
 pub mod target;
 pub mod worker;
