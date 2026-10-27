@@ -168,6 +168,38 @@ const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TRANSACTION_DATA_BYTES: usize = 16 * 1024 * 1024;
 
 // ─────────────────────────────────────────────────────────────────────────
+// Transport seam
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The three USB operations [`PtpUsbSession`] performs on its device handle.
+///
+/// This exists so the session's *sequencing* — OpenSession's
+/// already-open retry, transaction-ID bookkeeping, data/response/event
+/// container handling, the setup-then-write order of the FTP op, teardown
+/// — can be exercised in tests against a scripted byte-level transport
+/// instead of only against live hardware (finding
+/// nikon-fleet-20260909-7b2e#18). The only real implementation is
+/// `rusb::DeviceHandle`; it is `pub` solely so `PtpUsbSession<T>` is
+/// nameable, not as a supported extension point.
+pub trait BulkTransport {
+    fn write_bulk(&self, endpoint: u8, data: &[u8], timeout: Duration) -> rusb::Result<usize>;
+    fn read_bulk(&self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> rusb::Result<usize>;
+    fn release_interface(&self, interface: u8) -> rusb::Result<()>;
+}
+
+impl BulkTransport for rusb::DeviceHandle<GlobalContext> {
+    fn write_bulk(&self, endpoint: u8, data: &[u8], timeout: Duration) -> rusb::Result<usize> {
+        rusb::DeviceHandle::write_bulk(self, endpoint, data, timeout)
+    }
+    fn read_bulk(&self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> rusb::Result<usize> {
+        rusb::DeviceHandle::read_bulk(self, endpoint, buf, timeout)
+    }
+    fn release_interface(&self, interface: u8) -> rusb::Result<()> {
+        rusb::DeviceHandle::release_interface(self, interface)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -682,8 +714,8 @@ pub fn encode_ftp_profile(profile: &FtpProfile) -> Result<Vec<u8>, PtpUsbError> 
 /// An open raw-PTP-over-USB session. Closes the PTP session and releases the
 /// USB interface on drop (best-effort — errors are ignored, matching
 /// `sdk.rs`'s `Device::drop` policy of not panicking on teardown).
-pub struct PtpUsbSession {
-    handle: rusb::DeviceHandle<GlobalContext>,
+pub struct PtpUsbSession<T: BulkTransport = rusb::DeviceHandle<GlobalContext>> {
+    handle: T,
     interface: u8,
     ep_out: u8,
     ep_in: u8,
@@ -718,6 +750,25 @@ impl PtpUsbSession {
         };
         session.open_ptp_session()?;
         Ok(session)
+    }
+
+}
+
+impl<T: BulkTransport> PtpUsbSession<T> {
+    /// Test-only constructor: a session over `handle` with fixed endpoints,
+    /// no PTP session opened yet (call [`Self::open_ptp_session`]).
+    #[cfg(test)]
+    fn with_transport(handle: T, model: &str) -> Self {
+        PtpUsbSession {
+            handle,
+            interface: 0,
+            ep_out: 0x02,
+            ep_in: 0x81,
+            transaction_id: 0,
+            session_open: false,
+            model: model.to_string(),
+            read_scratch: vec![0u8; 16384],
+        }
     }
 
     /// The connected camera's model string (e.g. `"Z 9"`, `"Z6_3"`), as read
@@ -811,17 +862,16 @@ impl PtpUsbSession {
         }
     }
 
-    /// Live-hardware-only from here down: `transact`/`open_ptp_session` and
-    /// everything built on them need a real USB device (`self.handle`) to
-    /// exercise at all, and this crate deliberately has no mock/fake
-    /// transport layer (see the repo's testing conventions — no mocking
-    /// anywhere in this codebase's Rust tests). The one piece of decision
-    /// logic that doesn't need real I/O — classifying an OpenSession
-    /// response — is pulled out into [`classify_open_session_response`]
-    /// below specifically so it has its own unit tests; the surrounding
-    /// retry *sequencing* (send, read, close, resend) is exercised only by
-    /// live hardware, same as `read_container`'s accumulation loop and
-    /// `claim_with_retry`'s race-retry loop.
+    /// Open the PTP session, retrying once if a prior claimant (typically
+    /// macOS's own `ptpcamerad`) left one open.
+    ///
+    /// The OpenSession-response decision is [`classify_open_session_response`];
+    /// the surrounding sequencing (send, read, CloseSession, reset the
+    /// transaction ID, resend) is covered against a scripted
+    /// [`BulkTransport`] in this module's tests — the real-hardware
+    /// behavior of that sequence on a Z 9 / Z6_3 is what the
+    /// 2026-09-06 interactive session confirmed, but is not re-checked by
+    /// the test suite.
     fn open_ptp_session(&mut self) -> Result<(), PtpUsbError> {
         let (code, _, _) = self.transact(OP_OPEN_SESSION, &[SESSION_ID], None)?;
         match classify_open_session_response(code) {
@@ -907,7 +957,7 @@ impl PtpUsbSession {
     }
 }
 
-impl Drop for PtpUsbSession {
+impl<T: BulkTransport> Drop for PtpUsbSession<T> {
     fn drop(&mut self) {
         if self.session_open {
             let _ = self.transact(OP_CLOSE_SESSION, &[], None);
@@ -1740,5 +1790,415 @@ mod tests {
         // The whole point of this fallback: two serial-less cameras on the
         // same bus must not collide on one shared identifier.
         assert_ne!(fallback_serial(20, 3), fallback_serial(20, 4));
+    }
+
+    // ── session sequencing against a scripted transport ──────────────────
+    //
+    // Finding nikon-fleet-20260909-7b2e#18: `transact`, OpenSession's
+    // already-open retry, the vendor ops and teardown previously had no
+    // coverage short of live hardware. `ScriptedTransport` is a hand-rolled
+    // byte-level replay (not a mocking framework): it records every
+    // bulk-OUT write and serves a fixed queue of bulk-IN reads. An
+    // unscripted read fails with `Timeout`, so a code path that reads more
+    // than the test expects fails loudly instead of hanging or passing
+    // vacuously. What this CANNOT show is that the camera really answers
+    // this way — that remains the 2026-09-06 live session's job.
+
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    enum Step {
+        Bytes(Vec<u8>),
+        Err(rusb::Error),
+    }
+
+    #[derive(Default)]
+    struct Wire {
+        writes: Vec<(u8, Vec<u8>)>,
+        reads: VecDeque<Step>,
+        released: Vec<u8>,
+    }
+
+    #[derive(Clone, Default)]
+    struct ScriptedTransport(Rc<RefCell<Wire>>);
+
+    impl BulkTransport for ScriptedTransport {
+        fn write_bulk(&self, endpoint: u8, data: &[u8], _timeout: Duration) -> rusb::Result<usize> {
+            self.0.borrow_mut().writes.push((endpoint, data.to_vec()));
+            Ok(data.len())
+        }
+        fn read_bulk(&self, _endpoint: u8, buf: &mut [u8], _timeout: Duration) -> rusb::Result<usize> {
+            match self.0.borrow_mut().reads.pop_front() {
+                Some(Step::Bytes(b)) => {
+                    assert!(b.len() <= buf.len(), "scripted chunk larger than the read buffer");
+                    buf[..b.len()].copy_from_slice(&b);
+                    Ok(b.len())
+                }
+                Some(Step::Err(e)) => Err(e),
+                None => Err(rusb::Error::Timeout),
+            }
+        }
+        fn release_interface(&self, interface: u8) -> rusb::Result<()> {
+            self.0.borrow_mut().released.push(interface);
+            Ok(())
+        }
+    }
+
+    impl ScriptedTransport {
+        fn script(steps: Vec<Step>) -> Self {
+            let t = ScriptedTransport::default();
+            t.0.borrow_mut().reads = steps.into();
+            t
+        }
+        /// Every frame written so far, decoded: (kind, code, transaction id, payload).
+        fn sent(&self) -> Vec<(u16, u16, u32, Vec<u8>)> {
+            self.0
+                .borrow()
+                .writes
+                .iter()
+                .map(|(_, raw)| {
+                    let c = decode_container(raw).expect("session wrote a well-formed container");
+                    (c.kind, c.code, c.transaction_id, c.payload)
+                })
+                .collect()
+        }
+        fn released(&self) -> Vec<u8> {
+            self.0.borrow().released.clone()
+        }
+        fn unread(&self) -> usize {
+            self.0.borrow().reads.len()
+        }
+    }
+
+    fn resp(code: u16) -> Step {
+        Step::Bytes(encode_container(CONTAINER_RESPONSE, code, 0, &[]))
+    }
+    fn data_c(op: u16, payload: &[u8]) -> Step {
+        Step::Bytes(encode_data(op, 0, payload))
+    }
+    /// One logical container delivered as bulk-IN chunks of at most 16384 bytes.
+    fn chunked(raw: Vec<u8>) -> Vec<Step> {
+        raw.chunks(16384).map(|c| Step::Bytes(c.to_vec())).collect()
+    }
+    fn session(steps: Vec<Step>, model: &str) -> (PtpUsbSession<ScriptedTransport>, ScriptedTransport) {
+        let t = ScriptedTransport::script(steps);
+        (PtpUsbSession::with_transport(t.clone(), model), t)
+    }
+    fn le(v: u32) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    // ── open_ptp_session ─────────────────────────────────────────────────
+
+    #[test]
+    fn open_session_clean_sends_one_open_and_marks_open() {
+        let (mut s, t) = session(vec![resp(RESP_OK)], "Z 9");
+        s.open_ptp_session().unwrap();
+        assert_eq!(t.sent(), vec![(CONTAINER_COMMAND, OP_OPEN_SESSION, 0, le(SESSION_ID))]);
+        assert!(s.session_open);
+        assert_eq!(s.transaction_id, 1);
+    }
+
+    #[test]
+    fn open_session_already_open_closes_resets_ids_and_reopens() {
+        let (mut s, t) = session(vec![resp(RESP_SESSION_ALREADY_OPEN), resp(RESP_OK), resp(RESP_OK)], "Z 9");
+        s.open_ptp_session().unwrap();
+        // Open, Close, Open — each at transaction id 0 (the id is reset
+        // before the close and again before the re-open).
+        assert_eq!(
+            t.sent(),
+            vec![
+                (CONTAINER_COMMAND, OP_OPEN_SESSION, 0, le(SESSION_ID)),
+                (CONTAINER_COMMAND, OP_CLOSE_SESSION, 0, vec![]),
+                (CONTAINER_COMMAND, OP_OPEN_SESSION, 0, le(SESSION_ID)),
+            ]
+        );
+        assert!(s.session_open);
+        assert_eq!(s.transaction_id, 1);
+        assert_eq!(t.unread(), 0);
+    }
+
+    #[test]
+    fn open_session_second_already_open_is_fatal_not_looped() {
+        let (mut s, t) = session(vec![resp(RESP_SESSION_ALREADY_OPEN), resp(RESP_OK), resp(RESP_SESSION_ALREADY_OPEN)], "Z 9");
+        let err = s.open_ptp_session().unwrap_err();
+        assert!(matches!(err, PtpUsbError::OpenSessionFailed(PtpResponseCode(RESP_SESSION_ALREADY_OPEN))), "{err:?}");
+        assert_eq!(t.sent().len(), 3, "exactly one retry, no further loop");
+        assert!(!s.session_open);
+    }
+
+    #[test]
+    fn open_session_retry_failing_with_a_different_code_reports_that_code() {
+        let (mut s, _t) = session(vec![resp(RESP_SESSION_ALREADY_OPEN), resp(RESP_OK), resp(0x2002)], "Z 9");
+        let err = s.open_ptp_session().unwrap_err();
+        assert!(matches!(err, PtpUsbError::OpenSessionFailed(PtpResponseCode(0x2002))), "{err:?}");
+        assert!(!s.session_open);
+    }
+
+    #[test]
+    fn open_session_close_failure_during_retry_is_ignored_and_reopen_still_attempted() {
+        // Pins the deliberate best-effort `let _ =` on the CloseSession:
+        // its I/O failure must not stop the re-open.
+        let (mut s, t) = session(vec![resp(RESP_SESSION_ALREADY_OPEN), Step::Err(rusb::Error::Timeout), resp(RESP_OK)], "Z 9");
+        s.open_ptp_session().unwrap();
+        assert_eq!(t.sent().len(), 3);
+        assert!(s.session_open);
+    }
+
+    #[test]
+    fn open_session_other_failure_code_does_not_retry() {
+        let (mut s, t) = session(vec![resp(0x2002)], "Z 9");
+        let err = s.open_ptp_session().unwrap_err();
+        assert!(matches!(err, PtpUsbError::OpenSessionFailed(PtpResponseCode(0x2002))), "{err:?}");
+        assert_eq!(t.sent().len(), 1);
+        assert!(!s.session_open);
+    }
+
+    #[test]
+    fn open_session_io_error_propagates_without_retry() {
+        let (mut s, t) = session(vec![Step::Err(rusb::Error::Timeout)], "Z 9");
+        let err = s.open_ptp_session().unwrap_err();
+        assert!(matches!(err, PtpUsbError::Usb(rusb::Error::Timeout)), "{err:?}");
+        assert_eq!(t.sent().len(), 1);
+        assert!(!s.session_open);
+    }
+
+    // ── transact / read_container ────────────────────────────────────────
+
+    #[test]
+    fn transact_collects_data_phase_then_response() {
+        let (mut s, _t) = session(vec![data_c(0x943B, &[1, 2, 3]), resp(RESP_OK)], "Z 9");
+        let (code, params, data) = s.transact(0x943B, &[], None).unwrap();
+        assert_eq!((code, params, data), (RESP_OK, vec![], vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn transact_concatenates_multiple_data_containers() {
+        let (mut s, _t) = session(vec![data_c(0x943B, &[1, 2]), data_c(0x943B, &[3]), resp(RESP_OK)], "Z 9");
+        assert_eq!(s.transact(0x943B, &[], None).unwrap().2, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn transact_decodes_response_params() {
+        let raw = encode_container(CONTAINER_RESPONSE, RESP_OK, 0, &[7, 0, 0, 0, 9, 0, 0, 0]);
+        let (mut s, _t) = session(vec![Step::Bytes(raw)], "Z 9");
+        assert_eq!(s.transact(0x1001, &[], None).unwrap().1, vec![7, 9]);
+    }
+
+    #[test]
+    fn transact_advances_transaction_id_only_after_a_full_round_trip() {
+        let (mut s, t) = session(vec![Step::Err(rusb::Error::Timeout), resp(RESP_OK)], "Z 9");
+        s.transaction_id = 5;
+        assert!(s.transact(0x1001, &[], None).is_err());
+        assert_eq!(s.transaction_id, 5, "an I/O failure must not consume the id");
+        s.transact(0x1001, &[], None).unwrap();
+        assert_eq!(s.transaction_id, 6);
+        // Both attempts were sent under id 5.
+        assert_eq!(t.sent().iter().map(|f| f.2).collect::<Vec<_>>(), vec![5, 5]);
+    }
+
+    #[test]
+    fn transact_misaligned_response_params_is_an_error_and_keeps_the_id() {
+        let raw = encode_container(CONTAINER_RESPONSE, RESP_OK, 0, &[1, 2, 3]);
+        let (mut s, _t) = session(vec![Step::Bytes(raw)], "Z 9");
+        s.transaction_id = 4;
+        let err = s.transact(0x1001, &[], None).unwrap_err();
+        assert!(matches!(err, PtpUsbError::MisalignedResponseParams(3)), "{err:?}");
+        assert_eq!(s.transaction_id, 4);
+    }
+
+    #[test]
+    fn transact_ignores_event_and_unrecognized_containers() {
+        let event = Step::Bytes(encode_container(CONTAINER_EVENT, 0x4006, 0, &[]));
+        let weird = Step::Bytes(encode_container(9, 0, 0, &[]));
+        let (mut s, _t) = session(vec![event, weird, resp(RESP_OK)], "Z 9");
+        assert_eq!(s.transact(0x1001, &[], None).unwrap().0, RESP_OK);
+    }
+
+    #[test]
+    fn transact_sends_command_then_data_out_under_the_same_transaction_id() {
+        let (mut s, t) = session(vec![resp(RESP_OK)], "Z 9");
+        s.transact(0x90EE, &[7], Some(&[9, 9])).unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![(CONTAINER_COMMAND, 0x90EE, 0, le(7)), (CONTAINER_DATA, 0x90EE, 0, vec![9, 9])]
+        );
+    }
+
+    #[test]
+    fn transact_does_not_validate_the_response_transaction_id() {
+        // Pins current behavior, not an endorsement: a response carrying a
+        // different transaction id than the command is accepted.
+        let raw = encode_container(CONTAINER_RESPONSE, RESP_OK, 999, &[]);
+        let (mut s, _t) = session(vec![Step::Bytes(raw)], "Z 9");
+        assert_eq!(s.transact(0x1001, &[], None).unwrap().0, RESP_OK);
+    }
+
+    #[test]
+    fn transact_data_phase_at_the_limit_is_accepted() {
+        let mut steps = chunked(encode_data(0x943B, 0, &vec![0u8; MAX_TRANSACTION_DATA_BYTES]));
+        steps.push(resp(RESP_OK));
+        let (mut s, _t) = session(steps, "Z 9");
+        assert_eq!(s.transact(0x943B, &[], None).unwrap().2.len(), MAX_TRANSACTION_DATA_BYTES);
+    }
+
+    #[test]
+    fn transact_data_phase_one_byte_over_the_limit_is_rejected() {
+        let mut steps = chunked(encode_data(0x943B, 0, &vec![0u8; MAX_TRANSACTION_DATA_BYTES + 1]));
+        steps.push(resp(RESP_OK));
+        let (mut s, _t) = session(steps, "Z 9");
+        let err = s.transact(0x943B, &[], None).unwrap_err();
+        assert!(
+            matches!(err, PtpUsbError::TransactionDataTooLarge { got, limit }
+                if got == MAX_TRANSACTION_DATA_BYTES + 1 && limit == MAX_TRANSACTION_DATA_BYTES),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn read_container_assembles_a_container_split_across_bulk_reads() {
+        let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let mut steps = chunked(encode_data(0x943B, 0, &payload));
+        assert_eq!(steps.len(), 2, "20 KB payload must span two 16 KB bulk reads");
+        steps.push(resp(RESP_OK));
+        let (mut s, _t) = session(steps, "Z 9");
+        assert_eq!(s.transact(0x943B, &[], None).unwrap().2, payload);
+    }
+
+    #[test]
+    fn read_container_stops_on_a_zero_length_read_and_reports_truncation() {
+        let full = encode_data(0x943B, 0, &[0u8; 88]); // declares 100 bytes
+        assert_eq!(full.len(), 100);
+        let (mut s, _t) = session(vec![Step::Bytes(full[..20].to_vec()), Step::Bytes(vec![])], "Z 9");
+        let err = s.transact(0x943B, &[], None).unwrap_err();
+        assert!(matches!(err, PtpUsbError::TruncatedContainer { declared: 100, got: 20 }), "{err:?}");
+    }
+
+    #[test]
+    fn read_container_short_first_read_is_a_short_container_error() {
+        let (mut s, _t) = session(vec![Step::Bytes(vec![1, 2, 3])], "Z 9");
+        let err = s.transact(0x1001, &[], None).unwrap_err();
+        assert!(matches!(err, PtpUsbError::ShortContainer(3)), "{err:?}");
+    }
+
+    // ── vendor ops ───────────────────────────────────────────────────────
+
+    #[test]
+    fn read_vendor_property_sends_flagged_propcode_and_returns_data() {
+        let (mut s, t) = session(vec![data_c(OP_VENDOR_PROP_READ, &[0xAA, 0xBB]), resp(RESP_OK)], "Z 9");
+        assert_eq!(s.read_vendor_property(0xD053).unwrap(), vec![0xAA, 0xBB]);
+        assert_eq!(t.sent(), vec![(CONTAINER_COMMAND, OP_VENDOR_PROP_READ, 0, le(0x1D053))]);
+    }
+
+    #[test]
+    fn read_vendor_property_non_ok_response_is_operation_failed() {
+        let (mut s, _t) = session(vec![resp(0x2002)], "Z 9");
+        let err = s.read_vendor_property(0xD053).unwrap_err();
+        assert!(
+            matches!(err, PtpUsbError::OperationFailed { op: OP_VENDOR_PROP_READ, code: PtpResponseCode(0x2002) }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn read_vendor_property_on_an_unconfirmed_model_still_reads() {
+        // Pins: unlike the write, the read only warns on stderr.
+        let (mut s, t) = session(vec![data_c(OP_VENDOR_PROP_READ, &[1]), resp(RESP_OK)], "Z 50");
+        assert_eq!(s.read_vendor_property(0xD053).unwrap(), vec![1]);
+        assert_eq!(t.sent().len(), 1);
+    }
+
+    #[test]
+    fn write_ftp_profile_sends_setup_then_profile_with_incrementing_ids() {
+        let profile = valid_profile();
+        let (mut s, t) = session(vec![resp(RESP_OK), resp(RESP_OK)], "Z 9");
+        s.write_ftp_profile(&profile, false).unwrap();
+        let blob = encode_ftp_profile(&profile).unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![
+                (CONTAINER_COMMAND, OP_FTP_SETUP, 0, vec![]),
+                (CONTAINER_DATA, OP_FTP_SETUP, 0, FTP_SETUP_DATA.to_vec()),
+                (CONTAINER_COMMAND, OP_FTP_PROFILE_WRITE, 1, [le(0), le(0)].concat()),
+                (CONTAINER_DATA, OP_FTP_PROFILE_WRITE, 1, blob),
+            ]
+        );
+    }
+
+    #[test]
+    fn write_ftp_profile_setup_failure_stops_before_the_profile_write() {
+        let (mut s, t) = session(vec![resp(0x2002)], "Z 9");
+        let err = s.write_ftp_profile(&valid_profile(), false).unwrap_err();
+        assert!(
+            matches!(err, PtpUsbError::OperationFailed { op: OP_FTP_SETUP, code: PtpResponseCode(0x2002) }),
+            "{err:?}"
+        );
+        assert_eq!(t.sent().len(), 2, "only the setup command+data; the 0x90EE profile blob is never sent");
+    }
+
+    #[test]
+    fn write_ftp_profile_write_failure_is_reported_against_the_profile_op() {
+        let (mut s, _t) = session(vec![resp(RESP_OK), resp(0x2002)], "Z 9");
+        let err = s.write_ftp_profile(&valid_profile(), false).unwrap_err();
+        assert!(
+            matches!(err, PtpUsbError::OperationFailed { op: OP_FTP_PROFILE_WRITE, code: PtpResponseCode(0x2002) }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn write_ftp_profile_refuses_an_unconfirmed_model_before_any_io() {
+        let (mut s, t) = session(vec![resp(RESP_OK), resp(RESP_OK)], "Z 50");
+        let err = s.write_ftp_profile(&valid_profile(), false).unwrap_err();
+        assert!(matches!(&err, PtpUsbError::UnconfirmedModel(m) if m == "Z 50"), "{err:?}");
+        assert!(t.sent().is_empty());
+    }
+
+    #[test]
+    fn write_ftp_profile_force_flag_overrides_the_model_gate() {
+        let (mut s, t) = session(vec![resp(RESP_OK), resp(RESP_OK)], "Z 50");
+        s.write_ftp_profile(&valid_profile(), true).unwrap();
+        assert_eq!(t.sent().len(), 4);
+    }
+
+    #[test]
+    fn write_ftp_profile_encoding_error_happens_before_any_io() {
+        let mut p = valid_profile();
+        p.ssid_24ghz = "café".to_string();
+        let (mut s, t) = session(vec![resp(RESP_OK), resp(RESP_OK)], "Z 9");
+        let err = s.write_ftp_profile(&p, false).unwrap_err();
+        assert!(matches!(err, PtpUsbError::FtpFieldNotAscii { .. }), "{err:?}");
+        assert!(t.sent().is_empty(), "a bad field must not leave a half-done setup call on the camera");
+    }
+
+    // ── teardown ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn dropping_an_open_session_sends_close_then_releases_the_interface() {
+        let (mut s, t) = session(vec![resp(RESP_OK), resp(RESP_OK)], "Z 9");
+        s.open_ptp_session().unwrap();
+        drop(s);
+        let sent = t.sent();
+        assert_eq!(sent.last().map(|f| f.1), Some(OP_CLOSE_SESSION));
+        assert_eq!(sent.len(), 2);
+        assert_eq!(t.released(), vec![0]);
+    }
+
+    #[test]
+    fn dropping_a_never_opened_session_releases_without_sending_close() {
+        let (s, t) = session(vec![], "Z 9");
+        drop(s);
+        assert!(t.sent().is_empty());
+        assert_eq!(t.released(), vec![0]);
+    }
+
+    #[test]
+    fn drop_after_failed_open_does_not_send_close() {
+        let (mut s, t) = session(vec![resp(0x2002)], "Z 9");
+        assert!(s.open_ptp_session().is_err());
+        drop(s);
+        assert_eq!(t.sent().len(), 1, "only the failed OpenSession; no CloseSession for a session that never opened");
+        assert_eq!(t.released(), vec![0]);
     }
 }
