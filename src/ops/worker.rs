@@ -146,6 +146,48 @@ impl<W: Write> Emitter<W> {
     }
 }
 
+/// Why the result channel could not be opened.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FdError {
+    /// 0, 1 and 2 are stdin, stdout and stderr: stdout is exactly what the
+    /// protocol must stay off.
+    Reserved(i32),
+    /// Not an open descriptor in this process.
+    NotOpen(i32),
+}
+
+impl std::fmt::Display for FdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FdError::Reserved(fd) => write!(f, "result fd {fd} is a standard stream; the protocol must not share stdout"),
+            FdError::NotOpen(fd) => write!(f, "result fd {fd} is not open"),
+        }
+    }
+}
+
+impl std::error::Error for FdError {}
+
+/// Take ownership of an inherited file descriptor as the result channel.
+///
+/// The parent opens a pipe and passes its write end as a descriptor number on
+/// the command line; this checks the number is open and not a standard stream
+/// before wrapping it. The caller must pass a descriptor it owns: nothing else
+/// in the process may close or use it afterwards.
+#[cfg(unix)]
+pub fn open_result_fd(fd: i32) -> Result<std::fs::File, FdError> {
+    use std::os::fd::FromRawFd;
+    if (0..=2).contains(&fd) {
+        return Err(FdError::Reserved(fd));
+    }
+    // SAFETY: F_GETFD only inspects the descriptor.
+    if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Err(FdError::NotOpen(fd));
+    }
+    // SAFETY: `fd` is open (just checked) and, by this function's contract,
+    // owned by the caller, who hands it over here.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
 /// How reading a worker's output ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadEnd {
@@ -368,5 +410,36 @@ mod tests {
             let (r, _) = read(&String::from_utf8(spy.bytes).unwrap());
             assert_eq!(r.end, ReadEnd::Result(o));
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_result_fd_must_be_open_and_not_a_standard_stream() {
+        for fd in [0, 1, 2] {
+            assert_eq!(open_result_fd(fd).unwrap_err(), FdError::Reserved(fd));
+        }
+        for fd in [-1, 3_000_000] {
+            assert_eq!(open_result_fd(fd).unwrap_err(), FdError::NotOpen(fd));
+        }
+        assert!(FdError::Reserved(1).to_string().contains("stdout"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_pipe_end_becomes_a_writable_channel() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let w = open_result_fd(fds[1]).unwrap();
+        let mut e = Emitter::new(w);
+        e.progress("hello").unwrap();
+        e.result(Outcome::ok(json!(1))).unwrap();
+        drop(e); // closes the write end
+        let mut text = String::new();
+        reader.read_to_string(&mut text).unwrap();
+        let (r, _) = read(&text);
+        assert_eq!(r.progress, ["hello"]);
+        assert_eq!(r.end, ReadEnd::Result(Outcome::ok(json!(1))));
     }
 }

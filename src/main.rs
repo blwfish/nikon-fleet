@@ -3,6 +3,8 @@
 //! All real logic lives in the `nikon_fleet` library; this file is just
 //! the command-line surface.
 
+mod worker_cmd;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
@@ -96,6 +98,11 @@ enum Cmd {
     /// Manage per-camera reference snapshots.
     #[command(subcommand)]
     Ref(RefCmd),
+
+    /// Internal: run one operation and report it on an inherited file
+    /// descriptor (the MCP server's child process). Not for direct use.
+    #[command(hide = true)]
+    Worker(worker_cmd::WorkerArgs),
 
     /// Manage the per-model capture baselines that decide whether a capture
     /// is complete (docs/mcp-plan.md §5.5).
@@ -2116,6 +2123,10 @@ fn main() -> Result<()> {
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
         Cmd::Baseline(sub) => cmd_baseline(sub),
+        Cmd::Worker(args) => {
+            let code = worker_cmd::run(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args);
+            std::process::exit(code)
+        }
         Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, args, no_reset),
         Cmd::Transplant(args) => cmd_transplant(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
         Cmd::VendorRead(args) => cmd_vendor_read(args),
