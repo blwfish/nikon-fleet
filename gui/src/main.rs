@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
 use eframe::egui;
@@ -9,6 +11,7 @@ use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::ptp_usb::{self, FtpProfile};
 use nikon_fleet::sdk::{DeviceInfo, Sdk, OP_GET, UsbCameraInfo, pair_devices, usb_camera_list};
 use nikon_fleet::snapshot::{Camera, Snapshot, SnapshotSummary, Transport};
+use nikon_fleet::vendor_argv::{vendor_read_argv, vendor_write_ftp_argv};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -399,10 +402,11 @@ impl eframe::App for FleetApp {
         // ── Vendor Ops window ────────────────────────────────────────────
         // Raw USB PTP vendor operations reverse-engineered from an NX Field
         // WiFi capture (docs/nx-field-session-2026-07-09.md) — bypass the
-        // MAID SDK entirely via nikon_fleet::ptp_usb. Unlike the rest of
-        // this GUI these don't need a prior Discover: the library talks
-        // straight to the USB device and only needs a serial when more than
-        // one Nikon camera is attached.
+        // MAID SDK entirely. Unlike the rest of this GUI these don't need a
+        // prior Discover: they talk straight to the USB device and only need
+        // a serial when more than one Nikon camera is attached. They run as
+        // `nikon-fleet` CLI subprocesses, not in this process — see
+        // `do_vendor_read`.
         let mut vendor_ops_open = self.vendor_ops_open;
         let mut vendor_read_trigger = false;
         let mut vendor_write_trigger: Option<bool> = None; // Some(dry_run)
@@ -819,35 +823,115 @@ fn do_snapshot(schema: &MaidLayerConfig, data_dir: &Path, serial: &str, label: &
     Ok(Evt::SnapshotDone(filename))
 }
 
+/// Env var that overrides where the `nikon-fleet` CLI is found.
+const CLI_ENV: &str = "NIKON_FLEET_CLI";
+const CLI_NAME: &str = "nikon-fleet";
+
+/// Where to find the CLI binary: `$NIKON_FLEET_CLI` if set, else
+/// `nikon-fleet` next to this executable (a `cargo build --workspace` puts
+/// both in the same target directory). An override that points nowhere is an
+/// error — it is not silently ignored in favour of the sibling, which would
+/// hide a typo'd path.
+fn resolve_cli(
+    env_override: Option<OsString>,
+    current_exe: Option<&Path>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Result<PathBuf, String> {
+    if let Some(v) = env_override {
+        let p = PathBuf::from(v);
+        return if is_file(&p) {
+            Ok(p)
+        } else {
+            Err(format!("{CLI_ENV} is set to {} but no file exists there", p.display()))
+        };
+    }
+    let exe = current_exe.ok_or_else(|| {
+        format!("could not determine fleet-gui's own location to find the {CLI_NAME} CLI; set {CLI_ENV}")
+    })?;
+    let sibling = exe.with_file_name(CLI_NAME);
+    if is_file(&sibling) {
+        Ok(sibling)
+    } else {
+        Err(format!(
+            "the {CLI_NAME} CLI was not found at {} — Vendor Ops runs it as a subprocess. \
+             Build it with `cargo build --workspace` (building only fleet-gui does not build it), \
+             or set {CLI_ENV} to its path",
+            sibling.display()
+        ))
+    }
+}
+
+fn locate_cli() -> Result<PathBuf, String> {
+    resolve_cli(std::env::var_os(CLI_ENV), std::env::current_exe().ok().as_deref(), Path::is_file)
+}
+
+/// Run `program args…`, optionally piping `stdin_data` (then closing stdin),
+/// and return its trimmed stdout. Success is the exit status alone — the
+/// text is only ever shown to the user, never parsed. A non-zero exit
+/// (including death by signal) is `Err` carrying the child's stderr, or its
+/// exit status if stderr was empty. Stderr from a *successful* run (e.g. a
+/// "model not in the confirmed list" warning) is forwarded to our own.
+fn run_cli(program: &Path, args: &[String], stdin_data: Option<&str>) -> Result<String, String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() });
+    let mut child = cmd.spawn().map_err(|e| format!("could not run {}: {e}", program.display()))?;
+
+    // A failed write (the child exited before reading) is not reported on
+    // its own: the child's exit status and stderr below say why it quit.
+    let mut stdin_write_err = None;
+    if let Some(data) = stdin_data {
+        let mut stdin = child.stdin.take().expect("stdin was configured as piped");
+        stdin_write_err = stdin.write_all(data.as_bytes()).err();
+        // `stdin` drops here, closing the pipe so the child sees EOF.
+    }
+
+    let out = child.wait_with_output().map_err(|e| format!("waiting for {}: {e}", program.display()))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.success() {
+        if !stderr.trim().is_empty() {
+            eprintln!("{}", stderr.trim_end());
+        }
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    let detail = stderr.trim();
+    Err(if !detail.is_empty() {
+        detail.to_string()
+    } else if let Some(e) = stdin_write_err {
+        format!("{} exited with {} (and could not be given its input: {e})", program.display(), out.status)
+    } else {
+        format!("{} exited with {}", program.display(), out.status)
+    })
+}
+
 /// Read a vendor property via `0x943B`, bypassing the MAID SDK entirely —
 /// no Discover/connect needed first, unlike every other worker function
-/// here. See `nikon_fleet::ptp_usb`.
+/// here. Runs `nikon-fleet vendor-read` as a **subprocess**, not
+/// `ptp_usb::read_vendor_property` in-process.
 ///
-/// UNVERIFIED CRASH-CLASS RISK, flagged not fixed: this (and
-/// `do_vendor_write_ftp`) run on the GUI's background worker thread and
-/// call into `ptp_usb::PtpUsbSession::open`, which — via `claim_with_retry`
-/// — SIGKILLs `ptpcamerad`/`icdd` and repeatedly calls
-/// `set_active_configuration` to win the PTP-interface claim race. This
-/// codebase already had to fix a real crash with the same *shape*: commit
-/// 48704d5 found that `reset_nikon_usb_cameras()`'s USB disconnect/
-/// reconnect events, fired from a background thread, reached the main
-/// AppKit run loop and invalidated the Metal drawing surface mid-frame,
-/// segfaulting the GUI — the fix was to keep that USB-reset path CLI-only.
-/// Whether `set_active_configuration`/interface-claim churn from this
-/// thread triggers the same class of run-loop event has NOT been verified
-/// live (no camera/display available in this pass to click-test it) — if
-/// you hit a GUI crash while using Vendor Ops, start here.
+/// Why (finding nikon-fleet-20260909-7b2e#12): in-process, this runs on the
+/// GUI worker thread and, via `ptp_usb::claim_with_retry`, SIGKILLs
+/// `ptpcamerad`/`icdd` and repeatedly re-asserts the USB configuration. The
+/// codebase already had to fix a crash of the same shape (commit 48704d5:
+/// USB device events reaching the AppKit run loop mid-frame invalidated the
+/// Metal surface and segfaulted the GUI), and whether this path triggers it
+/// was never verified. A subprocess takes the question away: the churn
+/// happens outside this process, and if the child dies it comes back as an
+/// error string. (`gui/fleet_gui.py` has always worked this way.)
 fn do_vendor_read(propcode: u16, serial: Option<&str>) -> Result<Evt, String> {
-    let data = ptp_usb::read_vendor_property(serial, propcode).map_err(|e| e.to_string())?;
-    Ok(Evt::VendorReadDone(format!(
-        "0x{propcode:04x}: {} byte(s): {}",
-        data.len(),
-        ptp_usb::hex_bytes(&data)
-    )))
+    vendor_read_via(&locate_cli()?, propcode, serial)
+}
+
+fn vendor_read_via(cli: &Path, propcode: u16, serial: Option<&str>) -> Result<Evt, String> {
+    let text = run_cli(cli, &vendor_read_argv(propcode, serial), None)?;
+    Ok(Evt::VendorReadDone(text))
 }
 
 /// Write (or preview) an FTP profile via `0x90EE`. Same no-Discover-needed
-/// property as `do_vendor_read`.
+/// property as `do_vendor_read`. The dry-run preview never touches USB, so
+/// it is still done in-process; the real write is a subprocess for the same
+/// reason as `do_vendor_read`, with the password piped on stdin (never in
+/// argv, where `ps` would show it).
 fn do_vendor_write_ftp(profile: &FtpProfile, serial: Option<&str>, dry_run: bool) -> Result<Evt, String> {
     if dry_run {
         // Redact the password before encoding for preview — the hex dump
@@ -860,11 +944,15 @@ fn do_vendor_write_ftp(profile: &FtpProfile, serial: Option<&str>, dry_run: bool
             ptp_usb::hex_bytes(&blob)
         )));
     }
-    // No GUI control for force_unconfirmed_model yet — always false, so the
+    // No GUI control for --force-unconfirmed-model yet — never passed, so the
     // GUI can only write to models ptp_usb's confirmed-safe list covers.
     // Use the CLI's --force-unconfirmed-model if you've independently
     // verified the wire format on an unconfirmed model.
-    ptp_usb::write_ftp_profile(serial, profile, false).map_err(|e| e.to_string())?;
+    vendor_write_via(&locate_cli()?, profile, serial)
+}
+
+fn vendor_write_via(cli: &Path, profile: &FtpProfile, serial: Option<&str>) -> Result<Evt, String> {
+    run_cli(cli, &vendor_write_ftp_argv(profile, serial), Some(&profile.password))?;
     Ok(Evt::VendorWriteFtpDone(format!(
         "Wrote FTP profile {:?} ({}@{}:{})",
         profile.profile_name, profile.username, profile.host, profile.port
@@ -1452,5 +1540,200 @@ mod tests {
         assert!(!dst_dir.path().join("snapshots/good.json").parent().unwrap()
             .parent().unwrap().join("evil_sibling.txt").exists());
         assert!(!Path::new("/tmp/evil_absolute.txt").exists());
+    }
+
+    // ── Vendor Ops subprocess (finding nikon-fleet-20260909-7b2e#12) ─────
+
+    fn sh(script: &str) -> (PathBuf, Vec<String>) {
+        (PathBuf::from("/bin/sh"), vec!["-c".to_string(), script.to_string()])
+    }
+
+    #[test]
+    fn run_cli_returns_trimmed_stdout_on_success() {
+        let (p, a) = sh("echo '  hello  '");
+        assert_eq!(run_cli(&p, &a, None), Ok("hello".to_string()));
+    }
+
+    #[test]
+    fn run_cli_pipes_stdin_exactly_and_closes_it() {
+        // `wc -c` only finishes once stdin hits EOF, so this also proves the
+        // pipe is closed; and 9 bytes proves no newline was appended.
+        let (p, a) = sh("wc -c");
+        assert_eq!(run_cli(&p, &a, Some("pa ss--wd")), Ok("9".to_string()));
+    }
+
+    #[test]
+    fn run_cli_non_zero_exit_returns_stderr() {
+        let (p, a) = sh("echo 'boom: no camera' >&2; exit 3");
+        assert_eq!(run_cli(&p, &a, None), Err("boom: no camera".to_string()));
+    }
+
+    #[test]
+    fn run_cli_non_zero_exit_with_empty_stderr_reports_the_status() {
+        let (p, a) = sh("exit 3");
+        let e = run_cli(&p, &a, None).unwrap_err();
+        assert!(e.contains("exited with") && e.contains('3'), "{e}");
+    }
+
+    #[test]
+    fn run_cli_child_killed_by_signal_is_an_error_not_a_gui_crash() {
+        // The point of #12: if the USB churn takes the child down, the GUI
+        // gets a message instead of dying with it.
+        let (p, a) = sh("kill -SEGV $$");
+        let e = run_cli(&p, &a, None).unwrap_err();
+        assert!(e.contains("signal"), "{e}");
+    }
+
+    #[test]
+    fn run_cli_stderr_on_success_is_not_an_error() {
+        let (p, a) = sh("echo 'warning: unconfirmed model' >&2; echo ok");
+        assert_eq!(run_cli(&p, &a, None), Ok("ok".to_string()));
+    }
+
+    #[test]
+    fn run_cli_child_that_exits_without_reading_stdin_reports_its_own_error() {
+        // The stdin write can fail (EPIPE) — the child's stderr must still win.
+        let (p, a) = sh("echo 'rejected: bad args' >&2; exit 2");
+        assert_eq!(run_cli(&p, &a, Some(&"x".repeat(1_000_000))), Err("rejected: bad args".to_string()));
+    }
+
+    #[test]
+    fn run_cli_missing_program_is_a_clear_error() {
+        let e = run_cli(Path::new("/nonexistent/nikon-fleet"), &[], None).unwrap_err();
+        assert!(e.contains("could not run") && e.contains("/nonexistent/nikon-fleet"), "{e}");
+    }
+
+    #[test]
+    fn resolve_cli_prefers_a_valid_env_override() {
+        let got = resolve_cli(Some("/opt/x/nikon-fleet".into()), Some(Path::new("/t/fleet-gui")), |_| true);
+        assert_eq!(got, Ok(PathBuf::from("/opt/x/nikon-fleet")));
+    }
+
+    #[test]
+    fn resolve_cli_bad_env_override_does_not_fall_back_to_the_sibling() {
+        // A typo'd override must fail loudly even though the sibling exists.
+        let got = resolve_cli(Some("/typo/nikon-fleet".into()), Some(Path::new("/t/fleet-gui")), |p| {
+            p == Path::new("/t/nikon-fleet")
+        });
+        let e = got.unwrap_err();
+        assert!(e.contains(CLI_ENV) && e.contains("/typo/nikon-fleet"), "{e}");
+    }
+
+    #[test]
+    fn resolve_cli_finds_the_sibling_of_the_gui_executable() {
+        let got = resolve_cli(None, Some(Path::new("/t/debug/fleet-gui")), |p| p == Path::new("/t/debug/nikon-fleet"));
+        assert_eq!(got, Ok(PathBuf::from("/t/debug/nikon-fleet")));
+    }
+
+    #[test]
+    fn resolve_cli_missing_sibling_says_how_to_build_it() {
+        let e = resolve_cli(None, Some(Path::new("/t/debug/fleet-gui")), |_| false).unwrap_err();
+        assert!(e.contains("/t/debug/nikon-fleet") && e.contains("cargo build --workspace") && e.contains(CLI_ENV), "{e}");
+    }
+
+    #[test]
+    fn resolve_cli_without_a_known_exe_path_asks_for_the_override() {
+        let e = resolve_cli(None, None, |_| true).unwrap_err();
+        assert!(e.contains(CLI_ENV), "{e}");
+    }
+
+    #[test]
+    fn vendor_write_dry_run_still_works_without_any_cli_present() {
+        // The preview never touches USB or the CLI, so it must not depend on
+        // `locate_cli` succeeding (the test binary has no sibling nikon-fleet
+        // guarantee) — and must keep redacting the password.
+        let profile = FtpProfile {
+            profile_name: "P".to_string(),
+            ssid_24ghz: "a".to_string(),
+            ssid_5ghz: "b".to_string(),
+            host: "h".to_string(),
+            port: 21,
+            username: "u".to_string(),
+            password: "topsecret".to_string(),
+        };
+        let Ok(Evt::VendorWriteFtpDone(text)) = do_vendor_write_ftp(&profile, None, true) else {
+            panic!("dry run should succeed");
+        };
+        assert!(text.starts_with("Would write"), "{text}");
+        assert!(!text.contains("topsecret"));
+    }
+
+    /// A stand-in for the CLI: records its argv (one per line) and stdin to
+    /// files next to it, prints `stdout_line`, exits `code`.
+    fn fake_cli(dir: &Path, stdout_line: &str, code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("nikon-fleet");
+        let script = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{d}/argv.txt'\ncat > '{d}/stdin.txt'\n\
+             echo '{stdout_line}'\nexit {code}\n",
+            d = dir.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn sample_profile() -> FtpProfile {
+        FtpProfile {
+            profile_name: "CLAUDE".to_string(),
+            ssid_24ghz: "n24".to_string(),
+            ssid_5ghz: "n5".to_string(),
+            host: "ftp.example.com".to_string(),
+            port: 2121,
+            username: "user".to_string(),
+            password: "s3cret pw".to_string(),
+        }
+    }
+
+    #[test]
+    fn vendor_write_sends_the_password_on_stdin_and_never_in_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(dir.path(), "ignored", 0);
+        let p = sample_profile();
+        let Ok(Evt::VendorWriteFtpDone(msg)) = vendor_write_via(&cli, &p, Some("SER1")) else { panic!("should succeed") };
+        assert_eq!(msg, "Wrote FTP profile \"CLAUDE\" (user@ftp.example.com:2121)");
+        assert_eq!(std::fs::read_to_string(dir.path().join("stdin.txt")).unwrap(), "s3cret pw");
+        let argv = std::fs::read_to_string(dir.path().join("argv.txt")).unwrap();
+        assert!(!argv.contains("s3cret"), "password leaked into argv:\n{argv}");
+        assert_eq!(argv.lines().map(str::to_string).collect::<Vec<_>>(), vendor_write_ftp_argv(&p, Some("SER1")));
+    }
+
+    #[test]
+    fn vendor_write_failure_is_an_error_and_no_success_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(dir.path(), "x", 1);
+        // fake_cli prints to stdout, not stderr; make the failure carry a message.
+        std::fs::write(
+            &cli,
+            "#!/bin/sh\ncat >/dev/null\necho 'Error: could not claim the PTP USB interface' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let err = vendor_write_via(&cli, &sample_profile(), None).err().expect("CLI exited non-zero");
+        assert_eq!(err, "Error: could not claim the PTP USB interface");
+    }
+
+    #[test]
+    fn vendor_read_shows_the_cli_output_and_passes_the_serial() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(dir.path(), "0xd053: 2 byte(s): aa bb", 0);
+        let Ok(Evt::VendorReadDone(text)) = vendor_read_via(&cli, 0xD053, Some("SER1")) else { panic!("should succeed") };
+        assert_eq!(text, "0xd053: 2 byte(s): aa bb");
+        let argv = std::fs::read_to_string(dir.path().join("argv.txt")).unwrap();
+        assert_eq!(argv.lines().collect::<Vec<_>>(), vec!["vendor-read", "0xd053", "--serial=SER1"]);
+    }
+
+    #[test]
+    fn vendor_read_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("nikon-fleet");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&cli, "#!/bin/sh\necho 'Error: no Nikon USB camera found' >&2\nexit 1\n").unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(
+            vendor_read_via(&cli, 0xD053, None).err().expect("CLI exited non-zero"),
+            "Error: no Nikon USB camera found"
+        );
     }
 }

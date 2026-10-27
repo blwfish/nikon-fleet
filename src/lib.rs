@@ -12,3 +12,4 @@ pub mod range_value;
 pub mod sdk;
 pub mod snapshot;
 pub mod transplant;
+pub mod vendor_argv;
