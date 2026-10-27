@@ -65,7 +65,11 @@ reference file" lives in both the Python `gui/fleet_lib.py` and the Rust GUI's `
 behaviour to the CLI rather than merging two copies. It becomes the canonical rule, but the GUIs
 are **not** migrated in Phase 0: the Python GUI cannot call Rust `ops` (it would have to shell out
 to `ls --json`). The §7 parity test pins all three to the same fixtures instead; migrating the
-GUIs is a later cleanup (decided, §9).
+GUIs is a later cleanup (decided, §9). Landing the parity test found two divergences, both fixed in
+the GUIs without migrating them: the Python GUI looked the reference up by the caller's model (so an
+`id-N` serial shared by two models never marked the second model's reference), and neither GUI
+guarded the lookup path against a serial containing `/`. `ops::list` also reports a reference file
+that exists but cannot be read (`reference_read_failures`) instead of treating it as absent.
 
 ## 3. Architecture
 
@@ -452,7 +456,7 @@ snapshot" as meaningful, or filter them from the default lists.
 | `--json` on `ls`, `ref list`, `check`, `snapshot`, `transplant`, `restore`; `discover --json` gains `available`/`connected_pid` | `ls` and `ref list` **done** (`0c551a7`, through `ops::list::list_dir`; entries have no `is_reference` until the byte-identity rule lands); the rest todo |
 | `ops::capture` returns `read_ok`/`read_err`/failed codes, uses create-new writes | create-new writes **done** (`e50e43c`: `Snapshot::save_new`, used by the CLI and GUI captures); the returned stats are todo |
 | Per-model baseline file (readable-capability sets, seeded from F5) and the superset gate (also useful to the CLI: a partial capture still exits 0) | todo |
-| One `ops::list` byte-identity rule, new for the CLI. The GUIs keep their copies; parity test only (§2) | todo |
+| One `ops::list` byte-identity rule, new for the CLI. The GUIs keep their copies; parity test only (§2) | **done** (`72a7eb5`, `7155886`): `ls --json` carries `is_reference`; all three implementations are checked against `tests/fixtures/reference_parity`, which found and fixed two divergences (below §2) |
 | Cross-process `flock` on an open fd at a fixed per-user local path (not `--data-dir`), taken by CLI, GUI and MCP worker (§3) | **done** (`a8b5c95`): `nikon_fleet::camera_lock`, taken in the CLI's `open_sdk` and the Rust GUI's discover and snapshot; the MCP worker takes it the same way once it exists. `vendor-read`/`vendor-write-ftp` are raw USB PTP and do not take it |
 | A small camera-port trait (`capabilities`/`read_capability`/`write_capability`) so plan/apply and the restore-point logic are testable without a `Device` (`plan_property` covers translate+gate only) | todo |
 | Lift `firmware latest --json`'s types out of `main.rs` | todo |
