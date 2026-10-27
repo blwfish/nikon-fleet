@@ -403,8 +403,10 @@ ordering is attempted, so the undo does not trust itself: `restore_apply` reads 
 `residual`, the properties that still differ from the restore point afterwards, rather than
 claiming success. Fidelity is verified for one property only (F4, F10): a one-property
 cross-model change was applied, read back, and undone by a **full** restore that left the camera
-identical to the restore point. The targeted form writes a strict subset of that, but has not
-itself been run on hardware (§8.2), and no side-effect case has been seen. Restore-point files
+identical to the restore point. The targeted form (`restore --only`) has now been run on hardware for two enum
+properties on the Z 9 (F16): it restored the named property, left a second property that had been
+changed since alone, and no side effect was seen. Ranges, literals, strings and a cross-model undo are
+still untested, and so is a case where a write changes another property. Restore-point files
 land in `snapshots/` under the `mcp-restore-` prefix (§3); check that nothing treats "latest
 snapshot" as meaningful, or filter them from the default lists.
 
@@ -449,7 +451,7 @@ snapshot" as meaningful, or filter them from the default lists.
 | Hidden `nikon-fleet worker` subcommand: runs one `ops` call on the process main thread; JSON lines on a dedicated fd (`progress` lines, then one `result` line flushed before the SDK is torn down); stdout discarded (§3) | todo |
 | Same-model refusal (`ambiguous_pairing`) in `ops` for capture/check/plan/apply; CLI keeps its warning | todo |
 | USB-only camera listing (no SDK) with the USB-name to SDK-model-name mapping, and a test of the mapping | todo |
-| `restore --only <property>` (repeatable) and the `ops` equivalent, for the targeted undo (§5.6) | **done** (`ops::restore`: `resolve_only`, `plan`; CLI exits non-zero if a named property is not written). Dry runs verified on the Z 9; the real targeted undo on hardware is still the §7 live test |
+| `restore --only <property>` (repeatable) and the `ops` equivalent, for the targeted undo (§5.6) | **done** (`ops::restore`: `resolve_only`, `plan`; CLI exits non-zero if a named property is not written). Verified on the Z 9 for two enum properties (F16); the §7 live test for ranges, literals and a cross-model undo is still open |
 | Gate numeric literal scalars like raw codes: `SkipReason::literal_unconfirmed`, same opt-in list (§5.3) | **done** (`6d412c7`); the opt-in was confirmed in a live dry run (F15), but the opted-in write itself has not been run on hardware |
 | Add `ShootNoCard` to `NEVER_TRANSPLANT` (and its real-config name check) | **done** (`c619f23`); the table has 10 entries |
 | `Serialize` on `Strategy`/`SkipReason` as closed tags (exhaustive match) and on outcomes | **done** (`8b2bcd7`): `tag()` and a new `Severity` (`routine`/`policy`/`warn`/`error`, the table's column); `{tag, severity, detail?}` with `detail` omitted when empty; outcomes are `{name, code, status: copied\|skipped, strategy\|reason, choice?}`; the CLI's warn decision now reads `severity()` |
@@ -610,8 +612,9 @@ To write for the MCP:
   so this is a CLI nicety, not a blocker.
 - Whether the USB-only camera list and the SDK's list agree on model and serial for every
   attached body, including the USB product string to SDK model-name mapping (`Z6_3`).
-- **Targeted restore (`only`)** on hardware: verified only as a subset of the one-property full
-  restore (F4, F10).
+- **Targeted restore (`only`)** on hardware: verified on the Z 9 for two raw-code enum properties
+  (F16); not for a range, literal or string property, not cross-model, and not for a write with
+  a side effect.
 - The teardown hang's rate and trigger; in particular whether it follows "first open after the body
   was attached or woken" (replug or power-cycle, then capture several times).
 - Whether a **per-camera** lock is enough (F12 is inconclusive).

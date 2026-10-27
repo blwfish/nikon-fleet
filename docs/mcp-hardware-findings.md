@@ -41,6 +41,7 @@ finding led to a code change, the commit is named.
 | F12 | Two bodies attached together | verified for selection; concurrency inconclusive |
 | F13 | Still unverified after all of the above | open |
 | F15 | Phase 0 live checks: another teardown hang, then the SDK stopped enumerating a bus-visible body | open |
+| F16 | Targeted undo (`restore --only`) on the Z 9: restores the named property, leaves a later change alone | verified (two enum properties) |
 | F14 | Spike B: worker-style spawn, fd cleanliness, SIGKILL of a capture child | verified (small samples) |
 
 ---
@@ -420,6 +421,34 @@ The Z6III was not attached during this session.
   failed with `1 capability readable in the Z 9 baseline ... could not be read`, exit non-zero, and the
   snapshot count did not change; with `--allow-partial` the same capture printed the warning and was
   written. Neither run hung at teardown.
+
+## F16. Targeted undo with `restore --only` (2026-10-27, Z 9 A, fw 5.31)
+
+Run with the user's go-ahead, writing to the body. Scratch data directory, release CLI.
+
+1. **B0**: baseline capture, `ok=196 err=11`.
+2. Two hand-edited copies of B0, each with one `value_index` moved one step:
+   `HighlightBrightness` 26 to 25 (a playback display threshold, as in F4), and `HiResZoom` 0 to 1
+   (chosen after `FlashRangeDisplay` turned out to be read-only on this body, which the new verdict
+   reported correctly: `1 of 1 named property was not written ... (read_only)`, exit non-zero).
+3. `restore <edit> --only <name>` for each: `written=1 ... skipped(not-selected)=195 errors=0` both
+   times.
+4. **B1** capture; `diff B0 B1` showed exactly two changes, those two properties, and nothing else:
+   no dependent property moved.
+5. **Undo**: `restore B0 --only HighlightBrightness` (`written=1`). **B2** capture; `diff B0 B2`
+   showed exactly one change, `HiResZoom` 0 to 1: `HighlightBrightness` was back at 26, and the property
+   changed after the restore point was taken was **left alone**, which is what a full restore of B0
+   would not have done (not run).
+6. **Put back**: `restore B0 --only HiResZoom`. **B3** capture; `diff B0 B3` showed `(no differences)`;
+   with `--include-volatile` only `AngleLevel` and `AngleLevelPitch`, the known live sensors.
+
+Teardown hangs (F3): 2 of the 12 SDK sessions in this run (the B2 and B3 captures) printed their
+result and then sat in teardown until the harness killed them, 6 s after the result line; the writes
+and captures were complete each time and the camera was healthy afterwards. Every other session,
+including all three that wrote to the body, exited normally.
+
+Not covered: ranges, literals and strings; a cross-model undo; a write that changes another
+property; the MCP's own sequence (digest, restore point, baseline gate, read-back) end to end.
 
 ## F13. Still unverified
 
