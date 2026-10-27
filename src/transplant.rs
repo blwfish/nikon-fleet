@@ -59,6 +59,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
 use crate::maid_layer::MaidLayerConfig;
@@ -172,6 +173,26 @@ pub enum Strategy {
     RangeClamped,
 }
 
+impl Strategy {
+    /// Closed machine-readable tag (snake_case), for structured output. The
+    /// match has no wildcard arm, so a new variant does not compile until it
+    /// is given a tag. `Display` keeps the hyphenated form for the CLI text.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Strategy::Literal => "literal",
+            Strategy::EnumByLabel => "enum_by_label",
+            Strategy::EnumByRawValue => "enum_by_raw_value",
+            Strategy::RangeClamped => "range_clamped",
+        }
+    }
+}
+
+impl Serialize for Strategy {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.tag())
+    }
+}
+
 impl std::fmt::Display for Strategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -256,6 +277,113 @@ pub enum SkipReason {
     /// would change the target, and the user did not opt this property in.
     /// `proposed` is `5, was 3`, or `5 (target's current value unknown)`.
     LiteralUnconfirmed { proposed: String },
+}
+
+/// How a skip should be read. Routine skips are expected and numerous; policy
+/// skips are the tool declining on purpose (and, for opt-in gates, offering a
+/// way to override); warn skips want a person's attention; an error is a write
+/// that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Routine,
+    Policy,
+    Warn,
+    Error,
+}
+
+impl SkipReason {
+    /// Closed machine-readable tag (snake_case). No wildcard arm: a new
+    /// variant must be given a tag before this compiles. Nothing downstream
+    /// should read the `Display` text to decide anything.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            SkipReason::AbsentOnTarget => "absent_on_target",
+            SkipReason::ReadOnly => "read_only",
+            SkipReason::UnsupportedWriteType => "unsupported_write_type",
+            SkipReason::NoMatchingOption => "no_matching_option",
+            SkipReason::UnsupportedValueShape => "unsupported_value_shape",
+            SkipReason::TargetReadFailed(_) => "target_read_failed",
+            SkipReason::MalformedSource => "malformed_source",
+            SkipReason::WriteFailed(_) => "write_failed",
+            SkipReason::EnumUndecodedBySdk { .. } => "enum_undecoded_by_sdk",
+            SkipReason::EnumTypeMismatch { .. } => "enum_type_mismatch",
+            SkipReason::CapabilityNameMismatch { .. } => "capability_name_mismatch",
+            SkipReason::AmbiguousLabel { .. } => "ambiguous_label",
+            SkipReason::NeverCopied { .. } => "never_copied",
+            SkipReason::RawCodeUnconfirmed { .. } => "raw_code_unconfirmed",
+            SkipReason::LiteralUnconfirmed { .. } => "literal_unconfirmed",
+        }
+    }
+
+    /// How this skip should be read. The CLI warns on `Warn` and `Error` only,
+    /// so this is the one place that decision lives.
+    pub fn severity(&self) -> Severity {
+        match self {
+            SkipReason::AbsentOnTarget | SkipReason::ReadOnly | SkipReason::UnsupportedWriteType => {
+                Severity::Routine
+            }
+            SkipReason::NeverCopied { .. }
+            | SkipReason::RawCodeUnconfirmed { .. }
+            | SkipReason::LiteralUnconfirmed { .. } => Severity::Policy,
+            SkipReason::NoMatchingOption
+            | SkipReason::UnsupportedValueShape
+            | SkipReason::TargetReadFailed(_)
+            | SkipReason::MalformedSource
+            | SkipReason::EnumUndecodedBySdk { .. }
+            | SkipReason::EnumTypeMismatch { .. }
+            | SkipReason::CapabilityNameMismatch { .. }
+            | SkipReason::AmbiguousLabel { .. } => Severity::Warn,
+            SkipReason::WriteFailed(_) => Severity::Error,
+        }
+    }
+
+    /// The typed detail a variant carries, as named fields. `None` for the
+    /// variants that carry nothing. SDK error text appears only as the value
+    /// of a `message` field, for a human; it is never the tag.
+    fn detail(&self) -> Option<Value> {
+        match self {
+            SkipReason::AbsentOnTarget
+            | SkipReason::ReadOnly
+            | SkipReason::UnsupportedWriteType
+            | SkipReason::NoMatchingOption
+            | SkipReason::UnsupportedValueShape
+            | SkipReason::MalformedSource => None,
+            SkipReason::TargetReadFailed(message) | SkipReason::WriteFailed(message) => {
+                Some(json!({ "message": message }))
+            }
+            SkipReason::EnumUndecodedBySdk { side, reason } => {
+                Some(json!({ "side": side, "reason": reason }))
+            }
+            SkipReason::EnumTypeMismatch { source_elem_type, target_elem_type } => {
+                Some(json!({ "source_elem_type": source_elem_type, "target_elem_type": target_elem_type }))
+            }
+            SkipReason::CapabilityNameMismatch { source_names, target_names } => {
+                Some(json!({ "source_names": source_names, "target_names": target_names }))
+            }
+            SkipReason::AmbiguousLabel { label, source_count, target_count } => {
+                Some(json!({ "label": label, "source_count": source_count, "target_count": target_count }))
+            }
+            SkipReason::NeverCopied { reason } => Some(json!({ "reason": reason })),
+            SkipReason::RawCodeUnconfirmed { proposed } | SkipReason::LiteralUnconfirmed { proposed } => {
+                Some(json!({ "proposed": proposed }))
+            }
+        }
+    }
+}
+
+impl Serialize for SkipReason {
+    /// `{"tag": ..., "severity": ..., "detail": {...}}`; `detail` is omitted
+    /// when the variant carries none. Never the `Display` text.
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = serde_json::Map::new();
+        m.insert("tag".into(), json!(self.tag()));
+        m.insert("severity".into(), json!(self.severity()));
+        if let Some(d) = self.detail() {
+            m.insert("detail".into(), d);
+        }
+        Value::Object(m).serialize(s)
+    }
 }
 
 impl std::fmt::Display for SkipReason {
@@ -749,6 +877,45 @@ pub struct ResolvedChoice {
     pub choice: String,
     pub current_index: Option<u64>,
     pub current: Option<String>,
+}
+
+impl Serialize for ResolvedChoice {
+    /// `unchanged` is derived so a consumer never re-implements the comparison.
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        json!({
+            "target_index": self.target_index,
+            "choice": self.choice,
+            "current_index": self.current_index,
+            "current": self.current,
+            "unchanged": self.is_unchanged(),
+        })
+        .serialize(s)
+    }
+}
+
+impl Serialize for TransplantOutcome {
+    /// `status` is `"copied"` (written, or would be in a dry run) or
+    /// `"skipped"`. A copied outcome carries `strategy` (and `choice` for
+    /// enums); a skipped one carries `reason`.
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = serde_json::Map::new();
+        m.insert("name".into(), json!(self.name));
+        m.insert("code".into(), json!(self.code));
+        match &self.result {
+            Ok(strategy) => {
+                m.insert("status".into(), json!("copied"));
+                m.insert("strategy".into(), json!(strategy));
+            }
+            Err(reason) => {
+                m.insert("status".into(), json!("skipped"));
+                m.insert("reason".into(), json!(reason));
+            }
+        }
+        if let Some(choice) = &self.choice {
+            m.insert("choice".into(), json!(choice));
+        }
+        Value::Object(m).serialize(s)
+    }
 }
 
 impl ResolvedChoice {
@@ -1453,6 +1620,169 @@ mod tests {
         assert_eq!(plan_property(&json!("© me"), None, false).unwrap().1, Strategy::Literal);
         let range = json!({"value": 1.0, "default": 0.0, "value_index": 1, "default_index": 0, "lower": 0.0, "upper": 2.0, "steps": 3});
         assert_eq!(plan_property(&range, Some(&range), false).unwrap().1, Strategy::RangeClamped);
+    }
+
+    // ── structured output: closed tags, typed detail ─────────────────────
+
+    fn every_skip_reason() -> Vec<SkipReason> {
+        vec![
+            SkipReason::AbsentOnTarget,
+            SkipReason::ReadOnly,
+            SkipReason::UnsupportedWriteType,
+            SkipReason::NoMatchingOption,
+            SkipReason::UnsupportedValueShape,
+            SkipReason::TargetReadFailed("usb timeout".into()),
+            SkipReason::MalformedSource,
+            SkipReason::WriteFailed("-125".into()),
+            SkipReason::EnumUndecodedBySdk { side: "source", reason: "_invalid_physical_bytes".into() },
+            SkipReason::EnumTypeMismatch { source_elem_type: 7, target_elem_type: 2 },
+            SkipReason::CapabilityNameMismatch { source_names: "A".into(), target_names: "B/C".into() },
+            SkipReason::AmbiguousLabel { label: "125".into(), source_count: 2, target_count: 1 },
+            SkipReason::NeverCopied { reason: "lock state" },
+            SkipReason::RawCodeUnconfirmed { proposed: "code 5 (#2)".into() },
+            SkipReason::LiteralUnconfirmed { proposed: "5, was 3".into() },
+        ]
+    }
+
+    #[test]
+    fn skip_reason_tags_are_the_documented_closed_set() {
+        // The doc table in docs/mcp-plan.md §5.1 is this list; the exhaustive
+        // match in `tag()` is what forces a new variant to appear here.
+        let tags: Vec<&str> = every_skip_reason().iter().map(SkipReason::tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "absent_on_target", "read_only", "unsupported_write_type", "no_matching_option",
+                "unsupported_value_shape", "target_read_failed", "malformed_source", "write_failed",
+                "enum_undecoded_by_sdk", "enum_type_mismatch", "capability_name_mismatch",
+                "ambiguous_label", "never_copied", "raw_code_unconfirmed", "literal_unconfirmed",
+            ]
+        );
+        let distinct: BTreeSet<&str> = tags.iter().copied().collect();
+        assert_eq!(distinct.len(), tags.len(), "duplicate tag");
+        assert!(tags.iter().all(|t| t.chars().all(|c| c.is_ascii_lowercase() || c == '_')), "snake_case only");
+    }
+
+    #[test]
+    fn strategy_tags_are_snake_case_and_distinct_from_the_cli_text() {
+        let all = [Strategy::Literal, Strategy::EnumByLabel, Strategy::EnumByRawValue, Strategy::RangeClamped];
+        let tags: Vec<&str> = all.iter().map(Strategy::tag).collect();
+        assert_eq!(tags, ["literal", "enum_by_label", "enum_by_raw_value", "range_clamped"]);
+        for s in all {
+            assert_eq!(serde_json::to_value(s).unwrap(), json!(s.tag()));
+        }
+        // The hyphenated CLI form is unchanged.
+        assert_eq!(Strategy::EnumByLabel.to_string(), "enum-by-label");
+    }
+
+    #[test]
+    fn skip_reason_severity_matches_the_plan_table() {
+        use Severity::*;
+        let got: Vec<(&str, Severity)> = every_skip_reason().iter().map(|r| (r.tag(), r.severity())).collect();
+        assert_eq!(
+            got,
+            [
+                ("absent_on_target", Routine), ("read_only", Routine), ("unsupported_write_type", Routine),
+                ("no_matching_option", Warn), ("unsupported_value_shape", Warn), ("target_read_failed", Warn),
+                ("malformed_source", Warn), ("write_failed", Error), ("enum_undecoded_by_sdk", Warn),
+                ("enum_type_mismatch", Warn), ("capability_name_mismatch", Warn), ("ambiguous_label", Warn),
+                ("never_copied", Policy), ("raw_code_unconfirmed", Policy), ("literal_unconfirmed", Policy),
+            ]
+        );
+    }
+
+    #[test]
+    fn skip_reason_json_has_tag_severity_and_typed_detail_only_where_one_exists() {
+        let j = |r: SkipReason| serde_json::to_value(r).unwrap();
+        // No detail field at all (not null) for the variants that carry none.
+        assert_eq!(j(SkipReason::ReadOnly), json!({"tag": "read_only", "severity": "routine"}));
+        assert_eq!(
+            j(SkipReason::WriteFailed("-125".into())),
+            json!({"tag": "write_failed", "severity": "error", "detail": {"message": "-125"}})
+        );
+        assert_eq!(
+            j(SkipReason::EnumTypeMismatch { source_elem_type: 7, target_elem_type: 2 }),
+            json!({"tag": "enum_type_mismatch", "severity": "warn",
+                   "detail": {"source_elem_type": 7, "target_elem_type": 2}})
+        );
+        assert_eq!(
+            j(SkipReason::AmbiguousLabel { label: "125".into(), source_count: 2, target_count: 1 }),
+            json!({"tag": "ambiguous_label", "severity": "warn",
+                   "detail": {"label": "125", "source_count": 2, "target_count": 1}})
+        );
+        assert_eq!(
+            j(SkipReason::LiteralUnconfirmed { proposed: "5, was 3".into() }),
+            json!({"tag": "literal_unconfirmed", "severity": "policy", "detail": {"proposed": "5, was 3"}})
+        );
+    }
+
+    #[test]
+    fn skip_reason_json_never_contains_the_display_text() {
+        for r in every_skip_reason() {
+            let json_text = serde_json::to_string(&r).unwrap();
+            let display = r.to_string();
+            assert!(!json_text.contains(&display), "{}: Display leaked into JSON", r.tag());
+        }
+    }
+
+    #[test]
+    fn skip_reason_detail_passes_awkward_text_through_unmangled() {
+        // Quotes, newlines and non-ASCII in SDK error text must survive as data.
+        let msg = "bad \"value\"\nline 2 – café";
+        let v = serde_json::to_value(SkipReason::TargetReadFailed(msg.into())).unwrap();
+        assert_eq!(v["detail"]["message"], json!(msg));
+        assert_eq!(v["tag"], json!("target_read_failed"));
+    }
+
+    #[test]
+    fn resolved_choice_json_derives_unchanged_at_the_boundary() {
+        let c = |target, current: Option<u64>| ResolvedChoice {
+            target_index: target,
+            choice: "AE Only".into(),
+            current_index: current,
+            current: current.map(|i| format!("opt{i}")),
+        };
+        assert_eq!(serde_json::to_value(c(1, Some(1))).unwrap()["unchanged"], json!(true));
+        assert_eq!(serde_json::to_value(c(1, Some(0))).unwrap()["unchanged"], json!(false));
+        // Unknown current value is not "unchanged".
+        let unknown = serde_json::to_value(c(1, None)).unwrap();
+        assert_eq!(unknown["unchanged"], json!(false));
+        assert_eq!(unknown["current_index"], json!(null));
+        assert_eq!(unknown["current"], json!(null));
+    }
+
+    #[test]
+    fn outcome_json_for_copied_and_skipped() {
+        let copied = TransplantOutcome {
+            name: "kNkMAIDCapability_BracketingVary".into(),
+            code: 0x8029,
+            result: Ok(Strategy::EnumByLabel),
+            choice: Some(ResolvedChoice {
+                target_index: 1,
+                choice: "AE Only".into(),
+                current_index: Some(0),
+                current: Some("AE & Flash".into()),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&copied).unwrap(),
+            json!({
+                "name": "kNkMAIDCapability_BracketingVary", "code": 0x8029, "status": "copied",
+                "strategy": "enum_by_label",
+                "choice": {"target_index": 1, "choice": "AE Only", "current_index": 0,
+                           "current": "AE & Flash", "unchanged": false}
+            })
+        );
+        let skipped = TransplantOutcome {
+            name: "kNkMAIDCapability_LockCamera".into(),
+            code: 33089,
+            result: Err(SkipReason::NeverCopied { reason: "lock state" }),
+            choice: None,
+        };
+        let v = serde_json::to_value(&skipped).unwrap();
+        assert_eq!(v["status"], json!("skipped"));
+        assert_eq!(v["reason"]["tag"], json!("never_copied"));
+        assert!(v.get("strategy").is_none() && v.get("choice").is_none(), "{v}");
     }
 
     // ── numeric-literal gate ─────────────────────────────────────────────

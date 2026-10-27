@@ -2101,72 +2101,60 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
                 }
             }
             Err(reason) => {
-                // The match below decides which counter bucket this
-                // outcome belongs in and whether it's warn-worthy (routine
-                // skips like AbsentOnTarget aren't); the actual eprintln!
-                // lives once, after the match, instead of copy-pasted into
-                // every warn-worthy arm.
-                let warn = match reason {
+                // The match below decides which counter bucket this outcome
+                // belongs in; whether it is warn-worthy comes from
+                // `SkipReason::severity`, and the actual eprintln! lives once,
+                // after the match.
+                match reason {
                     transplant::SkipReason::AbsentOnTarget => {
                         skipped_absent += 1;
-                        false
                     }
                     transplant::SkipReason::ReadOnly => {
                         skipped_read_only += 1;
-                        false
                     }
                     transplant::SkipReason::UnsupportedWriteType => {
                         skipped_unsupported_type += 1;
-                        false
                     }
                     transplant::SkipReason::NoMatchingOption => {
                         skipped_no_match += 1;
-                        true
                     }
                     transplant::SkipReason::WriteFailed(_) => {
                         errors += 1;
-                        true
                     }
                     transplant::SkipReason::EnumTypeMismatch { .. } => {
                         skipped_type_mismatch += 1;
-                        true
                     }
                     transplant::SkipReason::EnumUndecodedBySdk { .. } => {
                         skipped_sdk_decode_failure += 1;
-                        true
                     }
                     transplant::SkipReason::CapabilityNameMismatch { .. } => {
                         skipped_name_mismatch += 1;
-                        true
                     }
                     transplant::SkipReason::AmbiguousLabel { .. } => {
                         skipped_ambiguous += 1;
-                        true
                     }
                     // Policy skips, not problems: routine and numerous, so
                     // counted but not warned about one by one (the per-property
                     // lines are in the summary hint below).
                     transplant::SkipReason::NeverCopied { .. } => {
                         skipped_never += 1;
-                        false
                     }
                     transplant::SkipReason::RawCodeUnconfirmed { proposed } => {
                         skipped_raw_unconfirmed += 1;
                         raw_unconfirmed.push((outcome.name.clone(), proposed.clone()));
-                        false
                     }
                     transplant::SkipReason::LiteralUnconfirmed { proposed } => {
                         skipped_literal_unconfirmed += 1;
                         literal_unconfirmed.push((outcome.name.clone(), proposed.clone()));
-                        false
                     }
                     transplant::SkipReason::UnsupportedValueShape
                     | transplant::SkipReason::TargetReadFailed(_)
                     | transplant::SkipReason::MalformedSource => {
                         skipped_other += 1;
-                        true
                     }
-                };
+                }
+                // Whether to warn is the reason's own severity, not a second table here.
+                let warn = matches!(reason.severity(), transplant::Severity::Warn | transplant::Severity::Error);
                 if warn {
                     eprintln!("  warn: {} [{:#x}]: {reason}", outcome.name, outcome.code);
                 }
