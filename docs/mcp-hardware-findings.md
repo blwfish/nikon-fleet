@@ -530,9 +530,10 @@ data directory, release binary, worker ops with their result channel on a file.
    properties only `AngleLevel` and `AngleLevelPitch`. 20 snapshot files in the scratch directory, two of
    them restore points.
 
-Writes to the body in this test: five that took effect (612 to 613 by apply, 613 to 612 by apply, 612 to 613
-by `transplant`, 613 to 612 by the primed `restore`, plus the final state) and two `restore` writes that were
-accepted and ignored. No session hung at teardown.
+Writes to the body in this test: four that took effect (612 to 613 by apply, 613 to 612 by apply, 612 to 613
+by `transplant`, 613 to 612 by the primed `restore`) and two blind `restore` writes that were accepted and
+ignored. The setting was moved one step and back each way; it ended where it started. No session printed a
+teardown hang.
 
 What this settles and what it does not: a stepped range write through the SDK struct, with `value` and
 `value_index` coherent, changes the setting, and the read-back and an independent capture agree. It does not
