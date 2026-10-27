@@ -20,7 +20,7 @@
 //! - **`format_version` from day one.** Cheap insurance against having to
 //!   re-snapshot when the schema evolves.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -120,6 +120,12 @@ impl Snapshot {
             transport,
             properties: BTreeMap::new(),
         }
+    }
+
+    /// Capability codes present in this snapshot. A capture inserts a property
+    /// only when the read succeeded, so this is the readable set.
+    pub fn readable_codes(&self) -> BTreeSet<u32> {
+        self.properties.values().map(|p| p.code).collect()
     }
 
     /// Convenience: insert one property.

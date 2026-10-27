@@ -1,0 +1,793 @@
+{
+  "format_version": 1,
+  "model": "Z 9",
+  "firmware": "5.31",
+  "seeded_from": "Z_9_0000003023668_z9a-baseline-2026-10-27_20261027T164440.323806Z.json",
+  "seeded_captured_at": "2026-10-27T16:44:40.323806Z",
+  "readable": [
+    {
+      "code": 1,
+      "name": "cap_0x1"
+    },
+    {
+      "code": 6,
+      "name": "cap_0x6"
+    },
+    {
+      "code": 9,
+      "name": "cap_0x9"
+    },
+    {
+      "code": 11,
+      "name": "cap_0xb"
+    },
+    {
+      "code": 12,
+      "name": "cap_0xc"
+    },
+    {
+      "code": 48,
+      "name": "kNkMAIDCapability_BatteryLevel"
+    },
+    {
+      "code": 52,
+      "name": "kNkMAIDCapability_FlashMode"
+    },
+    {
+      "code": 33024,
+      "name": "kNkMAIDCapability_EVInterval"
+    },
+    {
+      "code": 33029,
+      "name": "kNkMAIDCapability_LockFocus"
+    },
+    {
+      "code": 33035,
+      "name": "kNkMAIDCapability_ExposureStatus"
+    },
+    {
+      "code": 33040,
+      "name": "kNkMAIDCapability_CompressionLevel"
+    },
+    {
+      "code": 33041,
+      "name": "kNkMAIDCapability_ExposureMode"
+    },
+    {
+      "code": 33042,
+      "name": "kNkMAIDCapability_ShutterSpeed"
+    },
+    {
+      "code": 33043,
+      "name": "kNkMAIDCapability_Aperture"
+    },
+    {
+      "code": 33044,
+      "name": "kNkMAIDCapability_FlexibleProgram"
+    },
+    {
+      "code": 33045,
+      "name": "kNkMAIDCapability_ExposureComp"
+    },
+    {
+      "code": 33046,
+      "name": "kNkMAIDCapability_MeteringMode"
+    },
+    {
+      "code": 33047,
+      "name": "kNkMAIDCapability_Sensitivity"
+    },
+    {
+      "code": 33048,
+      "name": "kNkMAIDCapability_WBMode"
+    },
+    {
+      "code": 33049,
+      "name": "kNkMAIDCapability_WBTuneAuto"
+    },
+    {
+      "code": 33051,
+      "name": "kNkMAIDCapability_WBTuneFluorescent"
+    },
+    {
+      "code": 33052,
+      "name": "kNkMAIDCapability_WBTuneSunny"
+    },
+    {
+      "code": 33053,
+      "name": "kNkMAIDCapability_WBTuneFlash"
+    },
+    {
+      "code": 33054,
+      "name": "kNkMAIDCapability_WBTuneShade"
+    },
+    {
+      "code": 33055,
+      "name": "kNkMAIDCapability_WBTuneCloudy"
+    },
+    {
+      "code": 33056,
+      "name": "kNkMAIDCapability_FocusMode"
+    },
+    {
+      "code": 33057,
+      "name": "kNkMAIDCapability_FocusAreaMode"
+    },
+    {
+      "code": 33059,
+      "name": "kNkMAIDCapability_FocalLength"
+    },
+    {
+      "code": 33060,
+      "name": "kNkMAIDCapability_ClockDateTime"
+    },
+    {
+      "code": 33062,
+      "name": "kNkMAIDCapability_BracketingOrder"
+    },
+    {
+      "code": 33063,
+      "name": "kNkMAIDCapability_BracketingVary"
+    },
+    {
+      "code": 33065,
+      "name": "kNkMAIDCapability_AFAreaSelector"
+    },
+    {
+      "code": 33066,
+      "name": "kNkMAIDCapability_AFsPriority"
+    },
+    {
+      "code": 33067,
+      "name": "kNkMAIDCapability_AFcPriority"
+    },
+    {
+      "code": 33069,
+      "name": "kNkMAIDCapability_CWMeteringDiameter"
+    },
+    {
+      "code": 33086,
+      "name": "kNkMAIDCapability_ShootingLimit"
+    },
+    {
+      "code": 33089,
+      "name": "kNkMAIDCapability_LockCamera"
+    },
+    {
+      "code": 33092,
+      "name": "kNkMAIDCapability_LensInfo"
+    },
+    {
+      "code": 33107,
+      "name": "kNkMAIDCapability_SensitivityInterval"
+    },
+    {
+      "code": 33108,
+      "name": "kNkMAIDCapability_ShootNoCard"
+    },
+    {
+      "code": 33111,
+      "name": "kNkMAIDCapability_ImageSize"
+    },
+    {
+      "code": 33132,
+      "name": "kNkMAIDCapability_IsoControl"
+    },
+    {
+      "code": 33165,
+      "name": "kNkMAIDCapability_ShootingMode"
+    },
+    {
+      "code": 33167,
+      "name": "kNkMAIDCapability_RemainContinuousShooting"
+    },
+    {
+      "code": 33169,
+      "name": "kNkMAIDCapability_WBPresetName"
+    },
+    {
+      "code": 33189,
+      "name": "kNkMAIDCapability_FlashSyncTime"
+    },
+    {
+      "code": 33190,
+      "name": "kNkMAIDCapability_FlashSlowLimit"
+    },
+    {
+      "code": 33193,
+      "name": "kNkMAIDCapability_BracketingFactor"
+    },
+    {
+      "code": 33198,
+      "name": "kNkMAIDCapability_ContinuousShootingNum"
+    },
+    {
+      "code": 33199,
+      "name": "kNkMAIDCapability_EnableBracketing"
+    },
+    {
+      "code": 33200,
+      "name": "kNkMAIDCapability_AEBracketingType"
+    },
+    {
+      "code": 33201,
+      "name": "kNkMAIDCapability_AEBracketingStep"
+    },
+    {
+      "code": 33202,
+      "name": "kNkMAIDCapability_WBBracketingStep"
+    },
+    {
+      "code": 33203,
+      "name": "kNkMAIDCapability_BracketingCount"
+    },
+    {
+      "code": 33204,
+      "name": "kNkMAIDCapability_CameraInclination"
+    },
+    {
+      "code": 33209,
+      "name": "kNkMAIDCapability_ExternalFlashSort"
+    },
+    {
+      "code": 33211,
+      "name": "kNkMAIDCapability_ExternalNewTypeFlashMode"
+    },
+    {
+      "code": 33213,
+      "name": "kNkMAIDCapability_ExternalFlashStatus"
+    },
+    {
+      "code": 33214,
+      "name": "kNkMAIDCapability_InternalFlashComp"
+    },
+    {
+      "code": 33215,
+      "name": "kNkMAIDCapability_ExternalFlashComp"
+    },
+    {
+      "code": 33220,
+      "name": "kNkMAIDCapability_ISOAutoShutterTime"
+    },
+    {
+      "code": 33232,
+      "name": "kNkMAIDCapability_CCDDataMode"
+    },
+    {
+      "code": 33239,
+      "name": "kNkMAIDCapability_CameraType"
+    },
+    {
+      "code": 33243,
+      "name": "kNkMAIDCapability_ImageColorSpace"
+    },
+    {
+      "code": 33266,
+      "name": "kNkMAIDCapability_ISOAutoHiLimit"
+    },
+    {
+      "code": 33324,
+      "name": "kNkMAIDCapability_Slot2ImageSaveMode"
+    },
+    {
+      "code": 33326,
+      "name": "kNkMAIDCapability_PictureControl"
+    },
+    {
+      "code": 33330,
+      "name": "kNkMAIDCapability_Active_D_Lighting"
+    },
+    {
+      "code": 33342,
+      "name": "kNkMAIDCapability_LiveViewStatus"
+    },
+    {
+      "code": 33344,
+      "name": "kNkMAIDCapability_ContrastAF"
+    },
+    {
+      "code": 33351,
+      "name": "kNkMAIDCapability_GetLiveViewImage"
+    },
+    {
+      "code": 33352,
+      "name": "kNkMAIDCapability_MFDriveStep"
+    },
+    {
+      "code": 33355,
+      "name": "kNkMAIDCapability_CompressRAWEx"
+    },
+    {
+      "code": 33357,
+      "name": "kNkMAIDCapability_WBFluorescentType"
+    },
+    {
+      "code": 33358,
+      "name": "kNkMAIDCapability_WBTuneColorAdjust"
+    },
+    {
+      "code": 33359,
+      "name": "kNkMAIDCapability_WBTunePreset1"
+    },
+    {
+      "code": 33360,
+      "name": "kNkMAIDCapability_WBTunePreset2"
+    },
+    {
+      "code": 33361,
+      "name": "kNkMAIDCapability_WBTunePreset3"
+    },
+    {
+      "code": 33362,
+      "name": "kNkMAIDCapability_WBTunePreset4"
+    },
+    {
+      "code": 33363,
+      "name": "kNkMAIDCapability_WBTunePreset5"
+    },
+    {
+      "code": 33364,
+      "name": "kNkMAIDCapability_AFAreaPoint"
+    },
+    {
+      "code": 33372,
+      "name": "kNkMAIDCapability_LensType"
+    },
+    {
+      "code": 33374,
+      "name": "kNkMAIDCapability_LiveViewProhibit"
+    },
+    {
+      "code": 33386,
+      "name": "kNkMAIDCapability_ShutterSpeedLockSetting"
+    },
+    {
+      "code": 33387,
+      "name": "kNkMAIDCapability_ApertureLockSetting"
+    },
+    {
+      "code": 33393,
+      "name": "kNkMAIDCapability_AngleLevel"
+    },
+    {
+      "code": 33394,
+      "name": "kNkMAIDCapability_MovieScreenSize"
+    },
+    {
+      "code": 33413,
+      "name": "kNkMAIDCapability_MovieRecMicrophone"
+    },
+    {
+      "code": 33414,
+      "name": "kNkMAIDCapability_MovieRecDestination"
+    },
+    {
+      "code": 33416,
+      "name": "kNkMAIDCapability_ADLBracketingType"
+    },
+    {
+      "code": 33429,
+      "name": "kNkMAIDCapability_RemainCountInMedia"
+    },
+    {
+      "code": 33430,
+      "name": "kNkMAIDCapability_AngleLevelPitch"
+    },
+    {
+      "code": 33431,
+      "name": "kNkMAIDCapability_AngleLevelYaw"
+    },
+    {
+      "code": 33433,
+      "name": "kNkMAIDCapability_MovRecInCardProhibit"
+    },
+    {
+      "code": 33540,
+      "name": "kNkMAIDCapability_ActiveSlot"
+    },
+    {
+      "code": 33541,
+      "name": "kNkMAIDCapability_SaveMedia"
+    },
+    {
+      "code": 33552,
+      "name": "kNkMAIDCapability_AFModeAtLiveView"
+    },
+    {
+      "code": 33558,
+      "name": "kNkMAIDCapability_WBAutoType"
+    },
+    {
+      "code": 33568,
+      "name": "kNkMAIDCapability_HDRMode"
+    },
+    {
+      "code": 33571,
+      "name": "kNkMAIDCapability_BlinkingStatus"
+    },
+    {
+      "code": 33573,
+      "name": "kNkMAIDCapability_WBTuneColorTempEx"
+    },
+    {
+      "code": 33584,
+      "name": "kNkMAIDCapability_ISOAutoShutterTimeAutoValue"
+    },
+    {
+      "code": 33586,
+      "name": "kNkMAIDCapability_MovieRecMicrophoneValue"
+    },
+    {
+      "code": 33588,
+      "name": "kNkMAIDCapability_LiveViewSelector"
+    },
+    {
+      "code": 33590,
+      "name": "kNkMAIDCapability_MovieShutterSpeed"
+    },
+    {
+      "code": 33591,
+      "name": "kNkMAIDCapability_MovieAperture"
+    },
+    {
+      "code": 33592,
+      "name": "kNkMAIDCapability_MovieSensitivity"
+    },
+    {
+      "code": 33593,
+      "name": "kNkMAIDCapability_MovieExposureComp"
+    },
+    {
+      "code": 33603,
+      "name": "kNkMAIDCapability_ADLBracketingStep"
+    },
+    {
+      "code": 33606,
+      "name": "kNkMAIDCapability_LiveViewPhotoShootingMode"
+    },
+    {
+      "code": 33607,
+      "name": "kNkMAIDCapability_ExposureDelayEx"
+    },
+    {
+      "code": 33617,
+      "name": "kNkMAIDCapability_CurrentItemID"
+    },
+    {
+      "code": 33619,
+      "name": "kNkMAIDCapability_LiveViewImageSize"
+    },
+    {
+      "code": 33621,
+      "name": "kNkMAIDCapability_WBTunePreset6"
+    },
+    {
+      "code": 33624,
+      "name": "kNkMAIDCapability_SpotWBMode"
+    },
+    {
+      "code": 33824,
+      "name": "kNkMAIDCapability_MovieWindNoiseReduction"
+    },
+    {
+      "code": 33825,
+      "name": "kNkMAIDCapability_RetractableLensWarningStatus"
+    },
+    {
+      "code": 33826,
+      "name": "kNkMAIDCapability_ISOControlSensitivity"
+    },
+    {
+      "code": 33872,
+      "name": "kNkMAIDCapability_MovieRecordingZone"
+    },
+    {
+      "code": 33873,
+      "name": "kNkMAIDCapability_MovieISOControl"
+    },
+    {
+      "code": 33874,
+      "name": "kNkMAIDCapability_MovieISOAutoHiLimit"
+    },
+    {
+      "code": 33876,
+      "name": "kNkMAIDCapability_RawJpegTransferStatus"
+    },
+    {
+      "code": 33888,
+      "name": "kNkMAIDCapability_MovieWBMode"
+    },
+    {
+      "code": 33889,
+      "name": "kNkMAIDCapability_MovieWBTuneAuto"
+    },
+    {
+      "code": 33890,
+      "name": "kNkMAIDCapability_MovieWBAutoType"
+    },
+    {
+      "code": 33892,
+      "name": "kNkMAIDCapability_MovieWBFluorescentType"
+    },
+    {
+      "code": 33893,
+      "name": "kNkMAIDCapability_MovieWBTuneFluorescent"
+    },
+    {
+      "code": 33894,
+      "name": "kNkMAIDCapability_MovieWBTuneSunny"
+    },
+    {
+      "code": 33896,
+      "name": "kNkMAIDCapability_MovieWBTuneShade"
+    },
+    {
+      "code": 33897,
+      "name": "kNkMAIDCapability_MovieWBTuneCloudy"
+    },
+    {
+      "code": 33898,
+      "name": "kNkMAIDCapability_MovieWBTuneColorTempEx"
+    },
+    {
+      "code": 33899,
+      "name": "kNkMAIDCapability_MovieWBTuneColorAdjust"
+    },
+    {
+      "code": 33900,
+      "name": "kNkMAIDCapability_MovieWBTunePreset1"
+    },
+    {
+      "code": 33901,
+      "name": "kNkMAIDCapability_MovieWBTunePreset2"
+    },
+    {
+      "code": 33902,
+      "name": "kNkMAIDCapability_MovieWBTunePreset3"
+    },
+    {
+      "code": 33903,
+      "name": "kNkMAIDCapability_MovieWBTunePreset4"
+    },
+    {
+      "code": 33904,
+      "name": "kNkMAIDCapability_MovieWBTunePreset5"
+    },
+    {
+      "code": 33905,
+      "name": "kNkMAIDCapability_MovieWBTunePreset6"
+    },
+    {
+      "code": 33913,
+      "name": "kNkMAIDCapability_MovieWBPresetName"
+    },
+    {
+      "code": 33919,
+      "name": "kNkMAIDCapability_MovieCCDDataMode"
+    },
+    {
+      "code": 33922,
+      "name": "kNkMAIDCapability_MoviePictureControl"
+    },
+    {
+      "code": 33925,
+      "name": "kNkMAIDCapability_MovieMeteringMode"
+    },
+    {
+      "code": 33944,
+      "name": "kNkMAIDCapability_ElectronicVR"
+    },
+    {
+      "code": 33985,
+      "name": "kNkMAIDCapability_FlashISOAutoHighLimit"
+    },
+    {
+      "code": 33991,
+      "name": "kNkMAIDCapability_RadioMultipleFlashChannel"
+    },
+    {
+      "code": 33992,
+      "name": "kNkMAIDCapability_OpticalMultipleFlashChannel"
+    },
+    {
+      "code": 33993,
+      "name": "kNkMAIDCapability_FlashRangeDisplay"
+    },
+    {
+      "code": 33994,
+      "name": "kNkMAIDCapability_AllTestFiringDisable"
+    },
+    {
+      "code": 34011,
+      "name": "kNkMAIDCapability_SBIntegrationFlashReady"
+    },
+    {
+      "code": 34034,
+      "name": "kNkMAIDCapability_MovieActive_D_Lighting"
+    },
+    {
+      "code": 34035,
+      "name": "kNkMAIDCapability_FlickerReductionSetting"
+    },
+    {
+      "code": 34038,
+      "name": "kNkMAIDCapability_MovieFileType"
+    },
+    {
+      "code": 34042,
+      "name": "kNkMAIDCapability_ExternalRecordingControl"
+    },
+    {
+      "code": 34044,
+      "name": "kNkMAIDCapability_WBTuneNatural"
+    },
+    {
+      "code": 34045,
+      "name": "kNkMAIDCapability_HighlightBrightness"
+    },
+    {
+      "code": 34046,
+      "name": "kNkMAIDCapability_MovieWBTuneNatural"
+    },
+    {
+      "code": 34047,
+      "name": "kNkMAIDCapability_MovieAttenuator"
+    },
+    {
+      "code": 34053,
+      "name": "kNkMAIDCapability_VibrationReduction"
+    },
+    {
+      "code": 34055,
+      "name": "kNkMAIDCapability_MovieAfAreaMode"
+    },
+    {
+      "code": 34056,
+      "name": "kNkMAIDCapability_MovieVibrationReduction"
+    },
+    {
+      "code": 34057,
+      "name": "kNkMAIDCapability_MovieFocusMode"
+    },
+    {
+      "code": 34062,
+      "name": "kNkMAIDCapability_RecordTimeCodes"
+    },
+    {
+      "code": 34063,
+      "name": "kNkMAIDCapability_CountUpMethod"
+    },
+    {
+      "code": 34065,
+      "name": "kNkMAIDCapability_DropFrame"
+    },
+    {
+      "code": 34066,
+      "name": "kNkMAIDCapability_MovieLogOutput"
+    },
+    {
+      "code": 34071,
+      "name": "kNkMAIDCapability_LiveViewImageStatus"
+    },
+    {
+      "code": 34072,
+      "name": "kNkMAIDCapability_LiveViewZoomArea"
+    },
+    {
+      "code": 34080,
+      "name": "kNkMAIDCapability_ChangeMonitorOffStatus"
+    },
+    {
+      "code": 34085,
+      "name": "kNkMAIDCapability_Slot2JpegImageSize"
+    },
+    {
+      "code": 34096,
+      "name": "kNkMAIDCapability_LockExposureEx"
+    },
+    {
+      "code": 34102,
+      "name": "kNkMAIDCapability_SilentMode"
+    },
+    {
+      "code": 34103,
+      "name": "kNkMAIDCapability_MovieShutterSpeedLockSetting"
+    },
+    {
+      "code": 34104,
+      "name": "kNkMAIDCapability_MovieApertureLockSetting"
+    },
+    {
+      "code": 34105,
+      "name": "kNkMAIDCapability_MovieExtendedIsoStepManual"
+    },
+    {
+      "code": 34115,
+      "name": "kNkMAIDCapability_HighSpeedFlickerReduction"
+    },
+    {
+      "code": 34116,
+      "name": "kNkMAIDCapability_MovieHighSpeedFlickerReduction"
+    },
+    {
+      "code": 34117,
+      "name": "kNkMAIDCapability_FlickerReductionShutterSpeed"
+    },
+    {
+      "code": 34118,
+      "name": "kNkMAIDCapability_AFSubjectDetection"
+    },
+    {
+      "code": 34119,
+      "name": "kNkMAIDCapability_MovieAFSubjectDetection"
+    },
+    {
+      "code": 34121,
+      "name": "kNkMAIDCapability_MovieH265ToneMode"
+    },
+    {
+      "code": 34122,
+      "name": "kNkMAIDCapability_MovieNRaw12bitToneMode"
+    },
+    {
+      "code": 34123,
+      "name": "kNkMAIDCapability_MovieProResToneMode"
+    },
+    {
+      "code": 34124,
+      "name": "kNkMAIDCapability_MovieProResRawHq12bitToneMode"
+    },
+    {
+      "code": 34125,
+      "name": "kNkMAIDCapability_SkinSoftening"
+    },
+    {
+      "code": 34126,
+      "name": "kNkMAIDCapability_MovieSkinSoftening"
+    },
+    {
+      "code": 34127,
+      "name": "kNkMAIDCapability_PortraitImpressionBalance"
+    },
+    {
+      "code": 34128,
+      "name": "kNkMAIDCapability_MoviePortraitImpressionBalance"
+    },
+    {
+      "code": 34130,
+      "name": "kNkMAIDCapability_SpecialShootingMode"
+    },
+    {
+      "code": 34140,
+      "name": "kNkMAIDCapability_FocusPointLock"
+    },
+    {
+      "code": 34141,
+      "name": "kNkMAIDCapability_MovieFocusPointLock"
+    },
+    {
+      "code": 34145,
+      "name": "kNkMAIDCapability_HiResZoom"
+    },
+    {
+      "code": 34146,
+      "name": "kNkMAIDCapability_SelectedSlot"
+    },
+    {
+      "code": 34147,
+      "name": "kNkMAIDCapability_Viewmode"
+    },
+    {
+      "code": 34148,
+      "name": "kNkMAIDCapability_MovieShutterMode"
+    },
+    {
+      "code": 34150,
+      "name": "kNkMAIDCapability_LensId"
+    },
+    {
+      "code": 34151,
+      "name": "kNkMAIDCapability_PowerZoomPosition"
+    }
+  ]
+}
