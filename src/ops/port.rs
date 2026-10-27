@@ -1,0 +1,224 @@
+//! The camera as the workflows see it: a list of capabilities that can be read
+//! and written. `Device` implements it for a real body; [`FakeCamera`] is an
+//! in-memory body for tests, so plan / apply / restore-point logic runs
+//! without hardware (docs/mcp-plan.md §6).
+//!
+//! The trait is exactly the three things the workflows do with a `Device`.
+//! It adds no behaviour: the properties that matter (what a failed read
+//! returns, that a write may change other values) are the fake's to model.
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::Value;
+
+use crate::sdk::{CapabilityInfo, Device, SdkError};
+
+pub trait CameraPort {
+    /// Every capability the body reports.
+    fn capabilities(&self) -> &[CapabilityInfo];
+    fn read_capability(&self, id: u32) -> Result<Value, SdkError>;
+    fn write_capability(&self, id: u32, kind: u32, value: &Value) -> Result<(), SdkError>;
+}
+
+impl CameraPort for Device<'_> {
+    fn capabilities(&self) -> &[CapabilityInfo] {
+        &self.capabilities
+    }
+    // Inherent methods win over trait methods in resolution, so these call
+    // `Device::read_capability` / `Device::write_capability`, not themselves.
+    fn read_capability(&self, id: u32) -> Result<Value, SdkError> {
+        Device::read_capability(self, id)
+    }
+    fn write_capability(&self, id: u32, kind: u32, value: &Value) -> Result<(), SdkError> {
+        Device::write_capability(self, id, kind, value)
+    }
+}
+
+/// How a fake operation fails. (`SdkError` is not `Clone`, so the fake stores
+/// this and builds the error each time.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// `SdkError::SdkCall` with this code (e.g. -125 for a state property, -126 unreadable).
+    Call(i32),
+    /// `SdkError::UnsupportedWrite`.
+    UnsupportedWrite,
+}
+
+impl Failure {
+    fn error(self, call: &'static str, kind: u32) -> SdkError {
+        match self {
+            Failure::Call(code) => SdkError::SdkCall { call, code },
+            Failure::UnsupportedWrite => SdkError::UnsupportedWrite(kind),
+        }
+    }
+}
+
+/// An in-memory body. Reads return the stored value; a write stores the new
+/// value, then applies any configured dependent change (writing one property
+/// can change others on a real body). Everything is recorded.
+#[derive(Default)]
+pub struct FakeCamera {
+    caps: Vec<CapabilityInfo>,
+    values: RefCell<BTreeMap<u32, Value>>,
+    read_failures: BTreeMap<u32, Failure>,
+    write_failures: BTreeMap<u32, Failure>,
+    /// code written -> (other code, value it takes) applied after that write succeeds.
+    dependents: BTreeMap<u32, Vec<(u32, Value)>>,
+    reads: RefCell<Vec<u32>>,
+    writes: RefCell<Vec<(u32, Value)>>,
+}
+
+impl FakeCamera {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a capability with the given operation bits and current value.
+    pub fn with(mut self, id: u32, operations: u32, value: Value) -> Self {
+        self.caps.push(CapabilityInfo { id, kind: 0, visibility: 0, operations, description: String::new() });
+        self.values.borrow_mut().insert(id, value);
+        self
+    }
+
+    /// A capability with no stored value (reading it fails unless configured otherwise).
+    pub fn with_unreadable(mut self, id: u32, operations: u32) -> Self {
+        self.caps.push(CapabilityInfo { id, kind: 0, visibility: 0, operations, description: String::new() });
+        self
+    }
+
+    pub fn failing_read(mut self, id: u32, f: Failure) -> Self {
+        self.read_failures.insert(id, f);
+        self
+    }
+
+    pub fn failing_write(mut self, id: u32, f: Failure) -> Self {
+        self.write_failures.insert(id, f);
+        self
+    }
+
+    /// After a successful write of `id`, `other` takes `value`.
+    pub fn with_dependent(mut self, id: u32, other: u32, value: Value) -> Self {
+        self.dependents.entry(id).or_default().push((other, value));
+        self
+    }
+
+    /// Current stored value, for assertions.
+    pub fn value(&self, id: u32) -> Option<Value> {
+        self.values.borrow().get(&id).cloned()
+    }
+
+    /// Every write that succeeded, in order.
+    pub fn writes(&self) -> Vec<(u32, Value)> {
+        self.writes.borrow().clone()
+    }
+
+    /// Every read attempted, in order (including failed ones).
+    pub fn reads(&self) -> Vec<u32> {
+        self.reads.borrow().clone()
+    }
+
+    pub fn codes_written(&self) -> BTreeSet<u32> {
+        self.writes.borrow().iter().map(|(c, _)| *c).collect()
+    }
+}
+
+impl CameraPort for FakeCamera {
+    fn capabilities(&self) -> &[CapabilityInfo] {
+        &self.caps
+    }
+
+    fn read_capability(&self, id: u32) -> Result<Value, SdkError> {
+        self.reads.borrow_mut().push(id);
+        if let Some(f) = self.read_failures.get(&id) {
+            return Err(f.error("GetCapability", 0));
+        }
+        self.values.borrow().get(&id).cloned().ok_or(SdkError::SdkCall { call: "GetCapability", code: -126 })
+    }
+
+    fn write_capability(&self, id: u32, kind: u32, value: &Value) -> Result<(), SdkError> {
+        if let Some(f) = self.write_failures.get(&id) {
+            return Err(f.error("SetCapability", kind));
+        }
+        self.values.borrow_mut().insert(id, value.clone());
+        self.writes.borrow_mut().push((id, value.clone()));
+        if let Some(deps) = self.dependents.get(&id) {
+            for (other, v) in deps {
+                self.values.borrow_mut().insert(*other, v.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sdk::{OP_GET, OP_SET};
+    use serde_json::json;
+
+    fn cam() -> FakeCamera {
+        FakeCamera::new().with(1, OP_GET | OP_SET, json!(10)).with(2, OP_GET, json!("x"))
+    }
+
+    #[test]
+    fn reads_return_the_stored_value_and_are_recorded() {
+        let c = cam();
+        assert_eq!(c.read_capability(1).unwrap(), json!(10));
+        assert_eq!(c.read_capability(2).unwrap(), json!("x"));
+        assert_eq!(c.reads(), [1, 2]);
+        assert_eq!(c.capabilities().len(), 2);
+    }
+
+    #[test]
+    fn a_write_changes_what_the_next_read_returns_and_is_recorded() {
+        let c = cam();
+        c.write_capability(1, 0, &json!(11)).unwrap();
+        assert_eq!(c.read_capability(1).unwrap(), json!(11));
+        assert_eq!(c.writes(), [(1, json!(11))]);
+        assert_eq!(c.codes_written(), BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn an_unknown_or_valueless_capability_reads_as_the_sdk_does_for_an_unreadable_one() {
+        let c = cam().with_unreadable(3, OP_GET);
+        for id in [3, 99] {
+            match c.read_capability(id) {
+                Err(SdkError::SdkCall { code: -126, .. }) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn configured_failures_apply_to_reads_and_writes_separately() {
+        let c = cam().failing_read(1, Failure::Call(-106)).failing_write(2, Failure::UnsupportedWrite);
+        assert!(matches!(c.read_capability(1), Err(SdkError::SdkCall { code: -106, .. })));
+        assert!(c.write_capability(1, 0, &json!(1)).is_ok(), "a read failure does not block a write");
+        assert!(matches!(c.write_capability(2, 7, &json!(1)), Err(SdkError::UnsupportedWrite(7))));
+        assert_eq!(c.value(2), Some(json!("x")), "a failed write stores nothing");
+        assert_eq!(c.writes().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_read_is_still_recorded_as_attempted() {
+        let c = cam().failing_read(1, Failure::Call(-1));
+        let _ = c.read_capability(1);
+        assert_eq!(c.reads(), [1]);
+    }
+
+    #[test]
+    fn a_write_can_change_another_property() {
+        let c = cam().with_dependent(1, 2, json!("changed-by-1"));
+        c.write_capability(1, 0, &json!(11)).unwrap();
+        assert_eq!(c.value(2), Some(json!("changed-by-1")));
+        assert_eq!(c.codes_written(), BTreeSet::from([1]), "the dependent change is not a write");
+    }
+
+    #[test]
+    fn a_failed_write_applies_no_dependent_change() {
+        let c = cam().with_dependent(1, 2, json!("nope")).failing_write(1, Failure::Call(-125));
+        let _ = c.write_capability(1, 0, &json!(11));
+        assert_eq!(c.value(2), Some(json!("x")));
+    }
+}
