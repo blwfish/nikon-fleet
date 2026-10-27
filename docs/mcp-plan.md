@@ -467,6 +467,16 @@ snapshot" as meaningful, or filter them from the default lists.
 | Read-back in `ops`: transplant returns `side_effects`, restore returns `residual` (§5.5-5.6) | **done** (`1c83fcb`, `ops::readback::{side_effects, residual}`), and the whole apply/undo sequence is tested on a fake body (`48c9b90`) |
 | Capture gate evaluated in memory before the file is written (a failed gate leaves no file) | **done** in the CLI and GUI (`d786333`); `ops::capture` returns the stats and the failed reads |
 
+**Where the work stands (end of the 2026-10-27 session).** Everything the Phase 2 and 3 tools need
+below the MCP server exists and is tested on an in-memory body: capture (`ops::capture_snapshot`), check
+(`ops::check`), plan and apply (`ops::plan`, `ops::apply`, with digest, echoed summary, restore point,
+baseline gate, read-back and the four statuses), restore decisions and execution (`ops::restore`), the
+retention rules, the read-back comparisons, names-not-paths, the camera lock and the worker protocol. The
+hidden `worker` subcommand runs `capture`, `check`, `transplant-plan` and `transplant-apply`; the first
+three have been run read-only on a Z 9. **No transplant has been applied to hardware by this code, and
+no range has ever been written (F18).** Not written yet: worker ops for `restore_plan` / `restore_apply`
+and `list_cameras`, the `mcp/` crate and the parent-side watchdog.
+
 Phase 0 touches `src/main.rs`, `lib.rs` and `gui/`; the firmware session's earlier edits there are
 committed, so nothing blocks it.
 
@@ -622,7 +632,8 @@ To write for the MCP:
   was attached or woken" (replug or power-cycle, then capture several times).
 - Whether a **per-camera** lock is enough (F12 is inconclusive).
 - A reset-initialised open while another process is mid-*write* (not attempted).
-- Restore and transplant fidelity beyond one enum property; restore after a power cycle; range,
+- Restore and transplant fidelity beyond one enum property (F18: ranges were mistranslated until `2068310`, and a
+  real range write has never been run); restore after a power cycle; range,
   string and boolean property round trips.
 - The Z 9 B, and same-model pairs (`warn_if_ambiguous_pairing` says serial pairing there is by
   enumeration order). Until a way to verify pairing exists, the MCP refuses these (`ambiguous_pairing`, §3), so

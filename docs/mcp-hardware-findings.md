@@ -41,6 +41,7 @@ finding led to a code change, the commit is named.
 | F12 | Two bodies attached together | verified for selection; concurrency inconclusive |
 | F13 | Still unverified after all of the above | open |
 | F15 | Phase 0 live checks: another teardown hang, then the SDK stopped enumerating a bus-visible body | open |
+| F18 | Stepped ranges read `value` 0.0; the position is `value_index` (a transplant would have zeroed 33 settings) | fixed, unwritten to hardware |
 | F17 | The `worker` subcommand live: result delivered before a teardown hang; one SIGSEGV after a result | verified (one body) |
 | F16 | Targeted undo (`restore --only`) on the Z 9: restores the named property, leaves a later change alone | verified (two enum properties) |
 | F14 | Spike B: worker-style spawn, fd cleanliness, SIGKILL of a capture child | verified (small samples) |
@@ -473,6 +474,37 @@ redirected to a file by the shell (so the "channel" is a file, not a pipe), stdo
 
 Not covered: a worker killed before its result; two workers racing for the lock on real hardware (the busy
 path is tested without hardware); the Z6III; the MCP server as the parent.
+
+## F18. Stepped ranges: `value` is 0.0, the position is `value_index` (2026-10-27, Z 9 A)
+
+Found by the first live `transplant-plan`, a read-only dry run of the F16 snapshot onto the Z 9 itself.
+
+- **Symptom.** The plan reported three range properties (`WBTuneColorTempEx`, `MovieWBTuneColorTempEx`,
+  `MovieRecMicrophoneValue`) as *changing* in a copy of a body onto itself, when the F16 diff had shown only
+  two enums differing.
+- **Cause.** The SDK fills a range's `value` field (`lfValue`) only for continuous ranges. Of the 39 range
+  properties in a Z 9 capture, **33 are stepped and every one reads `value: 0.0`**; the setting is in
+  `value_index`. The other six only look consistent because their real value happens to be 0.0 (for
+  example `ExposureComp` at index 15 of -5..5). Examples: `WBTuneAuto` index 612 of 1225 over 0..1224,
+  `WBTuneColorTempEx` index 250 of 751 over 2500..10000 (5000 K), all of `WBTune*` and `MovieWBTune*`.
+- **Consequence had it shipped.** `translate_range` clamped the junk 0.0 into the target's bounds and derived
+  the index from that: `WBTuneAuto` 612 to 0, `WBTuneColorTempEx` 5000 K to 2500 K, for about 21 settings
+  (the `range-clamped` bucket of every earlier dry run), even from a body onto itself. The post-write check
+  read back the same junk field, so it would have passed wherever the intended value was 0. `restore` was
+  never affected (it writes back the whole stored struct). No range has ever been written to hardware: F10
+  wrote one enum.
+- **Fix** (`2068310`). `range_value()` derives a stepped range's number from its index; translation, the
+  per-write check, the plan's change bit and the apply read-back use it, and a translated range carries the
+  target's index and the value at that index. Re-run live: the same plan reports only the two real changes
+  and all 22 `range_clamped` outcomes as unchanged.
+- **Still unknown.** Which field the camera honours when a range is *written* (the SDK struct carries both
+  `lfValue` and `ulValueIndex`). The fix writes them coherently, which is correct either way, but a real range
+  write has not been run. This is the first thing to confirm on hardware, with a restore point and a
+  one-property plan, before any broad apply.
+
+Also from the same runs: the digest of two real plans taken minutes apart was identical, and the summary
+counts three boolean/string-valued properties as "would change" because they are written without a read
+(their current value is unknown), so it says 5 when the real number is 2.
 
 ## F13. Still unverified
 
