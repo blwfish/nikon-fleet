@@ -271,7 +271,9 @@ mod tests {
         );
         assert_eq!(restore_point_label(RestoreOp::PreRestore, "t").unwrap(), "mcp-restore-pre-restore-t");
         assert_eq!(restore_point_label(RestoreOp::PreRestore, ""), Err(LabelError::Empty));
-        assert!(matches!(restore_point_label(RestoreOp::PreRestore, "a/b"), Err(LabelError::BadCharacter { .. })));
+        for (bad, ch) in [("a/b", '/'), ("a b", ' '), ("a:b", ':'), ("a\\b", '\\')] {
+            assert_eq!(restore_point_label(RestoreOp::PreRestore, bad), Err(LabelError::BadCharacter { found: ch }), "{bad:?}");
+        }
     }
 
     #[test]
