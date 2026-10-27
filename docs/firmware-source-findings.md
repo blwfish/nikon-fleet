@@ -99,3 +99,49 @@ forbids redistribution — the archive must stay a private store, not be publish
 | Release notes "from X to Y" and the page sentence agree with the row | Cross-checked at parse time |
 | HTTP 200 + this HTML shape stays; no bot-blocking | `/en/products/` and `/en/download/fw/` (directory URLs) return 403; real pages return 200. No evidence of rate limiting; we send ≤1 request/model/run |
 | Licence permits personal archiving | Per the licence text read above (one copy + one backup); not legal advice |
+
+## 6. Embedded browser for the gate (`fleet firmware browse <model>`)
+
+The user's decision (2026-10-27): the human accepts the licence in an embedded browser window and
+the app captures the download. Constraints carried over from §3: no injected script, no reading
+`agreement-2.0.0.js`/`download-2.0.0.js` to reach the file, no acceptance on the user's behalf.
+The window loads the release page and the human does everything on it.
+
+**Stack** (verified against the crates, 2026-10-27): `wry 0.57.1` on `tao 0.37.2`, behind cargo
+feature `webview` (off by default). WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux.
+wry offers `with_download_started_handler(|url, &mut PathBuf| -> bool)` (assign the absolute save
+path, return false to deny) and `with_download_completed_handler(|url, Option<PathBuf>, ok|)`.
+Ephemeral profile: `with_incognito(true)` plus a `WebContext` data dir inside the staging dir
+(wry ignores the context when incognito is honoured; WebView2 < 101 ignores incognito).
+
+**Flow.** `firmware_source::latest()` → fresh staging dir (`nikon-fleet-fw-*` under the OS temp dir) →
+window on `page_url` → download goes to `staging/NN-<sanitised name>` → window closes itself on the
+first successful download → checks → `ingest_bundle` (hash, provenance, never-overwrite).
+Provenance records `method: browser-after-gate`, the real file URL as `source_url`, and the
+site's file name as `original_filename` (new additive field; `--from-file` now fills it too).
+
+**Checks.** (a) Navigation only to http/https (and `about:blank`). (b) A download is denied unless the
+last *firmware page* the user was on is the release being archived (so the Z 9 version can't be
+filed from the Z6III page). (c) After download, the file *name* is compared with the page's version:
+`V<MMmm>` token (`F-Z9-V0533W.exe` → 5.33) or `_<MMmm>.bin`; a different version is refused, no
+recognisable version is allowed but reported as "from the page only". (d) At most one capture.
+On any failure after a file was captured the staging dir is kept and named in the error.
+
+**Fallback.** No `webview` feature, or the web view can't start (Windows: WebView2 runtime missing —
+`wry` returns an error from `build`; Linux: no WebKitGTK/display) → the command prints the page URL and
+the `--from-file` steps and exits non-zero. The GUI (tkinter) button "Download from Nikon…" runs the
+CLI as a subprocess (the tao event loop needs the main thread, which eframe/tk own).
+
+**Verified / not verified** (2026-10-27, macOS 15 arm64):
+- Verified: the real WKWebView window opens, navigation and download callbacks fire, the download is
+  redirected into the staging dir and the window closes itself — `cargo run --example webview_smoke
+  --features webview` (a local page that starts its own download; it does not touch Nikon's gate).
+- Verified offline: the tracker, name sanitising, version-from-name rule, orchestration, provenance, the
+  never-overwrite and keep-staging-on-failure paths (fake window, `cargo test`).
+- NOT verified: Nikon's real licence page inside the web view (JS-built link, download triggered via
+  navigation vs. `blob:`/XHR — a `blob:` link would be refused by the http/https navigation rule or
+  not reach the download handler); the real downloaded file name/format (the `V<MMmm>` pattern is from
+  memory); Windows (WebView2) and Linux builds — neither was compiled here (a Windows `cargo check`
+  stops at `ring`'s C build on this Mac; the Linux branch uses wry's documented `build_gtk` call).
+- The file *contents* are not inspected: a self-extracting installer is archived as the opaque
+  `firmware.bin`, as with `--from-file`.

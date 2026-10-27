@@ -6,7 +6,10 @@
 mod config_parse;
 pub mod diff;
 pub mod firmware;
+pub mod firmware_browse;
 pub mod firmware_source;
+#[cfg(feature = "webview")]
+pub mod firmware_webview;
 pub mod maid_layer;
 pub mod ptp_usb;
 pub mod range_value;

@@ -46,6 +46,25 @@ scraper = "0.29.0"
 # Scratch directory for downloads before they are verified and archived (also used by tests).
 tempfile = "3"
 
+# URL parsing for the browse window's page/navigation checks (already in the tree via ureq).
+url = "2"
+
+# Embedded browser for `fleet firmware browse` (cargo feature `webview`).
+# tao = windowing/event loop, wry = the OS web view (WKWebView on macOS,
+# WebView2 on Windows, WebKitGTK on Linux). Off by default so plain CLI
+# builds don't pull in the GUI stack; see docs/firmware-source-findings.md §6.
+wry = { version = "0.57.1", optional = true }
+tao = { version = "0.37.2", optional = true }
+
+[features]
+webview = ["dep:wry", "dep:tao"]
+
+# Display-needed smoke test of the embedded browser against a local page that
+# triggers its own download (never Nikon's gate): `cargo run --example webview_smoke --features webview`.
+[[example]]
+name = "webview_smoke"
+required-features = ["webview"]
+
 [dev-dependencies]
 # Nicer assertion output for tests
 pretty_assertions = "1"

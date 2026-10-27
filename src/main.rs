@@ -20,6 +20,9 @@ use nikon_fleet::firmware::{
     archive_dir, archive_exists, format_size, ingest_bundle, list_archives, load_meta,
     model_slug, save_meta, sha256_file, IngestOutcome, Provenance, RetrievalMethod,
 };
+use nikon_fleet::firmware_browse::{
+    BrowserWindow, VersionEvidence, browse_firmware, nikon_is_release_page,
+};
 use nikon_fleet::firmware_source::{
     CameraRelation, DownloadAccess, FirmwareSource, FwVersion, HttpGet, ModelStatus, NikonDownloadCenter,
     Release, SourceError, UreqHttp, assess, camera_relation, fetch_direct,
@@ -202,6 +205,17 @@ enum FirmwareCmd {
     /// Archive newly published firmware (or ingest a bundle you downloaded
     /// yourself with --from-file) with provenance.
     Fetch(FirmwareFetchArgs),
+    /// Open the release's download page in an embedded browser so YOU accept
+    /// Nikon's licence and click Download; the file is captured, checked
+    /// against the page's version and archived with provenance. Needs a build
+    /// with `--features webview`; otherwise prints the manual steps.
+    Browse(FirmwareBrowseArgs),
+}
+
+#[derive(Args, Debug)]
+struct FirmwareBrowseArgs {
+    /// Model whose newest firmware to download, e.g. "Z 9" or "Z6_3".
+    model: String,
 }
 
 /// Models checked when no --model is given: the fleet bodies that have
@@ -1692,6 +1706,70 @@ fn cmd_firmware_fetch(data_dir: &Path, args: &FirmwareFetchArgs) -> Result<()> {
     Ok(())
 }
 
+/// Manual route, shown when the embedded browser is unavailable.
+fn print_manual_download(model: &str, page_url: &str) {
+    println!("Download it by hand instead:");
+    println!("  1. open {page_url}");
+    println!("  2. read and accept the licence there, choose your OS, and download the file");
+    println!("  3. fleet firmware fetch --model {model:?} --from-file <downloaded file>");
+}
+
+#[cfg(feature = "webview")]
+fn embedded_browser() -> impl BrowserWindow {
+    nikon_fleet::firmware_webview::EmbeddedBrowser
+}
+
+/// Stand-in so the command still exists (and explains itself) in builds
+/// without the `webview` feature.
+#[cfg(not(feature = "webview"))]
+fn embedded_browser() -> impl BrowserWindow {
+    use nikon_fleet::firmware_browse::{BrowseError, DownloadTracker};
+    struct NoBrowser;
+    impl BrowserWindow for NoBrowser {
+        fn run(&self, _: &str, _: &Path, _: std::rc::Rc<std::cell::RefCell<DownloadTracker>>) -> Result<(), BrowseError> {
+            Err(BrowseError::NotCompiledIn)
+        }
+    }
+    NoBrowser
+}
+
+fn cmd_firmware_browse(data_dir: &Path, args: &FirmwareBrowseArgs) -> Result<()> {
+    let source = NikonDownloadCenter::new();
+    let http = UreqHttp::new();
+    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    println!("Looking up the newest {} firmware…", args.model);
+    // The window opens only after the lookup succeeds; show where we're going first.
+    let release = source.latest(&args.model, &http)
+        .with_context(|| format!("could not determine the newest firmware for {:?}", args.model))?;
+    println!("  {} {} (released {}) — {}", release.model, release.version,
+        release.released.as_deref().unwrap_or("?"), release.page_url);
+    println!("A browser window will open on that page. Read and accept Nikon's licence and click Download");
+    println!("yourself — this tool never ticks \"I agree\" or presses Download for you.");
+
+    match browse_firmware(data_dir, &source, &http, &args.model, &embedded_browser(), nikon_is_release_page, &now) {
+        Ok(rep) => {
+            match &rep.outcome {
+                IngestOutcome::Archived(m) => print_archived(m),
+                IngestOutcome::AlreadyPresent(_) => println!("      already archived (identical bytes); nothing written"),
+            }
+            match &rep.evidence {
+                VersionEvidence::Confirms => println!("      file name {:?} agrees with version {}", rep.captured.original_name, rep.release.version),
+                VersionEvidence::Unknown => println!(
+                    "      NOTE: file name {:?} does not say which version it is, so the version {} comes from the page you were on only",
+                    rep.captured.original_name, rep.release.version),
+                VersionEvidence::Contradicts(_) => {} // refused earlier
+            }
+            Ok(())
+        }
+        Err(e) if e.browser_unavailable() => {
+            eprintln!("{e}");
+            print_manual_download(&args.model, &release.page_url);
+            bail!("embedded browser unavailable")
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn print_archived(m: &FirmwareMeta) {
     println!(
         "      archived {} {}  firmware/{}/{}/firmware.bin  ({}, sha256 {})",
@@ -1991,6 +2069,7 @@ fn main() -> Result<()> {
             FirmwareCmd::Check(args) => cmd_firmware_check(&cli.data_dir, args),
             FirmwareCmd::Latest(args) => cmd_firmware_latest(&cli.data_dir, args),
             FirmwareCmd::Fetch(args) => cmd_firmware_fetch(&cli.data_dir, args),
+            FirmwareCmd::Browse(args) => cmd_firmware_browse(&cli.data_dir, args),
         },
     }
 }
