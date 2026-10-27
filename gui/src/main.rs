@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use eframe::egui;
 use nikon_fleet::firmware::model_slug;
 use nikon_fleet::maid_layer::MaidLayerConfig;
+use nikon_fleet::ops::baseline::{GateOutcome, describe_failure, gate as baseline_gate};
 use nikon_fleet::ops::list::is_plain_name_component;
 use nikon_fleet::ptp_usb::{self, FtpProfile};
 use nikon_fleet::camera_lock::CameraLock;
@@ -820,6 +821,15 @@ fn do_snapshot(schema: &MaidLayerConfig, data_dir: &Path, serial: &str, label: &
                 .unwrap_or_else(|| format!("cap_{:#x}", cap.id));
             snap.insert(name, cap.id, val);
         }
+    }
+
+    // Judge completeness before anything is written. No override here: a
+    // body in an unusual state can be captured with the CLI's --allow-partial.
+    if let GateOutcome::Failed { missing } = baseline_gate(&snap) {
+        return Err(format!(
+            "{} Nothing was saved. Retry, or capture with `nikon-fleet snapshot --allow-partial`.",
+            describe_failure(&snap, &missing)
+        ));
     }
 
     let dir = data_dir.join("snapshots");

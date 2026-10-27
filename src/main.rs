@@ -94,6 +94,11 @@ enum Cmd {
     #[command(subcommand)]
     Ref(RefCmd),
 
+    /// Manage the per-model capture baselines that decide whether a capture
+    /// is complete (docs/mcp-plan.md §5.5).
+    #[command(subcommand)]
+    Baseline(BaselineCmd),
+
     /// Diff two snapshot files.
     Diff(DiffArgs),
 
@@ -147,6 +152,29 @@ struct SnapshotArgs {
     /// Optional label, e.g. "wedding-baseline".
     #[arg(long)]
     label: Option<String>,
+    /// Save the capture even if it is missing capabilities the model's
+    /// baseline reads (a body in an unusual state, e.g. no card). Without
+    /// this an incomplete capture is refused and nothing is written.
+    #[arg(long)]
+    allow_partial: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum BaselineCmd {
+    /// Seed the baseline for a snapshot's model from that (known-good)
+    /// snapshot: its properties become the set of capabilities every later
+    /// capture of the model must be able to read. Rebuild afterwards: baselines
+    /// are embedded into the binary.
+    Seed {
+        snapshot_path: PathBuf,
+        /// Directory to write `{model}.json` into.
+        #[arg(long, default_value = "baselines")]
+        out_dir: PathBuf,
+        /// Replace an existing baseline for this model (needed after a
+        /// firmware update).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -180,6 +208,10 @@ struct DiffArgs {
 struct CheckArgs {
     #[arg(long)]
     serial: Option<String>,
+    /// Compare even if the live capture is missing capabilities the model's
+    /// baseline reads. The diff will then show them as removed.
+    #[arg(long)]
+    allow_partial: bool,
 }
 
 #[derive(Args, Debug)]
@@ -867,6 +899,81 @@ fn warn_if_unknown_schema(unknown_schema: usize, schema_path: &Path) {
     }
 }
 
+/// Judge a freshly captured snapshot against its model's baseline, in memory,
+/// before anything is written. An incomplete capture is an error unless
+/// `allow_partial`; a capture the gate cannot judge is noted on stderr and
+/// allowed (a new model has to be capturable to be baselined).
+fn apply_capture_gate(snap: &Snapshot, allow_partial: bool) -> Result<()> {
+    use nikon_fleet::ops::baseline::{GateOutcome, NoBaselineReason, describe_failure, gate};
+    match gate(snap) {
+        GateOutcome::Passed => Ok(()),
+        GateOutcome::Failed { missing } => {
+            let text = describe_failure(snap, &missing);
+            if allow_partial {
+                eprintln!("warning: {text} Continuing because --allow-partial was given.");
+                Ok(())
+            } else {
+                bail!("{text}\nNothing was written. Re-run the capture, or pass --allow-partial to keep it anyway.")
+            }
+        }
+        GateOutcome::NoBaseline(NoBaselineReason::UnknownModel) => {
+            eprintln!(
+                "note: no baseline for {:?}; this capture was not checked for completeness \
+                 (`nikon-fleet baseline seed <snapshot>` makes one).",
+                snap.camera.model
+            );
+            Ok(())
+        }
+        GateOutcome::NoBaseline(NoBaselineReason::FirmwareChanged { baseline, capture }) => {
+            eprintln!(
+                "note: firmware {capture} differs from the {:?} baseline's {baseline} and the readable set differs \
+                 too; this capture was not checked for completeness (re-seed the baseline for the new firmware).",
+                snap.camera.model
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Write the baseline seeded from `snapshot_path` to `out_dir/{model_slug}.json`.
+/// Refuses to replace an existing file unless `force`.
+fn seed_baseline(snapshot_path: &Path, out_dir: &Path, force: bool) -> Result<PathBuf> {
+    use nikon_fleet::ops::baseline::Baseline;
+    let snap = Snapshot::load_from_file(snapshot_path)
+        .with_context(|| format!("loading {}", snapshot_path.display()))?;
+    let from = snapshot_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let baseline = Baseline::from_snapshot(&snap, &from)?;
+    let slug = model_slug(&baseline.model);
+    if !is_safe_path_component(&slug) {
+        bail!("model {:?} does not make a usable file name", baseline.model);
+    }
+    ensure_dir(out_dir)?;
+    let path = out_dir.join(format!("{slug}.json"));
+    let json = baseline.to_pretty_json()?;
+    if force {
+        fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+    } else {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("{} (already exists? pass --force to replace it)", path.display()))?;
+        f.write_all(json.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(path)
+}
+
+fn cmd_baseline(sub: &BaselineCmd) -> Result<()> {
+    match sub {
+        BaselineCmd::Seed { snapshot_path, out_dir, force } => {
+            let path = seed_baseline(snapshot_path, out_dir, *force)?;
+            println!("Wrote {}\nBaselines are embedded at build time: rebuild to use it.", path.display());
+            Ok(())
+        }
+    }
+}
+
 fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &SnapshotArgs, no_usb_reset: bool) -> Result<()> {
     let mut sdk = open_sdk(bundle, no_usb_reset)?;
     let devices = sdk.devices()?;
@@ -912,6 +1019,9 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
         stats.read_ok, stats.read_err, stats.skipped_no_get, stats.unknown_schema
     );
     warn_if_unknown_schema(stats.unknown_schema, schema_path);
+
+    // Judge completeness in memory, before anything is written.
+    apply_capture_gate(&snap, args.allow_partial)?;
 
     // Save under snapshots/.
     let dir = snapshots_dir(data_dir);
@@ -1096,6 +1206,7 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     live.label = Some("live".into());
     let stats = capture_capabilities(&device, &name_lookup, &mut live);
     warn_if_unknown_schema(stats.unknown_schema, schema_path);
+    apply_capture_gate(&live, args.allow_partial)?;
 
     // Reference for this body.
     let ref_path = references_dir(data_dir).join(reference_filename(&target.name, &serial));
@@ -2211,6 +2322,7 @@ fn main() -> Result<()> {
         Cmd::Ls(args) => cmd_ls(&cli.data_dir, args),
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
+        Cmd::Baseline(sub) => cmd_baseline(sub),
         Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, args, no_reset),
         Cmd::Transplant(args) => cmd_transplant(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
         Cmd::VendorRead(args) => cmd_vendor_read(args),
@@ -2780,6 +2892,106 @@ mod tests {
     fn cmd_ref_list_missing_dir_ok_empty() {
         let data_dir = TempDir::new().unwrap();
         assert!(cmd_ref(data_dir.path(), &RefCmd::List { json: false }).is_ok());
+    }
+
+    // ── capture gate and baseline seeding ────────────────────────────────
+
+    fn capture_from_builtin(model: &str, drop_first: usize) -> Snapshot {
+        let b = nikon_fleet::ops::baseline::baseline_for(model).unwrap();
+        let mut s = Snapshot::new(
+            Camera { model: model.into(), serial: "1".into(), firmware: b.firmware.clone() },
+            Transport::Usb,
+            "2026-10-27T12:00:00Z".into(),
+        );
+        for c in b.readable.iter().skip(drop_first) {
+            s.insert(c.name.clone(), c.code, serde_json::json!(1));
+        }
+        s
+    }
+
+    #[test]
+    fn capture_gate_passes_a_complete_capture_and_refuses_an_incomplete_one() {
+        for model in ["Z 9", "Z6_3"] {
+            assert!(apply_capture_gate(&capture_from_builtin(model, 0), false).is_ok(), "{model} complete");
+            let err = apply_capture_gate(&capture_from_builtin(model, 1), false).unwrap_err().to_string();
+            assert!(err.contains("incomplete") && err.contains("Nothing was written") && err.contains("--allow-partial"), "{err}");
+            assert!(err.contains("1 capability "), "exactly one missing: {err}");
+        }
+    }
+
+    #[test]
+    fn capture_gate_allow_partial_lets_an_incomplete_capture_through() {
+        assert!(apply_capture_gate(&capture_from_builtin("Z 9", 1), true).is_ok());
+        // Nearly nothing read (the ok=18 shape from F2) is still only allowed on request.
+        let tiny = capture_from_builtin("Z 9", 178);
+        assert!(apply_capture_gate(&tiny, false).is_err());
+        assert!(apply_capture_gate(&tiny, true).is_ok());
+    }
+
+    #[test]
+    fn capture_gate_does_not_judge_an_unknown_model_or_a_changed_firmware() {
+        let mut unknown = capture_from_builtin("Z 9", 0);
+        unknown.camera.model = "Z 5".into();
+        unknown.properties.clear();
+        assert!(apply_capture_gate(&unknown, false).is_ok(), "no baseline: allowed, with a note");
+        let mut newer = capture_from_builtin("Z 9", 5);
+        newer.camera.firmware = "9.99".into();
+        assert!(apply_capture_gate(&newer, false).is_ok(), "other firmware and a different set: not blamed");
+    }
+
+    fn write_seed_source(dir: &Path, model: &str, firmware: &str, codes: &[u32]) -> PathBuf {
+        let mut s = Snapshot::new(
+            Camera { model: model.into(), serial: "1".into(), firmware: firmware.into() },
+            Transport::Usb,
+            "2026-10-27T12:00:00Z".into(),
+        );
+        for c in codes {
+            s.insert(format!("kNkMAIDCapability_C{c}"), *c, serde_json::json!(1));
+        }
+        let p = dir.join("src_snapshot.json");
+        s.save_to_file(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn seed_baseline_writes_model_slug_json_that_loads_back() {
+        let d = TempDir::new().unwrap();
+        let src = write_seed_source(d.path(), "Z 9", "5.31", &[3, 1, 2]);
+        let out = d.path().join("baselines");
+        let path = seed_baseline(&src, &out, false).unwrap();
+        assert_eq!(path, out.join("Z_9.json"));
+        let b = nikon_fleet::ops::baseline::Baseline::from_json(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((b.model.as_str(), b.firmware.as_str(), b.readable.len()), ("Z 9", "5.31", 3));
+        assert_eq!(b.seeded_from, "src_snapshot.json");
+    }
+
+    #[test]
+    fn seed_baseline_refuses_to_replace_without_force_and_leaves_the_file_alone() {
+        let d = TempDir::new().unwrap();
+        let out = d.path().join("baselines");
+        let first = write_seed_source(d.path(), "Z 9", "5.31", &[1, 2]);
+        let path = seed_baseline(&first, &out, false).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let second = write_seed_source(d.path(), "Z 9", "5.40", &[1, 2, 3]);
+        let err = seed_baseline(&second, &out, false).unwrap_err();
+        assert!(format!("{err:#}").contains("--force"), "{err:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        seed_baseline(&second, &out, true).unwrap();
+        let replaced = fs::read_to_string(&path).unwrap();
+        assert!(replaced.contains("5.40") && replaced != before);
+    }
+
+    #[test]
+    fn seed_baseline_refuses_a_useless_or_unsafe_source() {
+        let d = TempDir::new().unwrap();
+        let out = d.path().join("baselines");
+        let empty = write_seed_source(d.path(), "Z 9", "5.31", &[]);
+        assert!(seed_baseline(&empty, &out, false).is_err(), "no readable capabilities");
+        let no_fw = write_seed_source(d.path(), "Z 9", "", &[1]);
+        assert!(seed_baseline(&no_fw, &out, false).is_err(), "no firmware");
+        let hostile = write_seed_source(d.path(), "../evil", "1.00", &[1]);
+        assert!(seed_baseline(&hostile, &out, false).is_err(), "model that is not a file name");
+        assert!(!d.path().join("evil.json").exists() && !out.join("evil.json").exists());
     }
 
     // ── looks_like_bcd_version ───────────────────────────────────────────
