@@ -9,6 +9,7 @@ use eframe::egui;
 use nikon_fleet::firmware::model_slug;
 use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::ptp_usb::{self, FtpProfile};
+use nikon_fleet::camera_lock::CameraLock;
 use nikon_fleet::sdk::{DeviceInfo, Sdk, OP_GET, UsbCameraInfo, pair_devices, usb_camera_list};
 use nikon_fleet::snapshot::{Camera, Snapshot, SnapshotSummary, Transport};
 use nikon_fleet::vendor_argv::{vendor_read_argv, vendor_write_ftp_argv};
@@ -736,6 +737,9 @@ fn do_discover() -> Result<Evt, String> {
             path.display()
         ));
     }
+    // Held until this function returns (declared before `sdk`, so dropped
+    // after it): one SDK session at a time across the CLI, GUI and MCP.
+    let _camera_lock = CameraLock::acquire().map_err(|e| e.to_string())?;
     let mut sdk = Sdk::open(path).map_err(|e| e.to_string())?;
     // Skip USB reset in the GUI: resetting cameras from a background thread
     // fires USB disconnect/reconnect events through the main AppKit run loop,
@@ -766,6 +770,8 @@ fn do_discover() -> Result<Evt, String> {
 }
 
 fn do_snapshot(schema: &MaidLayerConfig, data_dir: &Path, serial: &str, label: &str) -> Result<Evt, String> {
+    // See do_discover: lock first, released after the SDK is dropped.
+    let _camera_lock = CameraLock::acquire().map_err(|e| e.to_string())?;
     let mut sdk = Sdk::open(Path::new(SDK_PATH)).map_err(|e| e.to_string())?;
     sdk.initialize_no_usb_reset().map_err(|e| e.to_string())?;
     let devices = sdk.devices().map_err(|e| e.to_string())?;

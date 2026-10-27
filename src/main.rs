@@ -14,6 +14,7 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use nikon_fleet::camera_lock::CameraLock;
 use nikon_fleet::diff::{Diff, DiffOptions, diff_with_schema, is_volatile};
 use nikon_fleet::firmware::{
     FirmwareError, FirmwareMeta, FIRMWARE_META_FORMAT_VERSION,
@@ -691,7 +692,33 @@ fn cmd_ref(data_dir: &Path, sub: &RefCmd) -> Result<()> {
 
 // OP_GET and OP_SET are re-exported from nikon_fleet::sdk.
 
-fn open_sdk(bundle_path: &Path, no_usb_reset: bool) -> Result<Sdk> {
+/// An initialised SDK plus the cross-process camera lock that serialises SDK
+/// sessions (`nikon_fleet::camera_lock`). The lock is released only after the
+/// SDK is dropped: fields drop in declaration order, so `sdk` must stay first.
+struct SdkSession {
+    sdk: Sdk,
+    _camera_lock: CameraLock,
+}
+
+impl std::ops::Deref for SdkSession {
+    type Target = Sdk;
+    fn deref(&self) -> &Sdk {
+        &self.sdk
+    }
+}
+
+impl std::ops::DerefMut for SdkSession {
+    fn deref_mut(&mut self) -> &mut Sdk {
+        &mut self.sdk
+    }
+}
+
+/// Take the camera lock, then load and initialise the SDK. The lock comes
+/// first because `InitializeSDK` (and the USB reset before it) is exactly the
+/// step that must not overlap another session (F2, F3 in
+/// docs/mcp-hardware-findings.md). Contention fails at once with
+/// "camera busy"; there is no wait or retry.
+fn open_sdk(bundle_path: &Path, no_usb_reset: bool) -> Result<SdkSession> {
     if !bundle_path.exists() {
         bail!(
             "SDK bundle not found at {}.\n\
@@ -699,6 +726,7 @@ fn open_sdk(bundle_path: &Path, no_usb_reset: bool) -> Result<Sdk> {
             bundle_path.display()
         );
     }
+    let camera_lock = CameraLock::acquire()?;
     let mut sdk = Sdk::open(bundle_path)
         .with_context(|| format!("loading SDK from {}", bundle_path.display()))?;
     if no_usb_reset {
@@ -706,7 +734,7 @@ fn open_sdk(bundle_path: &Path, no_usb_reset: bool) -> Result<Sdk> {
     } else {
         sdk.initialize().context("InitializeSDK")?;
     }
-    Ok(sdk)
+    Ok(SdkSession { sdk, _camera_lock: camera_lock })
 }
 
 fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs, no_usb_reset: bool) -> Result<()> {
