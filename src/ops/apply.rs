@@ -43,7 +43,7 @@ use crate::ops::plan::{PlanInput, digest, summary_text, would_change};
 use crate::ops::port::CameraPort;
 use crate::ops::readback::{SideEffects, side_effects};
 use crate::ops::retention::{self, DataDirFull, LabelError, RestoreOp};
-use crate::snapshot::{Camera, Snapshot, SnapshotError, Transport};
+use crate::snapshot::{Snapshot, SnapshotError, Transport};
 use crate::transplant::{CodeNameGuard, SkipReason, TransplantOutcome, numbers_equal, range_value, transplant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -373,6 +373,7 @@ mod tests {
     use crate::ops::plan::{PlanReport, build_plan};
     use crate::ops::port::{FakeCamera, Failure};
     use crate::sdk::{OP_GET, OP_SET};
+    use crate::snapshot::Camera;
     use crate::test_support::parse_config;
     use crate::transplant::TransplantOptions;
     use serde_json::json;

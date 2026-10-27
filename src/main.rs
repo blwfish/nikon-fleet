@@ -26,13 +26,13 @@ use nikon_fleet::firmware_browse::{
     BrowserWindow, VersionEvidence, browse_firmware, nikon_is_release_page,
 };
 use nikon_fleet::firmware_source::{
-    CameraRelation, DownloadAccess, FirmwareSource, FwVersion, HttpGet, ModelStatus, NikonDownloadCenter,
-    Release, UreqHttp, assess, camera_relation, fetch_direct,
+    CameraRelation, DownloadAccess, FirmwareSource, FwVersion, ModelStatus, NikonDownloadCenter,
+    Release, UreqHttp, camera_relation, fetch_direct,
 };
 use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::ops::cameras::duplicate_models;
 use nikon_fleet::ops::capture::{self as ops_capture, CaptureStats};
-use nikon_fleet::ops::firmware_latest::{LatestReport, ModelSurvey, survey_json};
+use nikon_fleet::ops::firmware_latest::{LatestReport, ModelSurvey, survey_json, survey_models, watch_models};
 use nikon_fleet::ops::paths::is_safe_path_component;
 use nikon_fleet::ops::list::{EntryState, Listing, list_dir, reference_filename};
 use nikon_fleet::ops::restore;
@@ -274,7 +274,6 @@ struct FirmwareBrowseArgs {
 
 /// Models checked when no --model is given: the fleet bodies that have
 /// newer firmware to watch (Z 5 is supported by the source but not default).
-const DEFAULT_WATCH_MODELS: &[&str] = &["Z 9", "Z6_3"];
 
 #[derive(Args, Debug)]
 struct FirmwareLatestArgs {
@@ -1561,38 +1560,6 @@ fn cmd_firmware_check(data_dir: &Path, args: &FirmwareCheckArgs) -> Result<()> {
 
 // ── Firmware source: latest / fetch ──────────────────────────────────────
 
-
-fn watch_models(requested: &[String]) -> Vec<String> {
-    if requested.is_empty() {
-        DEFAULT_WATCH_MODELS.iter().map(|m| m.to_string()).collect()
-    } else {
-        requested.to_vec()
-    }
-}
-
-fn survey_models(
-    data_dir: &Path,
-    models: &[String],
-    source: &dyn FirmwareSource,
-    http: &dyn HttpGet,
-) -> Vec<ModelSurvey> {
-    let cameras = usb_camera_list();
-    models.iter().map(|model| {
-        let release = source.latest(model, http);
-        let mut archived = Vec::new();
-        let mut archive_notes = Vec::new();
-        for e in list_archives(data_dir, Some(model)) {
-            match FwVersion::parse_canonical(&e.version) {
-                Ok(v) => archived.push(v),
-                Err(err) => archive_notes.push(format!("archive entry {:?} ignored: {err}", e.version)),
-            }
-        }
-        let status = assess(&release, &archived);
-        let cams = cameras.iter().filter(|c| &c.model == model)
-            .map(|c| (c.serial.clone(), c.firmware.clone())).collect();
-        ModelSurvey { model: model.clone(), release, archived, archive_notes, cameras: cams, status }
-    }).collect()
-}
 
 fn print_survey(s: &ModelSurvey) {
     match (&s.status, &s.release) {

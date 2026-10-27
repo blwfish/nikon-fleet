@@ -4,9 +4,14 @@
 
 use serde::Serialize;
 
+use std::path::Path;
+
+use crate::firmware::list_archives;
 use crate::firmware_source::{
-    CameraRelation, DownloadAccess, FwVersion, ModelStatus, Release, SourceError, camera_relation,
+    CameraRelation, DownloadAccess, FirmwareSource, FwVersion, HttpGet, ModelStatus, Release, SourceError, assess,
+    camera_relation,
 };
+use crate::sdk::usb_camera_list;
 
 /// Everything we know about one model before deciding what to do.
 pub struct ModelSurvey {
@@ -149,6 +154,43 @@ pub fn survey_json(s: &ModelSurvey) -> LatestModel {
         warnings,
     }
 }
+
+/// The models watched when none are named.
+pub const DEFAULT_WATCH_MODELS: &[&str] = &["Z 9", "Z6_3"];
+
+/// The models to survey: those named, or the default watch list.
+pub fn watch_models(requested: &[String]) -> Vec<String> {
+    if requested.is_empty() {
+        DEFAULT_WATCH_MODELS.iter().map(|m| m.to_string()).collect()
+    } else {
+        requested.to_vec()
+    }
+}
+
+pub fn survey_models(
+    data_dir: &Path,
+    models: &[String],
+    source: &dyn FirmwareSource,
+    http: &dyn HttpGet,
+) -> Vec<ModelSurvey> {
+    let cameras = usb_camera_list();
+    models.iter().map(|model| {
+        let release = source.latest(model, http);
+        let mut archived = Vec::new();
+        let mut archive_notes = Vec::new();
+        for e in list_archives(data_dir, Some(model)) {
+            match FwVersion::parse_canonical(&e.version) {
+                Ok(v) => archived.push(v),
+                Err(err) => archive_notes.push(format!("archive entry {:?} ignored: {err}", e.version)),
+            }
+        }
+        let status = assess(&release, &archived);
+        let cams = cameras.iter().filter(|c| &c.model == model)
+            .map(|c| (c.serial.clone(), c.firmware.clone())).collect();
+        ModelSurvey { model: model.clone(), release, archived, archive_notes, cameras: cams, status }
+    }).collect()
+}
+
 
 #[cfg(test)]
 mod tests {
