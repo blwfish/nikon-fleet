@@ -62,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde_json::{Value, json};
 
 use crate::maid_layer::MaidLayerConfig;
-use crate::sdk::{CapabilityInfo, Device, OP_SET, SdkError};
+use crate::sdk::{CapabilityInfo, Device, OP_GET, OP_SET, SdkError};
 use crate::snapshot::PropertyEntry;
 
 const PACKED_STRING_ELEM_TYPE: u64 = 7;
@@ -251,6 +251,11 @@ pub enum SkipReason {
     /// option on both bodies, and the user did not opt this property in.
     /// `proposed` is what it would have set (`code 5 (#2), was code 3 (#1)`).
     RawCodeUnconfirmed { proposed: String },
+    /// A numeric scalar copied as-is, which is no more self-describing than a
+    /// raw code (`WBAutoType` 3 on one body need not mean 3 on another, F9),
+    /// would change the target, and the user did not opt this property in.
+    /// `proposed` is `5, was 3`, or `5 (target's current value unknown)`.
+    LiteralUnconfirmed { proposed: String },
 }
 
 impl std::fmt::Display for SkipReason {
@@ -276,6 +281,11 @@ impl std::fmt::Display for SkipReason {
             SkipReason::RawCodeUnconfirmed { proposed } => write!(
                 f,
                 "matched only by raw numeric code, which is not known to mean the same option on both bodies; \
+                 would set {proposed}. Not written unless you opt this property in (--allow-raw-code)"
+            ),
+            SkipReason::LiteralUnconfirmed { proposed } => write!(
+                f,
+                "numeric value copied as-is, which is not known to mean the same on both bodies; \
                  would set {proposed}. Not written unless you opt this property in (--allow-raw-code)"
             ),
             SkipReason::AmbiguousLabel { label, source_count, target_count } => write!(
@@ -615,16 +625,19 @@ pub fn never_copied(code: u32) -> Option<&'static str> {
 /// Per-run choices that make `transplant` do more than its safe default.
 #[derive(Debug, Clone, Default)]
 pub struct TransplantOptions {
-    /// Full property names (as keyed in the snapshot) whose raw-code enum
-    /// match the user has explicitly accepted. Everything else matched only by
-    /// raw numeric code is skipped when it would change the target.
+    /// Full property names (as keyed in the snapshot) the user has explicitly
+    /// accepted: raw-code enum matches and numeric literal scalars, both of
+    /// which rest on both bodies giving the same number the same meaning.
+    /// Everything else of those kinds is skipped when it would change the
+    /// target. (The field and flag keep their original `raw_code` name.)
     pub allow_raw_code: BTreeSet<String>,
 }
 
 /// Turn `--allow-raw-code` arguments into full property names, checked
-/// against the snapshot being transplanted. Names are accepted with or without
-/// the `kNkMAIDCapability_` prefix. An unknown name, or one that is not a
-/// raw-code enum (so the flag could do nothing for it), is an error: a typo
+/// against the snapshot being transplanted (a raw-code enum or a numeric
+/// scalar, the two kinds the opt-in gates). Names are accepted with or without
+/// the `kNkMAIDCapability_` prefix. An unknown name, or one of any other kind
+/// (so the flag could do nothing for it), is an error: a typo
 /// silently opting nothing in would look exactly like a safe run.
 pub fn resolve_allow_raw_code(
     requested: &[String],
@@ -639,10 +652,10 @@ pub fn resolve_allow_raw_code(
         };
         let is_raw_enum = is_enum_shape(&prop.value)
             && prop.value.get("elem_type").and_then(Value::as_u64) != Some(PACKED_STRING_ELEM_TYPE);
-        if !is_raw_enum {
+        if !is_raw_enum && !prop.value.is_number() {
             return Err(format!(
-                "--allow-raw-code {r:?}: {full} is not a raw-code enum (it is a label enum, a range or a scalar), \
-                 so the flag does not apply to it"
+                "--allow-raw-code {r:?}: {full} is not a raw-code enum or a numeric scalar (it is a label enum, \
+                 a range, a string or a boolean), so the flag does not apply to it"
             ));
         }
         out.insert(full);
@@ -669,6 +682,51 @@ fn raw_code_gate(
         Some(c) if c.is_unchanged() => Ok(()),
         Some(c) => Err(SkipReason::RawCodeUnconfirmed { proposed: c.to_string() }),
         None => Err(SkipReason::RawCodeUnconfirmed { proposed: "(target's current value unknown)".to_string() }),
+    }
+}
+
+/// Numeric equality that does not depend on the JSON number's spelling: `3`
+/// and `3.0` are the same value, and two integers beyond 2^53 are compared
+/// as integers, not rounded through `f64`.
+fn numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> bool {
+    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+        return x == y;
+    }
+    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
+        return x == y;
+    }
+    matches!((a.as_f64(), b.as_f64()), (Some(x), Some(y)) if x == y)
+}
+
+/// The numeric-literal gate, device-free like [`raw_code_gate`].
+///
+/// An integer is no more self-describing than a raw code (F9: `WBAutoType`,
+/// `MovieRecMicrophone`, `ElectronicVR`), so a numeric scalar copied as-is is
+/// not written when it would change the target, unless opted in. A value equal
+/// to the target's current one is a no-op and passes. Strings and booleans
+/// describe themselves and are never gated. `target_live` is `None` when the
+/// current value could not be read (unreadable capability, failed read): the
+/// change cannot be ruled out, so it is treated as one.
+fn literal_gate(
+    strategy: Strategy,
+    source: &Value,
+    target_live: Option<&Value>,
+    opted_in: bool,
+) -> Result<(), SkipReason> {
+    let Some(src) = source.as_number().filter(|_| strategy == Strategy::Literal) else {
+        return Ok(());
+    };
+    if opted_in {
+        return Ok(());
+    }
+    match target_live {
+        Some(Value::Number(cur)) if numbers_equal(src, cur) => Ok(()),
+        Some(cur) => Err(SkipReason::LiteralUnconfirmed {
+            proposed: format!("{src}, was {}", truncate_with_marker(cur.to_string(), 80)),
+        }),
+        None => Err(SkipReason::LiteralUnconfirmed {
+            proposed: format!("{src} (target's current value unknown)"),
+        }),
     }
 }
 
@@ -760,8 +818,8 @@ pub fn transplant(
     properties
         .iter()
         .map(|(name, prop)| {
-            let allowed = options.allow_raw_code.contains(name);
-            match transplant_one(device, &cap_map, guard, prop, allowed, dry_run) {
+            let opted_in = options.allow_raw_code.contains(name);
+            match transplant_one(device, &cap_map, guard, prop, opted_in, dry_run) {
                 Ok((strategy, choice)) => TransplantOutcome { name: name.clone(), code: prop.code, result: Ok(strategy), choice },
                 Err(reason) => TransplantOutcome { name: name.clone(), code: prop.code, result: Err(reason), choice: None },
             }
@@ -792,16 +850,18 @@ fn precheck<'a>(
 
 /// Everything `transplant_one` decides between reading the target and writing
 /// it, with no device in sight: translate the source value, describe the
-/// resolved option, and apply the raw-code gate. Split out so that sequence
-/// (in particular that the gate is applied at all) is unit-testable.
+/// resolved option, and apply the raw-code and numeric-literal gates (one
+/// opt-in, `opted_in`, covers both). Split out so that sequence (in particular
+/// that the gates are applied at all) is unit-testable.
 fn plan_property(
     source_value: &Value,
     target_live: Option<&Value>,
-    raw_code_allowed: bool,
+    opted_in: bool,
 ) -> Result<(Value, Strategy, Option<ResolvedChoice>), SkipReason> {
     let (translated, strategy) = translate_value(source_value, target_live)?;
     let choice = target_live.and_then(|l| resolve_choice(&translated, l, strategy));
-    raw_code_gate(strategy, choice.as_ref(), raw_code_allowed)?;
+    raw_code_gate(strategy, choice.as_ref(), opted_in)?;
+    literal_gate(strategy, source_value, target_live, opted_in)?;
     Ok((translated, strategy, choice))
 }
 
@@ -810,7 +870,7 @@ fn transplant_one(
     cap_map: &HashMap<u32, &CapabilityInfo>,
     guard: &CodeNameGuard,
     prop: &PropertyEntry,
-    raw_code_allowed: bool,
+    opted_in: bool,
     dry_run: bool,
 ) -> Result<(Strategy, Option<ResolvedChoice>), SkipReason> {
     let cap = precheck(cap_map, guard, prop)?;
@@ -818,11 +878,16 @@ fn transplant_one(
     let needs_live_read = is_enum_shape(&prop.value) || is_range_shape(&prop.value);
     let live = if needs_live_read {
         Some(device.read_capability(prop.code).map_err(|e| SkipReason::TargetReadFailed(truncate_with_marker(e.to_string(), MAX_ERROR_MESSAGE_LEN)))?)
+    } else if prop.value.is_number() && cap.operations & OP_GET != 0 {
+        // The numeric-literal gate needs the target's current value to tell a
+        // no-op from a change. A failed read is not a skip: the gate treats an
+        // unknown current value as a change, and an opted-in write still goes.
+        device.read_capability(prop.code).ok()
     } else {
         None
     };
 
-    let (translated, strategy, choice) = plan_property(&prop.value, live.as_ref(), raw_code_allowed)?;
+    let (translated, strategy, choice) = plan_property(&prop.value, live.as_ref(), opted_in)?;
 
     if !dry_run {
         match device.write_capability(prop.code, cap.kind, &translated) {
@@ -1388,6 +1453,162 @@ mod tests {
         assert_eq!(plan_property(&json!("© me"), None, false).unwrap().1, Strategy::Literal);
         let range = json!({"value": 1.0, "default": 0.0, "value_index": 1, "default_index": 0, "lower": 0.0, "upper": 2.0, "steps": 3});
         assert_eq!(plan_property(&range, Some(&range), false).unwrap().1, Strategy::RangeClamped);
+    }
+
+    // ── numeric-literal gate ─────────────────────────────────────────────
+
+    fn lit_gate(src: Value, live: Option<Value>, opted_in: bool) -> Result<(), SkipReason> {
+        literal_gate(Strategy::Literal, &src, live.as_ref(), opted_in)
+    }
+
+    fn proposed(r: Result<(), SkipReason>) -> String {
+        match r {
+            Err(SkipReason::LiteralUnconfirmed { proposed }) => proposed,
+            other => panic!("expected LiteralUnconfirmed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn literal_gate_blocks_a_changing_number_and_names_both_values() {
+        assert_eq!(proposed(lit_gate(json!(5), Some(json!(3)), false)), "5, was 3");
+    }
+
+    #[test]
+    fn literal_gate_passes_a_number_equal_to_the_targets_current_value() {
+        assert_eq!(lit_gate(json!(3), Some(json!(3)), false), Ok(()));
+    }
+
+    #[test]
+    fn literal_gate_equality_ignores_how_the_number_is_spelled() {
+        // 3 vs 3.0, and zero vs negative zero, are the same value.
+        assert_eq!(lit_gate(json!(3), Some(json!(3.0)), false), Ok(()));
+        assert_eq!(lit_gate(json!(3.0), Some(json!(3)), false), Ok(()));
+        assert_eq!(lit_gate(json!(0), Some(json!(-0.0)), false), Ok(()));
+        assert_eq!(lit_gate(json!(0.5), Some(json!(0.5)), false), Ok(()));
+    }
+
+    #[test]
+    fn literal_gate_neighbouring_values_are_a_change() {
+        // Just below / above the target's value: both change it.
+        assert!(lit_gate(json!(2), Some(json!(3)), false).is_err());
+        assert!(lit_gate(json!(4), Some(json!(3)), false).is_err());
+        assert!(lit_gate(json!(-1), Some(json!(1)), false).is_err());
+        assert_eq!(lit_gate(json!(-1), Some(json!(-1)), false), Ok(()));
+        assert!(lit_gate(json!(0.5), Some(json!(0.25)), false).is_err());
+    }
+
+    #[test]
+    fn literal_gate_compares_big_integers_exactly_not_through_f64() {
+        // 2^53 + 1 and 2^53 collapse to the same f64.
+        let (a, b) = (9007199254740993u64, 9007199254740992u64);
+        assert!(lit_gate(json!(a), Some(json!(b)), false).is_err());
+        assert_eq!(lit_gate(json!(a), Some(json!(a)), false), Ok(()));
+        assert!(lit_gate(json!(u64::MAX), Some(json!(u64::MAX - 1)), false).is_err());
+        assert_eq!(lit_gate(json!(i64::MIN), Some(json!(i64::MIN)), false), Ok(()));
+    }
+
+    #[test]
+    fn literal_gate_opt_in_passes_a_change_and_an_unknown_target() {
+        assert_eq!(lit_gate(json!(5), Some(json!(3)), true), Ok(()));
+        assert_eq!(lit_gate(json!(5), None, true), Ok(()));
+    }
+
+    #[test]
+    fn literal_gate_unknown_current_value_counts_as_a_change() {
+        assert_eq!(proposed(lit_gate(json!(5), None, false)), "5 (target's current value unknown)");
+    }
+
+    #[test]
+    fn literal_gate_a_non_number_current_value_is_a_change_not_a_match() {
+        // "3" is not 3; null and an object are not numbers at all.
+        assert!(proposed(lit_gate(json!(3), Some(json!("3")), false)).contains("\"3\""));
+        assert!(lit_gate(json!(3), Some(json!(null)), false).is_err());
+        assert!(lit_gate(json!(3), Some(json!({"value": 3})), false).is_err());
+    }
+
+    #[test]
+    fn literal_gate_never_gates_strings_or_booleans() {
+        // They describe themselves; only the numeric kind is ambiguous.
+        for (src, live) in [(json!("a"), Some(json!("b"))), (json!(true), Some(json!(false))), (json!(false), None)] {
+            assert_eq!(lit_gate(src.clone(), live, false), Ok(()), "{src}");
+        }
+    }
+
+    #[test]
+    fn literal_gate_applies_only_to_the_literal_strategy() {
+        // A number in an enum/range translation is governed by its own gate.
+        for st in [Strategy::EnumByLabel, Strategy::EnumByRawValue, Strategy::RangeClamped] {
+            assert_eq!(literal_gate(st, &json!(5), Some(&json!(3)), false), Ok(()), "{st}");
+        }
+    }
+
+    #[test]
+    fn literal_gate_bounds_the_length_of_a_huge_current_value() {
+        let big = json!({"values": vec![1234567; 500]});
+        let msg = proposed(lit_gate(json!(5), Some(big), false));
+        assert!(msg.len() < 200, "{} bytes", msg.len());
+    }
+
+    #[test]
+    fn literal_unconfirmed_display_names_the_flag_and_the_proposal() {
+        let msg = SkipReason::LiteralUnconfirmed { proposed: "5, was 3".into() }.to_string();
+        assert!(msg.contains("--allow-raw-code") && msg.contains("5, was 3"), "{msg}");
+    }
+
+    #[test]
+    fn plan_property_gates_a_changing_numeric_literal_and_passes_the_rest() {
+        let blocked = plan_property(&json!(5), Some(&json!(3)), false).unwrap_err();
+        assert!(matches!(blocked, SkipReason::LiteralUnconfirmed { .. }), "{blocked:?}");
+        // Opted in: written as-is.
+        let (v, st, ch) = plan_property(&json!(5), Some(&json!(3)), true).unwrap();
+        assert_eq!((v, st, ch), (json!(5), Strategy::Literal, None));
+        // Unchanged: no opt-in needed.
+        assert_eq!(plan_property(&json!(5), Some(&json!(5)), false).unwrap().1, Strategy::Literal);
+        // Unreadable target, not opted in: blocked; opted in: still written.
+        assert!(plan_property(&json!(5), None, false).is_err());
+        assert!(plan_property(&json!(5), None, true).is_ok());
+        // Strings and booleans stay ungated.
+        assert!(plan_property(&json!("x"), Some(&json!("y")), false).is_ok());
+        assert!(plan_property(&json!(true), None, false).is_ok());
+    }
+
+    #[test]
+    fn one_opt_in_covers_a_raw_code_enum_and_a_numeric_literal_independently() {
+        let src = raw_code_enum(1, &[3, 5]);
+        let live = raw_code_enum(1, &[5, 3]);
+        assert!(plan_property(&src, Some(&live), false).is_err());
+        assert!(plan_property(&json!(5), Some(&json!(3)), false).is_err());
+        assert!(plan_property(&src, Some(&live), true).is_ok());
+        assert!(plan_property(&json!(5), Some(&json!(3)), true).is_ok());
+    }
+
+    #[test]
+    fn allow_raw_code_accepts_a_numeric_scalar_by_short_or_full_name() {
+        let p = props(&[("kNkMAIDCapability_WBAutoType", json!(3))]);
+        for name in ["WBAutoType", "kNkMAIDCapability_WBAutoType"] {
+            let got = resolve_allow_raw_code(&[name.to_string()], &p).unwrap();
+            assert_eq!(got, BTreeSet::from(["kNkMAIDCapability_WBAutoType".to_string()]), "{name}");
+        }
+        // Floats and negatives are numbers too.
+        let p = props(&[("kNkMAIDCapability_A", json!(0.5)), ("kNkMAIDCapability_B", json!(-2))]);
+        assert!(resolve_allow_raw_code(&["A".into(), "B".into()], &p).is_ok());
+    }
+
+    #[test]
+    fn allow_raw_code_still_rejects_every_other_kind() {
+        let range = json!({"value": 1.0, "default": 0.0, "value_index": 1, "default_index": 0, "lower": 0.0, "upper": 2.0, "steps": 3});
+        let p = props(&[
+            ("kNkMAIDCapability_Str", json!("x")),
+            ("kNkMAIDCapability_Bool", json!(true)),
+            ("kNkMAIDCapability_Null", json!(null)),
+            ("kNkMAIDCapability_Arr", json!([1, 2])),
+            ("kNkMAIDCapability_Range", range),
+            ("kNkMAIDCapability_Label", fx("z9", "BracketingVary")),
+        ]);
+        for n in ["Str", "Bool", "Null", "Arr", "Range", "Label"] {
+            let e = resolve_allow_raw_code(&[n.to_string()], &p).unwrap_err();
+            assert!(e.contains("not a raw-code enum or a numeric scalar"), "{n}: {e}");
+        }
     }
 
     // ── --allow-raw-code resolution ──────────────────────────────────────

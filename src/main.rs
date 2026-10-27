@@ -404,8 +404,9 @@ struct TransplantArgs {
     #[arg(long)]
     dry_run: bool,
     /// Also write this property, which is matched only by raw numeric code
-    /// (an enum without decoded labels, e.g. PictureControl, MeteringMode).
-    /// Nothing guarantees both bodies number the same option the same way, so
+    /// (an enum without decoded labels, e.g. PictureControl, MeteringMode) or
+    /// is a numeric scalar copied as-is (e.g. WBAutoType, MovieRecMicrophone).
+    /// Nothing guarantees both bodies give the same number the same meaning, so
     /// by default such a property is skipped whenever it would change the
     /// target; naming it here accepts that risk for that one property.
     /// Repeatable; accepts the name with or without the kNkMAIDCapability_
@@ -2078,6 +2079,8 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
     let mut skipped_never = 0usize;
     let mut skipped_raw_unconfirmed = 0usize;
     let mut raw_unconfirmed: Vec<(String, String)> = Vec::new();
+    let mut skipped_literal_unconfirmed = 0usize;
+    let mut literal_unconfirmed: Vec<(String, String)> = Vec::new();
     let mut skipped_other = 0usize;
     let mut errors = 0usize;
 
@@ -2152,6 +2155,11 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
                         raw_unconfirmed.push((outcome.name.clone(), proposed.clone()));
                         false
                     }
+                    transplant::SkipReason::LiteralUnconfirmed { proposed } => {
+                        skipped_literal_unconfirmed += 1;
+                        literal_unconfirmed.push((outcome.name.clone(), proposed.clone()));
+                        false
+                    }
                     transplant::SkipReason::UnsupportedValueShape
                     | transplant::SkipReason::TargetReadFailed(_)
                     | transplant::SkipReason::MalformedSource => {
@@ -2175,6 +2183,7 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
          skipped(type-mismatch)={skipped_type_mismatch} skipped(sdk-decode-failure)={skipped_sdk_decode_failure} \
          skipped(name-mismatch)={skipped_name_mismatch} skipped(ambiguous-label)={skipped_ambiguous} \
          skipped(never-copied)={skipped_never} skipped(raw-code-unconfirmed)={skipped_raw_unconfirmed} \
+         skipped(literal-unconfirmed)={skipped_literal_unconfirmed} \
          skipped(other)={skipped_other}  errors={errors}",
         if args.dry_run { "Dry run:" } else { "Transplant complete:" }
     );
@@ -2187,6 +2196,18 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
             if raw_unconfirmed.len() == 1 { "y was" } else { "ies were" }
         );
         for (name, proposed) in &raw_unconfirmed {
+            println!("  {name}: would set {proposed}");
+        }
+    }
+    if !literal_unconfirmed.is_empty() {
+        println!(
+            "\n{} numeric propert{} copied as-is would change the target; not written \
+             (an integer is no more self-describing than a raw code, so nothing says both bodies \
+             give it the same meaning). Review, then opt in per property with --allow-raw-code <name>:",
+            literal_unconfirmed.len(),
+            if literal_unconfirmed.len() == 1 { "y" } else { "ies" }
+        );
+        for (name, proposed) in &literal_unconfirmed {
             println!("  {name}: would set {proposed}");
         }
     }

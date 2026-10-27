@@ -27,6 +27,8 @@ fn write_snapshot(dir: &Path) -> std::path::PathBuf {
         json!({"value_index": 0, "default_index": 0, "elem_count": 2, "elem_type": 2, "elem_bytes": 4, "values": [1, 2]}),
     );
     s.insert("kNkMAIDCapability_Copyright", 2, json!("me"));
+    s.insert("kNkMAIDCapability_WBAutoType", 3, json!(3));
+    s.insert("kNkMAIDCapability_Beep", 4, json!(true));
     let path = dir.join("snap.json");
     s.save_to_file(&path).unwrap();
     path
@@ -93,4 +95,23 @@ fn flag_is_repeatable_and_one_bad_name_fails_the_whole_run() {
     let snap = write_snapshot(d.path());
     let o = run(d.path(), &snap, &["--allow-raw-code", "MeteringMode", "--allow-raw-code", "Nope"]);
     assert!(stderr(&o).contains("no property by that name"), "{}", stderr(&o));
+}
+
+#[test]
+fn numeric_scalar_opt_in_passes_validation_and_fails_only_at_the_missing_sdk() {
+    let d = tempfile::tempdir().unwrap();
+    let snap = write_snapshot(d.path());
+    for name in ["WBAutoType", "kNkMAIDCapability_WBAutoType"] {
+        let e = stderr(&run(d.path(), &snap, &["--allow-raw-code", name]));
+        assert!(e.contains("SDK bundle not found"), "{name}: validation should have passed: {e}");
+    }
+}
+
+#[test]
+fn boolean_scalar_is_still_rejected_before_the_sdk_is_touched() {
+    let d = tempfile::tempdir().unwrap();
+    let snap = write_snapshot(d.path());
+    let e = stderr(&run(d.path(), &snap, &["--allow-raw-code", "Beep"]));
+    assert!(e.contains("not a raw-code enum or a numeric scalar"), "{e}");
+    assert!(!e.contains("SDK bundle not found"), "{e}");
 }
