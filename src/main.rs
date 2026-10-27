@@ -1431,7 +1431,7 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
 /// instead of `restore`'s literal same-model copy. See that module's docs
 /// for the translation strategy and why capability *codes* (not menu
 /// position, not per-model renumbering) are the right join key here.
-fn cmd_transplant(data_dir: &Path, bundle: &Path, args: &TransplantArgs, no_usb_reset: bool) -> Result<()> {
+fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &TransplantArgs, no_usb_reset: bool) -> Result<()> {
     let snap_path = resolve_snapshot_path(data_dir, &args.snapshot_path);
     let snap = Snapshot::load_from_file(&snap_path)
         .with_context(|| format!("loading {}", snap_path.display()))?;
@@ -1458,6 +1458,13 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, args: &TransplantArgs, no_usb_
     }
     let (target, _usb) = select_device(enriched, args.serial.as_deref())?;
 
+    // Before connecting: refuse non-Z-series models and build the per-code
+    // name check. Needs the schema (MaidLayer.config) — unlike restore,
+    // transplant can't run without it.
+    let schema = MaidLayerConfig::parse_file(schema_path)
+        .with_context(|| format!("loading schema from {}", schema_path.display()))?;
+    let guard = transplant::CodeNameGuard::new(&schema, &snap.camera.model, &target.name)?;
+
     if target.name == snap.camera.model {
         println!(
             "note: source and target are both {:?} — transplant works the same either way, \
@@ -1469,7 +1476,7 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, args: &TransplantArgs, no_usb_
     println!("Connecting to {:?} (id={})…", target.name, target.id);
     let device = sdk.connect(target.id)?;
 
-    let outcomes = transplant::transplant(&device, &snap.properties, args.dry_run);
+    let outcomes = transplant::transplant(&device, &snap.properties, &guard, args.dry_run);
 
     let mut written_literal = 0usize;
     let mut written_enum_label = 0usize;
@@ -1481,6 +1488,7 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, args: &TransplantArgs, no_usb_
     let mut skipped_no_match = 0usize;
     let mut skipped_type_mismatch = 0usize;
     let mut skipped_sdk_decode_failure = 0usize;
+    let mut skipped_name_mismatch = 0usize;
     let mut skipped_other = 0usize;
     let mut errors = 0usize;
 
@@ -1532,6 +1540,10 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, args: &TransplantArgs, no_usb_
                         skipped_sdk_decode_failure += 1;
                         true
                     }
+                    transplant::SkipReason::CapabilityNameMismatch { .. } => {
+                        skipped_name_mismatch += 1;
+                        true
+                    }
                     transplant::SkipReason::UnsupportedValueShape
                     | transplant::SkipReason::TargetReadFailed(_)
                     | transplant::SkipReason::MalformedSource => {
@@ -1553,7 +1565,7 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, args: &TransplantArgs, no_usb_
          skipped(absent)={skipped_absent} skipped(read-only)={skipped_read_only} \
          skipped(unsupported-type)={skipped_unsupported_type} skipped(no-matching-option)={skipped_no_match} \
          skipped(type-mismatch)={skipped_type_mismatch} skipped(sdk-decode-failure)={skipped_sdk_decode_failure} \
-         skipped(other)={skipped_other}  errors={errors}",
+         skipped(name-mismatch)={skipped_name_mismatch} skipped(other)={skipped_other}  errors={errors}",
         if args.dry_run { "Dry run:" } else { "Transplant complete:" }
     );
     if !args.dry_run && restore_completely_failed(written, errors) {
@@ -1578,7 +1590,7 @@ fn main() -> Result<()> {
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
         Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, args, no_reset),
-        Cmd::Transplant(args) => cmd_transplant(&cli.data_dir, &cli.sdk_bundle, args, no_reset),
+        Cmd::Transplant(args) => cmd_transplant(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
         Cmd::VendorRead(args) => cmd_vendor_read(args),
         Cmd::VendorWriteFtp(args) => cmd_vendor_write_ftp(args),
         Cmd::Firmware(sub) => match sub {

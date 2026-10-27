@@ -42,7 +42,7 @@
 //! for a future "what's locking me out" diagnostic but not needed for
 //! snapshot-and-diff.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -289,6 +289,25 @@ impl MaidLayerConfig {
         for section in self.sections_for_model(model_name) {
             for cap in &section.capabilities {
                 map.entry(cap.code).or_insert_with(|| cap.name.clone());
+            }
+        }
+        map
+    }
+
+    /// Map from numeric capability code → every distinct symbolic name that
+    /// code carries anywhere in `model_name`'s sections (all firmware
+    /// versions).
+    ///
+    /// Unlike `name_map_for_model` (first-seen wins), this keeps aliases:
+    /// Nikon's config lists some codes under two names inside a single
+    /// section (e.g. `ExternalNewTypeFlashMode` and `ExternalFlashStatus`
+    /// both at 33211), and a cross-model comparison that only saw one of
+    /// them would report a spurious mismatch or miss a real one.
+    pub fn name_sets_for_model(&self, model_name: &str) -> HashMap<u32, BTreeSet<String>> {
+        let mut map: HashMap<u32, BTreeSet<String>> = HashMap::new();
+        for section in self.sections_for_model(model_name) {
+            for cap in &section.capabilities {
+                map.entry(cap.code).or_default().insert(cap.name.clone());
             }
         }
         map

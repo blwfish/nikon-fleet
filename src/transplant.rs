@@ -37,11 +37,31 @@
 //! A capability the target doesn't have, doesn't expose for writing, or
 //! whose translated value has no match on the target (an enum choice that
 //! simply doesn't exist there) is skipped, not guessed at.
+//!
+//! # Scope: Z-series only
+//!
+//! "The same capability code is the same setting on every body" was
+//! checked against every section of `MaidLayer.config` (see
+//! `tests::real_config_*`), and it holds across the Z-series bodies the
+//! config covers — with the two documented exceptions in
+//! `KNOWN_NAME_ALIASES` and the in-section alias at 33211. It does *not*
+//! hold across the whole file: the D6 section, for one, lists
+//! `WBTunePreset2` at the code every other body uses for `WBTunePreset1`.
+//! And there is no section at all for the other DSLRs the fleet owns (D5),
+//! so nothing could be checked for them. Rather than extend an unverified
+//! assumption, [`CodeNameGuard::new`] refuses any non-Z source or target
+//! model up front, before anything is written.
+//!
+//! Within the Z-series, [`CodeNameGuard`] also skips a capability whose
+//! symbolic name differs between the source and target models' sections
+//! (and isn't a declared alias), as a tripwire for a future SDK drop
+//! changing what a code means.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::{Value, json};
 
+use crate::maid_layer::MaidLayerConfig;
 use crate::sdk::{CapabilityInfo, Device, OP_SET, SdkError};
 use crate::snapshot::PropertyEntry;
 
@@ -153,6 +173,11 @@ pub enum SkipReason {
     /// doesn't exist on the target") rather than what it actually is: the
     /// two sides encode this capability differently.
     EnumTypeMismatch { source_elem_type: u64, target_elem_type: u64 },
+    /// `MaidLayer.config` gives this capability code unrelated symbolic
+    /// names on the source and target models (and the pair isn't in
+    /// `KNOWN_NAME_ALIASES`), so the code may not mean the same setting on
+    /// both bodies. Names are joined with `/` when a model lists several.
+    CapabilityNameMismatch { source_names: String, target_names: String },
 }
 
 impl std::fmt::Display for SkipReason {
@@ -173,6 +198,11 @@ impl std::fmt::Display for SkipReason {
                 f,
                 "source and target encode this enum differently (source elem_type={source_elem_type}, \
                  target elem_type={target_elem_type})"
+            ),
+            SkipReason::CapabilityNameMismatch { source_names, target_names } => write!(
+                f,
+                "capability code has unrelated names on the two models (source: {source_names}; \
+                 target: {target_names}) — it may not be the same setting"
             ),
         }
     }
@@ -342,6 +372,105 @@ pub fn translate_value(source_value: &Value, target_live: Option<&Value>) -> Res
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Scope + capability-name guard
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Capability codes whose symbolic name legitimately differs between Z-series
+/// models while meaning the same setting. Each entry is one equivalence
+/// class of names for one code.
+///
+/// 33200: `BracketingType` on most bodies, `AEBracketingType` on the Z 8 and
+/// Z 9. Confirmed 2026-10-27 against live Z 9 (fw 5.31), Z6_3 (fw 2.00) and
+/// Z 5 (fw 1.43): the Z 9 and Z6_3 offer the same option set {4..8} in
+/// different orders (so a value, not an index, must be matched — which
+/// `translate_enum` does), the Z 5 offers {0..8}, all three default to
+/// code 4, and the config's own display label is "AEBracketing Type" on
+/// the Z6_3, Z 8 and Z 9 alike. What each option code *means* in the menu
+/// is not independently confirmed.
+const KNOWN_NAME_ALIASES: &[(u32, &[&str])] =
+    &[(33200, &["kNkMAIDCapability_BracketingType", "kNkMAIDCapability_AEBracketingType"])];
+
+/// `transplant` was asked to use a model it has no verified support for.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "cross-model transplant supports Z-series bodies only; the {role} model {model:?} is not a Z-series \
+     section of the loaded MaidLayer.config (nothing was checked for it, and nothing was written)"
+)]
+pub struct UnsupportedModel {
+    pub role: &'static str,
+    pub model: String,
+}
+
+/// Is `model` a Z-series body with a section in `config`? A model with no
+/// section at all (e.g. a D5) is not: there is nothing to check its codes
+/// against. This is the one place the Z-series distinction lives; the
+/// config's non-body sections (`DC`, `Default`, `DEMO95`, `DemoZ f`) and
+/// DSLR sections (`D6`, `D780`) all fail the leading-`Z` test, and
+/// `tests::real_config_z_series_set_is_pinned` pins the exact set so a
+/// future config that breaks that convention fails loudly.
+pub fn is_z_series_model(config: &MaidLayerConfig, model: &str) -> bool {
+    model.starts_with('Z') && config.sections_for_model(model).next().is_some()
+}
+
+/// Per-transplant check that a capability code names the same setting on
+/// the source and target models. Built once, before any write.
+#[derive(Debug)]
+pub struct CodeNameGuard {
+    source: HashMap<u32, BTreeSet<String>>,
+    target: HashMap<u32, BTreeSet<String>>,
+}
+
+impl CodeNameGuard {
+    /// Refuses (without touching hardware) if either model isn't Z-series.
+    /// The source is checked first so a bad snapshot is reported before a
+    /// bad target.
+    pub fn new(config: &MaidLayerConfig, source_model: &str, target_model: &str) -> Result<Self, UnsupportedModel> {
+        for (role, model) in [("source", source_model), ("target", target_model)] {
+            if !is_z_series_model(config, model) {
+                return Err(UnsupportedModel { role, model: model.to_string() });
+            }
+        }
+        Ok(CodeNameGuard {
+            source: config.name_sets_for_model(source_model),
+            target: config.name_sets_for_model(target_model),
+        })
+    }
+
+    /// `Ok` if the code carries compatible names on both models — or if
+    /// either model's section doesn't list the code at all, in which case
+    /// the config has no verdict and the live capability list
+    /// (`AbsentOnTarget`) and the value translation remain the checks, as
+    /// before this guard existed. `Err(CapabilityNameMismatch)` only when
+    /// both list it and the names are unrelated.
+    pub fn check(&self, code: u32) -> Result<(), SkipReason> {
+        let (Some(src), Some(tgt)) = (self.source.get(&code), self.target.get(&code)) else {
+            return Ok(());
+        };
+        if names_compatible(code, src, tgt) {
+            return Ok(());
+        }
+        Err(SkipReason::CapabilityNameMismatch { source_names: join_names(src), target_names: join_names(tgt) })
+    }
+}
+
+fn join_names(names: &BTreeSet<String>) -> String {
+    names.iter().map(String::as_str).collect::<Vec<_>>().join("/")
+}
+
+/// Compatible if the two models share at least one name for the code, or
+/// every name either side lists is in one of `KNOWN_NAME_ALIASES`' classes
+/// for that code.
+fn names_compatible(code: u32, src: &BTreeSet<String>, tgt: &BTreeSet<String>) -> bool {
+    if !src.is_disjoint(tgt) {
+        return true;
+    }
+    KNOWN_NAME_ALIASES
+        .iter()
+        .filter(|(c, _)| *c == code)
+        .any(|(_, class)| src.iter().chain(tgt).all(|n| class.contains(&n.as_str())))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Orchestration — needs a live Device, so not unit-testable the way
 // translate_value/translate_enum/translate_range are.
 // ─────────────────────────────────────────────────────────────────────────
@@ -356,33 +485,58 @@ pub struct TransplantOutcome {
 /// may be a *different model* than `device`) onto `device`, translating
 /// enum/range values via the target's own live equivalents.
 ///
+/// `guard` (built with [`CodeNameGuard::new`], which also enforces the
+/// Z-series-only scope) skips any capability whose code doesn't name the same
+/// setting on the source and target models.
+///
 /// `dry_run` skips the actual write but still performs the live reads
 /// needed to report what *would* happen — intentionally more work than
 /// `fleet restore --dry-run`, which never touches the target beyond its
 /// capability list, but that's the only way to report a real
 /// `NoMatchingOption` skip before committing to anything.
-pub fn transplant(device: &Device, properties: &BTreeMap<String, PropertyEntry>, dry_run: bool) -> Vec<TransplantOutcome> {
+pub fn transplant(
+    device: &Device,
+    properties: &BTreeMap<String, PropertyEntry>,
+    guard: &CodeNameGuard,
+    dry_run: bool,
+) -> Vec<TransplantOutcome> {
     let cap_map: HashMap<u32, &CapabilityInfo> = device.capabilities.iter().map(|c| (c.id, c)).collect();
 
     properties
         .iter()
         .map(|(name, prop)| {
-            let result = transplant_one(device, &cap_map, prop, dry_run);
+            let result = transplant_one(device, &cap_map, guard, prop, dry_run);
             TransplantOutcome { name: name.clone(), code: prop.code, result }
         })
         .collect()
 }
 
-fn transplant_one(
-    device: &Device,
-    cap_map: &HashMap<u32, &CapabilityInfo>,
+/// The device-free checks that must pass before any live read or write, in
+/// order: the capability exists on the target, its code names the same
+/// setting on both models, and it's writable. Split out of `transplant_one`
+/// so the ordering (and that the name guard is wired in at all) is
+/// unit-testable without a `Device`.
+fn precheck<'a>(
+    cap_map: &HashMap<u32, &'a CapabilityInfo>,
+    guard: &CodeNameGuard,
     prop: &PropertyEntry,
-    dry_run: bool,
-) -> Result<Strategy, SkipReason> {
-    let cap = cap_map.get(&prop.code).ok_or(SkipReason::AbsentOnTarget)?;
+) -> Result<&'a CapabilityInfo, SkipReason> {
+    let cap = *cap_map.get(&prop.code).ok_or(SkipReason::AbsentOnTarget)?;
+    guard.check(prop.code)?;
     if cap.operations & OP_SET == 0 {
         return Err(SkipReason::ReadOnly);
     }
+    Ok(cap)
+}
+
+fn transplant_one(
+    device: &Device,
+    cap_map: &HashMap<u32, &CapabilityInfo>,
+    guard: &CodeNameGuard,
+    prop: &PropertyEntry,
+    dry_run: bool,
+) -> Result<Strategy, SkipReason> {
+    let cap = precheck(cap_map, guard, prop)?;
 
     let needs_live_read = is_enum_shape(&prop.value) || is_range_shape(&prop.value);
     let live = if needs_live_read {
@@ -874,5 +1028,318 @@ mod tests {
         let s = format!("{}€", "x".repeat(499)); // € is 3 bytes, cut point lands inside it
         let out = truncate_with_marker(s, 500);
         assert!(out.starts_with(&"x".repeat(499)));
+    }
+
+    // ── Z-series scope + capability-name guard ───────────────────────────
+
+    /// Build a MaidLayer.config text: one section per `(model, caps)`, each
+    /// cap `(symbolic name without prefix, code)`.
+    fn config_text(models: &[(&str, &[(&str, u32)])]) -> String {
+        let mut out = String::from("<ProfileVersion>9.0.3000</ProfileVersion>\n");
+        for (model, caps) in models {
+            out.push_str(&format!("<model:{model}>\n<version>common</version>\n<caplist>\n"));
+            for (name, code) in *caps {
+                out.push_str(&format!(
+                    "<capability:kNkMAIDCapability_{name}-{code}>\n<description>0,0,\"{name}\"</description>\n\
+                     <allowedoperation:14></allowedoperation>\n<DeviceCommand>1,0,0,0,0</DeviceCommand>\n</capability>\n"
+                ));
+            }
+            out.push_str("</caplist>\n</model>\n");
+        }
+        out
+    }
+
+    fn parse_config(models: &[(&str, &[(&str, u32)])]) -> MaidLayerConfig {
+        MaidLayerConfig::parse(&config_text(models)).expect("fixture config parses")
+    }
+
+    fn names(ns: &[&str]) -> BTreeSet<String> {
+        ns.iter().map(|n| format!("kNkMAIDCapability_{n}")).collect()
+    }
+
+    #[test]
+    fn z_series_model_with_section_is_supported() {
+        let c = parse_config(&[("Z 9", &[("Aperture", 1)])]);
+        assert!(is_z_series_model(&c, "Z 9"));
+    }
+
+    #[test]
+    fn dslr_section_is_not_z_series() {
+        // D6 has a section in the real config but is outside the verified scope.
+        let c = parse_config(&[("D6", &[("Aperture", 1)])]);
+        assert!(!is_z_series_model(&c, "D6"));
+    }
+
+    #[test]
+    fn model_with_no_section_is_not_z_series() {
+        // The D5 case: no section at all, so nothing to check codes against —
+        // and a Z-looking name that simply isn't in the config ("Z 99")
+        // must not pass on its leading letter alone.
+        let c = parse_config(&[("Z 9", &[("Aperture", 1)])]);
+        assert!(!is_z_series_model(&c, "D5"));
+        assert!(!is_z_series_model(&c, "Z 99"));
+        assert!(!is_z_series_model(&c, ""));
+    }
+
+    #[test]
+    fn leading_z_alone_is_not_enough_for_non_body_sections() {
+        // "DemoZ f" contains Z but doesn't start with it.
+        let c = parse_config(&[("DemoZ f", &[("Aperture", 1)]), ("Default", &[("Aperture", 1)])]);
+        assert!(!is_z_series_model(&c, "DemoZ f"));
+        assert!(!is_z_series_model(&c, "Default"));
+    }
+
+    #[test]
+    fn guard_new_rejects_non_z_source_with_role() {
+        let c = parse_config(&[("Z 9", &[("Aperture", 1)]), ("D6", &[("Aperture", 1)])]);
+        let err = CodeNameGuard::new(&c, "D6", "Z 9").unwrap_err();
+        assert_eq!(err, UnsupportedModel { role: "source", model: "D6".to_string() });
+    }
+
+    #[test]
+    fn guard_new_rejects_non_z_target_with_role() {
+        let c = parse_config(&[("Z 9", &[("Aperture", 1)]), ("D6", &[("Aperture", 1)])]);
+        let err = CodeNameGuard::new(&c, "Z 9", "D5").unwrap_err();
+        assert_eq!(err, UnsupportedModel { role: "target", model: "D5".to_string() });
+    }
+
+    #[test]
+    fn guard_new_reports_source_first_when_both_are_unsupported() {
+        let c = parse_config(&[("Z 9", &[("Aperture", 1)])]);
+        let err = CodeNameGuard::new(&c, "D5", "D6").unwrap_err();
+        assert_eq!(err.role, "source");
+    }
+
+    #[test]
+    fn guard_new_accepts_same_model_both_sides() {
+        let c = parse_config(&[("Z 9", &[("Aperture", 1)])]);
+        assert!(CodeNameGuard::new(&c, "Z 9", "Z 9").is_ok());
+    }
+
+    #[test]
+    fn unsupported_model_message_names_role_and_model() {
+        let e = UnsupportedModel { role: "target", model: "D5".to_string() };
+        let msg = e.to_string();
+        assert!(msg.contains("target") && msg.contains("\"D5\"") && msg.contains("Z-series"), "{msg}");
+    }
+
+    #[test]
+    fn check_passes_when_names_match() {
+        let c = parse_config(&[("Z 9", &[("Aperture", 1)]), ("Z 8", &[("Aperture", 1)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap();
+        assert_eq!(g.check(1), Ok(()));
+    }
+
+    #[test]
+    fn check_skips_unrelated_names_on_the_same_code() {
+        let c = parse_config(&[("Z 9", &[("Aperture", 7)]), ("Z 8", &[("ShutterSpeed", 7)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap();
+        assert_eq!(
+            g.check(7),
+            Err(SkipReason::CapabilityNameMismatch {
+                source_names: "kNkMAIDCapability_Aperture".to_string(),
+                target_names: "kNkMAIDCapability_ShutterSpeed".to_string(),
+            })
+        );
+        // Symmetric.
+        let g = CodeNameGuard::new(&c, "Z 8", "Z 9").unwrap();
+        assert!(matches!(g.check(7), Err(SkipReason::CapabilityNameMismatch { .. })));
+    }
+
+    #[test]
+    fn check_allows_the_declared_33200_alias_in_both_directions() {
+        let c = parse_config(&[("Z 9", &[("AEBracketingType", 33200)]), ("Z6_3", &[("BracketingType", 33200)])]);
+        assert_eq!(CodeNameGuard::new(&c, "Z 9", "Z6_3").unwrap().check(33200), Ok(()));
+        assert_eq!(CodeNameGuard::new(&c, "Z6_3", "Z 9").unwrap().check(33200), Ok(()));
+    }
+
+    #[test]
+    fn check_alias_does_not_cover_a_third_name() {
+        // Boundary of the alias rule: EVERY name on both sides must be in the
+        // class, not just one pair of them.
+        let c = parse_config(&[
+            ("Z 9", &[("AEBracketingType", 33200)]),
+            ("Z6_3", &[("BracketingType", 33200), ("Mystery", 33200)]),
+        ]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z6_3").unwrap();
+        assert!(matches!(g.check(33200), Err(SkipReason::CapabilityNameMismatch { .. })));
+    }
+
+    #[test]
+    fn check_alias_is_scoped_to_its_own_code() {
+        // The same two names, disjoint, at a code that is NOT 33200: no alias.
+        let c = parse_config(&[("Z 9", &[("AEBracketingType", 5)]), ("Z6_3", &[("BracketingType", 5)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z6_3").unwrap();
+        assert!(matches!(g.check(5), Err(SkipReason::CapabilityNameMismatch { .. })));
+    }
+
+    #[test]
+    fn check_passes_when_sides_share_one_of_several_names() {
+        // 33211-style: the newer body lists an extra in-section alias.
+        let c = parse_config(&[
+            ("Z 5", &[("ExternalNewTypeFlashMode", 33211)]),
+            ("Z 8", &[("ExternalNewTypeFlashMode", 33211), ("ExternalFlashStatus", 33211)]),
+        ]);
+        assert_eq!(CodeNameGuard::new(&c, "Z 5", "Z 8").unwrap().check(33211), Ok(()));
+        assert_eq!(CodeNameGuard::new(&c, "Z 8", "Z 5").unwrap().check(33211), Ok(()));
+    }
+
+    #[test]
+    fn check_has_no_verdict_when_either_model_omits_the_code() {
+        // Pins current behavior: absence in the config is not a mismatch (the
+        // live capability list and value translation remain the checks).
+        let c = parse_config(&[("Z 9", &[("Aperture", 1)]), ("Z 8", &[("Other", 2)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap();
+        assert_eq!(g.check(1), Ok(())); // only on source
+        assert_eq!(g.check(2), Ok(())); // only on target
+        assert_eq!(g.check(999), Ok(())); // on neither
+    }
+
+    #[test]
+    fn check_unions_names_across_firmware_sections_of_one_model() {
+        // name_map_for_model is first-seen-wins; the guard must see both.
+        let text = "<model:Z 9>\n<version>1.0</version>\n<caplist>\n\
+                    <capability:kNkMAIDCapability_Aperture-3>\n<allowedoperation:14></allowedoperation>\n</capability>\n</caplist>\n</model>\n\
+                    <model:Z 9>\n<version>2.0</version>\n<caplist>\n\
+                    <capability:kNkMAIDCapability_ApertureNew-3>\n<allowedoperation:14></allowedoperation>\n</capability>\n</caplist>\n</model>\n";
+        let c = MaidLayerConfig::parse(text).expect("parses");
+        assert_eq!(c.name_sets_for_model("Z 9").get(&3), Some(&names(&["Aperture", "ApertureNew"])));
+    }
+
+    #[test]
+    fn capability_name_mismatch_display_names_both_sides() {
+        let r = SkipReason::CapabilityNameMismatch { source_names: "A".to_string(), target_names: "B/C".to_string() };
+        let msg = r.to_string();
+        assert!(msg.contains("source: A") && msg.contains("target: B/C"), "{msg}");
+    }
+
+    // ── precheck ordering (the wiring transplant_one relies on) ──────────
+
+    fn cap_info(id: u32, operations: u32) -> CapabilityInfo {
+        CapabilityInfo { id, kind: 0, visibility: 0, operations, description: String::new() }
+    }
+
+    fn prop_for(code: u32) -> PropertyEntry {
+        PropertyEntry { code, value: json!(1) }
+    }
+
+    #[test]
+    fn precheck_absent_on_target_wins_over_name_mismatch() {
+        // Unrelated names at code 7, but the target doesn't even have the
+        // capability: the routine skip is reported, not the name warning.
+        let c = parse_config(&[("Z 9", &[("Aperture", 7)]), ("Z 8", &[("ShutterSpeed", 7)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap();
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::new();
+        assert_eq!(precheck(&caps, &g, &prop_for(7)).unwrap_err(), SkipReason::AbsentOnTarget);
+    }
+
+    #[test]
+    fn precheck_name_mismatch_wins_over_read_only() {
+        let c = parse_config(&[("Z 9", &[("Aperture", 7)]), ("Z 8", &[("ShutterSpeed", 7)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap();
+        let ro = cap_info(7, 0); // no OP_SET bit
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(7, &ro)]);
+        assert!(matches!(precheck(&caps, &g, &prop_for(7)), Err(SkipReason::CapabilityNameMismatch { .. })));
+    }
+
+    #[test]
+    fn precheck_read_only_reported_when_names_agree() {
+        let c = parse_config(&[("Z 9", &[("Aperture", 7)]), ("Z 8", &[("Aperture", 7)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap();
+        let ro = cap_info(7, 0);
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(7, &ro)]);
+        assert_eq!(precheck(&caps, &g, &prop_for(7)).unwrap_err(), SkipReason::ReadOnly);
+    }
+
+    #[test]
+    fn precheck_passes_writable_capability_with_matching_names() {
+        let c = parse_config(&[("Z 9", &[("Aperture", 7)]), ("Z 8", &[("Aperture", 7)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap();
+        let rw = cap_info(7, OP_SET);
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(7, &rw)]);
+        assert_eq!(precheck(&caps, &g, &prop_for(7)).unwrap().id, 7);
+    }
+
+    // ── real MaidLayer.config sweep ──────────────────────────────────────
+    //
+    // `sdk-runtime/` is gitignored (Nikon's SDK), so these only run where the
+    // SDK has been set up (scripts/setup-sdk-runtime.sh). Absence is loud on
+    // stderr but not a failure, since a clean checkout legitimately has no
+    // config; set REQUIRE_SDK_RUNTIME=1 to make absence fail (e.g. on the
+    // machine that is supposed to have it).
+
+    const EXPECTED_Z_MODELS: &[&str] = &[
+        "Z 30", "Z 5", "Z 50", "Z 6", "Z 6_2", "Z 7", "Z 7_2", "Z 8", "Z 9", "Z f", "Z fc", "Z50_2", "Z5_2", "Z6_3", "ZR",
+    ];
+
+    fn real_config() -> Option<MaidLayerConfig> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/sdk-runtime/MaidLayer.config");
+        if !std::path::Path::new(path).exists() {
+            assert!(
+                std::env::var_os("REQUIRE_SDK_RUNTIME").is_none(),
+                "REQUIRE_SDK_RUNTIME is set but {path} does not exist"
+            );
+            eprintln!("SKIPPED real-config sweep: {path} not present (run scripts/setup-sdk-runtime.sh)");
+            return None;
+        }
+        Some(MaidLayerConfig::parse_file(path).expect("real MaidLayer.config parses"))
+    }
+
+    #[test]
+    fn real_config_z_series_set_is_pinned() {
+        let Some(c) = real_config() else { return };
+        let mut z: Vec<String> = c.known_models().into_iter().filter(|m| is_z_series_model(&c, m)).collect();
+        z.sort();
+        let mut expected: Vec<String> = EXPECTED_Z_MODELS.iter().map(|m| m.to_string()).collect();
+        expected.sort();
+        assert_eq!(z, expected);
+        for non_z in ["D6", "D780", "DC", "Default", "DEMO95", "DemoZ f"] {
+            assert!(!is_z_series_model(&c, non_z), "{non_z} must not count as Z-series");
+        }
+    }
+
+    #[test]
+    fn real_config_cross_model_name_exceptions_are_exactly_the_declared_ones() {
+        let Some(c) = real_config() else { return };
+        let sets: Vec<(&str, HashMap<u32, BTreeSet<String>>)> =
+            EXPECTED_Z_MODELS.iter().map(|m| (*m, c.name_sets_for_model(m))).collect();
+
+        // (a) Every Z-model pair, every code both list: the guard passes
+        // (declared aliases included).
+        let mut guard_failures = Vec::new();
+        // (b) Same sweep with the alias table ignored: only plain
+        // name-set disjointness. Pins that the table covers exactly what
+        // needs covering and nothing stale.
+        let mut raw_disjoint_codes = BTreeSet::new();
+        for (sm, ss) in &sets {
+            for (tm, ts) in &sets {
+                for (code, sn) in ss {
+                    let Some(tn) = ts.get(code) else { continue };
+                    if sn.is_disjoint(tn) {
+                        raw_disjoint_codes.insert(*code);
+                    }
+                    if !names_compatible(*code, sn, tn) {
+                        guard_failures.push((*sm, *tm, *code));
+                    }
+                }
+            }
+        }
+        assert_eq!(guard_failures, vec![], "unexplained cross-model name divergence");
+        assert_eq!(raw_disjoint_codes.into_iter().collect::<Vec<_>>(), vec![33200]);
+        assert_eq!(KNOWN_NAME_ALIASES.iter().map(|(c, _)| *c).collect::<Vec<_>>(), vec![33200]);
+    }
+
+    #[test]
+    fn real_config_in_section_alias_codes_are_exactly_33211() {
+        let Some(c) = real_config() else { return };
+        let mut multi_name_codes = BTreeSet::new();
+        for m in EXPECTED_Z_MODELS {
+            for (code, ns) in c.name_sets_for_model(m) {
+                if ns.len() > 1 {
+                    multi_name_codes.insert(code);
+                }
+            }
+        }
+        assert_eq!(multi_name_codes.into_iter().collect::<Vec<_>>(), vec![33211]);
     }
 }
