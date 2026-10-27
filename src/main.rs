@@ -29,6 +29,7 @@ use nikon_fleet::firmware_source::{
     Release, SourceError, UreqHttp, assess, camera_relation, fetch_direct,
 };
 use nikon_fleet::maid_layer::MaidLayerConfig;
+use nikon_fleet::ops::list::{EntryState, Listing, list_dir};
 use nikon_fleet::sdk::{CapabilityInfo, Device, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET, OP_SET};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use nikon_fleet::transplant;
@@ -155,7 +156,12 @@ enum RefCmd {
     /// Show the reference snapshot for a (model, serial).
     Show { model: String, serial: String },
     /// List all references.
-    List,
+    List {
+        /// Output as JSON (one object: dir, dir_exists, entries with each
+        /// reference's model/serial/firmware/label, skipped_dir_entries).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -181,6 +187,10 @@ struct LsArgs {
     /// Limit to snapshots for a specific camera, in "{model}_{serial}" form.
     #[arg(long)]
     camera: Option<String>,
+    /// Output as JSON (one object: dir, dir_exists, entries, skipped_dir_entries).
+    /// An unreadable file is listed with status "unreadable" and an error_kind.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -573,62 +583,45 @@ fn resolve_snapshot_path(data_dir: &Path, p: &Path) -> PathBuf {
     }
 }
 
-/// Whether a snapshot `name` (a filename) belongs to the camera identified
-/// by `filter` (a "{model}_{serial}" string, per `--camera`'s documented
-/// form). Matches the whole leading `{model_slug}_{serial}` component, not
-/// just a string prefix — without the trailing "_", a filter of "…_id-1"
-/// would also match "…_id-10_..." (the "id-{id}" fallback serial makes this
-/// a real, not just theoretical, collision: "id-1" is a proper string
-/// prefix of "id-10").
-fn camera_filename_matches(name: &str, filter: &str) -> bool {
-    name.starts_with(&format!("{}_", model_slug(filter)))
-}
-
 fn cmd_ls(data_dir: &Path, args: &LsArgs) -> Result<()> {
-    let dir = snapshots_dir(data_dir);
-    if !dir.exists() {
-        println!("(no snapshots — directory {} does not exist)", dir.display());
+    let listing = list_dir(&snapshots_dir(data_dir), args.camera.as_deref())?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&listing)?);
         return Ok(());
     }
-    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
-        .with_context(|| format!("listing {}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "json"))
-        .collect();
-    entries.sort();
-
-    let filter = args.camera.as_deref();
-    let mut shown = 0usize;
-    for path in &entries {
-        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if let Some(f) = filter {
-            if !camera_filename_matches(name, f) {
-                continue;
-            }
-        }
-        // Read just enough to surface camera + label + timestamp.
-        match Snapshot::load_from_file(path) {
-            Ok(s) => {
-                println!(
-                    "{name}\n  {model} {serial}  label={label}  fw={fw}  {captured}",
-                    name = name,
-                    model = s.camera.model,
-                    serial = s.camera.serial,
-                    label = s.label.as_deref().unwrap_or("-"),
-                    fw = s.camera.firmware,
-                    captured = s.captured_at,
-                );
-            }
-            Err(e) => {
-                println!("{name}  (failed to load: {e})");
-            }
-        }
-        shown += 1;
+    if !listing.dir_exists {
+        println!("(no snapshots — directory {} does not exist)", listing.dir);
+        return Ok(());
     }
-    if shown == 0 {
+    warn_skipped_dir_entries(&listing);
+    for entry in &listing.entries {
+        match &entry.state {
+            EntryState::Ok { model, serial, firmware, label, captured_at, .. } => println!(
+                "{name}\n  {model} {serial}  label={label}  fw={firmware}  {captured_at}",
+                name = entry.file,
+                label = label.as_deref().unwrap_or("-"),
+            ),
+            EntryState::Unreadable { error, .. } => println!("{}  (failed to load: {error})", entry.file),
+        }
+    }
+    if listing.entries.is_empty() {
         println!("(no snapshots match)");
     }
     Ok(())
+}
+
+/// Directory entries the OS refused to yield are counted by `list_dir`; say so
+/// (stderr, so `--json` and piped stdout stay clean) instead of dropping them.
+fn warn_skipped_dir_entries(listing: &Listing) {
+    if listing.skipped_dir_entries > 0 {
+        eprintln!(
+            "warning: {} entr{} in {} could not be read and {} not listed",
+            listing.skipped_dir_entries,
+            if listing.skipped_dir_entries == 1 { "y" } else { "ies" },
+            listing.dir,
+            if listing.skipped_dir_entries == 1 { "was" } else { "were" },
+        );
+    }
 }
 
 fn cmd_rm(_data_dir: &Path, args: &RmArgs) -> Result<()> {
@@ -668,19 +661,19 @@ fn cmd_ref(data_dir: &Path, sub: &RefCmd) -> Result<()> {
                 snap.properties.len(),
             );
         }
-        RefCmd::List => {
-            if !refs.exists() {
-                println!("(no references — directory {} does not exist)", refs.display());
+        RefCmd::List { json } => {
+            let listing = list_dir(&refs, None)?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&listing)?);
                 return Ok(());
             }
-            let mut entries: Vec<_> = fs::read_dir(&refs)?
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|e| e == "json"))
-                .collect();
-            entries.sort();
-            for p in entries {
-                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                println!("{name}");
+            if !listing.dir_exists {
+                println!("(no references — directory {} does not exist)", listing.dir);
+                return Ok(());
+            }
+            warn_skipped_dir_entries(&listing);
+            for entry in &listing.entries {
+                println!("{}", entry.file);
             }
         }
     }
@@ -2788,28 +2781,7 @@ mod tests {
     #[test]
     fn cmd_ref_list_missing_dir_ok_empty() {
         let data_dir = TempDir::new().unwrap();
-        assert!(cmd_ref(data_dir.path(), &RefCmd::List).is_ok());
-    }
-
-    // ── camera_filename_matches ──────────────────────────────────────────
-
-    #[test]
-    fn camera_filename_matches_exact_camera() {
-        assert!(camera_filename_matches("Z_9_ABC123_baseline_20260101T000000Z.json", "Z 9_ABC123"));
-    }
-
-    #[test]
-    fn camera_filename_matches_rejects_prefix_collision() {
-        // Regression: "id-1" is a string prefix of "id-10" — without
-        // anchoring on the trailing "_", filtering by the id-1 fallback
-        // serial would also match id-10's snapshots.
-        assert!(!camera_filename_matches("Z_9_id-10_baseline_20260101T000000Z.json", "Z 9_id-1"));
-        assert!(camera_filename_matches("Z_9_id-1_baseline_20260101T000000Z.json", "Z 9_id-1"));
-    }
-
-    #[test]
-    fn camera_filename_matches_rejects_other_camera() {
-        assert!(!camera_filename_matches("Z_9_OTHER456_baseline_20260101T000000Z.json", "Z 9_ABC123"));
+        assert!(cmd_ref(data_dir.path(), &RefCmd::List { json: false }).is_ok());
     }
 
     // ── looks_like_bcd_version ───────────────────────────────────────────

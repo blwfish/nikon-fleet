@@ -88,6 +88,17 @@ pub enum SnapshotError {
     UnsupportedVersion { found: u32, expected: u32 },
 }
 
+impl SnapshotError {
+    /// Closed machine-readable tag, for structured output. Exhaustive match.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            SnapshotError::Io(_) => "io",
+            SnapshotError::Json(_) => "json",
+            SnapshotError::UnsupportedVersion { .. } => "unsupported_version",
+        }
+    }
+}
+
 /// Replace path-separator characters in a free-text value bound for a
 /// filename component. `/` is the dangerous one on any platform this runs
 /// on (macOS/Linux path separator; also treated as a separator by Rust's
