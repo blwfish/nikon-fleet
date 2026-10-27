@@ -497,7 +497,12 @@ Encode the exact filename Nikon requires on the SD card per model (e.g. `Z9FW050
 
 ### Automatic firmware acquisition
 
-Nikon distributes firmware through the Download Center web interface with no machine-readable API. Out of scope.
+**Partly done (2026-10-27) — see `docs/firmware-source-findings.md`.** Release *detection* is implemented
+(`fleet firmware latest`, `src/firmware_source.rs`, pluggable `FirmwareSource`; Nikon's Download Center pages are
+static HTML). The *download* is behind a licence click-through, so it is not automated: `fleet firmware fetch`
+prints the page to visit and ingests the user-downloaded file via `--from-file` with provenance
+(`FirmwareMeta.provenance`, additive; `format_version` stays 1). Needs fresh-session review before
+anyone decides to automate the gate.
 
 ### Survey remaining fleet models
 

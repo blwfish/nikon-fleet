@@ -28,6 +28,48 @@ pub struct FirmwareMeta {
     pub source_path: String,
     pub canonical_snapshot_path: Option<String>,
     pub notes: Option<String>,
+    /// Where the bundle came from. Absent on entries made by `fleet firmware
+    /// add` before provenance existed (additive: `format_version` stays 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+/// How the bytes reached the archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetrievalMethod {
+    /// The user accepted the source's licence/gate themselves, downloaded the
+    /// file, and handed it to `fleet firmware fetch --from-file`.
+    ManualAfterGate,
+    /// The tool downloaded it from an ungated URL.
+    DirectDownload,
+    /// The user accepted the gate and clicked Download themselves inside the
+    /// embedded browser (`fleet firmware browse`); the tool only chose where
+    /// the file landed, so `source_url` is the real file URL.
+    BrowserAfterGate,
+}
+
+/// Provenance recorded for bundles that came from a firmware source.
+/// `bin_sha256`/`bin_size_bytes` in `FirmwareMeta` are always *computed* from
+/// the stored bytes; `published_*` are what the source claimed (if anything).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    pub source_id: String,
+    /// URL the bytes were fetched from (equals `page_url` for manual retrieval,
+    /// where the tool never sees the file URL).
+    pub source_url: String,
+    pub page_url: String,
+    /// ISO date the source gave for the release, if any.
+    pub released: Option<String>,
+    pub retrieved_at: String,
+    pub method: RetrievalMethod,
+    pub published_size: Option<u64>,
+    pub published_sha256: Option<String>,
+    /// File name the source gave the download (e.g. an installer name), when
+    /// the tool saw it. The archive stores the bytes as `firmware.bin`, so
+    /// this is the only record of what the file was called.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_filename: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -44,6 +86,15 @@ pub enum FirmwareError {
     NotFound { model: String, version: String },
     #[error("SHA-256 mismatch: stored={stored}, computed={computed}")]
     ChecksumMismatch { stored: String, computed: String },
+    #[error(
+        "{model} {version} is already archived with different bytes (archived sha256 {existing}, \
+         new {new}); refusing to overwrite — the same version number should be the same file"
+    )]
+    ContentMismatch { model: String, version: String, existing: String, new: String },
+    #[error("{path} holds a firmware.bin without a metadata.json (interrupted archive?); inspect and remove it by hand")]
+    IncompleteArchive { path: String },
+    #[error("{what} {value:?} is not a single plain path component")]
+    UnsafePathComponent { what: &'static str, value: String },
 }
 
 // ─── Identity helpers ────────────────────────────────────────────────────────
@@ -122,6 +173,95 @@ pub fn format_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+// ─── Ingest (source-independent archiving) ───────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IngestOutcome {
+    Archived(FirmwareMeta),
+    /// Same version, same bytes already archived; nothing written.
+    AlreadyPresent(FirmwareMeta),
+}
+
+fn safe_component(what: &'static str, value: &str) -> Result<(), FirmwareError> {
+    let ok = !value.is_empty() && value != "." && value != ".." && !value.contains(['/', '\\']);
+    if ok { Ok(()) } else { Err(FirmwareError::UnsafePathComponent { what, value: value.to_owned() }) }
+}
+
+/// Archive `src` as `(model, version)` with provenance. Never replaces an
+/// existing bundle: identical bytes are a no-op, different bytes are
+/// `ContentMismatch`. `bin` is written to a temp name, re-hashed, and renamed
+/// into place, and `metadata.json` (the entry's existence marker, see
+/// `archive_exists`) is written last, so a crash never leaves a half entry
+/// that looks complete.
+pub fn ingest_bundle(
+    data_dir: &Path,
+    model: &str,
+    version: &str,
+    src: &Path,
+    provenance: &Provenance,
+    source_page: Option<&str>,
+) -> Result<IngestOutcome, FirmwareError> {
+    safe_component("model", &model_slug(model))?;
+    safe_component("version", version)?;
+
+    if fs::metadata(src)?.len() == 0 {
+        return Err(FirmwareError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, format!("{} is empty; not archiving", src.display()),
+        )));
+    }
+    let new_sha = sha256_file(src)?;
+    let dir = archive_dir(data_dir, model, version);
+    let bin = dir.join("firmware.bin");
+
+    if dir.join("metadata.json").exists() {
+        let meta = load_meta(data_dir, model, version)?;
+        let existing = sha256_file(&bin)?;
+        if existing != meta.bin_sha256 {
+            return Err(FirmwareError::ChecksumMismatch { stored: meta.bin_sha256, computed: existing });
+        }
+        return if existing == new_sha {
+            Ok(IngestOutcome::AlreadyPresent(meta))
+        } else {
+            Err(FirmwareError::ContentMismatch {
+                model: model.to_owned(), version: version.to_owned(), existing, new: new_sha,
+            })
+        };
+    }
+    if bin.exists() {
+        return Err(FirmwareError::IncompleteArchive { path: dir.display().to_string() });
+    }
+
+    fs::create_dir_all(&dir)?;
+    let part = dir.join("firmware.bin.part");
+    fs::copy(src, &part)?;
+    let copied_sha = sha256_file(&part)?;
+    if copied_sha != new_sha {
+        let _ = fs::remove_file(&part); // best effort; the mismatch below is the real error
+        return Err(FirmwareError::ChecksumMismatch { stored: new_sha, computed: copied_sha });
+    }
+    let size = fs::metadata(&part)?.len();
+    fs::rename(&part, &bin)?;
+    if let Some(html) = source_page {
+        fs::write(dir.join("source-page.html"), html)?;
+    }
+
+    let meta = FirmwareMeta {
+        format_version: FIRMWARE_META_FORMAT_VERSION,
+        model: model.to_owned(),
+        firmware_version: version.to_owned(),
+        archived_at: provenance.retrieved_at.clone(),
+        archived_by: "fleet firmware fetch".into(),
+        bin_sha256: new_sha,
+        bin_size_bytes: size,
+        source_path: src.display().to_string(),
+        canonical_snapshot_path: None,
+        notes: None,
+        provenance: Some(provenance.clone()),
+    };
+    save_meta(&meta, &dir)?;
+    Ok(IngestOutcome::Archived(meta))
 }
 
 // ─── Listing ─────────────────────────────────────────────────────────────────
@@ -357,6 +497,7 @@ mod tests {
             source_path: "/tmp/Z9FW0531.BIN".into(),
             canonical_snapshot_path: None,
             notes: None,
+            provenance: None,
         };
         save_meta(&meta, &adir).unwrap();
         let loaded = load_meta(data_dir.path(), "Z 9", "5.31").unwrap();
@@ -400,6 +541,7 @@ mod tests {
             source_path: "".into(),
             canonical_snapshot_path: None,
             notes: None,
+            provenance: None,
         };
         fs::write(adir.join("metadata.json"), serde_json::to_string(&bad).unwrap()).unwrap();
         let err = load_meta(data_dir.path(), "Z 9", "5.31").unwrap_err();
@@ -425,6 +567,7 @@ mod tests {
             source_path: "".into(),
             canonical_snapshot_path: None,
             notes: None,
+            provenance: None,
         };
         fs::write(adir.join("metadata.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
     }
@@ -547,5 +690,118 @@ mod tests {
         // At fw_major=3: neither section included (both above the boundary)
         let caps3 = capability_map_for_fw(&schema, "Z 9", 3);
         assert!(caps3.is_empty(), "no sections should be included at fw_major=3");
+    }
+
+    // ── ingest_bundle ────────────────────────────────────────────────────────
+
+    fn prov() -> Provenance {
+        Provenance {
+            source_id: "test".into(),
+            source_url: "https://example.test/page".into(),
+            page_url: "https://example.test/page".into(),
+            released: Some("2026-10-20".into()),
+            retrieved_at: "2026-10-27T00:00:00Z".into(),
+            method: RetrievalMethod::ManualAfterGate,
+            published_size: None,
+            published_sha256: None,
+            original_filename: None,
+        }
+    }
+
+    fn file_with(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn ingest_archives_with_provenance_and_page() {
+        let (data, src) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f = file_with(src.path(), "in.bin", b"hello");
+        let out = ingest_bundle(data.path(), "Z 9", "5.33", &f, &prov(), Some("<html>page</html>")).unwrap();
+        let IngestOutcome::Archived(meta) = out else { panic!("expected Archived") };
+        assert_eq!(meta.bin_sha256, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(meta.bin_size_bytes, 5);
+        let dir = archive_dir(data.path(), "Z 9", "5.33");
+        assert_eq!(fs::read(dir.join("firmware.bin")).unwrap(), b"hello");
+        assert_eq!(fs::read_to_string(dir.join("source-page.html")).unwrap(), "<html>page</html>");
+        assert!(!dir.join("firmware.bin.part").exists(), "temp file must not linger");
+        // round-trips, and is visible to the existing listing code
+        assert_eq!(load_meta(data.path(), "Z 9", "5.33").unwrap().provenance, Some(prov()));
+        assert_eq!(list_archives(data.path(), None).len(), 1);
+    }
+
+    #[test]
+    fn ingest_same_bytes_is_noop_different_bytes_never_overwrites() {
+        let (data, src) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let a = file_with(src.path(), "a.bin", b"hello");
+        let b = file_with(src.path(), "b.bin", b"hellO"); // same length, one byte differs
+        ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), None).unwrap();
+        assert!(matches!(
+            ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), None).unwrap(),
+            IngestOutcome::AlreadyPresent(_)
+        ));
+        let err = ingest_bundle(data.path(), "Z 9", "5.33", &b, &prov(), None).unwrap_err();
+        assert!(matches!(err, FirmwareError::ContentMismatch { .. }), "{err:?}");
+        let bin = archive_dir(data.path(), "Z 9", "5.33").join("firmware.bin");
+        assert_eq!(fs::read(bin).unwrap(), b"hello", "original bytes must survive the refused overwrite");
+    }
+
+    #[test]
+    fn ingest_detects_corrupted_existing_archive() {
+        let (data, src) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let a = file_with(src.path(), "a.bin", b"hello");
+        ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), None).unwrap();
+        fs::write(archive_dir(data.path(), "Z 9", "5.33").join("firmware.bin"), b"rotted").unwrap();
+        let err = ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), None).unwrap_err();
+        assert!(matches!(err, FirmwareError::ChecksumMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn ingest_refuses_bin_without_metadata_and_empty_input_and_unsafe_names() {
+        let (data, src) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let a = file_with(src.path(), "a.bin", b"hello");
+        let dir = archive_dir(data.path(), "Z 9", "5.33");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("firmware.bin"), b"orphan").unwrap();
+        assert!(matches!(
+            ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), None).unwrap_err(),
+            FirmwareError::IncompleteArchive { .. }
+        ));
+        assert_eq!(fs::read(dir.join("firmware.bin")).unwrap(), b"orphan");
+
+        let empty = file_with(src.path(), "empty.bin", b"");
+        assert!(matches!(
+            ingest_bundle(data.path(), "Z 9", "5.34", &empty, &prov(), None).unwrap_err(),
+            FirmwareError::Io(_)
+        ));
+        assert!(!archive_exists(data.path(), "Z 9", "5.34"));
+
+        for bad in ["", ".", "..", "../x", "a/b", "a\\b"] {
+            assert!(matches!(
+                ingest_bundle(data.path(), "Z 9", bad, &a, &prov(), None).unwrap_err(),
+                FirmwareError::UnsafePathComponent { .. }
+            ), "version {bad:?}");
+        }
+        assert!(ingest_bundle(data.path(), "../evil", "5.33", &a, &prov(), None).is_err());
+    }
+
+    #[test]
+    fn ingest_missing_source_file_is_error() {
+        let data = TempDir::new().unwrap();
+        let err = ingest_bundle(data.path(), "Z 9", "5.33", Path::new("/nonexistent/x.bin"), &prov(), None).unwrap_err();
+        assert!(matches!(err, FirmwareError::Io(_)));
+    }
+
+    #[test]
+    fn legacy_metadata_without_provenance_still_loads() {
+        // Entries written by `fleet firmware add` before provenance existed.
+        let data = TempDir::new().unwrap();
+        let adir = archive_dir(data.path(), "Z 9", "5.31");
+        fs::create_dir_all(&adir).unwrap();
+        fs::write(adir.join("metadata.json"), r#"{"format_version":1,"model":"Z 9","firmware_version":"5.31",
+            "archived_at":"t","archived_by":"fleet firmware add","bin_sha256":"x","bin_size_bytes":1,
+            "source_path":"p","canonical_snapshot_path":null,"notes":null}"#).unwrap();
+        assert_eq!(load_meta(data.path(), "Z 9", "5.31").unwrap().provenance, None);
     }
 }

@@ -10,14 +10,19 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use nikon_fleet::diff::{Diff, DiffOptions, diff_with_schema, is_volatile};
 use nikon_fleet::firmware::{
     FirmwareError, FirmwareMeta, FIRMWARE_META_FORMAT_VERSION,
-    archive_dir, archive_exists, format_size, list_archives, load_meta,
-    model_slug, save_meta, sha256_file,
+    archive_dir, archive_exists, format_size, ingest_bundle, list_archives, load_meta,
+    model_slug, save_meta, sha256_file, IngestOutcome, Provenance, RetrievalMethod,
+};
+use nikon_fleet::firmware_source::{
+    CameraRelation, DownloadAccess, FirmwareSource, FwVersion, HttpGet, ModelStatus, NikonDownloadCenter,
+    Release, SourceError, UreqHttp, assess, camera_relation, fetch_direct,
 };
 use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::sdk::{CapabilityInfo, Device, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET, OP_SET};
@@ -191,6 +196,43 @@ enum FirmwareCmd {
     Rollback(FirmwareRollbackArgs),
     /// Compare live camera firmware against references and check archive coverage.
     Check(FirmwareCheckArgs),
+    /// Ask the firmware source what is newest for each model, and compare with
+    /// the archive and the connected cameras.
+    Latest(FirmwareLatestArgs),
+    /// Archive newly published firmware (or ingest a bundle you downloaded
+    /// yourself with --from-file) with provenance.
+    Fetch(FirmwareFetchArgs),
+}
+
+/// Models checked when no --model is given: the fleet bodies that have
+/// newer firmware to watch (Z 5 is supported by the source but not default).
+const DEFAULT_WATCH_MODELS: &[&str] = &["Z 9", "Z6_3"];
+
+#[derive(Args, Debug)]
+struct FirmwareLatestArgs {
+    /// Model to look up, e.g. "Z 9" or "Z6_3". Repeatable. Default: Z 9 and Z6_3.
+    #[arg(long = "model")]
+    models: Vec<String>,
+    /// Output the survey as JSON (for GUI / scripting). Exit status is the
+    /// same as without it: non-zero if any model could not be determined.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct FirmwareFetchArgs {
+    /// Model to fetch, e.g. "Z 9" or "Z6_3". Repeatable. Default: Z 9 and Z6_3.
+    /// Exactly one is required with --from-file.
+    #[arg(long = "model")]
+    models: Vec<String>,
+    /// Report what would be downloaded/archived; write nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// The firmware file you downloaded yourself from the release's download
+    /// page (after accepting Nikon's licence there). Archived under the latest
+    /// published version for --model, with provenance and the page saved.
+    #[arg(long)]
+    from_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1052,6 +1094,7 @@ fn cmd_firmware_add(data_dir: &Path, args: &FirmwareAddArgs) -> Result<()> {
         source_path: args.bin_path.display().to_string(),
         canonical_snapshot_path: None,
         notes: args.notes.clone(),
+        provenance: None,
     };
     save_meta(&meta, &dir)?;
 
@@ -1348,6 +1391,353 @@ fn cmd_firmware_check(data_dir: &Path, args: &FirmwareCheckArgs) -> Result<()> {
     Ok(())
 }
 
+// ── Firmware source: latest / fetch ──────────────────────────────────────
+
+/// Everything we know about one model before deciding what to do.
+struct ModelSurvey {
+    model: String,
+    release: Result<Release, SourceError>,
+    archived: Vec<FwVersion>,
+    /// Archive entries whose version string isn't canonical and so can't be matched.
+    archive_notes: Vec<String>,
+    /// (serial, reported firmware) for connected bodies of this model.
+    cameras: Vec<(String, String)>,
+    status: ModelStatus,
+}
+
+fn watch_models(requested: &[String]) -> Vec<String> {
+    if requested.is_empty() {
+        DEFAULT_WATCH_MODELS.iter().map(|m| m.to_string()).collect()
+    } else {
+        requested.to_vec()
+    }
+}
+
+fn survey_models(
+    data_dir: &Path,
+    models: &[String],
+    source: &dyn FirmwareSource,
+    http: &dyn HttpGet,
+) -> Vec<ModelSurvey> {
+    let cameras = usb_camera_list();
+    models.iter().map(|model| {
+        let release = source.latest(model, http);
+        let mut archived = Vec::new();
+        let mut archive_notes = Vec::new();
+        for e in list_archives(data_dir, Some(model)) {
+            match FwVersion::parse_canonical(&e.version) {
+                Ok(v) => archived.push(v),
+                Err(err) => archive_notes.push(format!("archive entry {:?} ignored: {err}", e.version)),
+            }
+        }
+        let status = assess(&release, &archived);
+        let cams = cameras.iter().filter(|c| &c.model == model)
+            .map(|c| (c.serial.clone(), c.firmware.clone())).collect();
+        ModelSurvey { model: model.clone(), release, archived, archive_notes, cameras: cams, status }
+    }).collect()
+}
+
+fn print_survey(s: &ModelSurvey) {
+    match (&s.status, &s.release) {
+        (ModelStatus::CouldNotDetermine { reason }, _) => {
+            println!("{:<5} COULD NOT DETERMINE — {reason}", s.model);
+            println!("      (this says nothing about whether new firmware exists)");
+        }
+        (status, Ok(r)) => {
+            let label = match status {
+                ModelStatus::NewAvailable { .. } => "NEW — not in archive",
+                _ => "already archived",
+            };
+            println!("{:<5} latest {} ({})  {label}", s.model, r.version,
+                r.released.as_deref().map(|d| format!("released {d}")).unwrap_or_else(|| "release date unknown".into()));
+            println!("      page: {}", r.page_url);
+            match &r.download {
+                DownloadAccess::Gated { notice } => println!("      download: GATED — {notice}"),
+                DownloadAccess::Direct { url, .. } => println!("      download: direct — {url}"),
+            }
+            for w in &r.warnings {
+                println!("      warning: {w}");
+            }
+        }
+        (_, Err(_)) => unreachable!("assess() maps every Err to CouldNotDetermine"),
+    }
+    let archived: Vec<String> = s.archived.iter().map(|v| v.to_string()).collect();
+    println!("      archived: {}", if archived.is_empty() { "(none)".into() } else { archived.join(", ") });
+    for n in &s.archive_notes {
+        println!("      warning: {n}");
+    }
+    if s.cameras.is_empty() {
+        println!("      fleet: no {} connected via USB", s.model);
+    }
+    for (serial, fw) in &s.cameras {
+        let rel = match &s.release {
+            Ok(r) => match camera_relation(fw, r.version) {
+                CameraRelation::Behind => "behind latest".to_string(),
+                CameraRelation::Current => "at latest".to_string(),
+                CameraRelation::Ahead => "AHEAD of the source's latest".to_string(),
+                CameraRelation::Unreadable(why) => format!("firmware unreadable ({why})"),
+            },
+            Err(_) => "latest unknown".to_string(),
+        };
+        let in_archive = FwVersion::parse_canonical(fw).ok().is_some_and(|v| s.archived.contains(&v));
+        println!("      fleet: {serial}  fw={fw}  {rel}; running version {}",
+            if in_archive { "archived" } else { "NOT archived" });
+    }
+}
+
+// ── `firmware latest --json` ────────────────────────────────────────────────
+// The shape is a contract with scripts and the GUI; `latest_json_shape_*`
+// tests pin it. Every verdict is a closed enum serialised as snake_case; the
+// free-text `reason`/`detail` fields only explain a verdict, never carry it.
+
+/// Source verdict for one model.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LatestStatus {
+    /// Published and not in the archive.
+    NewAvailable,
+    /// Published and already in the archive.
+    AlreadyArchived,
+    /// The source could not be read; says nothing about whether anything is new.
+    CouldNotDetermine,
+}
+
+/// How one connected camera relates to the latest published version.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LatestRelation {
+    Behind,
+    Current,
+    Ahead,
+    /// The camera's reported firmware isn't a canonical version.
+    Unreadable,
+    /// There is no latest version to compare with (the lookup failed).
+    LatestUnknown,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LatestDownload {
+    Gated,
+    Direct,
+}
+
+#[derive(Serialize, Debug)]
+struct LatestRelease {
+    version: String,
+    released: Option<String>,
+    page_url: String,
+    download: LatestDownload,
+}
+
+#[derive(Serialize, Debug)]
+struct LatestCamera {
+    serial: String,
+    /// Firmware the camera reports over USB, verbatim.
+    installed: String,
+    relation: LatestRelation,
+    /// Why the relation is `unreadable`; null otherwise.
+    relation_detail: Option<String>,
+    /// Whether the archive holds the version this camera is running.
+    /// Null when `installed` isn't a canonical version.
+    running_version_archived: Option<bool>,
+}
+
+#[derive(Serialize, Debug)]
+struct LatestModel {
+    model: String,
+    status: LatestStatus,
+    /// Null exactly when `status` is `could_not_determine`.
+    latest: Option<LatestRelease>,
+    /// Why the lookup failed; null unless `status` is `could_not_determine`.
+    reason: Option<String>,
+    /// Whether the archive holds `latest.version`. Null when `latest` is.
+    archive_holds_latest: Option<bool>,
+    /// All archived versions of this model, oldest first.
+    archived_versions: Vec<String>,
+    /// Connected bodies of this model (empty if none are connected).
+    cameras: Vec<LatestCamera>,
+    /// Non-fatal oddities from the source and the archive scan.
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct LatestReport {
+    models: Vec<LatestModel>,
+}
+
+fn survey_json(s: &ModelSurvey) -> LatestModel {
+    let (status, reason) = match &s.status {
+        ModelStatus::NewAvailable { .. } => (LatestStatus::NewAvailable, None),
+        ModelStatus::AlreadyArchived { .. } => (LatestStatus::AlreadyArchived, None),
+        ModelStatus::CouldNotDetermine { reason } => (LatestStatus::CouldNotDetermine, Some(reason.clone())),
+    };
+    let latest = s.release.as_ref().ok().map(|r| LatestRelease {
+        version: r.version.to_string(),
+        released: r.released.clone(),
+        page_url: r.page_url.clone(),
+        download: match r.download {
+            DownloadAccess::Gated { .. } => LatestDownload::Gated,
+            DownloadAccess::Direct { .. } => LatestDownload::Direct,
+        },
+    });
+    let mut archived = s.archived.clone();
+    archived.sort();
+    let mut warnings: Vec<String> = s.release.as_ref().map(|r| r.warnings.clone()).unwrap_or_default();
+    warnings.extend(s.archive_notes.iter().cloned());
+    let cameras = s.cameras.iter().map(|(serial, fw)| {
+        let (relation, relation_detail) = match &s.release {
+            Ok(r) => match camera_relation(fw, r.version) {
+                CameraRelation::Behind => (LatestRelation::Behind, None),
+                CameraRelation::Current => (LatestRelation::Current, None),
+                CameraRelation::Ahead => (LatestRelation::Ahead, None),
+                CameraRelation::Unreadable(why) => (LatestRelation::Unreadable, Some(why)),
+            },
+            Err(_) => (LatestRelation::LatestUnknown, None),
+        };
+        LatestCamera {
+            serial: serial.clone(),
+            installed: fw.clone(),
+            relation,
+            relation_detail,
+            running_version_archived: FwVersion::parse_canonical(fw).ok().map(|v| s.archived.contains(&v)),
+        }
+    }).collect();
+    LatestModel {
+        model: s.model.clone(),
+        status,
+        archive_holds_latest: s.release.as_ref().ok().map(|r| s.archived.contains(&r.version)),
+        latest,
+        reason,
+        archived_versions: archived.iter().map(|v| v.to_string()).collect(),
+        cameras,
+        warnings,
+    }
+}
+
+fn cmd_firmware_latest(data_dir: &Path, args: &FirmwareLatestArgs) -> Result<()> {
+    let models = watch_models(&args.models);
+    let surveys = survey_models(data_dir, &models, &NikonDownloadCenter::new(), &UreqHttp::new());
+    let unknown = surveys.iter().filter(|s| matches!(s.status, ModelStatus::CouldNotDetermine { .. })).count();
+    if args.json {
+        let report = LatestReport { models: surveys.iter().map(survey_json).collect() };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for s in &surveys {
+            print_survey(s);
+        }
+    }
+    if unknown > 0 {
+        bail!("{unknown} of {} model(s) could not be determined (see above)", surveys.len());
+    }
+    Ok(())
+}
+
+fn cmd_firmware_fetch(data_dir: &Path, args: &FirmwareFetchArgs) -> Result<()> {
+    if args.from_file.is_some() && args.models.len() != 1 {
+        bail!("--from-file needs exactly one --model (got {}); the file belongs to one model", args.models.len());
+    }
+    let source = NikonDownloadCenter::new();
+    let http = UreqHttp::new();
+    let models = watch_models(&args.models);
+    let surveys = survey_models(data_dir, &models, &source, &http);
+    let mut failures = 0usize;
+    let mut manual_pending = 0usize;
+
+    for s in &surveys {
+        print_survey(s);
+        let release = match &s.release {
+            Ok(r) => r,
+            Err(_) => { failures += 1; continue; }
+        };
+        let result: Result<()> = (|| {
+            if let Some(file) = &args.from_file {
+                return ingest_user_file(data_dir, source.id(), release, file, args.dry_run);
+            }
+            match (&s.status, &release.download) {
+                (ModelStatus::AlreadyArchived { .. }, _) => Ok(()),
+                (_, DownloadAccess::Gated { .. }) => {
+                    manual_pending += 1;
+                    println!("      ACTION REQUIRED: open {}", release.page_url);
+                    println!("        accept the licence there and download the file, then run:");
+                    println!("        fleet firmware fetch --model {:?} --from-file <downloaded file>", s.model);
+                    Ok(())
+                }
+                (_, DownloadAccess::Direct { url, .. }) if args.dry_run => {
+                    println!("      dry-run: would download {url} and archive as {} {}", s.model, release.version);
+                    Ok(())
+                }
+                (_, DownloadAccess::Direct { .. }) => {
+                    let scratch = tempfile::tempdir().context("creating scratch dir")?;
+                    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+                    match fetch_direct(&http, source.id(), release, data_dir, scratch.path(), &now)? {
+                        IngestOutcome::Archived(m) => print_archived(&m),
+                        IngestOutcome::AlreadyPresent(_) => println!("      already archived (identical bytes)"),
+                    }
+                    Ok(())
+                }
+            }
+        })();
+        if let Err(e) = result {
+            failures += 1;
+            eprintln!("error: {}: {e:#}", s.model);
+        }
+    }
+    if manual_pending > 0 {
+        println!("\n{manual_pending} model(s) need a manual, licence-gated download (see ACTION REQUIRED above).");
+    }
+    if failures > 0 {
+        bail!("{failures} of {} model(s) failed (see above)", surveys.len());
+    }
+    Ok(())
+}
+
+fn print_archived(m: &FirmwareMeta) {
+    println!(
+        "      archived {} {}  firmware/{}/{}/firmware.bin  ({}, sha256 {})",
+        m.model, m.firmware_version, model_slug(&m.model), m.firmware_version,
+        format_size(m.bin_size_bytes), m.bin_sha256
+    );
+}
+
+/// Archive a file the user downloaded themselves as `release`'s version.
+fn ingest_user_file(data_dir: &Path, source_id: &str, release: &Release, file: &Path, dry_run: bool) -> Result<()> {
+    let version = release.version.to_string();
+    if dry_run {
+        let sha = sha256_file(file).with_context(|| format!("hashing {}", file.display()))?;
+        let size = fs::metadata(file)?.len();
+        if archive_exists(data_dir, &release.model, &version) {
+            let meta = load_meta(data_dir, &release.model, &version)?;
+            if meta.bin_sha256 == sha {
+                println!("      dry-run: {} {version} already archived with identical bytes; no-op", release.model);
+            } else {
+                bail!("dry-run: {} {version} is already archived with DIFFERENT bytes (archived {}, file {sha}); a real run would refuse",
+                    release.model, meta.bin_sha256);
+            }
+        } else {
+            println!("      dry-run: would archive {} as {} {version} ({}, sha256 {sha})",
+                file.display(), release.model, format_size(size));
+        }
+        return Ok(());
+    }
+    let prov = Provenance {
+        source_id: source_id.to_owned(),
+        source_url: release.page_url.clone(),
+        page_url: release.page_url.clone(),
+        released: release.released.clone(),
+        retrieved_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
+        method: RetrievalMethod::ManualAfterGate,
+        published_size: None,
+        published_sha256: None,
+        original_filename: file.file_name().map(|n| n.to_string_lossy().into_owned()),
+    };
+    match ingest_bundle(data_dir, &release.model, &version, file, &prov, Some(&release.raw_page))? {
+        IngestOutcome::Archived(m) => print_archived(&m),
+        IngestOutcome::AlreadyPresent(_) => println!("      already archived (identical bytes); nothing written"),
+    }
+    Ok(())
+}
+
 fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset: bool) -> Result<()> {
     let snap_path = resolve_snapshot_path(data_dir, &args.snapshot_path);
     let snap = Snapshot::load_from_file(&snap_path)
@@ -1599,6 +1989,8 @@ fn main() -> Result<()> {
             FirmwareCmd::Pin(args) => cmd_firmware_pin(&cli.data_dir, args),
             FirmwareCmd::Rollback(args) => cmd_firmware_rollback(&cli.data_dir, &cli.schema, args),
             FirmwareCmd::Check(args) => cmd_firmware_check(&cli.data_dir, args),
+            FirmwareCmd::Latest(args) => cmd_firmware_latest(&cli.data_dir, args),
+            FirmwareCmd::Fetch(args) => cmd_firmware_fetch(&cli.data_dir, args),
         },
     }
 }
@@ -1613,6 +2005,115 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
     use serde_json::json;
+
+    // ── firmware latest --json shape ─────────────────────────────────────
+
+    fn fwv(major: u32, minor: u32) -> FwVersion {
+        FwVersion { major, minor }
+    }
+
+    fn test_release(version: FwVersion, download: DownloadAccess) -> Release {
+        Release {
+            model: "Z 9".into(),
+            version,
+            released: Some("2026-10-20".into()),
+            page_url: "https://dl.test/en/download/fw/607.html".into(),
+            download,
+            warnings: vec!["row looked odd".into()],
+            raw_page: String::new(),
+        }
+    }
+
+    fn gated() -> DownloadAccess {
+        DownloadAccess::Gated { notice: "click".into() }
+    }
+
+    fn test_survey(release: Result<Release, SourceError>, archived: Vec<FwVersion>, cameras: &[(&str, &str)]) -> ModelSurvey {
+        let status = assess(&release, &archived);
+        ModelSurvey {
+            model: "Z 9".into(),
+            release,
+            archived,
+            archive_notes: vec!["archive entry \"x\" ignored: bad".into()],
+            cameras: cameras.iter().map(|(s, f)| (s.to_string(), f.to_string())).collect(),
+            status,
+        }
+    }
+
+    /// Pins the whole object for a new release with cameras in every relation.
+    #[test]
+    fn latest_json_shape_new_available() {
+        let s = test_survey(
+            Ok(test_release(fwv(5, 33), gated())),
+            vec![fwv(5, 31), fwv(5, 9), fwv(5, 10)],
+            &[("A1", "5.31"), ("A2", "5.33"), ("A3", "5.34"), ("A4", "garbage")],
+        );
+        assert_eq!(
+            serde_json::to_value(survey_json(&s)).unwrap(),
+            json!({
+                "model": "Z 9",
+                "status": "new_available",
+                "latest": {
+                    "version": "5.33",
+                    "released": "2026-10-20",
+                    "page_url": "https://dl.test/en/download/fw/607.html",
+                    "download": "gated"
+                },
+                "reason": null,
+                "archive_holds_latest": false,
+                // Numeric order (minor 9 prints as "5.09"): 5.09 < 5.10 < 5.31.
+                "archived_versions": ["5.09", "5.10", "5.31"],
+                "cameras": [
+                    {"serial": "A1", "installed": "5.31", "relation": "behind",
+                     "relation_detail": null, "running_version_archived": true},
+                    {"serial": "A2", "installed": "5.33", "relation": "current",
+                     "relation_detail": null, "running_version_archived": false},
+                    {"serial": "A3", "installed": "5.34", "relation": "ahead",
+                     "relation_detail": null, "running_version_archived": false},
+                    {"serial": "A4", "installed": "garbage", "relation": "unreadable",
+                     "relation_detail": FwVersion::parse_canonical("garbage").unwrap_err().to_string(),
+                     "running_version_archived": null}
+                ],
+                "warnings": ["row looked odd", "archive entry \"x\" ignored: bad"]
+            })
+        );
+    }
+
+    #[test]
+    fn latest_json_shape_already_archived_and_direct() {
+        let direct = DownloadAccess::Direct { url: "https://x.test/f".into(), expected_size: None, expected_sha256: None };
+        let s = test_survey(Ok(test_release(fwv(5, 33), direct)), vec![fwv(5, 33)], &[]);
+        let v = serde_json::to_value(survey_json(&s)).unwrap();
+        assert_eq!(v["status"], "already_archived");
+        assert_eq!(v["archive_holds_latest"], true);
+        assert_eq!(v["latest"]["download"], "direct");
+        assert_eq!(v["cameras"], json!([]), "no connected camera -> empty list, not null");
+    }
+
+    /// A failed lookup is a typed status with null latest, never prose in a
+    /// "nothing new" field.
+    #[test]
+    fn latest_json_shape_could_not_determine() {
+        let err = SourceError::Parse { url: "https://dl.test/p".into(), reason: "layout changed".into() };
+        let s = test_survey(Err(err), vec![fwv(5, 31)], &[("A1", "5.31")]);
+        let v = serde_json::to_value(survey_json(&s)).unwrap();
+        assert_eq!(v["status"], "could_not_determine");
+        assert!(v["latest"].is_null());
+        assert!(v["archive_holds_latest"].is_null(), "unknown, not false");
+        assert!(v["reason"].as_str().unwrap().contains("layout changed"));
+        assert_eq!(v["cameras"][0]["relation"], "latest_unknown");
+        assert_eq!(v["cameras"][0]["running_version_archived"], true);
+        assert_eq!(v["archived_versions"], json!(["5.31"]));
+    }
+
+    #[test]
+    fn latest_json_top_level_is_models_array() {
+        let s = test_survey(Ok(test_release(fwv(5, 33), gated())), vec![], &[]);
+        let report = LatestReport { models: vec![survey_json(&s)] };
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["models"]);
+        assert_eq!(v["models"].as_array().unwrap().len(), 1);
+    }
 
     // ── reference_filename parity ────────────────────────────────────────
     // Python GUI uses: f"{model.replace(' ', '_')}_{serial}.json"

@@ -39,8 +39,13 @@ rusb = "0.9"
 # SHA-256 hashing for firmware archive integrity checks.
 sha2 = "0.10"
 
+# Blocking HTTP and HTML parsing for the firmware source (src/firmware_source.rs).
+ureq = "2"
+scraper = "0.29.0"
+
+# Scratch directory for downloads before they are verified and archived (also used by tests).
+tempfile = "3"
+
 [dev-dependencies]
 # Nicer assertion output for tests
 pretty_assertions = "1"
-# Temporary directories for firmware tests
-tempfile = "3"
