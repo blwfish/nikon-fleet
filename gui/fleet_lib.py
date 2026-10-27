@@ -247,3 +247,16 @@ def snapshot_rows(data_dir: Path, model: str, serial: str, warn=None) -> list[tu
             warn(f"warning: could not read snapshot {f}: {e}")
     rows.sort(reverse=True)
     return rows
+
+
+def browse_outcome(returncode: int, stdout: str, stderr: str) -> tuple[bool, str]:
+    """Interpret a finished `fleet firmware browse` run for display.
+
+    Exit 0 means the download was captured and archived (or was already
+    archived); the CLI's stdout says which. Anything else is a failure whose
+    explanation is on stderr — and, when the embedded browser is unavailable,
+    the manual-download steps are on stdout — so both are shown.
+    """
+    if returncode == 0:
+        return True, stdout.strip()
+    return False, "\n".join(p for p in (stderr.strip(), stdout.strip()) if p) or f"fleet exited {returncode}"

@@ -5,12 +5,13 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
 import zipfile
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode, is_valid_u16, snapshot_rows
+from fleet_lib import browse_outcome, strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode, is_valid_u16, snapshot_rows
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -316,6 +317,7 @@ class FleetApp:
         bf.pack(side=tk.BOTTOM, anchor=tk.W, pady=4)
         ttk.Button(bf, text="Add Firmware…", command=self.add_firmware).pack(side=tk.LEFT, padx=2)
         ttk.Button(bf, text="Remove",        command=self.remove_firmware).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bf, text="Download from Nikon…", command=self.download_firmware).pack(side=tk.LEFT, padx=2)
         self._fw_tree = ttk.Treeview(parent, columns=("model", "version", "filename"),
                                       show="headings", selectmode="browse")
         self._fw_tree.heading("model",    text="Model")
@@ -371,6 +373,43 @@ class FleetApp:
             model, version = parse_fw_filename(f.name)
             self._fw_tree.insert("", tk.END, iid=f"flat|{f.name}",
                                  values=(model, version, f.name))
+
+    def download_firmware(self) -> None:
+        """Open Nikon's download page in `fleet firmware browse`'s own window.
+
+        You accept the licence and click Download in that window; the CLI
+        captures, checks and archives the file. It is a separate process
+        because the web view needs its own main-thread event loop, and it
+        runs on a worker thread so this window stays responsive meanwhile.
+        """
+        model = simpledialog.askstring(
+            "Download from Nikon", 'Camera model to download the newest firmware for\n(e.g. "Z 9" or "Z6_3"):',
+            initialvalue="Z 9", parent=self.root,
+        )
+        if not model:
+            return
+        cmd = [str(_fleet_bin()), "--data-dir", str(_data_dir()), "firmware", "browse", model]
+        result: list[tuple[bool, str]] = []
+
+        def work() -> None:
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                result.append(browse_outcome(r.returncode, r.stdout, r.stderr))
+            except OSError as e:
+                result.append((False, f"could not run {cmd[0]}: {e}"))
+
+        def poll() -> None:
+            if not result:
+                self.root.after(300, poll)
+                return
+            ok, text = result[0]
+            self._load_firmware()
+            self._status(f"Nikon download for {model}: {'done' if ok else 'not archived'}.")
+            (messagebox.showinfo if ok else messagebox.showerror)("Download from Nikon", text, parent=self.root)
+
+        self._status(f"A browser window is open for {model}: accept the licence there and click Download…")
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(300, poll)
 
     def add_firmware(self) -> None:
         # Delegates to `fleet firmware add` rather than copying the file

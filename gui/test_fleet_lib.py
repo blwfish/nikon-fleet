@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode, is_valid_u16, snapshot_rows
+from fleet_lib import browse_outcome, strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode, is_valid_u16, snapshot_rows
 
 _FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "capability_value_shapes.json"
 
@@ -462,3 +462,21 @@ class TestSnapshotRows:
         rows = snapshot_rows(tmp_path, "Z 9", "ABC123", warn=warnings.append)
         assert [r[3] for r in rows] == ["good.json"]
         assert len(warnings) == 2
+
+
+class TestBrowseOutcome:
+    def test_success_shows_stdout(self):
+        ok, text = browse_outcome(0, "  archived Z 9 5.33\n", "")
+        assert ok and text == "archived Z 9 5.33"
+
+    def test_failure_shows_stderr_then_stdout(self):
+        ok, text = browse_outcome(1, "Download it by hand instead:\n  1. open X\n", "could not open the embedded browser: no\n")
+        assert not ok
+        assert text.startswith("could not open the embedded browser: no")
+        assert text.endswith("1. open X")
+
+    def test_failure_with_no_output_still_says_something(self):
+        assert browse_outcome(2, "", "") == (False, "fleet exited 2")
+
+    def test_nonzero_with_only_stdout(self):
+        assert browse_outcome(1, "hint\n", "") == (False, "hint")
