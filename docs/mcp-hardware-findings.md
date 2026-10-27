@@ -540,7 +540,10 @@ What this settles and what it does not: a stepped range write through the SDK st
 say which field the camera reads (both were always coherent). Continuous ranges, other stepped ranges, a
 cross-model range translation and ranges with a dependent effect are still unwritten. The ignored blind
 write is a general warning: **success from a write call proves nothing; only a read-back does**, which is why
-`restore_apply` must report `residual` (`ops::readback::residual`, not yet wired into the CLI's restore).
+`restore_apply` must report `residual` (`ops::readback::residual`). It now does: the CLI's restore and the ops
+`restore_flow` both read the body back, and a body that accepts and ignores a write comes out
+`applied_unverified` in tests on a fake body (`ignoring_writes`, and `ignoring_blind_writes` for the range case). Not yet
+confirmed on hardware.
 
 Also from the same runs: the digest of two real plans taken minutes apart was identical, and the summary
 counts three boolean/string-valued properties as "would change" because they are written without a read

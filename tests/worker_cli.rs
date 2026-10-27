@@ -327,11 +327,107 @@ fn plan_and_apply_report_camera_busy_without_loading_the_sdk() {
         vec!["transplant-plan", "--serial", "0000003023668", "--source", &src],
         vec!["transplant-apply", "--serial", "0000003023668", "--source", &src, "--digest", "d", "--summary", "s"],
         vec!["check", "--serial", "0000003023668"],
+        vec!["restore-plan", "--serial", "0000003023668", "--source", &src],
+        vec!["restore-apply", "--serial", "0000003023668", "--source", &src, "--digest", "d", "--summary", "s"],
     ] {
         let mut w = spawn(&global, &op, &env);
         let r = w.read();
         assert_eq!(err_tag(&r), "camera_busy", "{op:?}");
         assert_eq!(r.progress, ["starting"], "{op:?}");
         assert_eq!(w.finish().0, Some(1));
+    }
+}
+
+// ── restore-plan / restore-apply: what is refused before any camera ──
+
+#[test]
+fn restore_plan_refuses_unsafe_and_missing_sources_before_the_sdk() {
+    let (d, _) = data_dir_with_source();
+    for (name, tag) in [("../source.json", "unsafe_name"), ("/etc/passwd", "unsafe_name"), ("a/b.json", "unsafe_name"), ("", "unsafe_name"), ("nope.json", "not_found")] {
+        let mut w = spawn(&g(d.path()), &["restore-plan", "--serial", "0000003023668", "--source", name], &[]);
+        let r = w.read();
+        assert_eq!(err_tag(&r), tag, "{name:?}");
+        assert_eq!(r.progress, ["starting"], "{name:?}: stopped before the SDK");
+        let (code, stdout, _) = w.finish();
+        assert_eq!((code, stdout.as_str()), (Some(1), ""), "{name:?}");
+    }
+}
+
+#[test]
+fn restore_plan_refuses_a_bad_only_name_before_the_sdk() {
+    let (d, src) = data_dir_with_source();
+    for bad in ["Nope", "copyright", " Copyright", ""] {
+        let mut w = spawn(&g(d.path()), &["restore-plan", "--serial", "0000003023668", "--source", &src, "--only", bad], &[]);
+        let r = w.read();
+        assert_eq!(err_tag(&r), "no_such_property", "{bad:?}");
+        assert_eq!(r.progress, ["starting"], "{bad:?}");
+    }
+    // One bad name among good ones fails the whole selection.
+    let mut w = spawn(
+        &g(d.path()),
+        &["restore-plan", "--serial", "0000003023668", "--source", &src, "--only", "Copyright", "--only", "Nope"],
+        &[],
+    );
+    assert_eq!(err_tag(&w.read()), "no_such_property");
+}
+
+#[test]
+fn a_valid_restore_request_gets_as_far_as_the_missing_bundle() {
+    let (d, src) = data_dir_with_source();
+    for only in [vec![], vec!["--only", "Copyright"], vec!["--only", "kNkMAIDCapability_WBAutoType", "--only", "Copyright"]] {
+        let mut args = vec!["restore-plan", "--serial", "0000003023668", "--source", src.as_str()];
+        args.extend(only.iter().copied());
+        let mut w = spawn(&g(d.path()), &args, &[]);
+        assert_eq!(err_tag(&w.read()), "sdk_bundle_missing", "{only:?}: every earlier check passed");
+    }
+}
+
+#[test]
+fn restore_apply_demands_the_digest_and_the_summary_before_anything_else() {
+    let (d, src) = data_dir_with_source();
+    for (digest, summary) in [("", "s"), ("  ", "s"), ("d", ""), ("d", "   ")] {
+        let mut w = spawn(
+            &g(d.path()),
+            &["restore-apply", "--serial", "0000003023668", "--source", &src, "--digest", digest, "--summary", summary],
+            &[],
+        );
+        let r = w.read();
+        assert_eq!(err_tag(&r), "missing_confirmation", "{digest:?}/{summary:?}");
+        assert_eq!(r.progress, ["starting"]);
+    }
+    let mut w = spawn(
+        &g(d.path()),
+        &["restore-apply", "--serial", "0000003023668", "--source", &src, "--digest", "d", "--summary", "s"],
+        &[],
+    );
+    assert_eq!(err_tag(&w.read()), "sdk_bundle_missing");
+}
+
+#[test]
+fn restore_apply_refuses_an_unsafe_source_or_bad_only_even_with_a_valid_confirmation() {
+    let (d, src) = data_dir_with_source();
+    let mut w = spawn(
+        &g(d.path()),
+        &["restore-apply", "--serial", "0000003023668", "--source", "../x", "--digest", "d", "--summary", "s"],
+        &[],
+    );
+    assert_eq!(err_tag(&w.read()), "unsafe_name");
+    let mut w = spawn(
+        &g(d.path()),
+        &["restore-apply", "--serial", "0000003023668", "--source", &src, "--only", "Nope", "--digest", "d", "--summary", "s"],
+        &[],
+    );
+    assert_eq!(err_tag(&w.read()), "no_such_property");
+}
+
+#[test]
+fn restore_ops_refuse_a_serial_that_cannot_name_a_body_before_the_sdk() {
+    let (d, src) = data_dir_with_source();
+    for op in [
+        vec!["restore-plan", "--serial", "id-3", "--source", src.as_str()],
+        vec!["restore-apply", "--serial", "id-3", "--source", src.as_str(), "--digest", "d", "--summary", "s"],
+    ] {
+        let mut w = spawn(&g(d.path()), &op, &[]);
+        assert_eq!(err_tag(&w.read()), "no_usb_serial", "{op:?}");
     }
 }

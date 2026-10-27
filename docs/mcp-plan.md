@@ -469,14 +469,27 @@ snapshot" as meaningful, or filter them from the default lists.
 
 **Where the work stands (end of the 2026-10-27 session).** Everything the Phase 2 and 3 tools need
 below the MCP server exists and is tested on an in-memory body: capture (`ops::capture_snapshot`), check
-(`ops::check`), plan and apply (`ops::plan`, `ops::apply`, with digest, echoed summary, restore point,
-baseline gate, read-back and the four statuses), restore decisions and execution (`ops::restore`), the
+(`ops::check`), transplant plan and apply (`ops::plan`, `ops::apply`), restore plan and apply
+(`ops::restore_flow`: same shape, same-body only, its own `mcp-restore-pre-restore-<ts>` restore point,
+read-back judged by `ops::readback::residual`), restore decisions and execution (`ops::restore`), the
 retention rules, the read-back comparisons, names-not-paths, the camera lock and the worker protocol. The
-hidden `worker` subcommand runs `capture`, `check`, `transplant-plan` and `transplant-apply`; the first
-three have been run read-only on a Z 9. **One transplant (a single stepped range, `WBTuneAuto` 612 to 613) has been applied to hardware by this code
-and undone, with a restore point and a verified read-back (F18); nothing larger has, and it also showed that a
-blind range write is silently ignored, so `restore` now reads a stepped range first.** Not written yet: worker ops for `restore_plan` / `restore_apply`
-and `list_cameras`, the `mcp/` crate and the parent-side watchdog.
+hidden `worker` subcommand runs `capture`, `check`, `transplant-plan`, `transplant-apply`, `restore-plan`
+and `restore-apply`; the first three have been run read-only on a Z 9, the two restore ops have only been
+run against fake bodies and the binary's no-hardware refusals. **One transplant (a single stepped range,
+`WBTuneAuto` 612 to 613) has been applied to hardware by this code and undone, with a restore point and a
+verified read-back (F18); nothing larger has, and it also showed that a blind range write is silently
+ignored, so `restore` now reads a stepped range first.** The CLI's `restore` also reads the body back and
+reports a residual as unverified (exit status non-zero), so a restore the camera ignores is no longer
+reported as done. Not written yet: the `list_cameras` worker op, the `mcp/` crate and the parent-side
+watchdog.
+
+**Restore flow decisions (as built).** A restore that changes nothing (every selected property already
+holds the stored value) is a `no_op`: no restore point, no write, `applied_verified`, so a retry after
+success is harmless, as for a transplant; naming only properties that cannot be restored is `failed`, not a
+quiet success. The plan lists only the selected properties (the rest are in `counts`). A write the body
+accepts and ignores is `applied_unverified` with the residual, never `applied_verified`; a rejected write,
+or a named property that could not be restored, is `failed` (with whatever did take still verified). The
+undo set is written plus side effects, and its restore is a restore of the restore point.
 
 Phase 0 touches `src/main.rs`, `lib.rs` and `gui/`; the firmware session's earlier edits there are
 committed, so nothing blocks it.

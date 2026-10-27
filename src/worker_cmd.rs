@@ -29,6 +29,10 @@ use nikon_fleet::ops::check::{CheckError, CheckRequest, check};
 use nikon_fleet::ops::list::reference_filename;
 use nikon_fleet::ops::paths::resolve_existing;
 use nikon_fleet::ops::plan::{PlanInput, build_plan};
+use nikon_fleet::ops::restore::resolve_only;
+use nikon_fleet::ops::restore_flow::{
+    RestoreApplyError, RestoreApplyRequest, RestorePlanInput, apply_restore, build_restore_plan,
+};
 use nikon_fleet::ops::target::select_by_usb_serial;
 use nikon_fleet::ops::worker::{Emitter, Outcome, open_result_fd};
 use nikon_fleet::ops::port::CameraPort;
@@ -103,6 +107,33 @@ pub enum WorkerOp {
         #[arg(long)]
         summary: String,
     },
+    /// Dry-run restoring a body from a stored snapshot of the same body; returns a digest
+    /// and summary to echo to `restore-apply`. Reads the body; writes nothing.
+    RestorePlan {
+        #[arg(long)]
+        serial: String,
+        /// Snapshot name inside the data directory's snapshots/ (a name, not a path).
+        #[arg(long)]
+        source: String,
+        /// Restore only this property (short or full name). Repeatable; default is all.
+        #[arg(long = "only", value_name = "PROPERTY")]
+        only: Vec<String>,
+    },
+    /// Apply a planned restore: restore point, writes, read-back. WRITES TO THE CAMERA.
+    RestoreApply {
+        #[arg(long)]
+        serial: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long = "only", value_name = "PROPERTY")]
+        only: Vec<String>,
+        /// The plan's digest, copied from the plan result.
+        #[arg(long)]
+        digest: String,
+        /// The plan's summary line, copied from the plan result.
+        #[arg(long)]
+        summary: String,
+    },
 }
 
 /// Run the worker; returns the process exit status.
@@ -132,6 +163,19 @@ pub fn run(data_dir: &Path, bundle: &Path, schema: &Path, args: &WorkerArgs) -> 
             serial,
             source,
             allow_raw_code,
+            Some((digest.as_str(), summary.as_str())),
+        ),
+        WorkerOp::RestorePlan { serial, source, only } => {
+            op_restore(&mut em, data_dir, bundle, schema, serial, source, only, None)
+        }
+        WorkerOp::RestoreApply { serial, source, only, digest, summary } => op_restore(
+            &mut em,
+            data_dir,
+            bundle,
+            schema,
+            serial,
+            source,
+            only,
             Some((digest.as_str(), summary.as_str())),
         ),
     }
@@ -417,6 +461,98 @@ fn op_transplant(
                     Err(e) => {
                         let detail = match &e {
                             ApplyError::RestorePointIncomplete { missing, stats } => {
+                                Some(json!({"missing": missing, "read_ok": stats.read_ok, "read_err": stats.read_err}))
+                            }
+                            _ => None,
+                        };
+                        Outcome::err(e.tag(), e.to_string(), detail)
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// `restore-plan` (confirmation `None`) and `restore-apply` (`Some((digest, summary))`).
+#[allow(clippy::too_many_arguments)]
+fn op_restore(
+    em: &mut Emitter<File>,
+    data_dir: &Path,
+    bundle: &Path,
+    schema_path: &Path,
+    serial: &str,
+    source_name: &str,
+    only_names: &[String],
+    confirmation: Option<(&str, &str)>,
+) -> i32 {
+    progress(em, "starting");
+    // Everything that can be refused without a camera is refused first.
+    if let Some((digest, summary)) = confirmation {
+        if let Err(e) = require_confirmation(digest, summary) {
+            return finish(em, Outcome::err(e.tag(), e.to_string(), None));
+        }
+    }
+    let snapshots = snapshots_dir(data_dir);
+    let source_path = match resolve_existing(&snapshots, source_name) {
+        Ok(p) => p,
+        Err(e) => return finish(em, Outcome::err(e.tag(), e.to_string(), None)),
+    };
+    let source_bytes = match std::fs::read(&source_path) {
+        Ok(b) => b,
+        Err(e) => return finish(em, Outcome::err("source_unreadable", format!("{}: {e}", source_path.display()), None)),
+    };
+    let source = match std::str::from_utf8(&source_bytes)
+        .map_err(|e| e.to_string())
+        .and_then(|t| Snapshot::from_json(t).map_err(|e| e.to_string()))
+    {
+        Ok(s) => s,
+        Err(e) => return finish(em, Outcome::err("source_unreadable", format!("{}: {e}", source_path.display()), None)),
+    };
+    let only: Option<BTreeSet<String>> = if only_names.is_empty() {
+        None
+    } else {
+        match resolve_only(only_names, &source.properties) {
+            Ok(set) => Some(set),
+            Err(e) => return finish(em, Outcome::err(e.tag(), e.to_string(), None)),
+        }
+    };
+
+    with_body(em, bundle, schema_path, serial, |em, body| {
+        let input = RestorePlanInput {
+            source: &source,
+            source_name: &source_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            source_bytes: &source_bytes,
+            target: &body.camera,
+            only: only.as_ref(),
+        };
+        match confirmation {
+            None => {
+                progress(em, "planning");
+                match build_restore_plan(body.device, &input) {
+                    Ok(report) => Outcome::ok(serde_json::to_value(&report).unwrap_or(json!(null))),
+                    Err(e) => Outcome::err(e.tag(), e.to_string(), None),
+                }
+            }
+            Some((digest, summary)) => {
+                let name_lookup = body.schema.name_map_for_model(&body.camera.model);
+                let captured_at = match now() {
+                    Ok(t) => t,
+                    Err(o) => return o,
+                };
+                let req = RestoreApplyRequest {
+                    plan: input,
+                    snapshots_dir: &snapshots,
+                    name_lookup: &name_lookup,
+                    expected_digest: digest,
+                    expected_summary: summary,
+                    captured_at,
+                };
+                // As for the transplant: "writing" is the last phase at which cancelling is safe.
+                match apply_restore(body.device, &req, &mut |p| progress(em, p)) {
+                    Ok(report) => Outcome::ok(serde_json::to_value(&report).unwrap_or(json!(null))),
+                    Err(e) => {
+                        let detail = match &e {
+                            RestoreApplyError::RestorePointIncomplete { missing, stats } => {
                                 Some(json!({"missing": missing, "read_ok": stats.read_ok, "read_err": stats.read_err}))
                             }
                             _ => None,
