@@ -244,6 +244,13 @@ pub enum SkipReason {
     /// twice), so matching by label cannot say which position is meant.
     /// Skipped rather than guessing the first occurrence.
     AmbiguousLabel { label: String, source_count: usize, target_count: usize },
+    /// On [`NEVER_TRANSPLANT`]: reports body/session state (or locks it)
+    /// rather than holding a setting. Never written, with no override.
+    NeverCopied { reason: &'static str },
+    /// Matched only by raw numeric code, which is not known to mean the same
+    /// option on both bodies, and the user did not opt this property in.
+    /// `proposed` is what it would have set (`code 5 (#2), was code 3 (#1)`).
+    RawCodeUnconfirmed { proposed: String },
 }
 
 impl std::fmt::Display for SkipReason {
@@ -264,6 +271,12 @@ impl std::fmt::Display for SkipReason {
                 f,
                 "source and target encode this enum differently (source elem_type={source_elem_type}, \
                  target elem_type={target_elem_type})"
+            ),
+            SkipReason::NeverCopied { reason } => write!(f, "never copied between cameras: {reason}"),
+            SkipReason::RawCodeUnconfirmed { proposed } => write!(
+                f,
+                "matched only by raw numeric code, which is not known to mean the same option on both bodies; \
+                 would set {proposed}. Not written unless you opt this property in (--allow-raw-code)"
             ),
             SkipReason::AmbiguousLabel { label, source_count, target_count } => write!(
                 f,
@@ -569,6 +582,94 @@ fn names_compatible(code: u32, src: &BTreeSet<String>, tgt: &BTreeSet<String>) -
 // translate_value/translate_enum/translate_range are.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Capabilities `transplant` never copies, by code: they report what the
+/// body or its session is doing right now (or lock it), not a setting a person
+/// chose, so "make body B like body A" must not carry them across. A single
+/// table is the source of truth; [`never_copied`] and the real-config test
+/// both read it, so a code and its name cannot drift apart unnoticed.
+///
+/// Evidence is by name and by behaviour, not by anything in `MaidLayer.config`
+/// (it does not classify state vs setting): `LiveViewStatus` and
+/// `CurrentItemID` already failed with `SetCapability` -125 on a real Z6III
+/// restore. Judgement calls are marked; add to the table rather than
+/// special-casing elsewhere.
+pub const NEVER_TRANSPLANT: &[(u32, &str, &str)] = &[
+    (33089, "kNkMAIDCapability_LockCamera", "camera lock state; copying it could lock or unlock the target"),
+    (33342, "kNkMAIDCapability_LiveViewStatus", "whether live view is running; rejected by a real Z6III write (-125)"),
+    (33617, "kNkMAIDCapability_CurrentItemID", "the item currently selected in playback; rejected by a real Z6III write (-125)"),
+    (33213, "kNkMAIDCapability_ExternalFlashStatus", "what is attached to the hot shoe right now"),
+    (33876, "kNkMAIDCapability_RawJpegTransferStatus", "state of an in-progress transfer"),
+    (34080, "kNkMAIDCapability_ChangeMonitorOffStatus", "monitor power state (judgement call: status by name)"),
+    (33606, "kNkMAIDCapability_LiveViewPhotoShootingMode", "live-view session mode (judgement call: state by name)"),
+    (33165, "kNkMAIDCapability_ShootingMode", "exposure mode, set by the body's mode dial (judgement call)"),
+    (34147, "kNkMAIDCapability_Viewmode", "which display the body is showing (judgement call)"),
+];
+
+/// Why `code` is never transplanted, if it is on [`NEVER_TRANSPLANT`].
+pub fn never_copied(code: u32) -> Option<&'static str> {
+    NEVER_TRANSPLANT.iter().find(|(c, _, _)| *c == code).map(|(_, _, why)| *why)
+}
+
+/// Per-run choices that make `transplant` do more than its safe default.
+#[derive(Debug, Clone, Default)]
+pub struct TransplantOptions {
+    /// Full property names (as keyed in the snapshot) whose raw-code enum
+    /// match the user has explicitly accepted. Everything else matched only by
+    /// raw numeric code is skipped when it would change the target.
+    pub allow_raw_code: BTreeSet<String>,
+}
+
+/// Turn `--allow-raw-code` arguments into full property names, checked
+/// against the snapshot being transplanted. Names are accepted with or without
+/// the `kNkMAIDCapability_` prefix. An unknown name, or one that is not a
+/// raw-code enum (so the flag could do nothing for it), is an error: a typo
+/// silently opting nothing in would look exactly like a safe run.
+pub fn resolve_allow_raw_code(
+    requested: &[String],
+    properties: &BTreeMap<String, PropertyEntry>,
+) -> Result<BTreeSet<String>, String> {
+    const PREFIX: &str = "kNkMAIDCapability_";
+    let mut out = BTreeSet::new();
+    for r in requested {
+        let full = if properties.contains_key(r.as_str()) { r.clone() } else { format!("{PREFIX}{r}") };
+        let Some(prop) = properties.get(&full) else {
+            return Err(format!("--allow-raw-code {r:?}: no property by that name in the source snapshot"));
+        };
+        let is_raw_enum = is_enum_shape(&prop.value)
+            && prop.value.get("elem_type").and_then(Value::as_u64) != Some(PACKED_STRING_ELEM_TYPE);
+        if !is_raw_enum {
+            return Err(format!(
+                "--allow-raw-code {r:?}: {full} is not a raw-code enum (it is a label enum, a range or a scalar), \
+                 so the flag does not apply to it"
+            ));
+        }
+        out.insert(full);
+    }
+    Ok(out)
+}
+
+/// The raw-code gate, separated from the device I/O so it is unit-testable.
+///
+/// A raw-code enum match rests on the unverified assumption that both bodies
+/// number the same option the same way (the module docs call it a weaker
+/// heuristic), so by default it is not written. Exception: a match that
+/// resolves to the option the target already has is a no-op and passes without
+/// opt-in. Labels are matched strictly stronger and never reach this gate.
+fn raw_code_gate(
+    strategy: Strategy,
+    choice: Option<&ResolvedChoice>,
+    allowed: bool,
+) -> Result<(), SkipReason> {
+    if strategy != Strategy::EnumByRawValue || allowed {
+        return Ok(());
+    }
+    match choice {
+        Some(c) if c.is_unchanged() => Ok(()),
+        Some(c) => Err(SkipReason::RawCodeUnconfirmed { proposed: c.to_string() }),
+        None => Err(SkipReason::RawCodeUnconfirmed { proposed: "(target's current value unknown)".to_string() }),
+    }
+}
+
 pub struct TransplantOutcome {
     pub name: String,
     pub code: u32,
@@ -649,6 +750,7 @@ pub fn transplant(
     device: &Device,
     properties: &BTreeMap<String, PropertyEntry>,
     guard: &CodeNameGuard,
+    options: &TransplantOptions,
     dry_run: bool,
 ) -> Vec<TransplantOutcome> {
     let cap_map: HashMap<u32, &CapabilityInfo> = device.capabilities.iter().map(|c| (c.id, c)).collect();
@@ -656,7 +758,8 @@ pub fn transplant(
     properties
         .iter()
         .map(|(name, prop)| {
-            match transplant_one(device, &cap_map, guard, prop, dry_run) {
+            let allowed = options.allow_raw_code.contains(name);
+            match transplant_one(device, &cap_map, guard, prop, allowed, dry_run) {
                 Ok((strategy, choice)) => TransplantOutcome { name: name.clone(), code: prop.code, result: Ok(strategy), choice },
                 Err(reason) => TransplantOutcome { name: name.clone(), code: prop.code, result: Err(reason), choice: None },
             }
@@ -665,7 +768,7 @@ pub fn transplant(
 }
 
 /// The device-free checks that must pass before any live read or write, in
-/// order: the capability exists on the target, its code names the same
+/// order: the capability is not on [`NEVER_TRANSPLANT`], it exists on the target, its code names the same
 /// setting on both models, and it's writable. Split out of `transplant_one`
 /// so the ordering (and that the name guard is wired in at all) is
 /// unit-testable without a `Device`.
@@ -674,6 +777,9 @@ fn precheck<'a>(
     guard: &CodeNameGuard,
     prop: &PropertyEntry,
 ) -> Result<&'a CapabilityInfo, SkipReason> {
+    if let Some(reason) = never_copied(prop.code) {
+        return Err(SkipReason::NeverCopied { reason });
+    }
     let cap = *cap_map.get(&prop.code).ok_or(SkipReason::AbsentOnTarget)?;
     guard.check(prop.code)?;
     if cap.operations & OP_SET == 0 {
@@ -682,11 +788,27 @@ fn precheck<'a>(
     Ok(cap)
 }
 
+/// Everything `transplant_one` decides between reading the target and writing
+/// it, with no device in sight: translate the source value, describe the
+/// resolved option, and apply the raw-code gate. Split out so that sequence
+/// (in particular that the gate is applied at all) is unit-testable.
+fn plan_property(
+    source_value: &Value,
+    target_live: Option<&Value>,
+    raw_code_allowed: bool,
+) -> Result<(Value, Strategy, Option<ResolvedChoice>), SkipReason> {
+    let (translated, strategy) = translate_value(source_value, target_live)?;
+    let choice = target_live.and_then(|l| resolve_choice(&translated, l, strategy));
+    raw_code_gate(strategy, choice.as_ref(), raw_code_allowed)?;
+    Ok((translated, strategy, choice))
+}
+
 fn transplant_one(
     device: &Device,
     cap_map: &HashMap<u32, &CapabilityInfo>,
     guard: &CodeNameGuard,
     prop: &PropertyEntry,
+    raw_code_allowed: bool,
     dry_run: bool,
 ) -> Result<(Strategy, Option<ResolvedChoice>), SkipReason> {
     let cap = precheck(cap_map, guard, prop)?;
@@ -698,8 +820,7 @@ fn transplant_one(
         None
     };
 
-    let (translated, strategy) = translate_value(&prop.value, live.as_ref())?;
-    let choice = live.as_ref().and_then(|l| resolve_choice(&translated, l, strategy));
+    let (translated, strategy, choice) = plan_property(&prop.value, live.as_ref(), raw_code_allowed)?;
 
     if !dry_run {
         match device.write_capability(prop.code, cap.kind, &translated) {
@@ -1091,6 +1212,197 @@ mod tests {
         let mut old = byte_layout(0, &["Off"]);
         old["values"] = json!([]);
         assert_eq!(translate_value(&old, Some(&byte_layout(0, &["Off"]))), Err(SkipReason::MalformedSource));
+    }
+
+    // ── never-copied state properties ────────────────────────────────────
+
+    #[test]
+    fn never_copied_covers_every_table_entry_and_nothing_adjacent() {
+        for (code, name, why) in NEVER_TRANSPLANT {
+            assert_eq!(never_copied(*code), Some(*why), "{name}");
+            // Boundaries either side of each code are not caught by accident.
+            for neighbour in [code - 1, code + 1] {
+                if !NEVER_TRANSPLANT.iter().any(|(c, _, _)| *c == neighbour) {
+                    assert_eq!(never_copied(neighbour), None, "{neighbour} next to {name}");
+                }
+            }
+        }
+        assert_eq!(never_copied(0), None);
+        assert_eq!(never_copied(u32::MAX), None);
+    }
+
+    #[test]
+    fn never_transplant_table_has_unique_codes_and_names_and_a_reason() {
+        let codes: BTreeSet<u32> = NEVER_TRANSPLANT.iter().map(|(c, _, _)| *c).collect();
+        let names: BTreeSet<&str> = NEVER_TRANSPLANT.iter().map(|(_, n, _)| *n).collect();
+        assert_eq!(codes.len(), NEVER_TRANSPLANT.len(), "duplicate code");
+        assert_eq!(names.len(), NEVER_TRANSPLANT.len(), "duplicate name");
+        assert!(NEVER_TRANSPLANT.iter().all(|(_, n, w)| n.starts_with("kNkMAIDCapability_") && !w.is_empty()));
+    }
+
+    #[test]
+    fn real_config_never_transplant_names_match_their_codes() {
+        // Each (code, name) pair must exist as written in at least one Z-series
+        // section, so a mistyped code cannot leave the intended property
+        // unprotected while an unrelated one is blocked.
+        let Some(c) = real_config() else { return };
+        let z: Vec<String> = c.known_models().into_iter().filter(|m| is_z_series_model(&c, m)).collect();
+        for (code, name, _) in NEVER_TRANSPLANT {
+            let found = z.iter().any(|m| c.name_sets_for_model(m).get(code).is_some_and(|names| names.contains(*name)));
+            assert!(found, "{name} is not named at code {code} in any Z-series section");
+        }
+    }
+
+    #[test]
+    fn precheck_never_copied_wins_over_absent_and_over_name_mismatch() {
+        let denied = NEVER_TRANSPLANT[0].0;
+        let c = parse_config(&[("Z 9", &[("Aperture", denied)]), ("Z 8", &[("ShutterSpeed", denied)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap();
+        // Absent from the target AND unrelated names: the policy skip is what is reported.
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::new();
+        assert!(matches!(precheck(&caps, &g, &prop_for(denied)), Err(SkipReason::NeverCopied { .. })));
+        // Even present and writable on the target, it is still refused.
+        let ok = cap_info(denied, OP_SET);
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(denied, &ok)]);
+        assert!(matches!(precheck(&caps, &g, &prop_for(denied)), Err(SkipReason::NeverCopied { .. })));
+    }
+
+    #[test]
+    fn precheck_does_not_block_an_unlisted_code() {
+        let c = parse_config(&[("Z 9", &[("Aperture", 7)]), ("Z 8", &[("Aperture", 7)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap();
+        let ok = cap_info(7, OP_SET);
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(7, &ok)]);
+        assert_eq!(precheck(&caps, &g, &prop_for(7)).unwrap().id, 7);
+    }
+
+    #[test]
+    fn never_copied_display_states_the_reason() {
+        let msg = SkipReason::NeverCopied { reason: "camera lock state" }.to_string();
+        assert!(msg.contains("never copied") && msg.contains("camera lock state"), "{msg}");
+    }
+
+    // ── raw-code opt-in gate ─────────────────────────────────────────────
+
+    fn choice(target: u64, current: Option<u64>) -> ResolvedChoice {
+        ResolvedChoice {
+            target_index: target,
+            choice: format!("code {target}"),
+            current_index: current,
+            current: current.map(|c| format!("code {c}")),
+        }
+    }
+
+    #[test]
+    fn raw_code_gate_blocks_a_changing_match_unless_allowed() {
+        let changing = choice(2, Some(1));
+        let err = raw_code_gate(Strategy::EnumByRawValue, Some(&changing), false).unwrap_err();
+        assert_eq!(err, SkipReason::RawCodeUnconfirmed { proposed: "\"code 2\" (#2), was \"code 1\" (#1)".into() });
+        assert_eq!(raw_code_gate(Strategy::EnumByRawValue, Some(&changing), true), Ok(()));
+    }
+
+    #[test]
+    fn raw_code_gate_lets_a_no_op_through_without_opt_in() {
+        // Boundary: same index as the target already has => writing it back
+        // changes nothing, so no confirmation is needed.
+        assert_eq!(raw_code_gate(Strategy::EnumByRawValue, Some(&choice(3, Some(3))), false), Ok(()));
+        // One index off is a change.
+        assert!(raw_code_gate(Strategy::EnumByRawValue, Some(&choice(3, Some(4))), false).is_err());
+    }
+
+    #[test]
+    fn raw_code_gate_with_unknown_current_value_is_blocked_not_assumed_unchanged() {
+        assert!(raw_code_gate(Strategy::EnumByRawValue, Some(&choice(3, None)), false).is_err());
+        assert!(raw_code_gate(Strategy::EnumByRawValue, None, false).is_err());
+    }
+
+    #[test]
+    fn raw_code_gate_never_applies_to_other_strategies() {
+        for st in [Strategy::EnumByLabel, Strategy::Literal, Strategy::RangeClamped] {
+            assert_eq!(raw_code_gate(st, Some(&choice(2, Some(1))), false), Ok(()), "{st:?}");
+            assert_eq!(raw_code_gate(st, None, false), Ok(()), "{st:?}");
+        }
+    }
+
+    #[test]
+    fn raw_code_gate_end_to_end_through_translate_and_resolve() {
+        let src = raw_code_enum(1, &[3, 5]); // source picked code 5
+        let live = raw_code_enum(0, &[5, 3]); // target currently on index 0 (code 5): already equal
+        let (t, st) = translate_value(&src, Some(&live)).unwrap();
+        let c = resolve_choice(&t, &live, st).unwrap();
+        assert_eq!(raw_code_gate(st, Some(&c), false), Ok(()));
+
+        let live2 = raw_code_enum(1, &[5, 3]); // target on code 3: would change
+        let (t, st) = translate_value(&src, Some(&live2)).unwrap();
+        let c = resolve_choice(&t, &live2, st).unwrap();
+        assert!(matches!(raw_code_gate(st, Some(&c), false), Err(SkipReason::RawCodeUnconfirmed { .. })));
+    }
+
+    #[test]
+    fn raw_code_unconfirmed_display_names_the_flag_and_the_proposal() {
+        let msg = SkipReason::RawCodeUnconfirmed { proposed: "code 5 (#0)".into() }.to_string();
+        assert!(msg.contains("--allow-raw-code") && msg.contains("code 5 (#0)"), "{msg}");
+    }
+
+    #[test]
+    fn plan_property_applies_the_raw_code_gate_and_returns_what_would_be_written() {
+        let src = raw_code_enum(1, &[3, 5]);
+        let live = raw_code_enum(1, &[5, 3]); // on code 3; source wants code 5 => changes
+        let blocked = plan_property(&src, Some(&live), false).unwrap_err();
+        assert!(matches!(blocked, SkipReason::RawCodeUnconfirmed { .. }), "{blocked:?}");
+
+        let (translated, strategy, choice) = plan_property(&src, Some(&live), true).unwrap();
+        assert_eq!(strategy, Strategy::EnumByRawValue);
+        assert_eq!(translated["value_index"], json!(0));
+        assert_eq!(choice.unwrap().target_index, 0);
+    }
+
+    #[test]
+    fn plan_property_leaves_labels_scalars_and_ranges_ungated() {
+        let (_, st, ch) =
+            plan_property(&fx("z9", "BracketingVary"), Some(&fx("z6iii", "BracketingVary")), false).unwrap();
+        assert_eq!(st, Strategy::EnumByLabel);
+        assert!(!ch.unwrap().is_unchanged(), "a label match that changes the target needs no opt-in");
+        assert_eq!(plan_property(&json!("© me"), None, false).unwrap().1, Strategy::Literal);
+        let range = json!({"value": 1.0, "default": 0.0, "value_index": 1, "default_index": 0, "lower": 0.0, "upper": 2.0, "steps": 3});
+        assert_eq!(plan_property(&range, Some(&range), false).unwrap().1, Strategy::RangeClamped);
+    }
+
+    // ── --allow-raw-code resolution ──────────────────────────────────────
+
+    fn props(entries: &[(&str, Value)]) -> BTreeMap<String, PropertyEntry> {
+        entries.iter().enumerate().map(|(i, (n, v))| (n.to_string(), PropertyEntry { code: i as u32, value: v.clone() })).collect()
+    }
+
+    #[test]
+    fn allow_raw_code_accepts_short_and_full_names_and_dedups() {
+        let p = props(&[("kNkMAIDCapability_MeteringMode", raw_code_enum(0, &[1, 2]))]);
+        let got = resolve_allow_raw_code(
+            &["MeteringMode".into(), "kNkMAIDCapability_MeteringMode".into()],
+            &p,
+        )
+        .unwrap();
+        assert_eq!(got, BTreeSet::from(["kNkMAIDCapability_MeteringMode".to_string()]));
+        assert!(resolve_allow_raw_code(&[], &p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn allow_raw_code_rejects_unknown_and_inapplicable_names_loudly() {
+        let p = props(&[
+            ("kNkMAIDCapability_MeteringMode", raw_code_enum(0, &[1, 2])),
+            ("kNkMAIDCapability_WBMode", byte_layout(0, &["Auto"])),
+            ("kNkMAIDCapability_ExposureComp", json!({"value": 1.0, "lower": -3.0, "upper": 3.0, "steps": 7, "value_index": 0, "default_index": 0})),
+            ("kNkMAIDCapability_Copyright", json!("me")),
+        ]);
+        // A typo must not silently opt nothing in.
+        let e = resolve_allow_raw_code(&["MeteringMod".into()], &p).unwrap_err();
+        assert!(e.contains("no property by that name"), "{e}");
+        for name in ["WBMode", "ExposureComp", "Copyright"] {
+            let e = resolve_allow_raw_code(&[name.into()], &p).unwrap_err();
+            assert!(e.contains("not a raw-code enum"), "{name}: {e}");
+        }
+        // One bad name fails the whole request, even after a good one.
+        assert!(resolve_allow_raw_code(&["MeteringMode".into(), "Nope".into()], &p).is_err());
     }
 
     // ── resolved choice (what the dry run prints) ────────────────────────
