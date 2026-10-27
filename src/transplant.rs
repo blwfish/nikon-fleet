@@ -604,6 +604,7 @@ pub const NEVER_TRANSPLANT: &[(u32, &str, &str)] = &[
     (33606, "kNkMAIDCapability_LiveViewPhotoShootingMode", "live-view session mode (judgement call: state by name)"),
     (33165, "kNkMAIDCapability_ShootingMode", "exposure mode, set by the body's mode dial (judgement call)"),
     (34147, "kNkMAIDCapability_Viewmode", "which display the body is showing (judgement call)"),
+    (33108, "kNkMAIDCapability_ShootNoCard", "flipped on its own across a power cycle with nothing writing to the camera, so state-like or reset by the body (judgement call, hardware observation F10)"),
 ];
 
 /// Why `code` is never transplanted, if it is on [`NEVER_TRANSPLANT`].
@@ -1266,6 +1267,26 @@ mod tests {
         let ok = cap_info(denied, OP_SET);
         let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(denied, &ok)]);
         assert!(matches!(precheck(&caps, &g, &prop_for(denied)), Err(SkipReason::NeverCopied { .. })));
+    }
+
+    #[test]
+    fn shoot_no_card_is_never_copied_and_its_neighbours_are_not() {
+        // 33108 flipped across a power cycle with nothing writing (F10). Pin
+        // the code and both sides of it: a typo'd code would protect the wrong
+        // property while this one stayed writable.
+        assert!(never_copied(33108).is_some_and(|why| why.contains("power cycle")));
+        assert_eq!(never_copied(33107), None);
+        assert_eq!(never_copied(33109), None);
+        assert!(NEVER_TRANSPLANT.iter().any(|(c, n, _)| *c == 33108 && *n == "kNkMAIDCapability_ShootNoCard"));
+    }
+
+    #[test]
+    fn precheck_refuses_shoot_no_card_even_when_present_and_writable() {
+        let c = parse_config(&[("Z 9", &[("ShootNoCard", 33108)]), ("Z 8", &[("ShootNoCard", 33108)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap();
+        let ok = cap_info(33108, OP_SET);
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(33108, &ok)]);
+        assert!(matches!(precheck(&caps, &g, &prop_for(33108)), Err(SkipReason::NeverCopied { .. })));
     }
 
     #[test]

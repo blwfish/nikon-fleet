@@ -2618,6 +2618,17 @@ mod tests {
     }
 
     #[test]
+    fn restore_precheck_skips_shoot_no_card() {
+        // Restore shares the table, so a restore point no longer rewrites it (F10).
+        let c = cap(33108, OP_GET | OP_SET);
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(33108, &c)]);
+        assert_eq!(restore_precheck(&caps, 33108), Err(RestoreSkip::NeverCopied));
+        let neighbour = cap(33109, OP_GET | OP_SET);
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(33109, &neighbour)]);
+        assert_eq!(restore_precheck(&caps, 33109).unwrap().id, 33109);
+    }
+
+    #[test]
     fn restore_precheck_policy_skip_wins_over_absent_and_read_only() {
         let code = transplant::NEVER_TRANSPLANT[0].0;
         // Absent from the camera entirely.
