@@ -1,4 +1,6 @@
 """Pure helper functions — no tkinter, no subprocess. Importable for testing."""
+import json
+import sys
 from pathlib import Path
 
 
@@ -200,3 +202,48 @@ def parse_fw_filename(name: str) -> tuple[str, str]:
     if len(parts) == 2 and len(parts[1]) == 4 and parts[1].isdigit():
         return parts[0], f"{int(parts[1][:2])}.{parts[1][2:]}"
     return stem, ""
+
+
+def snapshot_rows(data_dir: Path, model: str, serial: str, warn=None) -> list[tuple]:
+    """Rows for one camera's snapshots, newest first.
+
+    Each row is ``(captured_at[:19], label, firmware, filename, is_reference)``.
+
+    A reference is a byte copy of the snapshot it was promoted from (saved
+    under ``references/{model_slug}_{serial}.json``), so a snapshot *is* the
+    reference exactly when its file is byte-identical to the reference file.
+    This replaced a ``captured_at[:19]`` comparison, which mis-flagged every
+    snapshot taken in the same second as the reference. The Rust GUI's
+    ``list_snapshots`` applies the same rule.
+
+    Unreadable or malformed snapshot files are skipped and reported through
+    *warn* (default: stderr), never silently dropped.
+    """
+    if warn is None:
+        def warn(msg):
+            print(msg, file=sys.stderr)
+    snap_dir = Path(data_dir) / "snapshots"
+    if not snap_dir.exists():
+        return []
+    ref_bytes = None
+    ref_path = Path(data_dir) / "references" / f"{model_slug(model)}_{serial}.json"
+    if ref_path.exists():
+        try:
+            ref_bytes = ref_path.read_bytes()
+        except OSError as e:
+            warn(f"warning: could not read reference {ref_path}: {e}")
+    rows = []
+    for f in snap_dir.glob("*.json"):
+        try:
+            raw = f.read_bytes()
+            d = json.loads(raw)
+            if d["camera"]["serial"] == serial:
+                rows.append((d.get("captured_at", "")[:19],
+                             d.get("label") or "",
+                             d["camera"].get("firmware", ""),
+                             f.name,
+                             ref_bytes is not None and raw == ref_bytes))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+            warn(f"warning: could not read snapshot {f}: {e}")
+    rows.sort(reverse=True)
+    return rows

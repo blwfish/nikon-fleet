@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode, is_valid_u16
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode, is_valid_u16, snapshot_rows
 
 _FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "capability_value_shapes.json"
 
@@ -392,3 +392,73 @@ class TestFmtCapValue:
         result = fmt_cap_value([1, 2, 3, 4, 5, 6, 7])
         assert "…" in result
         assert "7 items" in result
+
+
+# ── snapshot_rows (reference badge) ───────────────────────────────────────────
+
+def _write_snap(d: Path, name: str, serial="ABC123", captured="2026-01-01T00:00:00Z",
+                label="x", model="Z 9"):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_text(json.dumps({
+        "camera": {"model": model, "serial": serial, "firmware": "5.00"},
+        "captured_at": captured, "label": label,
+    }))
+
+
+def _promote(dd: Path, name: str, model="Z 9", serial="ABC123"):
+    import shutil
+    (dd / "references").mkdir(exist_ok=True)
+    shutil.copy2(dd / "snapshots" / name, dd / "references" / f"{model_slug(model)}_{serial}.json")
+
+
+class TestSnapshotRows:
+    def test_missing_snapshots_dir_is_empty(self, tmp_path):
+        assert snapshot_rows(tmp_path, "Z 9", "ABC123") == []
+
+    def test_marks_promoted_snapshot_only(self, tmp_path):
+        _write_snap(tmp_path / "snapshots", "ref.json", captured="2026-01-01T00:00:00Z")
+        _write_snap(tmp_path / "snapshots", "other.json", captured="2026-06-01T00:00:00Z")
+        _promote(tmp_path, "ref.json")
+        by = {r[3]: r[4] for r in snapshot_rows(tmp_path, "Z 9", "ABC123")}
+        assert by == {"ref.json": True, "other.json": False}
+
+    def test_same_second_snapshots_are_distinguished(self, tmp_path):
+        # The old captured_at[:19] rule flagged both of these.
+        _write_snap(tmp_path / "snapshots", "a.json", captured="2026-01-01T00:00:00.100Z", label="first")
+        _write_snap(tmp_path / "snapshots", "b.json", captured="2026-01-01T00:00:00.900Z", label="second")
+        _promote(tmp_path, "b.json")
+        by = {r[3]: r[4] for r in snapshot_rows(tmp_path, "Z 9", "ABC123")}
+        assert by == {"a.json": False, "b.json": True}
+
+    def test_no_reference_marks_nothing(self, tmp_path):
+        _write_snap(tmp_path / "snapshots", "a.json")
+        assert [r[4] for r in snapshot_rows(tmp_path, "Z 9", "ABC123")] == [False]
+
+    def test_edited_reference_matches_nothing(self, tmp_path):
+        _write_snap(tmp_path / "snapshots", "a.json")
+        _promote(tmp_path, "a.json")
+        ref = tmp_path / "references" / "Z_9_ABC123.json"
+        ref.write_bytes(ref.read_bytes() + b"\n")
+        assert [r[4] for r in snapshot_rows(tmp_path, "Z 9", "ABC123")] == [False]
+
+    def test_byte_identical_copies_are_both_marked(self, tmp_path):
+        import shutil
+        _write_snap(tmp_path / "snapshots", "a.json")
+        shutil.copy2(tmp_path / "snapshots" / "a.json", tmp_path / "snapshots" / "a_copy.json")
+        _promote(tmp_path, "a.json")
+        assert sum(r[4] for r in snapshot_rows(tmp_path, "Z 9", "ABC123")) == 2
+
+    def test_filters_by_serial_and_sorts_newest_first(self, tmp_path):
+        _write_snap(tmp_path / "snapshots", "old.json", captured="2026-01-01T00:00:00Z")
+        _write_snap(tmp_path / "snapshots", "new.json", captured="2026-06-01T00:00:00Z")
+        _write_snap(tmp_path / "snapshots", "other.json", serial="ZZZ")
+        assert [r[3] for r in snapshot_rows(tmp_path, "Z 9", "ABC123")] == ["new.json", "old.json"]
+
+    def test_malformed_snapshot_is_skipped_and_reported(self, tmp_path):
+        _write_snap(tmp_path / "snapshots", "good.json")
+        (tmp_path / "snapshots" / "bad.json").write_text("not json")
+        (tmp_path / "snapshots" / "nocam.json").write_text("{}")
+        warnings = []
+        rows = snapshot_rows(tmp_path, "Z 9", "ABC123", warn=warnings.append)
+        assert [r[3] for r in rows] == ["good.json"]
+        assert len(warnings) == 2

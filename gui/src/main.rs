@@ -969,11 +969,14 @@ fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {
 
     // A reference is a byte copy of some snapshot, saved under a different
     // (canonical model+serial) filename — so filename membership never
-    // matches the original snapshot's filename. Instead, mirror
-    // fleet_gui.py's _load_snapshots: read the reference's own captured_at
-    // and flag any snapshot whose captured_at[:19] matches. Resolved lazily
-    // per model since list_snapshots only receives a serial.
-    let mut ref_captured_at_by_model: HashMap<String, Option<String>> = HashMap::new();
+    // matches the original snapshot's filename. What does survive the copy
+    // is the content: a snapshot is "the reference" exactly when its file
+    // is byte-identical to the reference file. (This replaced a
+    // captured_at[:19] comparison, which mis-flagged two snapshots taken in
+    // the same second.) fleet_gui.py's _load_snapshots uses the same rule.
+    // The reference text is resolved lazily per model since list_snapshots
+    // only receives a serial.
+    let mut ref_text_by_model: HashMap<String, Option<String>> = HashMap::new();
 
     let mut rows: Vec<SnapRow> = entries
         .filter_map(|e| e.ok())
@@ -985,8 +988,16 @@ fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {
             let path = snap_dir.join(&fname);
             // SnapshotSummary, not the full Snapshot: listing never looks
             // at `properties` (potentially hundreds of capability entries
-            // per file), so there's no reason to deserialize it here.
-            let snap = match SnapshotSummary::load_from_file(&path) {
+            // per file), so there's no reason to deserialize it here. The
+            // raw text is kept for the byte-identity reference check below.
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(err) => {
+                    eprintln!("warning: skipping {}: {err}", path.display());
+                    return None;
+                }
+            };
+            let snap = match SnapshotSummary::from_json(&text) {
                 Ok(s) => s,
                 Err(err) => {
                     eprintln!("warning: skipping {}: {err}", path.display());
@@ -997,16 +1008,11 @@ fn list_snapshots(data_dir: &Path, serial: &str) -> Vec<SnapRow> {
                 return None;
             }
             let model = snap.camera.model.clone();
-            let ref_captured_at = ref_captured_at_by_model
-                .entry(model.clone())
-                .or_insert_with(|| {
-                    let ref_path = ref_dir.join(format!("{}_{serial}.json", model_slug(&model)));
-                    SnapshotSummary::load_from_file(&ref_path).ok().map(|s| s.captured_at)
-                })
-                .clone();
-            let is_reference = ref_captured_at
-                .as_deref()
-                .is_some_and(|r| snap.captured_at.get(..19) == r.get(..19));
+            let ref_text = ref_text_by_model.entry(model.clone()).or_insert_with(|| {
+                let ref_path = ref_dir.join(format!("{}_{serial}.json", model_slug(&model)));
+                std::fs::read_to_string(&ref_path).ok()
+            });
+            let is_reference = ref_text.as_deref() == Some(text.as_str());
             Some(SnapRow {
                 is_reference,
                 filename: fname,
@@ -1443,13 +1449,13 @@ mod tests {
     }
 
     #[test]
-    fn list_snapshots_marks_reference_by_captured_at() {
+    fn list_snapshots_marks_reference_by_content() {
         // Regression test: is_reference used to compare the snapshot's own
         // filename against filenames present in references/ — but
         // set_reference copies the file under a *different* canonical name,
-        // so that comparison could never match. Fixed to compare
-        // captured_at (mirrors fleet_gui.py's _load_snapshots), which this
-        // test pins.
+        // so that comparison could never match. It is now decided by
+        // byte-identity with the reference file (mirrors fleet_gui.py's
+        // _load_snapshots), which this test pins.
         let data_dir = TempDir::new().unwrap();
         let snap_dir = data_dir.path().join("snapshots");
         fs::create_dir_all(&snap_dir).unwrap();
@@ -1462,6 +1468,75 @@ mod tests {
         let by_name = |n: &str| rows.iter().find(|r| r.filename == n).unwrap();
         assert!(by_name("ref_candidate.json").is_reference);
         assert!(!by_name("other.json").is_reference);
+    }
+
+    #[test]
+    fn list_snapshots_same_second_snapshots_are_distinguished() {
+        // The old captured_at[:19] rule flagged every snapshot taken in the
+        // same second as the reference. Same timestamp, different content
+        // (label) must now flag only the one that was actually promoted.
+        let data_dir = TempDir::new().unwrap();
+        let snap_dir = data_dir.path().join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        for (name, label) in [("a.json", "first"), ("b.json", "second")] {
+            let mut s = Snapshot::new(
+                Camera { model: "Z 9".into(), serial: "ABC123".into(), firmware: "5.00".into() },
+                Transport::Usb,
+                "2026-01-01T00:00:00.100Z".into(),
+            );
+            s.label = Some(label.into());
+            s.save_to_file(snap_dir.join(name)).unwrap();
+        }
+
+        set_reference(data_dir.path(), "b.json").unwrap();
+
+        let rows = list_snapshots(data_dir.path(), "ABC123");
+        let by_name = |n: &str| rows.iter().find(|r| r.filename == n).unwrap();
+        assert!(by_name("b.json").is_reference);
+        assert!(!by_name("a.json").is_reference);
+    }
+
+    #[test]
+    fn list_snapshots_no_reference_file_marks_nothing() {
+        let data_dir = TempDir::new().unwrap();
+        let snap_dir = data_dir.path().join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        write_snapshot(&snap_dir, "a.json", "Z 9", "ABC123", "2026-01-01T00:00:00Z");
+        assert!(!list_snapshots(data_dir.path(), "ABC123")[0].is_reference);
+    }
+
+    #[test]
+    fn list_snapshots_edited_reference_no_longer_matches_any_snapshot() {
+        // Pins the byte-identity contract: a reference whose bytes diverge
+        // from every snapshot (hand-edited, re-saved) is not "the same
+        // snapshot", so no row is badged.
+        let data_dir = TempDir::new().unwrap();
+        let snap_dir = data_dir.path().join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        write_snapshot(&snap_dir, "a.json", "Z 9", "ABC123", "2026-01-01T00:00:00Z");
+        set_reference(data_dir.path(), "a.json").unwrap();
+        let ref_path = data_dir.path().join("references").join("Z_9_ABC123.json");
+        let mut text = fs::read_to_string(&ref_path).unwrap();
+        text.push('\n');
+        fs::write(&ref_path, text).unwrap();
+
+        assert!(!list_snapshots(data_dir.path(), "ABC123")[0].is_reference);
+    }
+
+    #[test]
+    fn list_snapshots_byte_identical_copies_are_both_marked() {
+        // Two files with identical content are the same snapshot as far as
+        // the reference is concerned; both get the badge. Pinned so the
+        // behaviour is deliberate, not accidental.
+        let data_dir = TempDir::new().unwrap();
+        let snap_dir = data_dir.path().join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        write_snapshot(&snap_dir, "a.json", "Z 9", "ABC123", "2026-01-01T00:00:00Z");
+        fs::copy(snap_dir.join("a.json"), snap_dir.join("a_copy.json")).unwrap();
+        set_reference(data_dir.path(), "a.json").unwrap();
+
+        let rows = list_snapshots(data_dir.path(), "ABC123");
+        assert_eq!(rows.iter().filter(|r| r.is_reference).count(), 2);
     }
 
     // ── do_export / do_import ───────────────────────────────────────────────

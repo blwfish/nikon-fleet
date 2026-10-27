@@ -10,7 +10,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode, is_valid_u16
+from fleet_lib import strip_sdk_prefix, accept_zip_entry, parse_fw_filename, fmt_cap_value, model_slug, parse_propcode, is_valid_u16, snapshot_rows
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -241,34 +241,8 @@ class FleetApp:
         serial   = self.cameras[self.selected]["serial"]
         model    = self.cameras[self.selected]["model"]
         dd       = _data_dir()
-        snap_dir = dd / "snapshots"
-        ref_dir  = dd / "references"
-        if not snap_dir.exists():
-            return
-        # Read the reference file for this camera (CLI naming: {model_slug}_{serial}.json).
-        ref_captured_at: str | None = None
-        if ref_dir.exists():
-            ref_name = f"{model_slug(model)}_{serial}.json"
-            ref_path = ref_dir / ref_name
-            if ref_path.exists():
-                try:
-                    ref_captured_at = json.loads(ref_path.read_text()).get("captured_at", "")[:19]
-                except Exception:
-                    pass
-        rows = []
-        for f in snap_dir.glob("*.json"):
-            try:
-                d = json.loads(f.read_text())
-                if d["camera"]["serial"] == serial:
-                    rows.append((d.get("captured_at", "")[:19],
-                                 d.get("label") or "",
-                                 d["camera"].get("firmware", ""),
-                                 f.name))
-            except Exception as e:
-                print(f"warning: could not read snapshot {f}: {e}", file=sys.stderr)
-        rows.sort(reverse=True)
-        for ts, label, fw, fname in rows:
-            ref_mark = "◀ ref" if ref_captured_at and ts == ref_captured_at else ""
+        for ts, label, fw, fname, is_ref in snapshot_rows(dd, model, serial):
+            ref_mark = "◀ ref" if is_ref else ""
             self._tree.insert("", tk.END, iid=fname, values=(ts, label, fw, ref_mark))
 
     def take_snapshot(self) -> None:
