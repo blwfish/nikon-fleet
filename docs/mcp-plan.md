@@ -76,8 +76,11 @@ GUIs is a later cleanup (decided, §9).
 - **MCP library: `rmcp`** (the official `modelcontextprotocol/rust-sdk`), pinned to an **exact**
   version, features `server`, `macros`, `transport-io`. Do not take `3.8.0`: it was published the
   day before the review that produced this note (about 4k downloads, eight 3.x minors since July);
-  start from `=3.5.1` (a month old) and confirm in spike A (§6). Its minimum Rust is
-  1.88 against the toolchain's 1.95, and edition 2024: compatible.
+  start from `=3.5.1` (a month old); spike A (§6) compiled and ran against it. Its minimum Rust is
+  1.88 against the toolchain's 1.95, and edition 2024: compatible. **`rmcp-macros` is a separate
+  crate with a caret requirement (`3.5.1` allows 3.8.0): `rmcp = "=3.5.1"` alone resolved the macros
+  to 3.8.0.** Pin it too (`cargo update -p rmcp-macros --precise 3.5.1`, or a direct
+  `rmcp-macros = "=3.5.1"`), keep `Cargo.lock` committed, and never run a blanket `cargo update`.
 - **macOS only for anything touching cameras.** The MAID SDK is loaded as a CFBundle/Mach-O dylib
   (see the `libloading` comment in `Cargo.toml`). Snapshot/check/restore/transplant cannot run on
   Windows; offline tools (diff, ls) could. `firmware_status` needs network, not a camera.
@@ -86,9 +89,11 @@ GUIs is a later cleanup (decided, §9).
   file in `--data-dir`, never overwriting; on by default because it cannot change a camera, but
   bounded (retention, below). (c) *Camera-writing*: the `*_apply` tools, registered only with
   `--enable-writes`. Client-side approval prompts are a second layer, not the protection (clients
-  differ in how they treat `destructiveHint`). Whether `rmcp` can register tools conditionally at
-  startup is unverified (§8.2); if not, register all and refuse in the handler with a typed
-  `writes_disabled`.
+  differ in how they treat `destructiveHint`). `rmcp` registers tools conditionally at
+  startup: `ToolRouter::disable_route`, `remove_route` or `with_disabled` hide a tool from
+  `tools/list`, and a direct call gets a JSON-RPC error `-32602 "tool not found"` (measured, F-A in
+  §8.1). So the `*_apply` tools are simply **absent** without `--enable-writes`; no handler-side
+  `writes_disabled` is needed.
 - **Retention.** There is no `rm` tool, so captures and restore points only accumulate. Files the
   MCP creates are marked by label prefix, added server-side so an agent-supplied label cannot
   dodge it: `mcp-<label>` for captures, `mcp-restore-<op>-<timestamp>` for restore points. Each
@@ -126,10 +131,21 @@ GUIs is a later cleanup (decided, §9).
     connect, three captures (about 5 s each on the bodies measured), and the writes. MCP clients
     have their own request timeouts, which differ by client and are unverified (§8.2): the
     deadline must be shorter than the client's, or the server sends progress notifications when
-    the client supplies a progress token.
+    the client supplies a progress token. Claude Code supplies one on every call and has no
+    default tool timeout at 75 s (`MCP_TOOL_TIMEOUT` shortens it); Claude Desktop is untested
+    (§8.2).
   - **Cancellation.** A client cancellation of a read-only or plan call kills the worker. For an
     apply it is honoured only before the worker reports the phase `writing`; after that it is
-    ignored, because killing mid-write leaves a half-applied camera. If the client times out or
+    ignored, because killing mid-write leaves a half-applied camera. `rmcp` only sets the
+    request's cancellation token (`RequestContext::ct`); it neither drops the handler nor sends
+    a response to the cancelled request, so the handler has to `select!` on the token (measured,
+    §8.1). **Client disconnect is different:** when stdin closes, `rmcp` drops the in-flight
+    handlers and the process exits within about 5 s. Read-only and plan workers are spawned with
+    `kill_on_drop`, so they die with the handler. An apply's supervision runs in a detached task
+    that `main` awaits (bounded) after the service stops, so a client exit mid-write does not
+    abandon a half-applied camera; if the server is killed outright, the orphaned worker keeps the
+    flock until it finishes, so the next call is `camera_busy`, not a second concurrent session.
+    If the client times out or
     gives up while the worker finishes, the agent's likely retry of the apply finds every outcome
     already unchanged, so its digest differs and it fails as `stale_plan` (tested, §7).
 - **Calls queue inside the server.** An agent may issue camera tool calls in parallel (two bodies,
@@ -393,6 +409,12 @@ snapshot" as meaningful, or filter them from the default lists.
   structured output, conditional registration under a flag (§8.2), and a tool that sleeps past the
   usual client timeout, run under the real clients, to see what timeout and cancellation do and
   whether progress notifications help (§8.2).
+
+  **Run 2026-10-27** (throwaway crate in the scratchpad, not kept in the repo; 5 tools, a scripted
+  stdio client, and Claude Code 2.1.308 via `claude -p --mcp-config`). Passed: conditional
+  registration, structured output, typed errors, annotations, progress, cancellation and
+  disconnect behaviour (§8.1 rows tagged A). **Not covered:** Claude Desktop, and any
+  client other than the scripted one and Claude Code.
 - **B. Worker experiment on hardware** (needs the user): a small parent that spawns the existing
   CLI `snapshot` as the child with a result fd and a deadline, and kills with SIGKILL and reaps.
   Confirms: the SDK writes nothing to the result fd's channel; the parent can read a result
@@ -455,8 +477,9 @@ validation, including a no-hardware CLI test; `restore_precheck` ordering; `diff
 
 To write for the MCP:
 
-- Without `--enable-writes`: `transplant_apply` and `restore_apply` are absent (or refuse with
-  `writes_disabled`), while the plan tools, capture and check are present and change no camera.
+- Without `--enable-writes`: `transplant_apply` and `restore_apply` are absent from `tools/list`
+  and a direct call gets `tool not found`, while the plan tools, capture and check are present and
+  change no camera.
 - `list_cameras` works with no SDK bundle present and takes no lock.
 - `ops` (and so the MCP process) writes nothing to stdout during any operation.
 - Two bodies of one model attached ⇒ `ambiguous_pairing` for capture, check, plan and apply, even
@@ -547,16 +570,23 @@ To write for the MCP:
 | The SDK dylib leaves an inherited extra fd alone | yes (0 bytes in every run) | F14 |
 | The plain `nikon-fleet` release build (linker-signed, no entitlements) loads the SDK when spawned from a clean env, new session, cwd `/` | yes, both bodies | F14 |
 | SIGKILL of a capture child leaves the body enumerable and the next capture at baseline | yes: 8 kills, both bodies | F14 |
+| `rmcp` can hide a tool at startup | yes: `disable_route` and `remove_route` both drop it from `tools/list`; a direct call gets `-32602 "tool not found"` | A |
+| `rmcp` structured output and typed errors | yes: `Json<T>` gives `structuredContent`, a text mirror in `content` and an `outputSchema`; `Err(Json<E>)` gives `isError: true` plus `structuredContent`. Gotcha: `u64` fields get `format: "uint64"`, which Claude Code warns about on stderr; use `i32`/`i64` | A |
+| `rmcp = "=3.5.1"` pins the macros | **no**: `rmcp-macros` floated to 3.8.0 until pinned separately | A |
+| A client cancellation stops the handler | **no**: it only trips `ctx.ct`; with `check_ct=false` the handler ran to completion; no response is sent to the cancelled request | A |
+| Progress notifications reach the client | yes, one per second, only when the request carried a progress token | A |
+| Claude Code cancels a call it times out | yes: `MCP_TOOL_TIMEOUT=6000` on a 20 s call tripped `ct` at about 6 s and the model saw "timed out after 6s" | A |
+| Claude Code supplies a progress token and has no 60 s default timeout | yes: the token was present on every call, even when asked for no progress; a 75 s call completed | A |
+| The server cleans up when the client goes away | partly: on stdin close (scripted client) and on Ctrl-C of `claude -p`, the handler was dropped and the server exited (5.05 s after stdin close, `rmcp`'s fixed wait); the handler's work did not finish | A |
 
 ### 8.2 Still unverified (review these)
 
-- **`rmcp`, checked 2026-10-27 against crates.io (not yet compiled against).** Verified: the
+- **`rmcp`, checked 2026-10-27 against crates.io and compiled against (spike A).** Verified: the
   crate is the official `modelcontextprotocol/rust-sdk`; `ToolAnnotations` has `read_only_hint` and
   `destructive_hint`; features `server`, `macros`, `transport-io` exist; minimum Rust 1.88. Also
   found: 3.8.0 is one day old, with many 3.x minors since July, so the version is pinned (§3).
-  **Still unverified:** structured tool output, and **registering tools conditionally at startup**
-  (the `--enable-writes` design wants it; the §3 fallback is a handler-side `writes_disabled`).
-  Spike A (§6) settles both.
+  Conditional registration and structured output now work as measured (§8.1). **Still
+  unverified:** that the API shape survives the next 3.x minor (hence the exact pin).
 - Tool annotations (`readOnlyHint`, `destructiveHint`): assumed advisory only. The server-side
   `--enable-writes` gate does not rely on the client honouring them.
 - The worker behaves as assumed as a **separate process running the SDK on its main thread**. That
@@ -588,7 +618,9 @@ To write for the MCP:
 - **MCP client timeouts and cancellation.** How the clients in use (Claude Desktop, Claude Code)
   time out a long tool call, whether they send a cancellation, and whether progress notifications
   extend the timeout are all unverified. The worker protocol (§3) is designed around plausible
-  answers, not measured ones. Spike A (§6).
+  answers, not measured ones. Measured so far (spike A): Claude Code, not Claude Desktop (§8.1).
+  Claude Desktop's tool timeout, cancellation and progress behaviour are untested; its config
+  was not touched.
 - **Codesigning of the worker.** `scripts/setup-sdk-runtime.sh` and `AGENT-README.md` say
   SDK-loading binaries need ad-hoc signing (`sdk-entitlements.plist`, `disable-library-validation`).
   The plain release build, which is linker-signed with no entitlements, loaded the SDK from a clean
@@ -639,6 +671,9 @@ To write for the MCP:
 14. **MCP-created file prefixes and caps (§3):** `mcp-` for captures, `mcp-restore-` for restore
     points, separate per-camera caps.
 15. **Order of work (§6):** the `rmcp` spike and the worker experiment come before Phase 0.
+16. **`rmcp` usage (spike A):** `*_apply` hidden via the router, not refused in the handler;
+    typed errors as `Err(Json<E>)`; handlers `select!` on `ctx.ct`; `rmcp-macros` pinned with
+    `rmcp`; no `u64` in tool schemas.
 
 ### Still open
 
@@ -650,8 +685,6 @@ To write for the MCP:
 - The per-tool worker deadlines, the apply one especially, and their relation to the clients'
   request timeouts (§3, §8.2).
 - A verified way to pair same-model bodies, which would lift `ambiguous_pairing` (§3).
-- Whether `rmcp` supports conditional tool registration and structured output (§8.2), decided by
-  spike A (§6).
 
 ## 10. Out of scope
 
