@@ -384,8 +384,10 @@ The Z6III was not attached during this session.
 - **Numeric-literal gate, live.** A read-only `transplant --dry-run` of the Z 9 baseline onto the
   Z 9 itself: 16 literals, none blocked (all equal to the camera's value), `never-copied=10`. With
   `WBAutoType` edited from 2 to 3 in a scratch copy of the snapshot, the dry run blocked exactly that
-  property: `would set 3, was 2`, where 2 is the value the camera really holds. The opted-in run was
-  not obtained (see below).
+  property: `would set 3, was 2`, where 2 is the value the camera really holds. After the replug
+  (below), the same dry run with `--allow-raw-code WBAutoType` listed `WBAutoType` as `would write via
+  literal`: `literal=16`, `literal-unconfirmed=0`. That is a dry run; the real opted-in **write** has
+  still not been run on hardware.
 - **Another teardown hang (F3).** The first dry run completed its work and then sat in
   `DisconnectDevice` (same stack as F3) for over five minutes, consuming CPU, after a **read-only**
   run with no other process using the camera. It was ended with SIGKILL; the next capture was at
@@ -397,7 +399,10 @@ The Z6III was not attached during this session.
   0000003023668). No fleet process was running. `ptpcamerad`, `icdd` and Photos were running; they
   were running before and I did not stop them. Cause unproven: it may or may not be related to the
   SIGKILL of the hung process (the capture after that kill worked, and so did one more run).
-  Needs a replug or power cycle to clear; whether that is what clears it is the next observation.
+  **A replug or power cycle of the body cleared it:** the next `discover` (no USB reset) listed the
+  Z 9 at once and the following dry run completed with no hang. One observation, so a correlation,
+  not a diagnosis. The practical rule stands: when the SDK reports no cameras for a body the USB bus
+  still lists, no software step tried here (waiting, the USB reset) helped; the user has to replug.
 
 ## F13. Still unverified
 

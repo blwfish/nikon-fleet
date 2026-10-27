@@ -446,7 +446,7 @@ snapshot" as meaningful, or filter them from the default lists.
 | Same-model refusal (`ambiguous_pairing`) in `ops` for capture/check/plan/apply; CLI keeps its warning | todo |
 | USB-only camera listing (no SDK) with the USB-name to SDK-model-name mapping, and a test of the mapping | todo |
 | `restore --only <property>` (repeatable) and the `ops` equivalent, for the targeted undo (§5.6) | todo |
-| Gate numeric literal scalars like raw codes: `SkipReason::literal_unconfirmed`, same opt-in list (§5.3) | **done** (`6d412c7`); the opted-in write path has not been run on hardware |
+| Gate numeric literal scalars like raw codes: `SkipReason::literal_unconfirmed`, same opt-in list (§5.3) | **done** (`6d412c7`); the opt-in was confirmed in a live dry run (F15), but the opted-in write itself has not been run on hardware |
 | Add `ShootNoCard` to `NEVER_TRANSPLANT` (and its real-config name check) | **done** (`c619f23`); the table has 10 entries |
 | `Serialize` on `Strategy`/`SkipReason` as closed tags (exhaustive match) and on outcomes | todo |
 | `--json` on `ls`, `ref list`, `check`, `snapshot`, `transplant`, `restore`; `discover --json` gains `available`/`connected_pid` | todo |
@@ -641,7 +641,7 @@ To write for the MCP:
 - The CLI `snapshot` still accepts a *partial* capture (e.g. `ok=18 err=194`) with exit 0 (F2).
 - Numeric **literal** scalars (`WBAutoType`, `MovieRecMicrophone`, `ElectronicVR`, ...) used to be
   copied as-is with the same unverified-meaning risk as raw codes (F9). The gate landed in `6d412c7`
-  (§5.3), so this no longer blocks `*_apply`; the opted-in write is untested on hardware.
+  (§5.3), so this no longer blocks `*_apply`; the opt-in is confirmed in a live dry run (F15); the opted-in write itself is untested on hardware.
 - `restore --dry-run` reports counts that real runs can miss (F4).
 
 ## 9. Decisions
