@@ -93,8 +93,47 @@ const VOLATILE_SUBSTRINGS: &[&str] = &[
 /// Options for `diff`.
 #[derive(Debug, Clone, Default)]
 pub struct DiffOptions {
-    /// Include properties from the volatile list. Default: false.
+    /// Include properties from the volatile list, and compare enum
+    /// `default_index` fields (see [`values_differ`]). Default: false.
     pub include_volatile: bool,
+}
+
+/// Whether two captured property values differ, for the purposes of `diff`.
+///
+/// Unless `include_volatile` is set, the `default_index` field of an enum
+/// value (an object carrying `value_index`, `default_index` and `values`) is
+/// ignored. Reason, observed on a Z6III (fw 2.00, 2026-10-27): the SDK leaves
+/// `NkMAIDEnum.ulDefault` uninitialised for at least
+/// `kNkMAIDCapability_MovieWBFluorescentType`, so every capture of an
+/// untouched camera recorded stale heap contents there (0, 1, 26, 72350,
+/// 50331648 across seven captures; 26 is another capability's genuine default)
+/// while `value_index` and `values` stayed stable. Both enum structs the SDK
+/// returns per read carry the same junk, so re-reading cannot detect it, and no
+/// capability operation bit distinguishes it from the 69 enums that are fine.
+///
+/// The field stays recorded in snapshots (raw-only, so old and new files remain
+/// comparable and nothing is lost); it is only left out of the comparison.
+/// Range values also carry a `default_index`, but no garbage has been observed
+/// there, so they are compared in full until it is.
+fn values_differ(a: &serde_json::Value, b: &serde_json::Value, opts: &DiffOptions) -> bool {
+    if opts.include_volatile || !(is_enum_shape(a) || is_enum_shape(b)) {
+        return a != b;
+    }
+    strip_default_index(a) != strip_default_index(b)
+}
+
+fn is_enum_shape(v: &serde_json::Value) -> bool {
+    v.as_object().is_some_and(|o| {
+        o.contains_key("value_index") && o.contains_key("default_index") && o.contains_key("values")
+    })
+}
+
+fn strip_default_index(v: &serde_json::Value) -> serde_json::Value {
+    let mut v = v.clone();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("default_index");
+    }
+    v
 }
 
 pub fn diff(a: &Snapshot, b: &Snapshot, opts: &DiffOptions) -> Result<Diff, DiffError> {
@@ -117,7 +156,7 @@ pub fn diff(a: &Snapshot, b: &Snapshot, opts: &DiffOptions) -> Result<Diff, Diff
         }
         let pa = &a.properties[*key];
         let pb = &b.properties[*key];
-        if pa.value != pb.value {
+        if values_differ(&pa.value, &pb.value, opts) {
             result.changed.push(Change {
                 name: (*key).clone(),
                 code: pa.code,
@@ -372,6 +411,97 @@ mod tests {
         let opts = DiffOptions { include_volatile: true };
         let d = diff(&a, &b, &opts).unwrap();
         assert_eq!(d.changed.len(), 1);
+    }
+
+    // ── enum default_index (SDK-uninitialised field) ─────────────────────
+
+    fn enum_val(value_index: u64, default_index: u64, count: u64) -> serde_json::Value {
+        json!({
+            "value_index": value_index, "default_index": default_index,
+            "elem_count": count, "elem_type": 2, "elem_bytes": 4,
+            "values": [3, 4, 5],
+        })
+    }
+
+    #[test]
+    fn enum_default_index_alone_is_not_a_change_by_default() {
+        // Regression: MovieWBFluorescentType's junk default_index (0 vs 26
+        // vs 72350 ...) made every check/diff of an untouched Z6III report a
+        // change.
+        let name = "kNkMAIDCapability_MovieWBFluorescentType";
+        let a = snap(&[(name, 33892, enum_val(0, 0, 3))]);
+        let b = snap(&[(name, 33892, enum_val(0, 72350, 3))]);
+        let d = diff(&a, &b, &DiffOptions::default()).unwrap();
+        assert!(d.is_empty(), "default_index-only difference must be ignored: {d:?}");
+    }
+
+    #[test]
+    fn enum_default_index_difference_is_reported_when_volatile_included() {
+        let name = "kNkMAIDCapability_MovieWBFluorescentType";
+        let a = snap(&[(name, 33892, enum_val(0, 0, 3))]);
+        let b = snap(&[(name, 33892, enum_val(0, 1, 3))]);
+        let d = diff(&a, &b, &DiffOptions { include_volatile: true }).unwrap();
+        assert_eq!(d.changed.len(), 1, "opting in must still surface the raw difference");
+    }
+
+    #[test]
+    fn enum_value_index_change_is_reported_even_when_default_index_also_differs() {
+        // The ignore must not swallow a real change that happens alongside the
+        // junk field (HighlightBrightness 26 -> 25 in the hardware test).
+        let name = "kNkMAIDCapability_HighlightBrightness";
+        let a = snap(&[(name, 34045, enum_val(26, 26, 3))]);
+        let b = snap(&[(name, 34045, enum_val(25, 99, 3))]);
+        let d = diff(&a, &b, &DiffOptions::default()).unwrap();
+        assert_eq!(d.changed.len(), 1);
+        assert_eq!(d.changed[0].value_b["value_index"], json!(25));
+    }
+
+    #[test]
+    fn enum_other_field_changes_are_reported() {
+        // Only default_index is excluded: elem_count / values still count.
+        let name = "kNkMAIDCapability_X";
+        let a = snap(&[(name, 1, enum_val(0, 0, 3))]);
+        let b = snap(&[(name, 1, enum_val(0, 0, 4))]);
+        assert_eq!(diff(&a, &b, &DiffOptions::default()).unwrap().changed.len(), 1);
+        let mut vb = enum_val(0, 0, 3);
+        vb["values"] = json!([3, 4, 6]);
+        let c = snap(&[(name, 1, vb)]);
+        assert_eq!(diff(&a, &c, &DiffOptions::default()).unwrap().changed.len(), 1);
+    }
+
+    #[test]
+    fn default_index_ignored_when_one_side_lacks_the_field() {
+        // An older snapshot format (or a hand-edited file) without the field
+        // must compare equal to a current one that differs only by it.
+        let name = "kNkMAIDCapability_X";
+        let mut old = enum_val(1, 0, 3);
+        old.as_object_mut().unwrap().remove("default_index");
+        // old lacks default_index, so it is not enum-shaped itself; the
+        // other side still is, and that alone must trigger the strip.
+        let a = snap(&[(name, 1, old)]);
+        let b = snap(&[(name, 1, enum_val(1, 7, 3))]);
+        assert!(diff(&a, &b, &DiffOptions::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_index_outside_an_enum_shape_is_still_compared() {
+        // Ambiguous input pinned: an object that has default_index but is not
+        // enum-shaped (range values: value/default/lower/upper/steps) is NOT
+        // stripped, nor is a scalar or an unrelated object.
+        let name = "kNkMAIDCapability_R";
+        let range = |d: u64| json!({"value": 1.0, "default": 1.0, "value_index": 2,
+            "default_index": d, "lower": 0.0, "upper": 4.0, "steps": 5});
+        let a = snap(&[(name, 1, range(0))]);
+        let b = snap(&[(name, 1, range(3))]);
+        assert_eq!(diff(&a, &b, &DiffOptions::default()).unwrap().changed.len(), 1);
+
+        let a = snap(&[(name, 1, json!({"default_index": 1}))]);
+        let b = snap(&[(name, 1, json!({"default_index": 2}))]);
+        assert_eq!(diff(&a, &b, &DiffOptions::default()).unwrap().changed.len(), 1);
+
+        let a = snap(&[(name, 1, json!(1))]);
+        let b = snap(&[(name, 1, json!(2))]);
+        assert_eq!(diff(&a, &b, &DiffOptions::default()).unwrap().changed.len(), 1);
     }
 
     #[test]

@@ -722,6 +722,11 @@ impl<'sdk> Device<'sdk> {
         // Snapshot the index fields before freeing.
         let st = unsafe { &*(val_ptr as *const NkMAIDEnum) };
         let value_idx   = st.ul_value;
+        // `ul_default` is recorded as-is but is NOT reliable: for at least
+        // kNkMAIDCapability_MovieWBFluorescentType the SDK never writes it
+        // (stale heap on a Z6III fw 2.00; both the GET_VALUE and GET_ARRAY
+        // structs carry the same junk, so a re-read cannot detect it).
+        // `diff` therefore ignores it by default; see `diff::values_differ`.
         let default_idx = st.ul_default;
         let elem_count  = st.ul_elements;
         let elem_type   = st.ul_type;
@@ -871,6 +876,8 @@ unsafe fn decode_value(data_ptr: *mut c_void, data_type: u32) -> Value {
             let values = decode_enum_values(st);
             json!({
                 "value_index": st.ul_value,
+                // Unreliable (SDK leaves ulDefault uninitialised for some
+                // capabilities); see read_enum_capability and diff::values_differ.
                 "default_index": st.ul_default,
                 "elem_count": st.ul_elements,
                 "elem_type": st.ul_type,

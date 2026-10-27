@@ -859,6 +859,7 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     }
 
     let device = sdk.connect(target.id)?;
+    ensure_capabilities_present(device.capabilities.len())?;
     println!("Reading {} capabilities…", device.capabilities.len());
 
     let captured_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
@@ -890,11 +891,11 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     let path = dir.join(&filename);
     snap.save_to_file(&path)?;
     println!("Wrote {}", path.display());
-    if snapshot_capture_failed(stats.read_ok, stats.read_err) {
+    if snapshot_capture_failed(stats.read_ok) {
         // The file is still written (matches prior behavior), but a
         // script/CI checking exit status must be able to tell this run was
         // a total failure, not a normal capture.
-        bail!("all {} capability read(s) failed (see errors above); wrote an empty snapshot to {}", stats.read_err, path.display());
+        bail!("no capability could be read ({} read error(s), see above); wrote an empty snapshot to {}", stats.read_err, path.display());
     }
     Ok(())
 }
@@ -960,10 +961,36 @@ fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
 }
 
 /// Whether a capture should be treated as a hard failure: zero capabilities
-/// read at all (an empty, useless snapshot), not a routine handful of
+/// read successfully (an empty, useless snapshot), not a routine handful of
 /// per-capability read errors mixed with real successes.
-fn snapshot_capture_failed(read_ok: usize, read_err: usize) -> bool {
-    read_ok == 0 && read_err > 0
+///
+/// The read-error count is deliberately not part of the test. An earlier version
+/// required `read_err > 0`, which let a 0-read/0-error capture through with
+/// exit status 0: observed on a Z6III when another process's USB reset landed
+/// during `connect`, leaving the device with an empty capability list and
+/// `snapshot` writing a 232-byte empty file as if it had succeeded. A real
+/// body always has hundreds of readable capabilities, so "nothing read" is a
+/// failure whatever the error count.
+fn snapshot_capture_failed(read_ok: usize) -> bool {
+    read_ok == 0
+}
+
+/// A connected camera that reports zero capabilities cannot be read from or
+/// written to, and every command downstream would misreport that as a normal
+/// result (snapshot: an empty file; restore/transplant: every property
+/// "absent on target"; check: every property "only in reference"). Seen on
+/// hardware when a second fleet process opened the SDK, with a USB reset,
+/// while this one was connecting. Call right after `sdk.connect`, before
+/// anything is read, written or saved.
+fn ensure_capabilities_present(count: usize) -> Result<()> {
+    if count == 0 {
+        bail!(
+            "the camera connected but reported 0 capabilities, so nothing was read or written. \
+             This usually means another fleet/GUI process reset or opened the camera at the same \
+             time; close it and retry (or unplug and replug the camera)"
+        );
+    }
+    Ok(())
 }
 
 /// Whether a restore should be treated as a hard failure: zero writes
@@ -988,6 +1015,7 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     let schema = MaidLayerConfig::parse_file(schema_path)?;
     let name_lookup = schema.name_map_for_model(&target.name);
     let device = sdk.connect(target.id)?;
+    ensure_capabilities_present(device.capabilities.len())?;
     let serial = snapshot_serial(&usb_info, target.id);
     let firmware = usb_info.as_ref().map(|u| u.firmware.clone())
         .unwrap_or_else(|| target.version.clone());
@@ -1847,6 +1875,7 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
 
     println!("Connecting to {:?} (id={})…", target.name, target.id);
     let device = sdk.connect(target.id)?;
+    ensure_capabilities_present(device.capabilities.len())?;
 
     // Index capabilities by code for O(1) lookup.
     let cap_map: HashMap<u32, &CapabilityInfo> =
@@ -1943,6 +1972,7 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
 
     println!("Connecting to {:?} (id={})…", target.name, target.id);
     let device = sdk.connect(target.id)?;
+    ensure_capabilities_present(device.capabilities.len())?;
 
     let outcomes = transplant::transplant(&device, &snap.properties, &guard, args.dry_run);
 
@@ -2417,22 +2447,35 @@ mod tests {
     // ── snapshot_capture_failed / restore_completely_failed ─────────────────
 
     #[test]
-    fn snapshot_capture_failed_zero_ok_zero_err_is_not_failure() {
-        // No capabilities existed to read at all (e.g. a camera with zero
-        // OP_GET capabilities) — not the same as every read failing.
-        assert!(!snapshot_capture_failed(0, 0));
+    fn snapshot_capture_failed_zero_ok_zero_err_is_failure() {
+        // Pinned from a hardware observation (Z6III, 2026-10-27): a USB reset
+        // from another process during connect produced "Reading 0
+        // capabilities" -> ok=0 err=0, and the old `read_ok == 0 && read_err
+        // > 0` test let that through as a successful capture of an empty
+        // snapshot. Nothing read is a failure regardless of the error count.
+        assert!(snapshot_capture_failed(0));
+    }
+
+    #[test]
+    fn ensure_capabilities_present_boundary() {
+        // At the threshold (0), just above (1), and a real body's size.
+        let zero = ensure_capabilities_present(0).unwrap_err().to_string();
+        assert!(zero.contains("0 capabilities"), "message was: {zero}");
+        assert!(zero.contains("another fleet/GUI process"), "needs an actionable hint: {zero}");
+        assert!(ensure_capabilities_present(1).is_ok());
+        assert!(ensure_capabilities_present(327).is_ok());
     }
 
     #[test]
     fn snapshot_capture_failed_zero_ok_nonzero_err_is_failure() {
-        assert!(snapshot_capture_failed(0, 1));
+        assert!(snapshot_capture_failed(0)); // with read errors alongside: same answer
     }
 
     #[test]
     fn snapshot_capture_failed_any_ok_is_not_failure() {
         // Boundary: even a single successful read means this isn't a total
         // failure, regardless of how many others failed.
-        assert!(!snapshot_capture_failed(1, 99));
+        assert!(!snapshot_capture_failed(1)); // 99 failed reads alongside don't matter
     }
 
     #[test]
