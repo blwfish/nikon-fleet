@@ -213,3 +213,125 @@ fn a_result_that_cannot_be_delivered_is_exit_status_2_not_a_success() {
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(out.stdout.is_empty());
 }
+
+// ── check / transplant-plan / transplant-apply: what is refused before any camera ──
+
+fn data_dir_with_source() -> (tempfile::TempDir, String) {
+    use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
+    let d = tempfile::tempdir().unwrap();
+    let snaps = d.path().join("snapshots");
+    std::fs::create_dir_all(&snaps).unwrap();
+    let mut s = Snapshot::new(
+        Camera { model: "Z6_3".into(), serial: "SRC".into(), firmware: "2.00".into() },
+        Transport::Usb,
+        "2026-10-27T00:00:00Z".into(),
+    );
+    s.insert("kNkMAIDCapability_Copyright", 1, json!("me"));
+    s.insert("kNkMAIDCapability_WBAutoType", 2, json!(3));
+    s.save_to_file(snaps.join("source.json")).unwrap();
+    (d, "source.json".to_string())
+}
+
+fn g<'a>(data_dir: &'a std::path::Path) -> Vec<&'a str> {
+    vec!["--data-dir", data_dir.to_str().unwrap(), "--sdk-bundle", "/nonexistent/sdk"]
+}
+
+#[test]
+fn check_refuses_a_bad_serial_and_a_missing_bundle_with_typed_errors() {
+    let d = tempfile::tempdir().unwrap();
+    let mut w = spawn(&g(d.path()), &["check", "--serial", "id-3"], &[]);
+    assert_eq!(err_tag(&w.read()), "no_usb_serial");
+    let mut w = spawn(&g(d.path()), &["check", "--serial", "0000003023668"], &[]);
+    assert_eq!(err_tag(&w.read()), "sdk_bundle_missing");
+}
+
+#[test]
+fn transplant_plan_refuses_unsafe_and_missing_sources_before_the_sdk() {
+    let (d, _) = data_dir_with_source();
+    for (name, tag) in [("../source.json", "unsafe_name"), ("/etc/passwd", "unsafe_name"), ("a/b.json", "unsafe_name"), ("", "unsafe_name"), ("nope.json", "not_found")] {
+        let mut w = spawn(&g(d.path()), &["transplant-plan", "--serial", "0000003023668", "--source", name], &[]);
+        let r = w.read();
+        assert_eq!(err_tag(&r), tag, "{name:?}");
+        assert_eq!(r.progress, ["starting"], "{name:?}: stopped before the SDK");
+        let (code, stdout, _) = w.finish();
+        assert_eq!((code, stdout.as_str()), (Some(1), ""), "{name:?}");
+    }
+}
+
+#[test]
+fn transplant_plan_refuses_a_bad_opt_in_name_before_the_sdk() {
+    let (d, src) = data_dir_with_source();
+    let mut w = spawn(&g(d.path()), &["transplant-plan", "--serial", "0000003023668", "--source", &src, "--allow-raw-code", "Nope"], &[]);
+    let r = w.read();
+    assert_eq!(err_tag(&r), "bad_opt_in");
+    assert_eq!(r.progress, ["starting"]);
+    // A string property is not something the opt-in applies to.
+    let mut w = spawn(&g(d.path()), &["transplant-plan", "--serial", "0000003023668", "--source", &src, "--allow-raw-code", "Copyright"], &[]);
+    assert_eq!(err_tag(&w.read()), "bad_opt_in");
+}
+
+#[test]
+fn a_valid_plan_request_gets_as_far_as_the_missing_bundle() {
+    let (d, src) = data_dir_with_source();
+    let mut w = spawn(&g(d.path()), &["transplant-plan", "--serial", "0000003023668", "--source", &src, "--allow-raw-code", "WBAutoType"], &[]);
+    assert_eq!(err_tag(&w.read()), "sdk_bundle_missing", "every earlier check passed");
+}
+
+#[test]
+fn transplant_apply_demands_the_digest_and_the_summary_before_anything_else() {
+    let (d, src) = data_dir_with_source();
+    for (digest, summary) in [("", "s"), ("  ", "s"), ("d", ""), ("d", "   ")] {
+        let mut w = spawn(
+            &g(d.path()),
+            &["transplant-apply", "--serial", "0000003023668", "--source", &src, "--digest", digest, "--summary", summary],
+            &[],
+        );
+        let r = w.read();
+        assert_eq!(err_tag(&r), "missing_confirmation", "{digest:?}/{summary:?}");
+        assert_eq!(r.progress, ["starting"]);
+    }
+    // With both present the request goes on (here to the missing bundle).
+    let mut w = spawn(
+        &g(d.path()),
+        &["transplant-apply", "--serial", "0000003023668", "--source", &src, "--digest", "d", "--summary", "s"],
+        &[],
+    );
+    assert_eq!(err_tag(&w.read()), "sdk_bundle_missing");
+}
+
+#[test]
+fn transplant_apply_refuses_an_unsafe_source_even_with_a_valid_confirmation() {
+    let (d, _) = data_dir_with_source();
+    let mut w = spawn(
+        &g(d.path()),
+        &["transplant-apply", "--serial", "0000003023668", "--source", "../x", "--digest", "d", "--summary", "s"],
+        &[],
+    );
+    assert_eq!(err_tag(&w.read()), "unsafe_name");
+}
+
+#[test]
+fn plan_and_apply_report_camera_busy_without_loading_the_sdk() {
+    let schema = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk-runtime/MaidLayer.config");
+    if !schema.exists() {
+        return;
+    }
+    let (d, src) = data_dir_with_source();
+    let lock_dir = tempfile::tempdir().unwrap();
+    let lock_path = lock_dir.path().join("camera.lock");
+    let _held = CameraLock::acquire_at(&lock_path).unwrap();
+    let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let global = ["--data-dir", d.path().to_str().unwrap(), "--sdk-bundle", bundle.to_str().unwrap(), "--schema", schema.to_str().unwrap()];
+    let env = [("NIKON_FLEET_CAMERA_LOCK", lock_path.to_str().unwrap())];
+    for op in [
+        vec!["transplant-plan", "--serial", "0000003023668", "--source", &src],
+        vec!["transplant-apply", "--serial", "0000003023668", "--source", &src, "--digest", "d", "--summary", "s"],
+        vec!["check", "--serial", "0000003023668"],
+    ] {
+        let mut w = spawn(&global, &op, &env);
+        let r = w.read();
+        assert_eq!(err_tag(&r), "camera_busy", "{op:?}");
+        assert_eq!(r.progress, ["starting"], "{op:?}");
+        assert_eq!(w.finish().0, Some(1));
+    }
+}

@@ -184,6 +184,18 @@ impl std::fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
+/// Both the digest and the summary must have been echoed. Callers check this
+/// before opening a camera session; `apply_transplant` checks it again.
+pub fn require_confirmation(digest: &str, summary: &str) -> Result<(), ApplyError> {
+    if digest.trim().is_empty() {
+        return Err(ApplyError::MissingConfirmation { which: "digest" });
+    }
+    if summary.trim().is_empty() {
+        return Err(ApplyError::MissingConfirmation { which: "summary" });
+    }
+    Ok(())
+}
+
 /// Does `got` (read back) show the effect of writing `planned`?
 fn took_effect(planned: &Value, got: &Value) -> bool {
     if planned.get("lower").is_some() {
@@ -214,12 +226,7 @@ pub fn apply_transplant<P: CameraPort + ?Sized>(
     req: &ApplyRequest<'_>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<ApplyReport, ApplyError> {
-    if req.expected_digest.trim().is_empty() {
-        return Err(ApplyError::MissingConfirmation { which: "digest" });
-    }
-    if req.expected_summary.trim().is_empty() {
-        return Err(ApplyError::MissingConfirmation { which: "summary" });
-    }
+    require_confirmation(req.expected_digest, req.expected_summary)?;
 
     // 1. Recompute the plan on the live body and compare.
     let props = &req.plan.source.properties;

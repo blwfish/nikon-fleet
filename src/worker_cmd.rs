@@ -11,6 +11,7 @@
 //! result channel could not be established. Callers must not rely on it
 //! (a killed or hung worker has none); the result line is the answer.
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::path::Path;
 
@@ -21,13 +22,21 @@ use time::format_description::well_known::Rfc3339;
 
 use nikon_fleet::camera_lock::LockError;
 use nikon_fleet::maid_layer::MaidLayerConfig;
-use nikon_fleet::ops::capture_snapshot::{CaptureError, CaptureRequest, capture_snapshot};
+use nikon_fleet::ops::apply::{ApplyError, ApplyRequest, apply_transplant, require_confirmation};
 use nikon_fleet::ops::cameras::require_unambiguous;
+use nikon_fleet::ops::capture_snapshot::{CaptureError, CaptureRequest, capture_snapshot};
+use nikon_fleet::ops::check::{CheckError, CheckRequest, check};
+use nikon_fleet::ops::list::reference_filename;
+use nikon_fleet::ops::paths::resolve_existing;
+use nikon_fleet::ops::plan::{PlanInput, build_plan};
 use nikon_fleet::ops::target::select_by_usb_serial;
 use nikon_fleet::ops::worker::{Emitter, Outcome, open_result_fd};
-use nikon_fleet::snapshot::Camera;
+use nikon_fleet::ops::port::CameraPort;
+use nikon_fleet::sdk::Device;
+use nikon_fleet::snapshot::{Camera, Snapshot};
+use nikon_fleet::transplant::{CodeNameGuard, TransplantOptions, resolve_allow_raw_code};
 
-use super::{enrich_devices, ensure_capabilities_present, open_sdk, snapshots_dir};
+use super::{enrich_devices, ensure_capabilities_present, open_sdk, references_dir, snapshots_dir};
 
 #[derive(Args, Debug)]
 pub struct WorkerArgs {
@@ -62,6 +71,38 @@ pub enum WorkerOp {
         #[arg(long)]
         label: Option<String>,
     },
+    /// Capture a body live and diff it against its reference (writes nothing).
+    Check {
+        #[arg(long)]
+        serial: String,
+    },
+    /// Dry-run a transplant of a stored snapshot onto a body; returns a digest and
+    /// summary to echo to `transplant-apply`. Writes nothing to the camera or the disk.
+    TransplantPlan {
+        #[arg(long)]
+        serial: String,
+        /// Snapshot name inside the data directory's snapshots/ (a name, not a path).
+        #[arg(long)]
+        source: String,
+        /// Accept a raw-code enum / numeric literal for this property. Repeatable.
+        #[arg(long = "allow-raw-code", value_name = "PROPERTY")]
+        allow_raw_code: Vec<String>,
+    },
+    /// Apply a planned transplant: restore point, writes, read-back. WRITES TO THE CAMERA.
+    TransplantApply {
+        #[arg(long)]
+        serial: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long = "allow-raw-code", value_name = "PROPERTY")]
+        allow_raw_code: Vec<String>,
+        /// The plan's digest, copied from the plan result.
+        #[arg(long)]
+        digest: String,
+        /// The plan's summary line, copied from the plan result.
+        #[arg(long)]
+        summary: String,
+    },
 }
 
 /// Run the worker; returns the process exit status.
@@ -79,6 +120,20 @@ pub fn run(data_dir: &Path, bundle: &Path, schema: &Path, args: &WorkerArgs) -> 
             selftest(&mut em, *fail, *hang_after_result, *exit_code)
         }
         WorkerOp::Capture { serial, label } => capture(&mut em, data_dir, bundle, schema, serial, label.as_deref()),
+        WorkerOp::Check { serial } => op_check(&mut em, data_dir, bundle, schema, serial),
+        WorkerOp::TransplantPlan { serial, source, allow_raw_code } => {
+            op_transplant(&mut em, data_dir, bundle, schema, serial, source, allow_raw_code, None)
+        }
+        WorkerOp::TransplantApply { serial, source, allow_raw_code, digest, summary } => op_transplant(
+            &mut em,
+            data_dir,
+            bundle,
+            schema,
+            serial,
+            source,
+            allow_raw_code,
+            Some((digest.as_str(), summary.as_str())),
+        ),
     }
 }
 
@@ -119,13 +174,24 @@ fn selftest(em: &mut Emitter<File>, fail: bool, hang_after_result: bool, exit_co
     if exit_code != 0 { exit_code } else { code }
 }
 
-fn capture(
+/// What an op gets once a body is chosen and connected.
+struct Body<'a, 'sdk> {
+    device: &'a Device<'sdk>,
+    /// Identity from the USB descriptors.
+    camera: Camera,
+    schema: &'a MaidLayerConfig,
+}
+
+/// Validate the serial and bundle before touching the SDK, take the lock, open
+/// the SDK without a USB reset (another process may hold a body: F2), choose the
+/// body by USB serial only, refuse same-model ambiguity, connect, and run `f`
+/// **while the session is alive** so its result is written before teardown.
+fn with_body(
     em: &mut Emitter<File>,
-    data_dir: &Path,
     bundle: &Path,
     schema_path: &Path,
     serial: &str,
-    label: Option<&str>,
+    f: impl FnOnce(&mut Emitter<File>, &Body<'_, '_>) -> Outcome,
 ) -> i32 {
     macro_rules! fail {
         ($tag:expr, $msg:expr) => {
@@ -136,8 +202,6 @@ fn capture(
         };
     }
 
-    progress(em, "starting");
-    // Reject what can be rejected before the SDK or the lock are touched.
     if let Err(e) = nikon_fleet::ops::target::require_usb_serial(serial) {
         fail!(e.tag(), e.to_string());
     }
@@ -148,8 +212,6 @@ fn capture(
         Ok(s) => s,
         Err(e) => fail!("schema_unreadable", format!("{}: {e}", schema_path.display())),
     };
-
-    // The worker never resets USB: another process may hold a body (F2).
     let mut sdk = match open_sdk(bundle, true) {
         Ok(s) => s,
         Err(e) => match e.downcast_ref::<LockError>() {
@@ -171,45 +233,198 @@ fn capture(
     if let Err(e) = require_unambiguous(&enriched, &target.name) {
         fail!(e.tag(), e.to_string(), json!({"model": e.model, "count": e.count}));
     }
-
     let device = match sdk.connect(target.id) {
         Ok(d) => d,
         Err(e) => fail!("sdk_connect_failed", e.to_string()),
     };
     progress(em, "connected");
-    if let Err(e) = ensure_capabilities_present(device.capabilities.len()) {
+    if let Err(e) = ensure_capabilities_present(device.capabilities().len()) {
         fail!("no_capabilities", e.to_string());
     }
-
-    let name_lookup = schema.name_map_for_model(&target.name);
-    let captured_at = match OffsetDateTime::now_utc().format(&Rfc3339) {
-        Ok(t) => t,
-        Err(e) => fail!("clock_failed", e.to_string()),
-    };
-    let snapshots = snapshots_dir(data_dir);
-    let req = CaptureRequest {
-        snapshots_dir: &snapshots,
+    let body = Body {
+        device: &device,
         camera: Camera { model: target.name.clone(), serial: usb.serial.clone(), firmware: usb.firmware.clone() },
-        label,
-        name_lookup: &name_lookup,
-        captured_at,
+        schema: &schema,
     };
-    let mut phases: Vec<String> = Vec::new();
-    let result = capture_snapshot(&device, &req, &mut |p| phases.push(p.to_string()));
-    for p in &phases {
-        progress(em, p);
-    }
-    match result {
-        Ok(outcome) => finish(em, Outcome::ok(serde_json::to_value(&outcome).unwrap_or(json!(null)))),
-        Err(e) => {
-            let detail = match &e {
-                CaptureError::Incomplete { missing, stats } => {
-                    Some(json!({"missing": missing, "read_ok": stats.read_ok, "read_err": stats.read_err}))
-                }
-                _ => None,
-            };
-            finish(em, Outcome::err(e.tag(), e.to_string(), detail))
+    let outcome = f(em, &body);
+    finish(em, outcome)
+    // `device` and `sdk` drop here, after the result line was written and flushed.
+}
+
+fn now() -> Result<String, Outcome> {
+    OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| Outcome::err("clock_failed", e.to_string(), None))
+}
+
+fn capture(
+    em: &mut Emitter<File>,
+    data_dir: &Path,
+    bundle: &Path,
+    schema_path: &Path,
+    serial: &str,
+    label: Option<&str>,
+) -> i32 {
+    progress(em, "starting");
+    with_body(em, bundle, schema_path, serial, |em, body| {
+        let name_lookup = body.schema.name_map_for_model(&body.camera.model);
+        let captured_at = match now() {
+            Ok(t) => t,
+            Err(o) => return o,
+        };
+        let snapshots = snapshots_dir(data_dir);
+        let req = CaptureRequest {
+            snapshots_dir: &snapshots,
+            camera: body.camera.clone(),
+            label,
+            name_lookup: &name_lookup,
+            captured_at,
+        };
+        let mut phases: Vec<String> = Vec::new();
+        let result = capture_snapshot(body.device, &req, &mut |p| phases.push(p.to_string()));
+        for p in &phases {
+            progress(em, p);
+        }
+        match result {
+            Ok(outcome) => Outcome::ok(serde_json::to_value(&outcome).unwrap_or(json!(null))),
+            Err(e) => {
+                let detail = match &e {
+                    CaptureError::Incomplete { missing, stats } => {
+                        Some(json!({"missing": missing, "read_ok": stats.read_ok, "read_err": stats.read_err}))
+                    }
+                    _ => None,
+                };
+                Outcome::err(e.tag(), e.to_string(), detail)
+            }
+        }
+    })
+}
+
+fn op_check(em: &mut Emitter<File>, data_dir: &Path, bundle: &Path, schema_path: &Path, serial: &str) -> i32 {
+    progress(em, "starting");
+    with_body(em, bundle, schema_path, serial, |em, body| {
+        let ref_path = references_dir(data_dir).join(reference_filename(&body.camera.model, &body.camera.serial));
+        let reference = match Snapshot::load_from_file(&ref_path) {
+            Ok(r) => r,
+            Err(e) => {
+                let missing = !ref_path.exists();
+                return Outcome::err(
+                    if missing { "no_reference" } else { "reference_unreadable" },
+                    format!("{}: {e}", ref_path.display()),
+                    None,
+                );
+            }
+        };
+        let name_lookup = body.schema.name_map_for_model(&body.camera.model);
+        let captured_at = match now() {
+            Ok(t) => t,
+            Err(o) => return o,
+        };
+        let req = CheckRequest {
+            live_camera: body.camera.clone(),
+            reference: &reference,
+            name_lookup: &name_lookup,
+            schema: body.schema,
+            captured_at,
+        };
+        progress(em, "reading");
+        match check(body.device, &req) {
+            Ok(report) => Outcome::ok(serde_json::to_value(&report).unwrap_or(json!(null))),
+            Err(e) => {
+                let detail = match &e {
+                    CheckError::Incomplete { missing, stats } => {
+                        Some(json!({"missing": missing, "read_ok": stats.read_ok, "read_err": stats.read_err}))
+                    }
+                    _ => None,
+                };
+                Outcome::err(e.tag(), e.to_string(), detail)
+            }
+        }
+    })
+}
+
+/// `transplant-plan` (confirmation `None`) and `transplant-apply` (`Some((digest, summary))`).
+#[allow(clippy::too_many_arguments)]
+fn op_transplant(
+    em: &mut Emitter<File>,
+    data_dir: &Path,
+    bundle: &Path,
+    schema_path: &Path,
+    serial: &str,
+    source_name: &str,
+    allow_raw_code: &[String],
+    confirmation: Option<(&str, &str)>,
+) -> i32 {
+    progress(em, "starting");
+    // Everything that can be refused without a camera is refused first.
+    if let Some((digest, summary)) = confirmation {
+        if let Err(e) = require_confirmation(digest, summary) {
+            return finish(em, Outcome::err(e.tag(), e.to_string(), None));
         }
     }
-    // `device` and `sdk` drop here, after the result line was written and flushed.
+    let snapshots = snapshots_dir(data_dir);
+    let source_path = match resolve_existing(&snapshots, source_name) {
+        Ok(p) => p,
+        Err(e) => return finish(em, Outcome::err(e.tag(), e.to_string(), None)),
+    };
+    let source_bytes = match std::fs::read(&source_path) {
+        Ok(b) => b,
+        Err(e) => return finish(em, Outcome::err("source_unreadable", format!("{}: {e}", source_path.display()), None)),
+    };
+    let source = match std::str::from_utf8(&source_bytes)
+        .map_err(|e| e.to_string())
+        .and_then(|t| Snapshot::from_json(t).map_err(|e| e.to_string()))
+    {
+        Ok(s) => s,
+        Err(e) => return finish(em, Outcome::err("source_unreadable", format!("{}: {e}", source_path.display()), None)),
+    };
+    let allow = match resolve_allow_raw_code(allow_raw_code, &source.properties) {
+        Ok(a) => a,
+        Err(msg) => return finish(em, Outcome::err("bad_opt_in", msg, None)),
+    };
+    let options = TransplantOptions { allow_raw_code: allow };
+
+    with_body(em, bundle, schema_path, serial, |em, body| {
+        let guard = match CodeNameGuard::new(body.schema, &source.camera.model, &body.camera.model) {
+            Ok(g) => g,
+            Err(e) => return Outcome::err("unsupported_model", e.to_string(), None),
+        };
+        let input = PlanInput { source: &source, source_bytes: &source_bytes, target: &body.camera, options: &options };
+        match confirmation {
+            None => {
+                progress(em, "planning");
+                let report = build_plan(body.device, &guard, &input);
+                Outcome::ok(serde_json::to_value(&report).unwrap_or(json!(null)))
+            }
+            Some((digest, summary)) => {
+                let name_lookup = body.schema.name_map_for_model(&body.camera.model);
+                let captured_at = match now() {
+                    Ok(t) => t,
+                    Err(o) => return o,
+                };
+                let req = ApplyRequest {
+                    plan: input,
+                    guard: &guard,
+                    snapshots_dir: &snapshots,
+                    name_lookup: &name_lookup,
+                    expected_digest: digest,
+                    expected_summary: summary,
+                    captured_at,
+                };
+                // Each phase is emitted as it happens: the parent decides what a cancellation
+                // can still do from the last one it has seen, and "writing" is the last safe point.
+                let result = apply_transplant(body.device, &req, &mut |p| progress(em, p));
+                match result {
+                    Ok(report) => Outcome::ok(serde_json::to_value(&report).unwrap_or(json!(null))),
+                    Err(e) => {
+                        let detail = match &e {
+                            ApplyError::RestorePointIncomplete { missing, stats } => {
+                                Some(json!({"missing": missing, "read_ok": stats.read_ok, "read_err": stats.read_err}))
+                            }
+                            _ => None,
+                        };
+                        Outcome::err(e.tag(), e.to_string(), detail)
+                    }
+                }
+            }
+        }
+    })
 }
