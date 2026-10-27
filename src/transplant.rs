@@ -76,6 +76,67 @@ const PACKED_STRING_ELEM_TYPE: u64 = 7;
 /// `value_index`.
 const KNOWN_ELEM_TYPES: &[u64] = &[0, 1, 2, 3, 7, 8];
 
+/// What the SDK substitutes for a menu label it could not look up. Seen on a
+/// Z6III (fw 2.00) for every option of `EVInterval` and all but the first of
+/// `BracketingFactor`. It is a placeholder, not a label: two different options
+/// carry the same text, so it can never identify one.
+const UNRESOLVED_LABEL: &str = "Resource String not found";
+
+/// The option labels of a packed-string (`elem_type` 7) enum, in index order,
+/// recovered from the `values` array `sdk::decode_enum_values` stored.
+///
+/// The SDK hands back one buffer of NUL-separated strings with
+/// `elem_bytes == 1` and `elem_count` equal to the buffer's byte length
+/// (e.g. 178 for a 13-option list). `decode_enum_values` assumes `elem_bytes`
+/// is a per-string stride, so for that layout it stores **one array element
+/// per byte** — `"J","P","E","G"," ","B",...,""` with `""` standing for each
+/// NUL — and `value_index` indexes the *strings*, not those elements.
+/// Reading `values[value_index]` therefore yields one arbitrary character;
+/// matching on it wrote wrong enum indices to a camera (hardware dry run,
+/// 2026-10-27: 8 of 17 label-matched properties, one out of range). The
+/// stored format is left as it is (existing snapshots stay valid); this
+/// rebuilds the strings from it.
+///
+/// - `elem_bytes == 1`: byte layout, join runs between `""` elements. A final
+///   run with no terminating NUL still counts as a string.
+/// - `elem_bytes > 1`: the stride layout the decoder's comment describes; each
+///   element is already one whole string.
+/// - anything else (absent, zero, non-numeric): not interpretable. Guessing a
+///   layout here would reintroduce the silent mismatch, so it is an error.
+///
+/// `side` ("source"/"target") only chooses which `SkipReason` carries the error.
+fn packed_string_options(enum_value: &Value, side: &'static str) -> Result<Vec<String>, SkipReason> {
+    let bad = |reason: &str| match side {
+        "source" => SkipReason::MalformedSource,
+        _ => SkipReason::EnumUndecodedBySdk { side, reason: reason.to_string() },
+    };
+    let elems = enum_value.get("values").and_then(Value::as_array).ok_or_else(|| bad("no values array"))?;
+    let strs: Vec<&str> =
+        elems.iter().map(|e| e.as_str().ok_or_else(|| bad("non-string element in a packed-string enum"))).collect::<Result<_, _>>()?;
+    match enum_value.get("elem_bytes").and_then(Value::as_u64) {
+        Some(1) => {
+            let mut out = Vec::new();
+            let mut cur = String::new();
+            let mut open = false;
+            for e in strs {
+                if e.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    open = false;
+                } else {
+                    cur.push_str(e);
+                    open = true;
+                }
+            }
+            if open {
+                out.push(cur);
+            }
+            Ok(out)
+        }
+        Some(n) if n > 1 => Ok(strs.into_iter().map(str::to_string).collect()),
+        _ => Err(bad("packed-string enum has no usable elem_bytes")),
+    }
+}
+
 /// Cap on how much of an external error message (SDK error text, captured
 /// via `SdkError::to_string()`) is kept in a `SkipReason` — an unusually
 /// verbose or malformed error string shouldn't be able to bloat the
@@ -178,6 +239,11 @@ pub enum SkipReason {
     /// `KNOWN_NAME_ALIASES`), so the code may not mean the same setting on
     /// both bodies. Names are joined with `/` when a model lists several.
     CapabilityNameMismatch { source_names: String, target_names: String },
+    /// The source's chosen label appears more than once in the source's or
+    /// the target's option list (e.g. `ISOControlSensitivity` lists "125"
+    /// twice), so matching by label cannot say which position is meant.
+    /// Skipped rather than guessing the first occurrence.
+    AmbiguousLabel { label: String, source_count: usize, target_count: usize },
 }
 
 impl std::fmt::Display for SkipReason {
@@ -198,6 +264,11 @@ impl std::fmt::Display for SkipReason {
                 f,
                 "source and target encode this enum differently (source elem_type={source_elem_type}, \
                  target elem_type={target_elem_type})"
+            ),
+            SkipReason::AmbiguousLabel { label, source_count, target_count } => write!(
+                f,
+                "option {label:?} appears {source_count} time(s) in the source's list and {target_count} in the \
+                 target's, so it cannot be matched to one position by label"
             ),
             SkipReason::CapabilityNameMismatch { source_names, target_names } => write!(
                 f,
@@ -287,10 +358,33 @@ fn translate_enum(source: &Value, target_live: &Value) -> Result<(Value, Strateg
         }
     }
 
-    let tgt_idx = tgt_values.iter().position(|v| v == src_label).ok_or(SkipReason::NoMatchingOption)?;
-
-    let strategy =
-        if src_elem_type == Some(PACKED_STRING_ELEM_TYPE) { Strategy::EnumByLabel } else { Strategy::EnumByRawValue };
+    let (tgt_idx, strategy) = if src_elem_type == Some(PACKED_STRING_ELEM_TYPE) {
+        // `src_label` above is one element of the stored array, which for the
+        // real byte layout is a single character: not usable here. Match on
+        // whole strings (see `packed_string_options`).
+        let src_options = packed_string_options(source, "source")?;
+        let tgt_options = packed_string_options(target_live, "target")?;
+        let label = src_options.get(src_idx).ok_or(SkipReason::MalformedSource)?;
+        if label == UNRESOLVED_LABEL {
+            return Err(SkipReason::EnumUndecodedBySdk {
+                side: "source",
+                reason: format!("the SDK could not resolve the selected option's label ({UNRESOLVED_LABEL:?})"),
+            });
+        }
+        let source_count = src_options.iter().filter(|o| *o == label).count();
+        let target_count = tgt_options.iter().filter(|o| *o == label).count();
+        if target_count == 0 {
+            return Err(SkipReason::NoMatchingOption);
+        }
+        if source_count > 1 || target_count > 1 {
+            return Err(SkipReason::AmbiguousLabel { label: label.clone(), source_count, target_count });
+        }
+        let idx = tgt_options.iter().position(|o| o == label).ok_or(SkipReason::NoMatchingOption)?;
+        (idx, Strategy::EnumByLabel)
+    } else {
+        let idx = tgt_values.iter().position(|v| v == src_label).ok_or(SkipReason::NoMatchingOption)?;
+        (idx, Strategy::EnumByRawValue)
+    };
 
     // Carry the target's own elem_type/elem_count/elem_bytes/default forward
     // unchanged — only the index (the thing that actually varies per body)
@@ -479,6 +573,63 @@ pub struct TransplantOutcome {
     pub name: String,
     pub code: u32,
     pub result: Result<Strategy, SkipReason>,
+    /// For an enum that was (or, in a dry run, would be) written: which option
+    /// was picked and what the target has now. `None` for scalars, ranges and
+    /// skipped properties.
+    pub choice: Option<ResolvedChoice>,
+}
+
+/// The option an enum translation resolved to, in terms a person can check
+/// against the camera's menu. `choice`/`current` are the option's label for
+/// packed-string enums and `code N` for raw-code enums (which have no label).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedChoice {
+    pub target_index: u64,
+    pub choice: String,
+    pub current_index: Option<u64>,
+    pub current: Option<String>,
+}
+
+impl ResolvedChoice {
+    /// Writing this would leave the target as it is.
+    pub fn is_unchanged(&self) -> bool {
+        self.current_index == Some(self.target_index)
+    }
+}
+
+impl std::fmt::Display for ResolvedChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} (#{})", self.choice, self.target_index)?;
+        match (&self.current, self.current_index) {
+            _ if self.is_unchanged() => f.write_str(", unchanged"),
+            (Some(cur), Some(i)) => write!(f, ", was {cur:?} (#{i})"),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Describe the option `translated` selects, next to what `live` (the
+/// target's current value) selects. `None` unless both are enum-shaped and
+/// the strategy was an enum one.
+pub fn resolve_choice(translated: &Value, live: &Value, strategy: Strategy) -> Option<ResolvedChoice> {
+    let name_at = |v: &Value, idx: u64| -> Option<String> {
+        match strategy {
+            Strategy::EnumByLabel => packed_string_options(v, "target").ok()?.get(idx as usize).cloned(),
+            Strategy::EnumByRawValue => {
+                let code = v.get("values")?.as_array()?.get(idx as usize)?;
+                Some(format!("code {code}"))
+            }
+            _ => None,
+        }
+    };
+    let target_index = translated.get("value_index")?.as_u64()?;
+    let current_index = live.get("value_index").and_then(Value::as_u64);
+    Some(ResolvedChoice {
+        target_index,
+        choice: name_at(translated, target_index)?,
+        current_index,
+        current: current_index.and_then(|i| name_at(live, i)),
+    })
 }
 
 /// Copy every property in `properties` (captured from a source camera that
@@ -505,8 +656,10 @@ pub fn transplant(
     properties
         .iter()
         .map(|(name, prop)| {
-            let result = transplant_one(device, &cap_map, guard, prop, dry_run);
-            TransplantOutcome { name: name.clone(), code: prop.code, result }
+            match transplant_one(device, &cap_map, guard, prop, dry_run) {
+                Ok((strategy, choice)) => TransplantOutcome { name: name.clone(), code: prop.code, result: Ok(strategy), choice },
+                Err(reason) => TransplantOutcome { name: name.clone(), code: prop.code, result: Err(reason), choice: None },
+            }
         })
         .collect()
 }
@@ -535,7 +688,7 @@ fn transplant_one(
     guard: &CodeNameGuard,
     prop: &PropertyEntry,
     dry_run: bool,
-) -> Result<Strategy, SkipReason> {
+) -> Result<(Strategy, Option<ResolvedChoice>), SkipReason> {
     let cap = precheck(cap_map, guard, prop)?;
 
     let needs_live_read = is_enum_shape(&prop.value) || is_range_shape(&prop.value);
@@ -546,6 +699,7 @@ fn transplant_one(
     };
 
     let (translated, strategy) = translate_value(&prop.value, live.as_ref())?;
+    let choice = live.as_ref().and_then(|l| resolve_choice(&translated, l, strategy));
 
     if !dry_run {
         match device.write_capability(prop.code, cap.kind, &translated) {
@@ -557,7 +711,7 @@ fn transplant_one(
             verify_range_write(device, prop.code, &translated)?;
         }
     }
-    Ok(strategy)
+    Ok((strategy, choice))
 }
 
 /// Read a just-written range capability back and confirm it landed close to
@@ -713,6 +867,270 @@ mod tests {
     fn enum_requires_target_live_value() {
         let source = packed_string_enum(0, &["Off"]);
         assert!(matches!(translate_value(&source, None), Err(SkipReason::TargetReadFailed(_))));
+    }
+
+    // ── packed-string enums: the real byte layout ────────────────────────
+    //
+    // `fleet snapshot` stores these as one array element per BYTE, "" for each
+    // NUL, with elem_bytes == 1 and value_index counting STRINGS. The tests
+    // above use whole-string elements with elem_bytes 8 (the stride layout),
+    // which never occurs on a real camera and so could not catch the
+    // single-character matching bug these tests pin.
+
+    /// Build a value the way the SDK decode stores a real packed-string enum.
+    fn byte_layout(value_index: u64, labels: &[&str]) -> Value {
+        let mut values: Vec<String> = Vec::new();
+        for l in labels {
+            values.extend(l.chars().map(|c| c.to_string()));
+            values.push(String::new());
+        }
+        json!({
+            "value_index": value_index, "default_index": 0, "elem_count": values.len(),
+            "elem_type": 7, "elem_bytes": 1, "values": values,
+        })
+    }
+
+    fn fixture() -> Value {
+        serde_json::from_str(include_str!("../tests/fixtures/packed_string_enums_z9_z6iii.json")).unwrap()
+    }
+
+    fn fx(body: &str, name: &str) -> Value {
+        fixture()[body][format!("kNkMAIDCapability_{name}")].clone()
+    }
+
+    #[test]
+    fn packed_string_options_rebuilds_real_capture_strings() {
+        let opts = packed_string_options(&fx("z9", "CompressionLevel"), "source").unwrap();
+        assert_eq!(opts.len(), 13, "178 bytes hold 13 NUL-terminated labels: {opts:?}");
+        assert_eq!(opts[6], "RAW");
+        // value_index counts strings, not bytes: the old bug read values[6] == "a".
+        assert_eq!(fx("z9", "CompressionLevel")["values"][6], json!("a"));
+    }
+
+    #[test]
+    fn real_z9_to_z6iii_label_enums_resolve_to_the_right_option() {
+        // Expected target index per property, worked out by reading both
+        // bodies' labels (None = the Z6III has no such option). The old code
+        // wrote a different index for CompressionLevel (48, beyond its 13
+        // options), FlashISOAutoHighLimit, ISOAutoHiLimit, ISOAutoShutterTime,
+        // MovieISOAutoHiLimit, MovieSensitivity, MovieWBMode and Sensitivity.
+        let expected: &[(&str, Option<u64>)] = &[
+            ("AFAreaSelector", Some(0)),
+            ("AFcPriority", Some(0)),
+            ("AFsPriority", Some(0)),
+            ("BracketingFactor", Some(0)),
+            ("BracketingOrder", Some(0)),
+            ("BracketingVary", Some(1)),
+            ("CWMeteringDiameter", Some(1)),
+            ("CompressionLevel", Some(6)),
+            ("FlashISOAutoHighLimit", Some(30)),
+            ("ISOAutoHiLimit", Some(21)),
+            ("ISOAutoShutterTime", Some(46)),
+            ("MovieISOAutoHiLimit", Some(21)),
+            ("MovieSensitivity", Some(0)),
+            ("MovieWBMode", Some(14)),
+            ("Sensitivity", None), // Z 9 ISO 64 does not exist on a Z6III
+            ("Slot2JpegImageSize", Some(1)),
+            ("WBMode", Some(0)),
+        ];
+        for (name, want) in expected {
+            let got = translate_value(&fx("z9", name), Some(&fx("z6iii", name)));
+            match want {
+                Some(idx) => {
+                    let (v, strategy) = got.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                    assert_eq!(strategy, Strategy::EnumByLabel, "{name}");
+                    assert_eq!(v["value_index"], json!(idx), "{name}");
+                    // Target's own list, count and layout are carried forward.
+                    assert_eq!(v["values"], fx("z6iii", name)["values"], "{name}");
+                    assert_eq!(v["elem_count"], fx("z6iii", name)["elem_count"], "{name}");
+                    assert_eq!(v["elem_bytes"], json!(1), "{name}");
+                }
+                None => assert_eq!(got, Err(SkipReason::NoMatchingOption), "{name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn real_capture_movie_sensitivity_stays_iso_100_not_200() {
+        // Both bodies are on "100" (Z 9 index 2, Z6III index 0). Single-char
+        // matching picked the first NUL separator on the target = index 3 =
+        // "200".
+        let (v, _) = translate_value(&fx("z9", "MovieSensitivity"), Some(&fx("z6iii", "MovieSensitivity"))).unwrap();
+        let opts = packed_string_options(&v, "target").unwrap();
+        assert_eq!(opts[v["value_index"].as_u64().unwrap() as usize], "100");
+    }
+
+    #[test]
+    fn real_capture_unique_label_in_a_list_with_duplicates_still_matches() {
+        // ISOControlSensitivity lists many ISO values twice, but "25600" is
+        // unique on both bodies, so it resolves (Z 9 index 57 -> Z6III 53).
+        let (v, _) =
+            translate_value(&fx("z9", "ISOControlSensitivity"), Some(&fx("z6iii", "ISOControlSensitivity"))).unwrap();
+        assert_eq!(v["value_index"], json!(53));
+    }
+
+    #[test]
+    fn real_capture_duplicated_label_is_ambiguous_not_first_match() {
+        // Z 9 index 10 is "125", which appears twice in both lists.
+        let mut src = fx("z9", "ISOControlSensitivity");
+        src["value_index"] = json!(10);
+        assert_eq!(
+            translate_value(&src, Some(&fx("z6iii", "ISOControlSensitivity"))),
+            Err(SkipReason::AmbiguousLabel { label: "125".into(), source_count: 2, target_count: 2 })
+        );
+    }
+
+    #[test]
+    fn real_capture_unresolved_label_placeholders_never_match() {
+        // Z6III EVInterval's three options are all "Resource String not found".
+        // Target side: the Z 9's real "1/3 Step" has no match (not "first
+        // placeholder").
+        assert_eq!(
+            translate_value(&fx("z9", "EVInterval"), Some(&fx("z6iii", "EVInterval"))),
+            Err(SkipReason::NoMatchingOption)
+        );
+        // Source side: a placeholder label identifies nothing, so it is
+        // reported as the SDK's failure, not matched against the target's
+        // own first placeholder-or-label.
+        assert!(matches!(
+            translate_value(&fx("z6iii", "EVInterval"), Some(&fx("z9", "EVInterval"))),
+            Err(SkipReason::EnumUndecodedBySdk { side: "source", .. })
+        ));
+        // A list that is mostly placeholders still matches its one real label.
+        let (v, _) = translate_value(&fx("z9", "BracketingFactor"), Some(&fx("z6iii", "BracketingFactor"))).unwrap();
+        assert_eq!(v["value_index"], json!(0));
+        let mut other = fx("z9", "BracketingFactor");
+        other["value_index"] = json!(1); // a real Z 9 label the Z6III cannot show
+        assert_eq!(translate_value(&other, Some(&fx("z6iii", "BracketingFactor"))), Err(SkipReason::NoMatchingOption));
+    }
+
+    #[test]
+    fn byte_layout_index_boundaries() {
+        let target = byte_layout(0, &["Off", "Low", "High"]);
+        // last string resolves; one past it is malformed (never a panic or an
+        // arbitrary byte).
+        assert_eq!(translate_value(&byte_layout(2, &["Off", "Low", "High"]), Some(&target)).unwrap().0["value_index"], json!(2));
+        assert_eq!(
+            translate_value(&byte_layout(3, &["Off", "Low", "High"]), Some(&target)),
+            Err(SkipReason::MalformedSource)
+        );
+        // index 0 of a one-option list.
+        assert_eq!(translate_value(&byte_layout(0, &["Off"]), Some(&target)).unwrap().0["value_index"], json!(0));
+    }
+
+    #[test]
+    fn byte_layout_different_position_and_missing_label() {
+        let target = byte_layout(0, &["Off", "High"]);
+        assert_eq!(translate_value(&byte_layout(2, &["Off", "Low", "High"]), Some(&target)).unwrap().0["value_index"], json!(1));
+        assert_eq!(translate_value(&byte_layout(1, &["Off", "Low", "High"]), Some(&target)), Err(SkipReason::NoMatchingOption));
+    }
+
+    #[test]
+    fn byte_layout_label_that_is_a_prefix_of_another_does_not_match_it() {
+        // "On" must not match "Online" or a stray "O"/"n" byte.
+        let target = byte_layout(0, &["Online", "O", "n"]);
+        assert_eq!(translate_value(&byte_layout(0, &["On"]), Some(&target)), Err(SkipReason::NoMatchingOption));
+    }
+
+    #[test]
+    fn byte_layout_final_string_without_terminating_nul_still_counts() {
+        let mut v = byte_layout(1, &["Off", "On"]);
+        v["values"].as_array_mut().unwrap().pop(); // drop the final NUL
+        let target = byte_layout(0, &["On", "Off"]);
+        assert_eq!(translate_value(&v, Some(&target)).unwrap().0["value_index"], json!(0));
+    }
+
+    #[test]
+    fn byte_layout_empty_label_is_pinned_as_an_ordinary_label() {
+        // Consecutive NULs make an empty string. None exist in the real
+        // captures; pinned so a change is deliberate. One empty option on each
+        // side matches; two on a side would be ambiguous like any duplicate.
+        let src = byte_layout(1, &["A", "", "B"]);
+        assert_eq!(translate_value(&src, Some(&byte_layout(0, &["B", "", "A"]))).unwrap().0["value_index"], json!(1));
+        assert!(matches!(
+            translate_value(&src, Some(&byte_layout(0, &["", "", "A"]))),
+            Err(SkipReason::AmbiguousLabel { .. })
+        ));
+    }
+
+    #[test]
+    fn byte_layout_label_duplicated_only_on_the_source_side_is_ambiguous() {
+        // Which "A" the source meant is unknowable even though the target has
+        // exactly one, so it must not be matched on the strength of the target
+        // list alone.
+        let src = byte_layout(0, &["A", "B", "A"]);
+        let target = byte_layout(0, &["C", "A"]);
+        assert_eq!(
+            translate_value(&src, Some(&target)),
+            Err(SkipReason::AmbiguousLabel { label: "A".into(), source_count: 2, target_count: 1 })
+        );
+    }
+
+    #[test]
+    fn packed_string_enum_without_usable_elem_bytes_is_rejected_not_guessed() {
+        let good = byte_layout(0, &["Off"]);
+        for bad_bytes in [json!(null), json!(0), json!("1")] {
+            let mut src = good.clone();
+            src["elem_bytes"] = bad_bytes.clone();
+            assert_eq!(translate_value(&src, Some(&good)), Err(SkipReason::MalformedSource), "source {bad_bytes}");
+            let mut tgt = good.clone();
+            tgt["elem_bytes"] = bad_bytes.clone();
+            assert!(
+                matches!(translate_value(&good, Some(&tgt)), Err(SkipReason::EnumUndecodedBySdk { side: "target", .. })),
+                "target {bad_bytes}"
+            );
+        }
+        let mut absent = good.clone();
+        absent.as_object_mut().unwrap().remove("elem_bytes");
+        assert_eq!(translate_value(&absent, Some(&good)), Err(SkipReason::MalformedSource));
+    }
+
+    #[test]
+    fn old_snapshot_with_empty_label_array_is_malformed_not_matched() {
+        // June 2026 snapshots stored `values: []` for every packed-string enum.
+        let mut old = byte_layout(0, &["Off"]);
+        old["values"] = json!([]);
+        assert_eq!(translate_value(&old, Some(&byte_layout(0, &["Off"]))), Err(SkipReason::MalformedSource));
+    }
+
+    // ── resolved choice (what the dry run prints) ────────────────────────
+
+    #[test]
+    fn resolve_choice_label_enum_changed_and_unchanged() {
+        let src = byte_layout(1, &["Off", "On"]);
+        let live = byte_layout(0, &["Off", "On"]);
+        let (translated, strategy) = translate_value(&src, Some(&live)).unwrap();
+        let c = resolve_choice(&translated, &live, strategy).unwrap();
+        assert_eq!(c, ResolvedChoice { target_index: 1, choice: "On".into(), current_index: Some(0), current: Some("Off".into()) });
+        assert!(!c.is_unchanged());
+        assert_eq!(c.to_string(), "\"On\" (#1), was \"Off\" (#0)");
+
+        let same_live = byte_layout(1, &["Off", "On"]);
+        let (translated, strategy) = translate_value(&src, Some(&same_live)).unwrap();
+        let c = resolve_choice(&translated, &same_live, strategy).unwrap();
+        assert!(c.is_unchanged());
+        assert_eq!(c.to_string(), "\"On\" (#1), unchanged");
+    }
+
+    #[test]
+    fn resolve_choice_real_capture_shows_the_label_a_person_can_check() {
+        let live = fx("z6iii", "ISOAutoHiLimit");
+        let (translated, strategy) = translate_value(&fx("z9", "ISOAutoHiLimit"), Some(&live)).unwrap();
+        let c = resolve_choice(&translated, &live, strategy).unwrap();
+        assert_eq!(c.choice, "25600");
+        assert_eq!(c.target_index, 21);
+        assert!(c.is_unchanged(), "both bodies are already on 25600");
+    }
+
+    #[test]
+    fn resolve_choice_raw_code_enum_and_non_enum() {
+        let src = raw_code_enum(1, &[3, 5]);
+        let live = raw_code_enum(0, &[5, 3]);
+        let (translated, strategy) = translate_value(&src, Some(&live)).unwrap();
+        let c = resolve_choice(&translated, &live, strategy).unwrap();
+        assert_eq!(c.choice, "code 5");
+        assert_eq!(c.target_index, 0);
+        assert!(resolve_choice(&json!(1), &json!(1), Strategy::Literal).is_none());
     }
 
     // ── translate_value: raw-code enum (not elem_type 7) ─────────────────

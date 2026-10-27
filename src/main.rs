@@ -1987,6 +1987,7 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
     let mut skipped_type_mismatch = 0usize;
     let mut skipped_sdk_decode_failure = 0usize;
     let mut skipped_name_mismatch = 0usize;
+    let mut skipped_ambiguous = 0usize;
     let mut skipped_other = 0usize;
     let mut errors = 0usize;
 
@@ -1994,7 +1995,10 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
         match &outcome.result {
             Ok(strategy) => {
                 if args.dry_run {
-                    println!("  would write  {} [{:#x}]  via {strategy}", outcome.name, outcome.code);
+                    match &outcome.choice {
+                        Some(c) => println!("  would write  {} [{:#x}]  via {strategy}: {c}", outcome.name, outcome.code),
+                        None => println!("  would write  {} [{:#x}]  via {strategy}", outcome.name, outcome.code),
+                    }
                 }
                 match strategy {
                     transplant::Strategy::Literal => written_literal += 1,
@@ -2042,6 +2046,10 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
                         skipped_name_mismatch += 1;
                         true
                     }
+                    transplant::SkipReason::AmbiguousLabel { .. } => {
+                        skipped_ambiguous += 1;
+                        true
+                    }
                     transplant::SkipReason::UnsupportedValueShape
                     | transplant::SkipReason::TargetReadFailed(_)
                     | transplant::SkipReason::MalformedSource => {
@@ -2063,7 +2071,8 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
          skipped(absent)={skipped_absent} skipped(read-only)={skipped_read_only} \
          skipped(unsupported-type)={skipped_unsupported_type} skipped(no-matching-option)={skipped_no_match} \
          skipped(type-mismatch)={skipped_type_mismatch} skipped(sdk-decode-failure)={skipped_sdk_decode_failure} \
-         skipped(name-mismatch)={skipped_name_mismatch} skipped(other)={skipped_other}  errors={errors}",
+         skipped(name-mismatch)={skipped_name_mismatch} skipped(ambiguous-label)={skipped_ambiguous} \
+         skipped(other)={skipped_other}  errors={errors}",
         if args.dry_run { "Dry run:" } else { "Transplant complete:" }
     );
     if !args.dry_run && restore_completely_failed(written, errors) {
