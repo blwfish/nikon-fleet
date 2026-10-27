@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -26,9 +25,10 @@ use nikon_fleet::firmware_browse::{
 };
 use nikon_fleet::firmware_source::{
     CameraRelation, DownloadAccess, FirmwareSource, FwVersion, HttpGet, ModelStatus, NikonDownloadCenter,
-    Release, SourceError, UreqHttp, assess, camera_relation, fetch_direct,
+    Release, UreqHttp, assess, camera_relation, fetch_direct,
 };
 use nikon_fleet::maid_layer::MaidLayerConfig;
+use nikon_fleet::ops::firmware_latest::{LatestReport, ModelSurvey, survey_json};
 use nikon_fleet::ops::list::{EntryState, Listing, list_dir, reference_filename};
 use nikon_fleet::ops::restore;
 use nikon_fleet::sdk::{CapabilityInfo, Device, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET};
@@ -1606,17 +1606,6 @@ fn cmd_firmware_check(data_dir: &Path, args: &FirmwareCheckArgs) -> Result<()> {
 
 // ── Firmware source: latest / fetch ──────────────────────────────────────
 
-/// Everything we know about one model before deciding what to do.
-struct ModelSurvey {
-    model: String,
-    release: Result<Release, SourceError>,
-    archived: Vec<FwVersion>,
-    /// Archive entries whose version string isn't canonical and so can't be matched.
-    archive_notes: Vec<String>,
-    /// (serial, reported firmware) for connected bodies of this model.
-    cameras: Vec<(String, String)>,
-    status: ModelStatus,
-}
 
 fn watch_models(requested: &[String]) -> Vec<String> {
     if requested.is_empty() {
@@ -1695,136 +1684,6 @@ fn print_survey(s: &ModelSurvey) {
         let in_archive = FwVersion::parse_canonical(fw).ok().is_some_and(|v| s.archived.contains(&v));
         println!("      fleet: {serial}  fw={fw}  {rel}; running version {}",
             if in_archive { "archived" } else { "NOT archived" });
-    }
-}
-
-// ── `firmware latest --json` ────────────────────────────────────────────────
-// The shape is a contract with scripts and the GUI; `latest_json_shape_*`
-// tests pin it. Every verdict is a closed enum serialised as snake_case; the
-// free-text `reason`/`detail` fields only explain a verdict, never carry it.
-
-/// Source verdict for one model.
-#[derive(Serialize, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum LatestStatus {
-    /// Published and not in the archive.
-    NewAvailable,
-    /// Published and already in the archive.
-    AlreadyArchived,
-    /// The source could not be read; says nothing about whether anything is new.
-    CouldNotDetermine,
-}
-
-/// How one connected camera relates to the latest published version.
-#[derive(Serialize, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum LatestRelation {
-    Behind,
-    Current,
-    Ahead,
-    /// The camera's reported firmware isn't a canonical version.
-    Unreadable,
-    /// There is no latest version to compare with (the lookup failed).
-    LatestUnknown,
-}
-
-#[derive(Serialize, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum LatestDownload {
-    Gated,
-    Direct,
-}
-
-#[derive(Serialize, Debug)]
-struct LatestRelease {
-    version: String,
-    released: Option<String>,
-    page_url: String,
-    download: LatestDownload,
-}
-
-#[derive(Serialize, Debug)]
-struct LatestCamera {
-    serial: String,
-    /// Firmware the camera reports over USB, verbatim.
-    installed: String,
-    relation: LatestRelation,
-    /// Why the relation is `unreadable`; null otherwise.
-    relation_detail: Option<String>,
-    /// Whether the archive holds the version this camera is running.
-    /// Null when `installed` isn't a canonical version.
-    running_version_archived: Option<bool>,
-}
-
-#[derive(Serialize, Debug)]
-struct LatestModel {
-    model: String,
-    status: LatestStatus,
-    /// Null exactly when `status` is `could_not_determine`.
-    latest: Option<LatestRelease>,
-    /// Why the lookup failed; null unless `status` is `could_not_determine`.
-    reason: Option<String>,
-    /// Whether the archive holds `latest.version`. Null when `latest` is.
-    archive_holds_latest: Option<bool>,
-    /// All archived versions of this model, oldest first.
-    archived_versions: Vec<String>,
-    /// Connected bodies of this model (empty if none are connected).
-    cameras: Vec<LatestCamera>,
-    /// Non-fatal oddities from the source and the archive scan.
-    warnings: Vec<String>,
-}
-
-#[derive(Serialize, Debug)]
-struct LatestReport {
-    models: Vec<LatestModel>,
-}
-
-fn survey_json(s: &ModelSurvey) -> LatestModel {
-    let (status, reason) = match &s.status {
-        ModelStatus::NewAvailable { .. } => (LatestStatus::NewAvailable, None),
-        ModelStatus::AlreadyArchived { .. } => (LatestStatus::AlreadyArchived, None),
-        ModelStatus::CouldNotDetermine { reason } => (LatestStatus::CouldNotDetermine, Some(reason.clone())),
-    };
-    let latest = s.release.as_ref().ok().map(|r| LatestRelease {
-        version: r.version.to_string(),
-        released: r.released.clone(),
-        page_url: r.page_url.clone(),
-        download: match r.download {
-            DownloadAccess::Gated { .. } => LatestDownload::Gated,
-            DownloadAccess::Direct { .. } => LatestDownload::Direct,
-        },
-    });
-    let mut archived = s.archived.clone();
-    archived.sort();
-    let mut warnings: Vec<String> = s.release.as_ref().map(|r| r.warnings.clone()).unwrap_or_default();
-    warnings.extend(s.archive_notes.iter().cloned());
-    let cameras = s.cameras.iter().map(|(serial, fw)| {
-        let (relation, relation_detail) = match &s.release {
-            Ok(r) => match camera_relation(fw, r.version) {
-                CameraRelation::Behind => (LatestRelation::Behind, None),
-                CameraRelation::Current => (LatestRelation::Current, None),
-                CameraRelation::Ahead => (LatestRelation::Ahead, None),
-                CameraRelation::Unreadable(why) => (LatestRelation::Unreadable, Some(why)),
-            },
-            Err(_) => (LatestRelation::LatestUnknown, None),
-        };
-        LatestCamera {
-            serial: serial.clone(),
-            installed: fw.clone(),
-            relation,
-            relation_detail,
-            running_version_archived: FwVersion::parse_canonical(fw).ok().map(|v| s.archived.contains(&v)),
-        }
-    }).collect();
-    LatestModel {
-        model: s.model.clone(),
-        status,
-        archive_holds_latest: s.release.as_ref().ok().map(|r| s.archived.contains(&r.version)),
-        latest,
-        reason,
-        archived_versions: archived.iter().map(|v| v.to_string()).collect(),
-        cameras,
-        warnings,
     }
 }
 
@@ -2365,113 +2224,6 @@ mod tests {
     use serde_json::json;
 
     // ── firmware latest --json shape ─────────────────────────────────────
-
-    fn fwv(major: u32, minor: u32) -> FwVersion {
-        FwVersion { major, minor }
-    }
-
-    fn test_release(version: FwVersion, download: DownloadAccess) -> Release {
-        Release {
-            model: "Z 9".into(),
-            version,
-            released: Some("2026-10-20".into()),
-            page_url: "https://dl.test/en/download/fw/607.html".into(),
-            download,
-            warnings: vec!["row looked odd".into()],
-            raw_page: String::new(),
-        }
-    }
-
-    fn gated() -> DownloadAccess {
-        DownloadAccess::Gated { notice: "click".into() }
-    }
-
-    fn test_survey(release: Result<Release, SourceError>, archived: Vec<FwVersion>, cameras: &[(&str, &str)]) -> ModelSurvey {
-        let status = assess(&release, &archived);
-        ModelSurvey {
-            model: "Z 9".into(),
-            release,
-            archived,
-            archive_notes: vec!["archive entry \"x\" ignored: bad".into()],
-            cameras: cameras.iter().map(|(s, f)| (s.to_string(), f.to_string())).collect(),
-            status,
-        }
-    }
-
-    /// Pins the whole object for a new release with cameras in every relation.
-    #[test]
-    fn latest_json_shape_new_available() {
-        let s = test_survey(
-            Ok(test_release(fwv(5, 33), gated())),
-            vec![fwv(5, 31), fwv(5, 9), fwv(5, 10)],
-            &[("A1", "5.31"), ("A2", "5.33"), ("A3", "5.34"), ("A4", "garbage")],
-        );
-        assert_eq!(
-            serde_json::to_value(survey_json(&s)).unwrap(),
-            json!({
-                "model": "Z 9",
-                "status": "new_available",
-                "latest": {
-                    "version": "5.33",
-                    "released": "2026-10-20",
-                    "page_url": "https://dl.test/en/download/fw/607.html",
-                    "download": "gated"
-                },
-                "reason": null,
-                "archive_holds_latest": false,
-                // Numeric order (minor 9 prints as "5.09"): 5.09 < 5.10 < 5.31.
-                "archived_versions": ["5.09", "5.10", "5.31"],
-                "cameras": [
-                    {"serial": "A1", "installed": "5.31", "relation": "behind",
-                     "relation_detail": null, "running_version_archived": true},
-                    {"serial": "A2", "installed": "5.33", "relation": "current",
-                     "relation_detail": null, "running_version_archived": false},
-                    {"serial": "A3", "installed": "5.34", "relation": "ahead",
-                     "relation_detail": null, "running_version_archived": false},
-                    {"serial": "A4", "installed": "garbage", "relation": "unreadable",
-                     "relation_detail": FwVersion::parse_canonical("garbage").unwrap_err().to_string(),
-                     "running_version_archived": null}
-                ],
-                "warnings": ["row looked odd", "archive entry \"x\" ignored: bad"]
-            })
-        );
-    }
-
-    #[test]
-    fn latest_json_shape_already_archived_and_direct() {
-        let direct = DownloadAccess::Direct { url: "https://x.test/f".into(), expected_size: None, expected_sha256: None };
-        let s = test_survey(Ok(test_release(fwv(5, 33), direct)), vec![fwv(5, 33)], &[]);
-        let v = serde_json::to_value(survey_json(&s)).unwrap();
-        assert_eq!(v["status"], "already_archived");
-        assert_eq!(v["archive_holds_latest"], true);
-        assert_eq!(v["latest"]["download"], "direct");
-        assert_eq!(v["cameras"], json!([]), "no connected camera -> empty list, not null");
-    }
-
-    /// A failed lookup is a typed status with null latest, never prose in a
-    /// "nothing new" field.
-    #[test]
-    fn latest_json_shape_could_not_determine() {
-        let err = SourceError::Parse { url: "https://dl.test/p".into(), reason: "layout changed".into() };
-        let s = test_survey(Err(err), vec![fwv(5, 31)], &[("A1", "5.31")]);
-        let v = serde_json::to_value(survey_json(&s)).unwrap();
-        assert_eq!(v["status"], "could_not_determine");
-        assert!(v["latest"].is_null());
-        assert!(v["archive_holds_latest"].is_null(), "unknown, not false");
-        assert!(v["reason"].as_str().unwrap().contains("layout changed"));
-        assert_eq!(v["cameras"][0]["relation"], "latest_unknown");
-        assert_eq!(v["cameras"][0]["running_version_archived"], true);
-        assert_eq!(v["archived_versions"], json!(["5.31"]));
-    }
-
-    #[test]
-    fn latest_json_top_level_is_models_array() {
-        let s = test_survey(Ok(test_release(fwv(5, 33), gated())), vec![], &[]);
-        let report = LatestReport { models: vec![survey_json(&s)] };
-        let v = serde_json::to_value(&report).unwrap();
-        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["models"]);
-        assert_eq!(v["models"].as_array().unwrap().len(), 1);
-    }
 
     // ── reference_filename parity ────────────────────────────────────────
     // Python GUI uses: f"{model.replace(' ', '_')}_{serial}.json"
