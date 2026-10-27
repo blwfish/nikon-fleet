@@ -19,6 +19,13 @@
 //! - The descriptor is close-on-exec, so a child process (the GUI spawns CLI
 //!   subprocesses) does not inherit the lock.
 //!
+//! - Release after drop is immediate except for one window: a thread that is
+//!   spawning a child at that instant has forked but not yet exec'd, so the
+//!   child briefly holds a duplicate of the descriptor (measured: a loop of
+//!   acquire/drop/acquire against a concurrent `Command::spawn` sees `Busy`
+//!   within a few hundred iterations). Callers treat `Busy` as "try again
+//!   later", which is the contract anyway; nothing here waits.
+//!
 //! The lock cannot exclude USB clients outside this project (NX Studio,
 //! Image Capture, other PTP software).
 
@@ -155,6 +162,22 @@ mod tests {
         dir.path().join("camera.lock")
     }
 
+    /// Acquire, tolerating the fork-before-exec window described in the module
+    /// docs: another test thread spawning a process can make a just-dropped
+    /// lock look busy for microseconds. Only `Busy` is retried, for at most 2 s.
+    fn acquire_eventually(path: &Path) -> CameraLock {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match CameraLock::acquire_at(path) {
+                Ok(l) => return l,
+                Err(LockError::Busy { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("lock not released: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn creates_parent_directories_and_the_anchor_file() {
         let d = TempDir::new().unwrap();
@@ -179,7 +202,7 @@ mod tests {
         let d = TempDir::new().unwrap();
         let first = CameraLock::acquire_at(&lock_in(&d)).unwrap();
         drop(first);
-        CameraLock::acquire_at(&lock_in(&d)).unwrap();
+        acquire_eventually(&lock_in(&d));
     }
 
     #[test]
@@ -255,7 +278,7 @@ mod tests {
 
         child.kill().unwrap(); // SIGKILL
         child.wait().unwrap();
-        CameraLock::acquire_at(&p).expect("kernel released the killed holder's lock");
+        acquire_eventually(&p); // the kernel released the killed holder's lock
     }
 
     // ── lock_path_from ───────────────────────────────────────────────────
