@@ -409,6 +409,16 @@ The Z6III was not attached during this session.
   the obvious suspect and is untested. The practical rule stands: when the SDK reports no cameras for a body the USB bus
   still lists, no software step tried here (waiting, the USB reset) helped; the user has to replug.
 
+- **Wake or replug cleared it again, and the baseline gate ran live.** The user reported "woke/replugged"
+  the Z 9 without saying which, so **asleep versus unplugged is not distinguished**; both clear it.
+  Afterwards `discover` (no USB reset) listed the Z 9 at once. A capture through the gate
+  (`ok=196 err=11`, the baseline's own numbers) passed silently and was written. To exercise the
+  failure path on the same body, a throwaway binary (built in a scratch target dir, file restored
+  afterwards) had a Z 9 baseline listing one extra capability the camera does not have: the capture
+  failed with `1 capability readable in the Z 9 baseline ... could not be read`, exit non-zero, and the
+  snapshot count did not change; with `--allow-partial` the same capture printed the warning and was
+  written. Neither run hung at teardown.
+
 ## F13. Still unverified
 
 - Whether `available` / `connected_pid` can be obtained, and what they mean while another process
