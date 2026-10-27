@@ -212,7 +212,7 @@ Phase 1, read-only (no camera write, no file write):
 
 | Tool | Backs | Notes |
 |---|---|---|
-| `list_cameras` | `discover --json` (USB path) | model, serial, firmware from the USB descriptors (rusb, as `enrich_devices` already reads them): **no SDK session, no lock, no hang risk, no reset**. Snapshots key on the SDK's model name (`Z6_3`), which differs from the USB product string, so Phase 0 adds the mapping and a test. Flags `pairing_ambiguous` (§3). `available`/`connected_pid` already exist on `sdk::DeviceInfo` (`sdk.rs`) but are not needed here; exposing them in `discover --json` stays a CLI nicety, and their meaning while another process holds a body remains unverified (F12). A USB product string with no mapping is reported `unknown_model`, never passed through as a model name, and such a body cannot be a target |
+| `list_cameras` | `discover --json` (USB path) | model, serial, firmware from the USB descriptors (rusb, as `enrich_devices` already reads them): **no SDK session, no lock, no hang risk, no reset**. Snapshots key on the SDK's model name; the survey (`docs/firmware-archive-spec.md` §2) shows the USB product string minus `NIKON DSC ` is the **same** string for every body (`Z 5`, `Z6_3`, `Z 9`), so the mapping is the identity over that verified table (`ops::cameras`). Flags `pairing_ambiguous` (§3). `available`/`connected_pid` already exist on `sdk::DeviceInfo` (`sdk.rs`) but are not needed here; exposing them in `discover --json` stays a CLI nicety, and their meaning while another process holds a body remains unverified (F12). A USB product string with no mapping is reported `unknown_model`, never passed through as a model name, and such a body cannot be a target |
 | `list_snapshots` | `ls` | per camera; `is_reference` by byte-identity via the single `ops::list` rule (§2); restore-point snapshots are labelled and filterable (§5) |
 | `list_references` | `ref list` | |
 | `get_snapshot` | `Snapshot` load | summary by default; property list paginated with `truncated`/`next` (no silent cap) |
@@ -447,10 +447,10 @@ snapshot" as meaningful, or filter them from the default lists.
 | `NEVER_TRANSPLANT`, raw-code gate, `--allow-raw-code`, device-free `plan_property` | **done** (`dff83cd`), in the library |
 | `restore` uses the never-copy table (`restore_precheck`) | **done** (`08db008`), in `main.rs` |
 | `diff` ignores the SDK-uninitialised enum `default_index` unless `include_volatile` | **done** (`aaa20da`) |
-| Move `cmd_snapshot`/`check`/`restore`/`transplant`, `restore_precheck`, `ensure_capabilities_present`, device selection and the ambiguity refusal into `ops`, returning structured results. Also move what they call and the MCP needs: `capture_capabilities` + `CaptureStats`, `enrich_devices`, `select_device`, `snapshot_serial`, `open_sdk`, `snapshots_dir`/`references_dir`/`reference_filename`/`ensure_dir`, and `is_safe_path_component`. `ops` writes nothing to stdout; printing stays in the CLI | todo |
+| Move `cmd_snapshot`/`check`/`restore`/`transplant`, `restore_precheck`, `ensure_capabilities_present`, device selection and the ambiguity refusal into `ops`, returning structured results. Also move what they call and the MCP needs: `capture_capabilities` + `CaptureStats`, `enrich_devices`, `select_device`, `snapshot_serial`, `open_sdk`, `snapshots_dir`/`references_dir`/`reference_filename`/`ensure_dir`, and `is_safe_path_component`. `ops` writes nothing to stdout; printing stays in the CLI | **partly done.** Moved: capture (`ops::capture`, `3231667`), the restore decisions and execution (`ops::restore`, `48c9b90`), `restore_precheck`, `reference_filename`, the listing, and the transplant orchestration now runs on the `CameraPort` (`eb7ad09`). **Still in `main.rs`:** the `cmd_*` wrappers themselves (device selection, `select_device`, `enrich_devices`, `snapshot_serial`, `open_sdk`, `ensure_capabilities_present`, the dir helpers, `is_safe_path_component`), i.e. the part that needs a real SDK session |
 | Hidden `nikon-fleet worker` subcommand: runs one `ops` call on the process main thread; JSON lines on a dedicated fd (`progress` lines, then one `result` line flushed before the SDK is torn down); stdout discarded (§3) | todo |
-| Same-model refusal (`ambiguous_pairing`) in `ops` for capture/check/plan/apply; CLI keeps its warning | todo |
-| USB-only camera listing (no SDK) with the USB-name to SDK-model-name mapping, and a test of the mapping | todo |
+| Same-model refusal (`ambiguous_pairing`) in `ops` for capture/check/plan/apply; CLI keeps its warning | rule **done** (`ops::cameras::require_unambiguous`, `duplicate_models`; the CLI warning uses the same grouping, `cffee5e`); calling it from the capture/plan/apply entry points happens when those move into `ops` |
+| USB-only camera listing (no SDK) with the USB-name to SDK-model-name mapping, and a test of the mapping | **done** (`cffee5e`, `ops::cameras::list_usb`); the mapping is the identity over `["Z 5", "Z6_3", "Z 9"]`, pinned to the survey and to the real schema's sections |
 | `restore --only <property>` (repeatable) and the `ops` equivalent, for the targeted undo (§5.6) | **done** (`ops::restore`: `resolve_only`, `plan`; CLI exits non-zero if a named property is not written). Verified on the Z 9 for two enum properties (F16); the §7 live test for ranges, literals and a cross-model undo is still open |
 | Gate numeric literal scalars like raw codes: `SkipReason::literal_unconfirmed`, same opt-in list (§5.3) | **done** (`6d412c7`); the opt-in was confirmed in a live dry run (F15), but the opted-in write itself has not been run on hardware |
 | Add `ShootNoCard` to `NEVER_TRANSPLANT` (and its real-config name check) | **done** (`c619f23`); the table has 10 entries |
@@ -460,12 +460,12 @@ snapshot" as meaningful, or filter them from the default lists.
 | Per-model baseline file (readable-capability sets, seeded from F5) and the superset gate (also useful to the CLI: a partial capture still exits 0) | **done**: `ops::baseline` and `baselines/{Z6_3,Z_9}.json` (200 and 196 capabilities, seeded from real captures with `nikon-fleet baseline seed`, embedded at build time); the CLI `snapshot` and `check` and the GUI capture refuse an incomplete capture before writing anything (`--allow-partial` on the CLI). live on the Z 9: a real capture passes, and a baseline with one extra capability makes `snapshot` fail with nothing written (F15); the Z6III was not attached |
 | One `ops::list` byte-identity rule, new for the CLI. The GUIs keep their copies; parity test only (§2) | **done** (`72a7eb5`, `7155886`): `ls --json` carries `is_reference`; all three implementations are checked against `tests/fixtures/reference_parity`, which found and fixed two divergences (below §2) |
 | Cross-process `flock` on an open fd at a fixed per-user local path (not `--data-dir`), taken by CLI, GUI and MCP worker (§3) | **done** (`a8b5c95`): `nikon_fleet::camera_lock`, taken in the CLI's `open_sdk` and the Rust GUI's discover and snapshot; the MCP worker takes it the same way once it exists. `vendor-read`/`vendor-write-ftp` are raw USB PTP and do not take it |
-| A small camera-port trait (`capabilities`/`read_capability`/`write_capability`) so plan/apply and the restore-point logic are testable without a `Device` (`plan_property` covers translate+gate only) | todo |
-| Lift `firmware latest --json`'s types out of `main.rs` | todo |
+| A small camera-port trait (`capabilities`/`read_capability`/`write_capability`) so plan/apply and the restore-point logic are testable without a `Device` (`plan_property` covers translate+gate only) | **done** (`72ed3a8`, `ops::port::{CameraPort, FakeCamera}`); `transplant()`, `capture()` and `restore::execute()` run on it |
+| Lift `firmware latest --json`'s types out of `main.rs` | **done** (`a08312a`, `ops::firmware_latest`) |
 | Strict USB-serial matcher in `ops` (refuses `id-N` and bare SDK ids, `no_usb_serial`); the CLI keeps `serial_matches` (§3) | matcher **done** (`638c23c`, `ops::target`); no caller yet, the MCP tools will be the first |
-| `mcp-` / `mcp-restore-` label prefixes and the two per-camera caps (§3) | todo |
-| Read-back in `ops`: transplant returns `side_effects`, restore returns `residual` (§5.5-5.6) | todo |
-| Capture gate evaluated in memory before the file is written (a failed gate leaves no file) | todo |
+| `mcp-` / `mcp-restore-` label prefixes and the two per-camera caps (§3) | **done** (`51ac523`, `f1b2705`, `ops::retention`): labels, per-camera counting by file content, cap checks (200 captures / 50 restore points, placeholders). Nothing calls it yet; the capture and apply tools will |
+| Read-back in `ops`: transplant returns `side_effects`, restore returns `residual` (§5.5-5.6) | **done** (`1c83fcb`, `ops::readback::{side_effects, residual}`), and the whole apply/undo sequence is tested on a fake body (`48c9b90`) |
+| Capture gate evaluated in memory before the file is written (a failed gate leaves no file) | **done** in the CLI and GUI (`d786333`); `ops::capture` returns the stats and the failed reads |
 
 Phase 0 touches `src/main.rs`, `lib.rs` and `gui/`; the firmware session's earlier edits there are
 committed, so nothing blocks it.
@@ -611,7 +611,10 @@ To write for the MCP:
   another process" while that process holds a body. No longer needed by `list_cameras` (USB-only),
   so this is a CLI nicety, not a blocker.
 - Whether the USB-only camera list and the SDK's list agree on model and serial for every
-  attached body, including the USB product string to SDK model-name mapping (`Z6_3`).
+  attached body. The model-name mapping question is settled by the survey (identity, §4), and the
+  Z 9 case has agreed on every run here; the Z6III spelling `Z6_3` rests on the survey and on
+  `pair_devices` having paired it by equality, and was not re-read this session (the body was not
+  attached).
 - **Targeted restore (`only`)** on hardware: verified on the Z 9 for two raw-code enum properties
   (F16); not for a range, literal or string property, not cross-model, and not for a write with
   a side effect.
