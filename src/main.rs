@@ -33,6 +33,7 @@ use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::ops::cameras::duplicate_models;
 use nikon_fleet::ops::capture::{self as ops_capture, CaptureStats};
 use nikon_fleet::ops::firmware_latest::{LatestReport, ModelSurvey, survey_json};
+use nikon_fleet::ops::paths::is_safe_path_component;
 use nikon_fleet::ops::list::{EntryState, Listing, list_dir, reference_filename};
 use nikon_fleet::ops::restore;
 use nikon_fleet::sdk::{Device, DeviceInfo, Sdk, UsbCameraInfo, pair_devices, usb_camera_list};
@@ -1199,15 +1200,6 @@ fn looks_like_bcd_version(version: &str) -> bool {
         && minor.len() == 2 && minor.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Whether `s` is safe to use as one component of a path this process will
-/// create/write to (as `model_slug(model)` and `version` both are, via
-/// `archive_dir`). Rejects anything that isn't a single plain path segment
-/// — a `--version` (or `--model`) of `"../../../../tmp/pwned"` would
-/// otherwise walk `archive_dir`'s `.join(...)` calls straight out of
-/// data-dir before `fs::create_dir_all`/`fs::copy`/`fs::write` ever run.
-fn is_safe_path_component(s: &str) -> bool {
-    !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\\')
-}
 
 fn cmd_firmware_add(data_dir: &Path, args: &FirmwareAddArgs) -> Result<()> {
     if !args.bin_path.exists() {
@@ -2686,48 +2678,6 @@ mod tests {
     #[test]
     fn looks_like_bcd_version_rejects_no_dot() {
         assert!(!looks_like_bcd_version("530"));
-    }
-
-    // ── is_safe_path_component ───────────────────────────────────────────
-
-    #[test]
-    fn is_safe_path_component_accepts_plain_segment() {
-        assert!(is_safe_path_component("5.31"));
-        assert!(is_safe_path_component("Z_9"));
-    }
-
-    #[test]
-    fn is_safe_path_component_rejects_dotdot() {
-        assert!(!is_safe_path_component(".."));
-    }
-
-    #[test]
-    fn is_safe_path_component_rejects_traversal_sequence() {
-        assert!(!is_safe_path_component("../../../../tmp/pwned"));
-    }
-
-    #[test]
-    fn is_safe_path_component_rejects_embedded_separator() {
-        assert!(!is_safe_path_component("a/b"));
-        assert!(!is_safe_path_component("a\\b"));
-    }
-
-    #[test]
-    fn is_safe_path_component_rejects_empty_and_dot() {
-        assert!(!is_safe_path_component(""));
-        assert!(!is_safe_path_component("."));
-    }
-
-    #[test]
-    fn cmd_firmware_add_path_traversal_version_rejected() {
-        let data_dir = TempDir::new().unwrap();
-        let bin_path = data_dir.path().join("fw.bin");
-        fs::write(&bin_path, b"v1").unwrap();
-        let err = cmd_firmware_add(
-            data_dir.path(),
-            &firmware_add_args(bin_path, "Z 9", "../../../../tmp/pwned", false),
-        ).unwrap_err();
-        assert!(err.to_string().contains("not a valid single path component"));
     }
 
     // ── cmd_firmware_add ──────────────────────────────────────────────────

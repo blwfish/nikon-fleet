@@ -11,6 +11,7 @@ pub mod capture;
 pub mod capture_snapshot;
 pub mod firmware_latest;
 pub mod list;
+pub mod paths;
 pub mod port;
 pub mod readback;
 pub mod restore;
