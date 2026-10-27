@@ -399,6 +399,13 @@ snapshot" as meaningful, or filter them from the default lists.
   written before a teardown hang; the camera is still enumerable after a SIGKILL of the child
   (also mid-capture); whether the binary loads the SDK when spawned by a parent launched from an
   MCP client (codesigning, §8.2).
+
+  **Run 2026-10-27 (F14), with both bodies attached.** Passed: the extra fd stays empty while the
+  SDK writes to **stdout** (so the dedicated fd is needed); the plain release binary loads the SDK
+  from a clean environment, new session and cwd `/`; 8 SIGKILLs (early, mid-capture, and just after
+  the snapshot file was written; both bodies) each left both bodies enumerable and the next capture
+  at baseline. **Not covered:** a real teardown hang (none occurred in the 10 uninterrupted captures), a kill mid-*write*
+  (deliberately not tried), and a parent that is a real MCP client.
 **Phase 0 — extract `ops`** (library). Status of each item:
 
 | Item | Status |
@@ -536,6 +543,10 @@ To write for the MCP:
 | Enum labels in snapshots are whole strings | **no**: one element per byte (fixed in matching) | F8 |
 | Two attached bodies enumerate, select and refuse ambiguity correctly | yes | F12 |
 | `snapshot` without `--serial` is safe with two bodies attached | **no**: it picks the first | F12 |
+| The SDK dylib writes nothing to stdout | **no**: it prints `InitializeSDK Execution duration: N` itself | F14 |
+| The SDK dylib leaves an inherited extra fd alone | yes (0 bytes in every run) | F14 |
+| The plain `nikon-fleet` release build (linker-signed, no entitlements) loads the SDK when spawned from a clean env, new session, cwd `/` | yes, both bodies | F14 |
+| SIGKILL of a capture child leaves the body enumerable and the next capture at baseline | yes: 8 kills, both bodies | F14 |
 
 ### 8.2 Still unverified (review these)
 
@@ -553,7 +564,9 @@ To write for the MCP:
   holding a pipe/fd for results and killing it on a deadline, or confirmed that the SDK dylib
   never writes to the result fd's channel (hence a dedicated fd, §3), or that a SIGKILL of a
   worker holding a body leaves it enumerable (F3's hangs were ended with SIGTERM/alarm). Spike B
-  (§6) settles these.
+  (§6, F14) settled the fd and SIGKILL questions: the SDK writes to stdout, not to an inherited
+  fd, and 8 SIGKILLs left both bodies healthy. **Still open:** a parent that reads a result and
+  then kills a worker in a real teardown hang (not provoked in the 10 uninterrupted captures), and a kill mid-write.
 - Whether `available` / `connected_pid` (already read into `sdk::DeviceInfo`) mean "held by
   another process" while that process holds a body. No longer needed by `list_cameras` (USB-only),
   so this is a CLI nicety, not a blocker.
@@ -578,8 +591,9 @@ To write for the MCP:
   answers, not measured ones. Spike A (§6).
 - **Codesigning of the worker.** `scripts/setup-sdk-runtime.sh` and `AGENT-README.md` say
   SDK-loading binaries need ad-hoc signing (`sdk-entitlements.plist`, `disable-library-validation`).
-  Whether the plain `nikon-fleet` build loads the SDK when spawned by `fleet-mcp`, itself launched
-  by an MCP client, is untested. Spike B.
+  The plain release build, which is linker-signed with no entitlements, loaded the SDK from a clean
+  environment, new session and cwd `/` (F14), so no extra signing step was needed. Launching it
+  from `fleet-mcp` under a real MCP client is still untested.
 - Whether the readable set of a healthy body shifts with body state (card removed, movie mode,
   live view), which would make the strict baseline gate (§5.5) refuse a good camera. Seen stable
   across about 20 captures per model; not varied deliberately.

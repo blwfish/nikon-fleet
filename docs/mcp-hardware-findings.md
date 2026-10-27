@@ -40,6 +40,7 @@ finding led to a code change, the commit is named.
 | F11 | `restore` stops attempting state properties | fixed (`08db008`) |
 | F12 | Two bodies attached together | verified for selection; concurrency inconclusive |
 | F13 | Still unverified after all of the above | open |
+| F14 | Spike B: worker-style spawn, fd cleanliness, SIGKILL of a capture child | verified (small samples) |
 
 ---
 
@@ -349,6 +350,31 @@ Read-only.
   touching the *same* body", and it shows two bodies can be read at once without partial
   captures. A per-camera lock is plausible but unproven; a global lock plus the watchdog remains
   the conservative design.
+
+## F14. Spike B: spawning the CLI as a worker, and killing it
+
+**Conditions.** Both bodies attached throughout (Z6III fw 2.00, Z 9 A fw 5.31). The release CLI
+(`target/release/nikon-fleet`, linker-signed ad hoc, no entitlements) was run by a Python parent
+with a minimal environment (`PATH=/usr/bin:/bin`, `HOME`), cwd `/`, a new session, stdin
+`/dev/null`, stdout and stderr piped separately, and an extra pipe passed as fd 3. Command:
+`--no-usb-reset --data-dir <scratch> snapshot --serial <S>`. Read-only against the cameras.
+
+- **Clean spawn.** Z6III: exit 0, 4.66 s, `ok=200 err=12`. Z 9: exit 0, 4.81 s, `ok=196 err=11`.
+  Both match the F5 baselines, so no codesigning or entitlement step was needed for the plain
+  build in this launch context.
+- **fd 3 stayed empty (0 bytes in both captures); the SDK writes to stdout.** The line
+  `InitializeSDK Execution duration: 202` appeared on stdout. It is not in `src/`; the string is
+  in the SDK binary. So the plan's dedicated result fd is needed, and the worker's stdout has to
+  be discarded or kept off the protocol channel.
+- **SIGKILL of the child, 8 trials, then recovery.** Kills at +0.5, +2.0 and +3.5 s (Z6III) and
+  +2.0 and +3.5 s (Z 9), against a normal run of about 4.6 s; and three kills the moment the
+  snapshot file appeared (about 2.9-3.0 s; Z6III twice, Z 9 once), i.e. after the result existed
+  and before teardown finished. Every child exited -9. After each kill, `discover` listed both
+  bodies and a full capture matched its baseline (4.56-4.74 s, exit 0, no hang).
+- **Not covered.** No teardown hang occurred in the 10 uninterrupted captures (plus 8 recovery `discover`s) (F3's solo rate was about 1 in 13),
+  so "read the result, then kill a hung worker" was exercised only as the file-written kills.
+  A kill during a *write* was deliberately not tried. The parent was a script, not an MCP client.
+  Phase timing of the kills is inferred from elapsed time, not from the child's progress.
 
 ## F13. Still unverified
 
