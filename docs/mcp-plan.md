@@ -1,9 +1,16 @@
 # Plan: optional MCP server for nikon-fleet
 
-Status: **plan only, nothing built.** Written 2026-10-27. Per the spec-review rule this needs a
-fresh-session review (esp. §8, external-system assumptions) before implementation starts. A first
-cold review against the code was done 2026-10-27 and its corrections are folded in below (marked
-*[review]*); the open items in §8 still need verification, two of them on hardware.
+**Status: plan only. The MCP server itself is not built.** Written and revised 2026-10-27.
+
+- Hardware evidence behind every "measured" claim below is in
+  [mcp-hardware-findings.md](mcp-hardware-findings.md) (findings F1-F13, cited inline).
+- Supporting fixes found while checking this plan are already on `master`: `aaa20da`,
+  `1043c31`, `dff83cd`, `08db008` (see the findings file). They are CLI/library changes the MCP
+  will sit on; none of them is MCP code.
+- Review history: a cold review against the code was done 2026-10-27 and folded in; this
+  version is the consolidation of that review plus the hardware work. **Per the spec-review rule
+  it needs a fresh-session review before implementation starts.** Suggested focus, in order: §8.2
+  (what is still unverified, starting with the MCP crate), §9 (decisions left open), then §3/§5.
 
 ## 1. Why, and what it must not become
 
@@ -15,29 +22,38 @@ Motivating requests (user, 2026-10-27):
 Both are already core operations (`diff`, `transplant`). The MCP is a natural-language front end
 over them, in the same way the GUI is a graphical one.
 
-Note the first request needs two snapshots, so it is not answerable until `capture_snapshot`
-(Phase 2) unless snapshots already exist on disk. *[review]*
+The first request needs two snapshots, so it is not answerable until `capture_snapshot` (Phase 2)
+unless snapshots already exist on disk. (A Z 9 A baseline now exists in the repo's `snapshots/`;
+a Z 9 B does not.) The second request cannot carry **Picture Controls** at all: they are
+unreadable through this SDK path on both bodies (F5), and the user-facing answer must say so.
 
 **Constraint:** nikon-fleet must run with no AI assistant (see memory `project-no-ai-runtime`). So
 the MCP is a separate, optional binary. No core path, GUI feature, install step or documentation
 flow may depend on it. Deleting the crate must leave the CLI and GUI unchanged.
 
-## 2. Finding that shapes the plan: the orchestration is in `main.rs`, not the library
+## 2. The orchestration is in `main.rs`, not the library
 
-`lib.rs` exports primitives (`sdk`, `snapshot`, `diff`, `transplant::transplant`, `firmware*`). The
+`lib.rs` exports primitives (`sdk`, `snapshot`, `diff`, `transplant`, `firmware*`). The
 *workflows* are in `src/main.rs`: `cmd_snapshot`, `cmd_check`, `cmd_restore`, `cmd_transplant`
 (device selection, the ambiguous-target refusal `transplant_target_ambiguous`, outcome counting,
-printing). So "a thin wrapper over the library" is not yet true. If the MCP re-implemented these it
-would be a second copy of each rule (CLAUDE.md: Parallel Implementation / single source of truth).
+printing, `ensure_capabilities_present`, `restore_precheck`), and `firmware latest --json`'s types
+(`LatestModel`, `LatestReport`, `survey_json`). So "a thin wrapper over the library" is not yet
+true. If the MCP re-implemented these it would be a second copy of each rule.
 
 **Phase 0 therefore extracts the workflows into a library module (`ops`)** that return structured,
 serialisable results. The CLI becomes a printer over them and the MCP a JSON adapter over them.
 This also closes the `--json` gaps (only `discover`, `diff` and `firmware latest` have it today).
 
-Several rules already exist in more than one place and Phase 0 should collapse them rather than add
-a third copy: the "snapshot is the reference iff byte-identical to the reference file" rule lives in
-both the Python `gui/fleet_lib.py` and the Rust GUI's `list_snapshots`. `ops::list` becomes the one
-implementation and the GUI migrates onto it (or the plan records explicitly why not). *[review]*
+What is already in the library and usable as-is: `transplant::plan_property` (translate + resolve +
+gate, device-free), `ResolvedChoice`, `TransplantOptions`, `resolve_allow_raw_code`,
+`NEVER_TRANSPLANT` / `never_copied`, `packed_string_options`. What is still in `main.rs` and must
+move: everything in the first paragraph above.
+
+Rules that exist in more than one place today, which Phase 0 should collapse rather than copy a
+third time: "a snapshot is the reference iff it is byte-identical to the reference file" lives in
+both the Python `gui/fleet_lib.py` and the Rust GUI's `list_snapshots` (`gui/src/main.rs`).
+`ops::list` becomes the one implementation and the GUI migrates onto it, or the plan records why
+not (§9).
 
 ## 3. Architecture
 
@@ -50,31 +66,36 @@ implementation and the GUI migrates onto it (or the plan records explicitly why 
 - **Read-only by default.** Write tools are registered only with `--enable-writes`. Client-side
   approval prompts are a second layer, not the protection (clients differ in how they treat
   `destructiveHint`).
-- **One SDK worker thread.** *[review]* `sdk.rs` documents the SDK as not thread-safe and single-
-  threaded, and the CF run-loop pump (`CFRunLoopRunInMode`) is per-thread: the IOKit notification
-  is registered on whichever thread calls `InitializeSDK`. So all SDK use goes through a dedicated
-  `std::thread` worker that owns the `Sdk`, fed by a channel; async handlers send a request and
-  await the reply. This replaces the earlier "process-wide mutex + `spawn_blocking`" idea (tokio's
-  blocking pool gives an arbitrary thread per call) and makes the Phase 4 persistent session a
-  small change. **Hardware check 2026-10-27 (§8): an SDK call can hang indefinitely inside
-  `DisconnectDevice` after a concurrent open from another process, and cannot be cancelled from
-  within the thread**, so a worker *thread* is necessary but not sufficient: put the SDK worker in
-  a killable child process with a watchdog, and take a cross-process lock in `--data-dir`.
-  Session lifetime is **per call** at first (open SDK, do the work, drop), matching
-  the CLI and avoiding a long-held USB claim that would lock the GUI/CLI out.
-- **Concurrent GUI/CLI: the USB reset is the hazard, not just contention.** *[review]*
-  `Sdk::initialize()` resets every attached Nikon body's USB link before `InitializeSDK`
-  (`reset_nikon_usb_cameras()`), which can disrupt a GUI/CLI session, including a transplant
-  write, running at the same time. A typed `camera_busy` error cannot help because the reset
-  happens before any busy check. Options: default to `initialize_no_usb_reset()` (the SDK
-  docs say already-connected cameras may then fail to enumerate; unverified, §8), and/or have the
-  write tools detect another running fleet process and refuse. No retry loops either way.
+- **The SDK runs in a killable child process with a watchdog.** The SDK is documented as not
+  thread-safe and single-threaded (`sdk.rs`), and the CF run-loop pump is per-thread (the IOKit
+  notification is registered on whichever thread calls `InitializeSDK`), so all SDK use goes
+  through one dedicated thread. That is necessary but **not sufficient**: the SDK can hang
+  indefinitely in `DisconnectDevice` at teardown, with or without a second process, including
+  after a successful write (F3), and a call stuck inside the SDK cannot be cancelled from its own
+  thread. So the SDK thread lives in a child process the MCP can kill and respawn, under a per-call
+  deadline; otherwise one hang blocks the whole stdio server. A persistent session (Phase 4) is a
+  small change once this exists.
+- **Apply results come from structured output and a read-back, never from an exit status.** A
+  timeout or non-zero exit after a write must not be reported as "the write failed" (F3, F10).
+- **No USB reset by default.** `Sdk::initialize()` resets every attached Nikon body's USB link,
+  which can corrupt another process's capture (F2). `initialize_no_usb_reset()` enumerates
+  already-connected bodies correctly from a plain process (F1), so the MCP uses it, and must
+  never reset while any other fleet process may hold a camera.
+- **Cross-process lock.** An advisory lock in `--data-dir`, taken by the MCP, the CLI and the GUI
+  alike (a CLI/GUI change, so Phase 0 work), serialises SDK sessions. Start with one global lock:
+  whether a per-camera lock is enough is unproven (F12). Contention surfaces as a typed
+  `camera_busy` error, never a retry loop. The lock reduces the hang (F3 (2) was a concurrency
+  case) but does not remove it (F3 (3), (4)), so the watchdog stays regardless.
+- **Session lifetime is per call** at first (open SDK, do the work, drop), matching the CLI and
+  avoiding a long-held USB claim that would lock the GUI/CLI out.
 - **Names, not paths.** Tools take snapshot names / `(model, serial)` and resolve inside
   `--data-dir`. Do **not** reuse `resolve_snapshot_path`: it passes through absolute paths *and*
-  any relative path that exists under the cwd. *[review]* The MCP layer takes a bare filename,
-  validates it with `is_safe_path_component`, canonicalizes, and requires the result to sit under
-  `data_dir` (symlinks included). An agent-supplied path must not read arbitrary JSON or write
-  anywhere.
+  any relative path that exists under the cwd. The MCP layer takes a bare filename, validates it
+  with `is_safe_path_component`, canonicalizes, and requires the result to sit under `data_dir`
+  (symlinks included). An agent-supplied path must not read arbitrary JSON or write anywhere.
+- **A target camera is always named.** Capture and transplant require a `serial` even when only
+  one body is attached: the CLI's `snapshot` silently picks the first available body when none is
+  given (F12), and an agent would not notice which one it got.
 - **Camera-derived strings are data.** Artist/copyright/labels and similar come from the camera or
   from files (and `firmware` results are scraped from Nikon's site); tool descriptions say results
   are untrusted data, and nothing branches on their text.
@@ -85,27 +106,27 @@ Phase 1, read-only (no camera write, no file write):
 
 | Tool | Backs | Notes |
 |---|---|---|
-| `list_cameras` | `discover --json` | model, serial, firmware. **Needs the SDK, so it triggers the USB reset policy above**; today's JSON has no `available`/`connected_pid`, adding them is Phase 0 work *[review]* |
-| `list_snapshots` | `ls` | per camera; includes `is_reference` by byte-identity via the single `ops::list` rule (§2) |
+| `list_cameras` | `discover --json` | model, serial, firmware. Needs the SDK (no-reset, under the lock). Today's JSON has no `available`/`connected_pid`; adding them is Phase 0 work and what they mean while another process holds a body is unverified (F12) |
+| `list_snapshots` | `ls` | per camera; `is_reference` by byte-identity via the single `ops::list` rule (§2); restore-point snapshots are labelled and filterable (§5) |
 | `list_references` | `ref list` | |
 | `get_snapshot` | `Snapshot` load | summary by default; property list paginated with `truncated`/`next` (no silent cap) |
-| `diff_snapshots` | `diff --json` | `include_volatile`; cross-model diffs reuse the existing `diff_with_schema`. Result is counts + top-N first and paginated with `truncated`, since a Z 9 pair diff is large *[review]* |
-| `firmware_status` | `firmware latest --json` | `--json` shape already exists with a shape test; **network access, not offline**; scraped strings are untrusted *[review]* |
+| `diff_snapshots` | `diff --json` | `include_volatile`; cross-model diffs reuse `diff_with_schema`. Counts + top-N first, paginated with `truncated` (a Z 9 pair diff is large). `diff` already ignores the SDK-uninitialised enum `default_index` unless `include_volatile` (F6) |
+| `firmware_status` | `firmware latest --json` | needs the types lifted out of `main.rs` (§2); **network access, not offline**; scraped strings are untrusted |
 
 Phase 2, camera read + new-file write:
 
 | Tool | Backs | Notes |
 |---|---|---|
-| `capture_snapshot` | `snapshot` | writes a **new** file only. Today `Snapshot::save_to_file` is `fs::write` and overwrites, so this needs create-new semantics (`OpenOptions::create_new`) in `ops`, not just the claim *[review]*. Ambiguous target without `serial` is refused |
-| `check_against_reference` | `check` | live read, diff vs the camera's reference |
+| `capture_snapshot` | `snapshot` | `serial` required. Writes a **new** file only: today `Snapshot::save_to_file` is `fs::write` and overwrites, so `ops` needs `OpenOptions::create_new`. Reports `read_ok`, `read_err`, the failed codes and the no-get-bit count, and fails when the capture is worse than the model baseline (§5), not only when `read_ok == 0` |
+| `check_against_reference` | `check` | live read, diff vs the camera's reference; same capture gate |
 
 Phase 3, writes (only with `--enable-writes`):
 
 | Tool | Notes |
 |---|---|
-| `transplant_plan` | = `transplant --dry-run`. Returns outcomes grouped by strategy / skip reason, plus a `plan_digest` |
-| `transplant_apply` | Requires `plan_digest`. Takes a restore point, then writes (§5) |
-| `restore_plan` / `restore_apply` | Same two-step shape, used to undo from the restore point |
+| `transplant_plan` | = `transplant --dry-run`. Inputs: source snapshot name, target `serial`, optional `allow_raw_code` (list of property names, validated against the snapshot before the camera is touched; same rule as the CLI flag). Returns the outcome report (§5) and a `plan_digest` |
+| `transplant_apply` | Requires the plan's digest (and token if §9 decides on one). Takes a restore point, then writes (§5) |
+| `restore_plan` / `restore_apply` | Same two-step shape, used to undo from the restore point. Skips the same never-copy properties |
 
 **Deliberately not exposed:** `vendor-write-ftp` (the old profile can't be read back; see memory
 `project-ftp-profile-readback`), anything that flashes firmware (does not exist yet), `firmware
@@ -113,380 +134,250 @@ fetch/browse` (the licence click is human by decision), `rm`, `vendor-read` (rev
 read-back work), `ref set` (changes what "reference" means, and takes an arbitrary path; could come
 later behind writes with the same name-only rule).
 
-## 5. Transplant: plan, apply, restore point
+## 5. Transplant and restore: report, plan, apply, restore point
 
-"Tell me what did not get copied" is already structured: `TransplantOutcome { name, code, result:
-Result<Strategy, SkipReason> }`. Needed: `Serialize` on `Strategy`/`SkipReason` as **closed string
-tags** with a separate typed detail field (e.g. `write_failed` + `detail`), not the Display text.
-The tag mapping is an **exhaustive `match` with no wildcard arm**, so a new `SkipReason` variant
-fails to compile until mapped. *[review]*
+### 5.1 Outcomes
 
-Report shape: counts per tag, then the full per-property list grouped by tag. `absent_on_target`
-and `read_only` are routine and numerous, so lead with counts and put the warn-worthy tags
-(`no_matching_option`, `write_failed`, `enum_type_mismatch`, `enum_undecoded_by_sdk`,
-`name_mismatch`, …) first. A paginated list sets `truncated`.
+Each property yields `TransplantOutcome { name, code, result: Result<Strategy, SkipReason>,
+choice: Option<ResolvedChoice> }`. For the MCP both enums serialise as **closed string tags**, with
+a separate typed detail field where one exists (e.g. `write_failed` + `detail`), never the Display
+text. The tag mapping is an **exhaustive `match` with no wildcard arm**, so a new variant fails to
+compile until mapped.
 
-**What `plan_digest` is, and is not.** *[review]* It is a **staleness guard**: it proves the camera
-or snapshot has not changed since the plan was computed. It is **not** a consent mechanism: an
-agent can call plan then apply back-to-back without a human seeing the plan. The real consent gates
-are `--enable-writes` and the client's approval prompt. If an unreviewed apply must also be
-prevented server-side, the plan result carries a short-lived single-use token that `transplant_apply`
-requires; the tool description tells the agent to show the plan to the user first. Decide which
-before building; do not describe the digest as the protection.
+| `Strategy` tag | Meaning |
+|---|---|
+| `literal` | scalar copied as-is |
+| `enum_by_label` | packed-string enum matched on the whole label |
+| `enum_by_raw_value` | enum matched by raw numeric code (weaker; see `raw_code_unconfirmed`) |
+| `range_clamped` | range value clamped/snapped into the target's bounds |
 
-Digest input must be **stable**: hash(source snapshot bytes, target serial, per-property
-`(name, code, tag, structured fields)` in `BTreeMap` order). Never hash the SDK error text carried
-by `TargetReadFailed(String)` / `WriteFailed(String)`, or a transient message produces a false
-`stale_plan`. *[review]*
+| `SkipReason` tag | Routine? | Meaning |
+|---|---|---|
+| `absent_on_target` | routine | capability not on the target |
+| `read_only` | routine | target does not allow setting it |
+| `unsupported_write_type` | routine | SDK rejected the capability kind |
+| `no_matching_option` | **warn** | the source's choice does not exist on the target |
+| `unsupported_value_shape` | **warn** | not a scalar/enum/range this code can translate |
+| `target_read_failed` | **warn** | the live read of the target failed (detail: SDK error) |
+| `malformed_source` | **warn** | corrupt or hand-edited snapshot value (includes pre-fix snapshots whose packed-string `values` are `[]`) |
+| `write_failed` | **error** | the write itself failed (detail: SDK error) |
+| `enum_undecoded_by_sdk` | **warn** | SDK could not decode the options, or the selected label is the `"Resource String not found"` placeholder |
+| `enum_type_mismatch` | **warn** | label enum on one side, raw-code on the other |
+| `capability_name_mismatch` | **warn** | the code has unrelated names on the two models |
+| `ambiguous_label` | **warn** | the chosen label repeats in either body's option list (e.g. `ISOControlSensitivity` lists most ISO values twice) |
+| `never_copied` | routine (policy) | on the never-copy table (§5.2); no override |
+| `raw_code_unconfirmed` | policy | matched only by raw numeric code, would change the target, and was not opted in (§5.3) |
 
-Apply sequence (all in one call on the SDK worker):
+Report shape: counts per tag first, then the per-property list grouped by tag with the warn-worthy
+tags first; each written or would-write enum carries its `ResolvedChoice` (option label or `code
+N`, target index, what the target has now, unchanged or not). A paginated list sets `truncated`.
+The report must also state what the SDK cannot read at all (**Picture Controls**, F5), because that
+is invisible in a per-property list.
 
-1. Recompute the dry run on the live target; compare `plan_digest`. Mismatch ⇒ refuse with
-   `stale_plan` (camera state or snapshot changed since the plan the user saw).
-2. Capture the target's current state as a snapshot labelled `pre-transplant-<timestamp>`
-   (the **restore point**), written create-new. **Abort before any camera write** if the file
-   write failed or the capture is *worse than that body's known baseline* (unchecked-result rule).
-   Note that `cmd_snapshot` today writes the file and bails only when *every* read failed, so a
-   half-failed capture reports success; `ops::capture` must expose read_ok/read_err and the set of
-   failed codes so the gate can be strict. **"Zero read errors" is not a usable gate:** a healthy
-   Z6III (fw 2.00) always reports `ok=200 err=12 skipped(no-get-bit)=17`, deterministic across
-   runs (§8, 2026-10-27 hardware check). The gate is instead: every failed code is in the model's
-   known-unreadable set (or the same set as the camera's reference), and `read_ok` has not dropped
-   below that baseline. The result reports the unreadable codes and the no-get-bit count so the
-   user knows what the restore point does *not* cover. *[review]*
-3. Run the real transplant; return the outcomes plus the restore point's name.
-4. `restore_plan`/`restore_apply` on that name is the undo.
+### 5.2 Never-copy table
 
-Honest limits to state in the tool description: the restore point holds only what the SDK let us
-*read*; write-only or unreadable properties cannot be restored. **Restoring writes every
-snapshotted property, not just the ones transplant touched, so any change made to the camera after
-the restore point was taken is overwritten.** *[review]* Whether re-applying a snapshot returns
-every written property to its prior value has not been verified on hardware (§8).
+`NEVER_TRANSPLANT` (code, name, reason) is the single source of truth, read by `precheck` in
+transplant **and** `restore_precheck` in restore through `never_copied`. It is checked before any
+live read or write and has no override. It holds properties that report what the body or session
+is doing, or lock it: `LockCamera`, `LiveViewStatus`, `CurrentItemID` (these two already failed
+-125 on a real restore), `ExternalFlashStatus`, `RawJpegTransferStatus`, `ChangeMonitorOffStatus`,
+`LiveViewPhotoShootingMode`, `ShootingMode`, `Viewmode`. Only the two -125 entries have hardware
+evidence; the other seven rest on their names (the SDK config does not classify state vs setting),
+and the code marks four of those (`ChangeMonitorOffStatus`, `LiveViewPhotoShootingMode`,
+`ShootingMode`, `Viewmode`) as explicit judgement calls. A real-config test checks every
+(code, name) pair against the Z-series sections. Consequence for `restore`: these are not restored
+either, which is right for an undo but a change for a backup/firmware-rollback restore (§9).
 
-Restore-point files land in `snapshots/` and would appear in `ls` and the GUI list. Give them a
-distinct label prefix and check that nothing treats "latest snapshot" as meaningful, or filter them
-from the default lists. *[review]*
+### 5.3 Raw-code opt-in
+
+A raw-code enum match assumes both bodies number the same option the same way, which nothing
+guarantees. It is skipped as `raw_code_unconfirmed` **when it would change the target**, unless the
+property is named in `allow_raw_code` (CLI: `--allow-raw-code <property>`, repeatable). A match that
+resolves to the option the target already has is a no-op and passes without opt-in. Names are
+validated against the source snapshot before the camera is opened; an unknown name, or one that is
+not a raw-code enum, is an error, so a typo cannot masquerade as a safe run.
+
+### 5.4 What a plan promises
+
+A plan is **not a prediction.** `restore --dry-run` once said `written=119 errors=0` and the real
+run wrote 115 with 2 errors and exit 0 (F4); the live reads in `transplant --dry-run` find
+`no_matching_option` but cannot find a failing write. Plan and apply tool descriptions say "would
+attempt", and the apply result reports actual written/skipped/error counts and codes.
+
+`plan_digest` is a **staleness guard**: it proves the camera or snapshot has not changed since the
+plan. It is **not** a consent mechanism: an agent can plan then apply back-to-back without a human
+seeing the plan. The real consent gates are `--enable-writes` and the client's approval prompt. If
+an unreviewed apply must also be prevented server-side, the plan result carries a short-lived
+single-use token that `transplant_apply` requires and the tool description tells the agent to show
+the plan first (decision in §9).
+
+The digest input must be **stable**: hash(source snapshot bytes, target serial, per-property
+`(name, code, tag, structured fields)` in `BTreeMap` order). Never hash SDK error text
+(`TargetReadFailed`/`WriteFailed` carry it) or the volatile/garbage fields (§4, F6), or a transient
+difference produces a false `stale_plan`.
+
+### 5.5 Apply sequence (all in one call on the SDK child)
+
+1. Recompute the dry run on the live target (with the same `allow_raw_code`); compare
+   `plan_digest`. Mismatch ⇒ refuse with `stale_plan`.
+2. Capture the target's current state as a snapshot labelled `pre-transplant-<timestamp>` (the
+   **restore point**), written create-new. **Abort before any camera write** if the file write
+   failed or the capture is *worse than that body's baseline*. "Zero read errors" is not a usable
+   gate: a healthy Z6III always reports `ok=200 err=12`, a Z 9 `ok=196 err=11` (F5). The gate is:
+   every failed code is in the model's known-unreadable set (or the same set as the camera's
+   reference), and `read_ok` has not dropped below that baseline. A mid-capture USB reset produced
+   captures like `ok=18 err=194` that exit 0 today (F2), which is exactly what this must catch.
+   `ops::capture` therefore returns `read_ok`, `read_err` and the failed codes; where per-model
+   baselines are stored and how they are created is open (§9).
+3. Run the real transplant; return the outcomes plus the restore point's name. Verify by read-back
+   (a fresh capture diffed against the restore point) and report the diff, since the process exit
+   status cannot be trusted (§3).
+4. `restore_plan`/`restore_apply` on the restore point's name is the undo.
+
+### 5.6 Restore and the restore point: honest limits
+
+The restore point holds only what the SDK let us *read*: write-only or unreadable properties
+(including Picture Controls) cannot be restored. **Restoring writes every snapshotted property
+that is not on the never-copy table, not only the ones transplant touched, so any change made to
+the camera after the restore point was taken is overwritten.** Fidelity is verified for one
+property only (F4, F10): a one-property cross-model change was applied, read back, and undone by a
+full restore that left the camera identical to the restore point. Restore-point files land in
+`snapshots/`, so they carry a distinct label prefix; check that nothing treats "latest snapshot" as
+meaningful, or filter them from the default lists.
 
 ## 6. Phases
 
-0. **Extract `ops`** (library): `capture`, `check`, `restore`, `transplant`, `list`; structured
-   results; `Serialize` on outcomes; CLI re-pointed at them; `--json` on `ls`, `ref list`, `check`,
-   `snapshot`, `transplant`, `restore`; `discover --json` gains `available`/`connected_pid`;
-   `ops::capture` returns read stats and uses create-new writes; one `ops::list` byte-identity rule
-   (GUI migrates onto it). Introduce a small camera-port trait
-   (`capabilities`/`read_capability`/`write_capability`) so plan/apply and the restore-point logic
-   are testable without a `Device` (today `transplant()` is documented as not unit-testable).
-   *Must wait until the firmware session's uncommitted edits to `src/main.rs` (and `lib.rs`,
-   `firmware.rs`, `gui/`) are committed.*
-1. `mcp/` scaffold + SDK worker thread + the Phase 1 tools, read-only registration only.
+**Phase 0 — extract `ops`** (library). Status of each item:
+
+| Item | Status |
+|---|---|
+| Reject empty captures: `snapshot_capture_failed` is `read_ok == 0`; `ensure_capabilities_present` after every `connect` | **done** (`aaa20da`), in `main.rs` |
+| Whole-label packed-string matching; `AmbiguousLabel`; placeholder labels; `ResolvedChoice` on outcomes | **done** (`1043c31`), in the library |
+| `NEVER_TRANSPLANT`, raw-code gate, `--allow-raw-code`, device-free `plan_property` | **done** (`dff83cd`), in the library |
+| `restore` uses the never-copy table (`restore_precheck`) | **done** (`08db008`), in `main.rs` |
+| `diff` ignores the SDK-uninitialised enum `default_index` unless `include_volatile` | **done** (`aaa20da`) |
+| Move `cmd_snapshot`/`check`/`restore`/`transplant`, `restore_precheck`, `ensure_capabilities_present`, device selection and the ambiguity refusal into `ops`, returning structured results | todo |
+| `Serialize` on `Strategy`/`SkipReason` as closed tags (exhaustive match) and on outcomes | todo |
+| `--json` on `ls`, `ref list`, `check`, `snapshot`, `transplant`, `restore`; `discover --json` gains `available`/`connected_pid` | todo |
+| `ops::capture` returns `read_ok`/`read_err`/failed codes, uses create-new writes | todo |
+| Per-model capture baselines and the "worse than baseline" gate (also useful to the CLI: a partial capture still exits 0) | todo |
+| One `ops::list` byte-identity rule; GUI (Rust and Python) migrate onto it | todo |
+| Cross-process advisory lock in `--data-dir`, taken by CLI, GUI and MCP | todo |
+| A small camera-port trait (`capabilities`/`read_capability`/`write_capability`) so plan/apply and the restore-point logic are testable without a `Device` (`plan_property` covers translate+gate only) | todo |
+| Lift `firmware latest --json`'s types out of `main.rs` | todo |
+
+Phase 0 touches `src/main.rs`, `lib.rs` and `gui/`; the firmware session's earlier edits there are
+committed, so nothing blocks it.
+
+1. `mcp/` scaffold + SDK child process with watchdog + the Phase 1 tools, read-only registration only.
 2. `capture_snapshot`, `check_against_reference`.
 3. Write tools behind `--enable-writes`.
-4. Optional: persistent SDK session (cheap once the worker thread exists); `vendor_read`.
+4. Optional: persistent SDK session (cheap once the child exists); `vendor_read`.
 
 ## 7. Tests (threshold / ambiguity list, written before code)
+
+Already in the repo (do not re-derive): packed-string enum fixtures from the real Z 9 and Z6III
+arrays with hard-coded expected indices; boundary/ambiguity/malformed cases for label matching;
+never-copy table integrity and its real-config name check; the raw-code gate matrix; `--allow-raw-code`
+validation, including a no-hardware CLI test; `restore_precheck` ordering; `diff` ignoring the enum
+`default_index`; the empty-capture predicate.
+
+To write for the MCP:
 
 - Read-only mode registers none of the write tools; `--enable-writes` registers them.
 - Path outside `data_dir` (absolute, `..`, symlink, **relative path that exists under the cwd**)
   rejected for every path-taking tool.
-- Two cameras attached and no `serial` ⇒ refused for capture and transplant.
+- Two cameras attached and no `serial` ⇒ refused for capture and transplant; a `serial` is
+  required even with one camera attached.
 - `transplant_apply` with: matching digest (proceeds), digest differing by one outcome (refuses),
-  missing digest (refuses), restore-point capture failure (no write happens), restore-point file
-  write failure (no write happens), **restore-point capture with partial read errors (no write
-  happens)**, **restore-point filename already exists (no overwrite, no write happens)**.
+  missing digest/token (refuses), restore-point capture failure (no write happens), restore-point
+  file write failure (no write happens), **restore-point capture with partial read errors, e.g.
+  `ok=18 err=194` (no write happens)**, **restore-point filename already exists (no overwrite, no
+  write happens)**, `allow_raw_code` differing between plan and apply (refuses as stale).
+- A process that finishes its write and then hangs/times out: the result is read from the
+  read-back diff and reports success, not failure; a process that hangs *before* the write: no
+  write is reported.
 - Digest stability: two dry runs with identical state but different `WriteFailed`/`TargetReadFailed`
-  text produce the same digest.
+  text, or different volatile/garbage fields, produce the same digest.
 - Empty snapshot properties; all-skipped plan (apply is a no-op and says so); source model equals
   target model (decide whether the CLI's "use `restore`" note is returned); non-Z-series model
   rejected (existing guard).
 - Pagination: exactly-N and N+1 properties around the page size; `truncated` correct at both, for
   `get_snapshot`, `diff_snapshots` and the plan list.
-- Outcome tags: every `SkipReason` variant round-trips to a distinct tag (exhaustive match; a new
-  variant must fail to compile until mapped).
-- Parity: CLI `--json` and MCP tool results come from the same `ops` value (one source of truth);
-  `is_reference` agrees across `ops::list`, the Rust GUI and `fleet_lib.py` for the same fixtures.
-- Live (needs the user and hardware): Z 9 ↔ Z6III plan/apply/undo on real bodies.
+- Outcome tags: every `SkipReason` and `Strategy` variant maps to a distinct tag (exhaustive match;
+  a new variant must fail to compile until mapped).
+- Parity: CLI `--json` and MCP tool results come from the same `ops` value; `is_reference` agrees
+  across `ops::list`, the Rust GUI and `fleet_lib.py` for the same fixtures.
+- Live (needs the user and hardware): Z 9 ↔ Z6III plan/apply/undo on real bodies beyond the single
+  enum-by-label property already done (F10): a range, a literal, an opted-in raw-code enum.
 
-## 8. External-system assumptions to verify before building
+## 8. External-system assumptions
 
-- MCP Rust SDK: assumed `rmcp` (the official `modelcontextprotocol/rust-sdk`), tokio-based, stdio
-  server, tool annotations. **Not checked**; confirm crate name, maturity and API first.
+### 8.1 Verified on hardware (details in the findings file)
+
+| Assumption | Result | Ref |
+|---|---|---|
+| `initialize_no_usb_reset()` enumerates already-connected bodies from a plain process | yes | F1 |
+| A reset-initialised open during another process's capture is harmless | **no**: empty or partial snapshots, exit 0 | F2 |
+| A second process opening the SDK fails cleanly | **no**: the holder can hang at teardown | F3 |
+| The teardown hang needs a second process | **no**: also solo, also after a write | F3 |
+| Undo by full restore returns the camera to the restore point | yes, for one enum property | F4, F10 |
+| A dry run predicts the real result | **no**, for failing writes | F4 |
+| A healthy capture has zero read errors | **no**: baselines are 200/12 (Z6III) and 196/11 (Z 9) | F5 |
+| Picture Controls can be read and so transplanted | **no**, on both bodies | F5 |
+| Diffs of an untouched camera are empty | only after ignoring the enum `default_index` (Z6III) and the volatile list | F6 |
+| Enum labels in snapshots are whole strings | **no**: one element per byte (fixed in matching) | F8 |
+| Two attached bodies enumerate, select and refuse ambiguity correctly | yes | F12 |
+| `snapshot` without `--serial` is safe with two bodies attached | **no**: it picks the first | F12 |
+
+### 8.2 Still unverified (review these)
+
+- **MCP Rust SDK: assumed `rmcp`** (the official `modelcontextprotocol/rust-sdk`), tokio-based,
+  stdio server, tool annotations. **Not checked**: confirm crate name, maturity and API first.
+  This is the main external-system assumption left.
 - Tool annotations (`readOnlyHint`, `destructiveHint`): assumed advisory only. The server-side
-  `--enable-writes` gate does not rely on the client honouring them (and `plan_digest` is a
-  staleness guard, not a gate; §5).
-- `Sdk`/`Device` thread behaviour (`Send`, main-thread requirements for the CFBundle/IOKit
-  notifications that `initialize()`'s USB reset exists to trigger). A dedicated worker thread that
-  both initialises and pumps is assumed to work; **unverified**.
-- **USB reset vs. enumeration. VERIFIED 2026-10-27 (Z6III, fw 2.00, release build, plain CLI
-  process, no AppKit).** `--no-usb-reset discover` enumerates the already-connected body (3 runs,
-  ~1.8-3.7 s), same as with the reset. So `initialize_no_usb_reset()` is viable as the MCP default
-  and the concurrent-reset hazard (§3) can be avoided.
-- **A reset-initialised open during another process's snapshot corrupts that snapshot silently.
-  OBSERVED 2026-10-27 (read-only test, 2 trials, `discover` WITH reset while a no-reset
-  `snapshot` ran).** Reset at +1.0 s: snapshot completed normally (200 ok / 12 err, but 8 s instead
-  of ~5 s). Reset at +2.5 s: the snapshot's `connect` succeeded but it printed **"Reading 0
-  capabilities"**, wrote a 232-byte empty snapshot and **exited 0**, because
-  `snapshot_capture_failed` is `read_ok == 0 && read_err > 0` and a 0/0 capture slips through.
-  Two consequences: (a) the concurrent-reset hazard in §3 is real, so the MCP must never reset
-  while any other fleet process may hold a camera (default no-reset; the cross-process lock covers
-  the CLI/GUI too); (b) **the restore-point gate must treat `read_ok == 0` (and anything below the
-  model baseline) as failure, not just read_err > 0**.
-  **CLI fixed 2026-10-27 (uncommitted, `src/main.rs`):** `snapshot_capture_failed` is now
-  `read_ok == 0`, and a new `ensure_capabilities_present` aborts `snapshot`/`check`/`restore`/
-  `transplant` right after `connect` when the device reports 0 capabilities, before anything is
-  read, written or saved. Re-run against the Z6III with the reset landing at +2.4-2.7 s: 3 of 6
-  trials hit the 0-capability race and each now exits 1 with an actionable message and no file
-  written. **The other 3 trials showed a second, unfixed failure mode: the reset landed a little
-  later and `snapshot` captured a *partial* snapshot (`ok=18 err=194`, `ok=77 err=135`,
-  `ok=101 err=111`), wrote it, and exited 0.** That is the real case the §5 restore-point gate
-  must catch: `read_ok > 0` is not enough; compare against the model baseline
-  (`ok=200 err=12` on this body, identical failed codes). The CLI `snapshot` itself still accepts
-  such a capture, which is worth a warning or non-zero exit once a per-model baseline exists.
-- **Concurrent SDK opens from two processes: NOT safe. OBSERVED 2026-10-27.** One `snapshot` ran
-  while a second process opened the SDK (`discover`, no reset). Both calls returned correct
-  results, but in one of two trials the snapshot process finished its work, wrote its file, then
-  **hung forever in `Drop for Device` -> `DisconnectDevice` -> `MaidCloseObjectEntryPoint`,
-  parked in `CFRunLoopRunSpecific`** (main thread, ~2 min, slowly burning CPU) until killed
-  with SIGTERM. The camera was healthy afterwards. n=2, so the rate is unknown; the other trial
-  was clean. **Follow-up loop (same day, 10 pairs, `discover` started 0.3-3.8 s after the
-  snapshot, 30 s hang limit): 1 of 10 hung, at the earliest offset (0.3 s, i.e. `discover` opening
-  the SDK while the snapshot was still initialising/connecting); offsets 0.8-3.8 s were clean. The
-  hang had the identical stack (`Drop for Device` -> `DisconnectDevice` -> `MaidCloseObjectEntryPoint`
-  -> `CFRunLoopRunSpecific`), and the camera enumerated normally afterwards.** Combined with the
-  first check that is 2 hangs in 12 overlapping runs (about 17%, wide uncertainty), not purely
-  determined by start offset: the first hang came at ~2.0 s, while 2.0 s was clean in the loop.
-  The hang is always in the process that held the camera at the time of the second open, never in
-  the newcomer. Consequences for the plan: (a) "fails cleanly rather than wedges" is **false**; the
-  failure mode is a hang in the holder, not an error in the newcomer; (b) every SDK call needs a
-  watchdog, and because a call stuck inside the SDK cannot be cancelled, the worker should be a
-  **child process** the MCP can kill and respawn (or the MCP must mark itself poisoned and
-  exit), otherwise one hang blocks the whole stdio server; (c) cross-process exclusion needs an
-  advisory lock file in `--data-dir` taken by the MCP, the CLI and the GUI alike (a CLI/GUI
-  change, so it is Phase 0 work), not just an in-process queue; (d) worth reproducing with a
-  deliberate loop before relying on any of this.
-- **Restore-point fidelity: VERIFIED for one property, same-model, 2026-10-27 (Z6III fw 2.00).**
-  Baseline snapshot B0; a hand-edited one-property snapshot changed `HighlightBrightness`
-  (playback display threshold) from index 26 to 25 via `restore` (written=1, errors=0); a fresh
-  snapshot B1 read the new value back (diff B0 vs B1: only that property, plus the garbage
-  field below). A **full** `restore` of B0 (the restore-point undo) then followed, and a fresh
-  snapshot B2 was **identical to B0 ("no differences")**. So undo-by-full-restore returned the
-  changed property to its prior value, and re-writing the other ~114 properties did not disturb
-  anything detectable. Not covered: cross-model `transplant` (needs the Z 9 as source), any
-  property class beyond one enum, unreadable properties (below), and a restore after the camera
-  was power-cycled. Observations that change the design:
-  - **The dry run does not predict failures.** `restore --dry-run` said written=119, errors=0;
-    the real run wrote 115, skipped 2 as `unsupported-type` and had 2 errors
-    (`CurrentItemID` 0x8351 and `LiveViewStatus` 0x823e, `SetCapability` -125, i.e. runtime state
-    that should never be restored), and still **exited 0** (`restore_completely_failed` needs
-    written == 0). So `restore_plan`/`transplant_plan` can only promise "would attempt"; the apply
-    result must report actual written/skipped/error counts and codes, and the tool description
-    must not present the plan as a prediction. Add a never-restore denylist for runtime-state
-    capabilities so the restore point doesn't generate known errors.
-  - **Diffs on an unchanged camera are noisy in two properties** (7 snapshots compared):
-    `AngleLevel` (live level sensor, differs every capture, expected) and
-    `MovieWBFluorescentType`, whose **`default_index` is garbage** (observed 0, 1, 26, 72350,
-    50331648) while `value_index` is stable, so the SDK decode likely reads an uninitialised
-    field for that 3-element enum. **Root cause confirmed 2026-10-27:** the SDK never writes
-    `NkMAIDEnum.ulDefault` for this capability (stale heap: both the GET_VALUE and GET_ARRAY
-    structs carry the same junk within a call, and 26 is another capability's real default), no
-    capability operation bit distinguishes it from the 69 fine enums, and re-reading cannot detect
-    it. So it cannot be fixed at the source; **mitigated 2026-10-27 (uncommitted, `src/diff.rs`):**
-    `diff` (and so `check`) ignores an enum's `default_index` unless `--include-volatile`; the
-    field stays recorded raw in snapshots so old and new files remain comparable. Range values'
-    `default_index` is not ignored (no garbage seen there). `plan_digest` must still hash only
-    stable fields, and the unchanged-camera diff on the Z6III is now empty.
-- Restore-point coverage data point: a Z6III snapshot reads 200 capabilities and fails 12 identically on every run:
-  eleven `-126` (incl. `PictureControlDataEx2` 0x8501, `MoviePictureControlDataEx2` 0x8502,
-  `PortraitImpressionBalanceDataSet`, `SpecialShootingSettingInfo`, `GetStorageInfoDataSet`,
-  the SB attr set) and one `-117` (`ResetWBMode`), plus 17 with no get-bit and 5 not in
-  `MaidLayer.config`. **Picture Controls are not readable through this path**, so they can be
-  neither diffed, restored from a restore point, nor (probably) transplanted, which matters for
-  "make my Z6III like this Z 9". Confirm whether transplant reports them as skips and say so in
-  the user-facing result.
-- **Z 9 A (serial 3023668, fw 5.31) baseline, read-only, 2026-10-27 (no Z 9 SDK snapshot existed
-  anywhere before this; `references/` only had a July PTP text dump).** 13 captures, `--no-usb-reset`:
-  - Shape: **227 capabilities, `ok=196 err=11 skipped(no-get-bit)=20 unknown-schema=5`**, 196
-    properties, ~4-5 s per snapshot. The 11 failures are identical every run, all `-126`, and are
-    the **same 11 codes as on the Z6III** (`AcceptDiskAcquisition`, the four SB attr caps,
-    **`PictureControlDataEx2` and `MoviePictureControlDataEx2`**, `PortraitImpressionBalanceDataSet`,
-    `SpecialShootingSettingInfo`, `GetStorageInfoDataSet`, `GetStorageIDS`). The Z6III additionally
-    fails `ResetWBMode` (-117). So the Picture Control unreadability is a property of this SDK path,
-    not of one body: a Z 9 -> Z6III transplant cannot carry Picture Controls either way, and the
-    user-facing "what did not get copied" report must say so explicitly rather than only listing
-    per-property skips.
-  - Per-model baselines differ (200/12 vs 196/11), so the §5 gate needs one per model, keyed by
-    model (and probably firmware).
-  - Volatile fields on an untouched Z 9: `AngleLevel` and `AngleLevelPitch` (both already hidden by
-    the `AngleLevel` substring). **The `MovieWBFluorescentType` `default_index` garbage does not
-    occur on the Z 9** (it is a Z6III-specific uninitialised field), so that diff fix matters
-    only for some bodies. Ten of ten solo captures diff clean against each other.
-  - **First capture of the session differed and then hung.** The first run's
-    `LiveViewZoomArea` options were `[0,256,512,1024,2048]` instead of the `[0,320,640,1280,2560]`
-    seen in the other 12, and **that process then hung in teardown for the full 120 s watchdog
-    (CPU spinning, as in the Z6III hangs) with NO other process using the camera.** The next 12
-    runs (2 + 10 solo) were normal. So (a) the teardown hang is **not exclusively a
-    concurrency problem**: 1 solo hang in 13 on the Z 9, alongside 2 in 12 overlapped on the
-    Z6III; (b) a plausible but **unproven** link is "first SDK open after the body was attached or
-    woken": its state differed too. Consequence: the watchdog / killable-child design in §3 is
-    required even with a perfect cross-process lock, and the lock alone must not be presented as
-    the fix. Worth a targeted test: replug or power-cycle, then capture several times.
-  - Not yet done: Z 9 B, two bodies attached together, and any Z 9 write.
-- **FIXED 2026-10-27 (uncommitted, `src/transplant.rs` + `src/main.rs`); was a BLOCKER. See the
-  "Fix" paragraph at the end of this bullet.** Found with a Z 9 A snapshot -> Z6III `transplant --dry-run` (read-only; nothing
-  was written to either body): `transplant`'s enum-by-label path matches single characters, not
-  labels, and would write the wrong value for 8 of the 17 label-matched properties.**
-  - Cause: packed-string enums (`elem_type` 7) come back from the SDK as one NUL-delimited byte
-    buffer with `elem_bytes=1` and `elem_count` = total bytes (e.g. 178), but
-    `sdk::decode_enum_values` (the `(7, bytes)` branch) assumes `elem_bytes` is a per-string stride
-    and emits **one array element per byte** (`["J","P","E","G"," ","B","a",...,"" ,...]`, `""` being
-    each NUL). `value_index` is an index into the *strings* (Z9 and Z6III `MovieSensitivity` both
-    read `'100'` at indices 2 and 0), so `values[value_index]` is an arbitrary single character, and
-    `translate_enum` then does `tgt_values.iter().position(|v| v == src_label)`, i.e. "first
-    occurrence of that character in the target's byte list". Unit tests missed it because they
-    use synthetic whole-string arrays.
-  - Measured on this pair: correct string-level outcome is 14 no-change, 2 change
-    (`BracketingVary` 'AE & Flash' -> 'AE Only'; `MovieISOAutoHiLimit` '51200' -> '25600'),
-    1 skip (`Sensitivity` '64' does not exist on the Z6III). The current code writes a wrong index
-    for 8: `CompressionLevel` idx 48 (only 13 real strings, so **out of range**), `ISOAutoHiLimit`
-    idx 12 ('3200', should stay '25600'), `MovieSensitivity` idx 3 ('200', should stay '100'),
-    `FlashISOAutoHighLimit`, `ISOAutoShutterTime`, `MovieWBMode`, `MovieISOAutoHiLimit`,
-    `Sensitivity` (writes where it should skip). The dry run printed all of them as
-    "would write ... via enum-by-label" with no hint.
-  - Not affected: `restore`/same-model round trips (they copy `value_index` unchanged, which is
-    why the earlier restore test passed), `diff`, `check`. Snapshots still contain the full byte
-    list, so the strings are recoverable (modulo `from_utf8_lossy` on non-ASCII bytes).
-  - **Fix (option b, no snapshot format change):** `translate_enum` now rebuilds the option strings
-    from the stored byte list (`packed_string_options`: `elem_bytes==1` -> join runs between `""`
-    elements, a final unterminated run counts; `elem_bytes>1` -> elements are already strings;
-    anything else is rejected rather than guessed) and matches whole strings. Two real-data cases
-    forced extra rules: **duplicate labels** (`ISOControlSensitivity` lists most ISO values twice) are
-    skipped as a new `SkipReason::AmbiguousLabel` if the label repeats on either side, instead of
-    silently taking the first; and the SDK's **`"Resource String not found"` placeholder** (every
-    `EVInterval` option on the Z6III) is never a label: as a source it is `EnumUndecodedBySdk`, as a
-    target it simply never matches. Dry runs now print the resolved option, e.g.
-    `via enum-by-label: "25600" (#21), unchanged` / `"AE Only" (#1), was "AE & Flash" (#0)`, and the
-    summary counts `skipped(ambiguous-label)`. `TransplantOutcome` gained `choice:
-    Option<ResolvedChoice>` (typed, for the MCP). Tests: a fixture of the real Z 9 and Z6III arrays
-    (`tests/fixtures/packed_string_enums_z9_z6iii.json`, 19 properties) with hard-coded expected
-    indices for all 17 label properties, plus boundary/ambiguity/malformed cases; 8 mutants of the
-    new logic were tried and the one real gap (source-only duplicates) was closed (the other, in
-    `resolve_choice`, is equivalent). **Re-run on the same hardware pair: 16 label enums resolve to
-    the right option (14 unchanged, 2 real changes: `BracketingVary`, `MovieISOAutoHiLimit`),
-    `Sensitivity` is now a skip, and the previously wrong writes are gone.**
-  - **Still open before a real transplant or any MCP write tool:** the state-property denylist and
-    raw-value opt-in described in the next bullet. Original options, kept for the record: (a) fix the decode to split on NUL and emit one string per element
-    (changes the snapshot format for these enums; old snapshots need a normalising load or old/new
-    diffs go noisy); (b) keep the stored format and rebuild strings from the byte list inside
-    `translate_enum` (no format change, smaller). Either way add a real-capture fixture test (the
-    Z 9 / Z6III arrays above), assert the target index equals the string's position, and make the
-    plan/dry-run print the resolved string labels and target index so a human can see them.
-- **Denylist and raw-code opt-in IMPLEMENTED 2026-10-27 (uncommitted, `src/transplant.rs`,
-  `src/main.rs`); hardware re-run pending (no camera was on the bus when this was finished).**
-  - `NEVER_TRANSPLANT` (one table of code, name, reason; 9 entries) is checked first in `precheck`,
-    so these never reach a live read or a write and cannot be overridden: `LockCamera`,
-    `LiveViewStatus`, `CurrentItemID` (the last two already failed -125 on a real restore),
-    `ExternalFlashStatus`, `RawJpegTransferStatus`, `ChangeMonitorOffStatus`,
-    `LiveViewPhotoShootingMode`, `ShootingMode`, `Viewmode`. The last four are **judgement calls by
-    name**, not evidence from the SDK config (which does not classify state vs setting), so review
-    them; a real-config test checks every (code, name) pair against the Z-series sections.
-  - Raw-code enum matches are skipped as `SkipReason::RawCodeUnconfirmed` **when they would change
-    the target**, unless named with `--allow-raw-code <property>` (repeatable, short or full name,
-    validated against the snapshot before the camera is opened: unknown or non-raw-code names are
-    errors, so a typo cannot masquerade as a safe run). A raw-code match that resolves to the
-    option the target already has passes without opt-in (it is a no-op). Dry runs list each
-    gated property with what it would set. `TransplantOptions`/`plan_property` keep this
-    device-free and unit-tested (12 mutants of the new logic killed; a CLI test covers the flag
-    wiring without hardware).
-  - **MEASURED 2026-10-27 on the real Z6III after commit `dff83cd`: the prediction below held
-    exactly** (`written=90 literal=17 enum-by-label=16 enum-by-raw-value=36 range-clamped=21`,
-    `never-copied=9`, `raw-code-unconfirmed=7`, the same seven names, errors 0), and the
-    `--allow-raw-code` dry run moved a named property from the gated list into the write list
-    while leaving the others gated; the Z6III's settings were unchanged by the dry runs (before/after
-    snapshot diff empty). Original prediction, for the record: written 90,
-    never-copied 9, raw-code-unconfirmed 7 (`AEBracketingStep`, `AEBracketingType`,
-    `AFSubjectDetection`, `ImageColorSpace`, `MeteringMode`, `MovieFileType`, `MovieScreenSize`);
-    36 raw-code enums already match and pass untouched. **Compare against the real output once a
-    Z6III is attached.**
-  - **Still open:** numeric *literal* scalars are copied as-is (`WBAutoType` 3 -> 2,
-    `MovieWBAutoType`, `MovieRecMicrophone` 0 -> 5, `ElectronicVR`, `MovieWindNoiseReduction`),
-    but an integer is no more self-describing than a raw code, so they carry the same unverified
-    meaning risk and arguably want the same gate (needs a live read of the target to tell a no-op
-    from a change). Also unverified: whether `ShootingMode`-style exclusions are the right set,
-    and a real transplant has still never been applied to hardware.
-- **FIRST CROSS-MODEL WRITE, 2026-10-27 (Z 9 A source -> Z6III fw 2.00), done and undone.** Source
-  was the Z 9 baseline cut down to one property (`BracketingVary`); restore point
-  `snapshots/Z6_3_..._pre-transplant-2026-10-27_*.json` taken first (`ok=200 err=12`, the model
-  baseline). Dry run: `"AE Only" (#1), was "AE & Flash" (#0)`. Real run: `written=1 errors=0`.
-  A fresh snapshot differed from the restore point in exactly that one property
-  (`value_index` 0 -> 1). Undo by **full `restore` of the restore point**: `written=115`, 2 errors
-  (`CurrentItemID`, `LiveViewStatus`, -125, the same two as before), exit 0, and the next snapshot
-  was **identical to the restore point ("no differences")**. So the plan -> apply -> verify ->
-  restore-point-undo loop works end to end for an enum-by-label change on real hardware.
-  Observations that change the plan:
-  - **The process hung in teardown AFTER a successful write** (`Transplant complete: written=1`
-    printed, then spun until the 90 s watchdog killed it; exit 142). First time on the Z6III
-    without a concurrent process, and the first after a write. The write had landed, so **a
-    non-zero exit/timeout must never be read as "the write failed"**: the MCP apply result has to
-    come from structured output and a read-back/diff, not the process exit status. The camera was
-    healthy afterwards. This also strengthens the killable-child-process design (§3).
-  - **`ShootNoCard` flipped false -> true across a power cycle** (not caused by anything run
-    here; the snapshot after the earlier dry runs was clean). It may be a card-slot-derived or
-    otherwise state-like property; it was in the transplant would-write list as a literal. Worth
-    a look for the denylist.
-  - **`restore` had the same state-property problem as transplant** (it attempted `CurrentItemID`
-    and `LiveViewStatus` and reported 2 errors on every full restore). **FIXED 2026-10-27
-    (uncommitted, `src/main.rs`):** `restore` now reads the same `NEVER_TRANSPLANT` table through a
-    device-free `restore_precheck` (policy skip first, then absent, then read-only) and reports
-    `skipped(never-copied)`. Measured on the Z6III with the restore point: dry run `written=110
-    never-copied=9 errors=0`; real restore `written=108 read-only=81 unsupported-type=2
-    never-copied=9 errors=0` (was `written=115 ... errors=2`), and the camera afterwards was
-    identical to the restore point. 5 mutants of the precheck were killed; the loop's `continue` is
-    only covered by that hardware run (it needs a Device). Consequence to note: the four
-    judgement-call entries (`ChangeMonitorOffStatus`, `LiveViewPhotoShootingMode`, `ShootingMode`,
-    `Viewmode`) and `LockCamera` are now also not restored, which is the intended behaviour for an
-    undo but is a change for a backup/firmware-rollback restore, so review that list with both
-    uses in mind. `errors == 0` is now a meaningful success signal for a restore point.
-- **Other transplant risks seen in the same dry run (original findings, now addressed above except as noted):**
-  107 properties would be written; 90 already match the Z6III. Among them are **runtime/state
-  capabilities that should never be copied**: `LockCamera`, `LiveViewStatus`, `CurrentItemID`,
-  `ExternalFlashStatus`, `RawJpegTransferStatus`, `ChangeMonitorOffStatus`, `ShootingMode`,
-  `Viewmode`, `LiveViewPhotoShootingMode`, `CCDDataMode` (the first two already errored -125 on a
-  Z6III restore). 46 are matched by **raw numeric code**, which is only meaningful if both bodies
-  number the same options identically (`PictureControl`, `MeteringMode`, `ShootingMode`,
-  `AFSubjectDetection`, `MovieFileType`, `ImageColorSpace`, ...); e.g. Z6III `ShootingMode` 0 ->
-  Z9 2 and `MeteringMode` 1 -> 0 would change the camera on an unverified assumption. Add a
-  never-copy denylist for state props and require explicit user opt-in per raw-value property.
-  Skips were: 3 `no_matching_option` (`EVInterval`, `LockExposureEx`, `SensitivityInterval`),
-  1 unreadable on target (`FlashSyncTime`, -106), 2 `unsupported value shape`
-  (`WBPresetName`, `MovieWBPresetName`), 76 read-only, 7 absent.
-- **Two bodies attached together (Z6III 3014527 + Z 9 A 3023668), read-only, 2026-10-27.**
-  - **Enumeration and selection behave correctly on real hardware.** `discover` lists both
-    (Z6_3 id 1, Z 9 id 2, correct serials/firmware; the same-model serial-pairing ambiguity
-    does not arise with different models). `transplant --dry-run` with no `--serial` **refuses**
-    ("2 Nikon cameras are available; pass --serial ...", `transplant_target_ambiguous` on real
-    devices, not only in the unit test); with `--serial` it targets the right body. `restore`
-    picks the target from the snapshot's serial (Z 9 snapshot -> Z 9, restore point -> Z6III).
-    **`snapshot` with no `--serial` silently picked the first available body (the Z6III)**, as
-    documented; the MCP's `capture_snapshot` must refuse instead (already in §4), since an agent
-    would not notice which body it got.
-  - **`discover --json` still has no `available`/`connected_pid`**; whether `available` flips
-    while another process holds a body is not observable from the CLI output and remains
-    unverified (Phase 0 work).
-  - **Concurrent captures of different bodies: 8 simultaneous pairs (16 processes), no hangs,
-    every capture complete (Z6III `ok=200 err=12`, Z 9 `ok=196 err=11`), camera enumeration
-    intact after each pair.** The Z 9 process started +0 (x2), 0.3, 0.6, 1.0, 1.5, 2.0 and
-    2.5 s after the Z6III one (my first loop script had an off-by-one in the offset array under
-    zsh; those are the offsets that actually ran). Pairs took 4-7 s against 4-5 s solo. **Do not
-    over-read this:** the Z6III-holding processes were exposed to a second SDK open exactly as
-    in the earlier hang test, and with the earlier ~17% rate a clean run of 8 such processes has
-    roughly a 1-in-4 chance by luck, so it does not show that different-body concurrency is
-    safe. It is compatible with "the hazard is a second process touching the *same* body", and
-    it shows that two bodies can be read at once without partial captures. A per-camera lock
-    is therefore plausible but unproven; a global lock plus the watchdog remains the
-    conservative design.
-- Dependency on the firmware session's `firmware latest` library shape for `firmware_status`
-  (the `--json` contract exists in `main.rs`; confirm it is committed and lifted into the library).
+  `--enable-writes` gate does not rely on the client honouring them.
+- The SDK worker behaves as assumed inside a **child process / dedicated thread**: `Sdk`/`Device`
+  are not known to be `Send`, the CLI has only ever run them on its main thread, and the
+  CFBundle/IOKit notification that `initialize()`'s USB reset exists to trigger, plus the
+  `CFRunLoopRunInMode` pump between `EnumDevices` retries, are per-thread.
+- What `available` / `connected_pid` mean while another process holds a body, and whether they
+  can be read without opening the SDK.
+- The teardown hang's rate and trigger; in particular whether it follows "first open after the body
+  was attached or woken" (replug or power-cycle, then capture several times).
+- Whether a **per-camera** lock is enough (F12 is inconclusive).
+- A reset-initialised open while another process is mid-*write* (not attempted).
+- Restore and transplant fidelity beyond one enum property; restore after a power cycle; range,
+  string and boolean property round trips.
+- The Z 9 B, and same-model pairs (`warn_if_ambiguous_pairing` says serial pairing there is by
+  enumeration order).
+- Whether the judgement-call entries in the never-copy table are the right set, and whether
+  `ShootNoCard` (flipped across a power cycle) belongs in it.
 
-## 9. Out of scope
+### 8.3 Known defects and gaps accepted for now
+
+- The CLI `snapshot` still accepts a *partial* capture (e.g. `ok=18 err=194`) with exit 0 (F2).
+- Numeric **literal** scalars (`WBAutoType`, `MovieRecMicrophone`, `ElectronicVR`, ...) are copied
+  as-is, with the same unverified-meaning risk as raw codes and no gate (F9).
+- `restore --dry-run` reports counts that real runs can miss (F4).
+
+## 9. Decisions left open for the reviewer
+
+1. **Digest vs token (§5.4):** accept that the digest is only a staleness guard and rely on
+   `--enable-writes` plus client approval, or add a server-side single-use plan token.
+2. **Lock granularity (§3):** one global lock, or per-camera. Evidence is inconclusive (F12).
+3. **Never-copy table membership (§5.2):** which of the judgement calls stay, whether `ShootNoCard`
+   joins, and whether `restore` for backup/firmware-rollback should use a smaller table than the
+   undo case.
+4. **Numeric literals (§8.3):** gate them like raw codes (needs a live read to tell a no-op from a
+   change), or accept the risk.
+5. **Per-model capture baselines (§5.5):** where they are stored, how they are created and
+   refreshed (per model, per firmware?), and what a new model with no baseline does.
+6. **GUI migration onto `ops::list` (§2):** do it in Phase 0 or leave the GUI's copies and test
+   parity (§7).
+7. **Source model equals target model:** return the CLI's "use `restore`" note, or just proceed.
+
+## 10. Out of scope
 
 Any dependence of the CLI/GUI on this crate; remote/HTTP transport; Windows camera access;
 automating the firmware licence; FTP profile writes; firmware flashing.
