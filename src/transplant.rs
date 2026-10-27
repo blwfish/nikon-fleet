@@ -63,7 +63,8 @@ use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
 use crate::maid_layer::MaidLayerConfig;
-use crate::sdk::{CapabilityInfo, Device, OP_GET, OP_SET, SdkError};
+use crate::ops::port::CameraPort;
+use crate::sdk::{CapabilityInfo, OP_GET, OP_SET, SdkError};
 use crate::snapshot::PropertyEntry;
 
 const PACKED_STRING_ELEM_TYPE: u64 = 7;
@@ -973,14 +974,14 @@ pub fn resolve_choice(translated: &Value, live: &Value, strategy: Strategy) -> O
 /// `fleet restore --dry-run`, which never touches the target beyond its
 /// capability list, but that's the only way to report a real
 /// `NoMatchingOption` skip before committing to anything.
-pub fn transplant(
-    device: &Device,
+pub fn transplant<P: CameraPort + ?Sized>(
+    device: &P,
     properties: &BTreeMap<String, PropertyEntry>,
     guard: &CodeNameGuard,
     options: &TransplantOptions,
     dry_run: bool,
 ) -> Vec<TransplantOutcome> {
-    let cap_map: HashMap<u32, &CapabilityInfo> = device.capabilities.iter().map(|c| (c.id, c)).collect();
+    let cap_map: HashMap<u32, &CapabilityInfo> = device.capabilities().iter().map(|c| (c.id, c)).collect();
 
     properties
         .iter()
@@ -1032,8 +1033,8 @@ fn plan_property(
     Ok((translated, strategy, choice))
 }
 
-fn transplant_one(
-    device: &Device,
+fn transplant_one<P: CameraPort + ?Sized>(
+    device: &P,
     cap_map: &HashMap<u32, &CapabilityInfo>,
     guard: &CodeNameGuard,
     prop: &PropertyEntry,
@@ -1078,7 +1079,7 @@ fn transplant_one(
 /// camera reports back something meaningfully different from what was
 /// intended, that's surfaced as a write failure instead of a silent,
 /// possibly-wrong success.
-fn verify_range_write(device: &Device, code: u32, translated: &Value) -> Result<(), SkipReason> {
+fn verify_range_write<P: CameraPort + ?Sized>(device: &P, code: u32, translated: &Value) -> Result<(), SkipReason> {
     let intended = translated.get("value").and_then(Value::as_f64);
     let Some(intended) = intended else { return Ok(()) }; // translate_range always sets this; defensive only
     let readback = device.read_capability(code).map_err(|e| {
@@ -2644,5 +2645,165 @@ mod tests {
             }
         }
         assert_eq!(multi_name_codes.into_iter().collect::<Vec<_>>(), vec![33211]);
+    }
+    // ── transplant() end to end on an in-memory body ─────────────────────
+
+    use crate::ops::port::{FakeCamera, Failure};
+
+    /// Source and target share names at the codes used below, so the name guard passes.
+    fn guard_for(codes: &[(&str, u32)]) -> CodeNameGuard {
+        let c = parse_config(&[("Z 9", codes), ("Z 8", codes)]);
+        CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap()
+    }
+
+    fn props_of(entries: &[(&str, u32, Value)]) -> BTreeMap<String, PropertyEntry> {
+        entries
+            .iter()
+            .map(|(n, c, v)| (format!("kNkMAIDCapability_{n}"), PropertyEntry { code: *c, value: v.clone() }))
+            .collect()
+    }
+
+    fn run(cam: &FakeCamera, entries: &[(&str, u32, Value)], opt_in: &[&str], dry: bool) -> Vec<TransplantOutcome> {
+        let codes: Vec<(&str, u32)> = entries.iter().map(|(n, c, _)| (*n, *c)).collect();
+        let options = TransplantOptions {
+            allow_raw_code: opt_in.iter().map(|n| format!("kNkMAIDCapability_{n}")).collect(),
+        };
+        transplant(cam, &props_of(entries), &guard_for(&codes), &options, dry)
+    }
+
+    fn tag(o: &TransplantOutcome) -> &'static str {
+        match &o.result {
+            Ok(_) => "copied",
+            Err(r) => r.tag(),
+        }
+    }
+
+    const RW: u32 = OP_GET | OP_SET;
+
+    #[test]
+    fn a_changing_numeric_literal_is_read_then_blocked_and_nothing_is_written() {
+        let cam = FakeCamera::new().with(100, RW, json!(3));
+        let out = run(&cam, &[("WBAutoType", 100, json!(5))], &[], false);
+        assert_eq!(tag(&out[0]), "literal_unconfirmed");
+        assert_eq!(cam.reads(), [100], "the target's current value is read to tell a no-op from a change");
+        assert!(cam.writes().is_empty());
+        assert!(matches!(&out[0].result, Err(SkipReason::LiteralUnconfirmed { proposed }) if proposed == "5, was 3"));
+    }
+
+    #[test]
+    fn an_opted_in_numeric_literal_is_written() {
+        let cam = FakeCamera::new().with(100, RW, json!(3));
+        let out = run(&cam, &[("WBAutoType", 100, json!(5))], &["WBAutoType"], false);
+        assert_eq!(out[0].result, Ok(Strategy::Literal));
+        assert_eq!(cam.writes(), [(100, json!(5))]);
+        assert_eq!(cam.value(100), Some(json!(5)));
+    }
+
+    #[test]
+    fn a_numeric_literal_equal_to_the_targets_passes_without_opt_in() {
+        let cam = FakeCamera::new().with(100, RW, json!(5));
+        let out = run(&cam, &[("WBAutoType", 100, json!(5))], &[], false);
+        assert_eq!(out[0].result, Ok(Strategy::Literal));
+    }
+
+    #[test]
+    fn a_numeric_literal_on_a_capability_that_cannot_be_read_is_not_read_and_counts_as_a_change() {
+        let cam = FakeCamera::new().with(100, OP_SET, json!(3)); // no OP_GET
+        let blocked = run(&cam, &[("W", 100, json!(5))], &[], false);
+        assert_eq!(tag(&blocked[0]), "literal_unconfirmed");
+        assert!(cam.reads().is_empty(), "no get bit: no read attempted");
+        let allowed = run(&cam, &[("W", 100, json!(5))], &["W"], false);
+        assert_eq!(allowed[0].result, Ok(Strategy::Literal));
+        assert_eq!(cam.writes(), [(100, json!(5))]);
+    }
+
+    #[test]
+    fn a_failed_read_of_a_numeric_literal_is_unknown_not_a_skip_for_an_opted_in_property() {
+        let cam = FakeCamera::new().with(100, RW, json!(3)).failing_read(100, Failure::Call(-106));
+        let blocked = run(&cam, &[("W", 100, json!(5))], &[], false);
+        assert!(matches!(&blocked[0].result, Err(SkipReason::LiteralUnconfirmed { proposed }) if proposed.contains("unknown")));
+        let allowed = run(&cam, &[("W", 100, json!(5))], &["W"], false);
+        assert_eq!(allowed[0].result, Ok(Strategy::Literal), "opted in: the write still goes ahead");
+    }
+
+    #[test]
+    fn strings_and_booleans_are_written_without_any_read() {
+        let cam = FakeCamera::new().with(1, RW, json!("old")).with(2, RW, json!(false));
+        let out = run(&cam, &[("Copyright", 1, json!("me")), ("Flag", 2, json!(true))], &[], false);
+        assert!(out.iter().all(|o| o.result == Ok(Strategy::Literal)));
+        assert!(cam.reads().is_empty());
+        assert_eq!(cam.writes().len(), 2);
+    }
+
+    #[test]
+    fn never_copied_absent_and_read_only_properties_touch_the_camera_not_at_all() {
+        let never = NEVER_TRANSPLANT[0].0;
+        let cam = FakeCamera::new().with(never, RW, json!(0)).with(200, OP_GET, json!(1));
+        let out = run(
+            &cam,
+            &[("Lock", never, json!(1)), ("RO", 200, json!(2)), ("Absent", 300, json!(3))],
+            &[],
+            false,
+        );
+        let tags: Vec<_> = out.iter().map(tag).collect();
+        // Outcomes are in property-name order: Absent, Lock, RO.
+        assert_eq!(tags, ["absent_on_target", "never_copied", "read_only"]);
+        assert!(cam.reads().is_empty() && cam.writes().is_empty());
+    }
+
+    #[test]
+    fn a_dry_run_reads_but_never_writes() {
+        let cam = FakeCamera::new().with(100, RW, json!(3)).with(101, RW, json!("s"));
+        let out = run(&cam, &[("N", 100, json!(5)), ("S", 101, json!("t"))], &["N"], true);
+        assert!(out.iter().all(|o| o.result.is_ok()));
+        assert_eq!(cam.reads(), [100]);
+        assert!(cam.writes().is_empty());
+        assert_eq!(cam.value(100), Some(json!(3)));
+    }
+
+    #[test]
+    fn write_failures_are_reported_per_property_and_do_not_stop_the_rest() {
+        let cam = FakeCamera::new()
+            .with(1, RW, json!("a"))
+            .with(2, RW, json!("b"))
+            .with(3, RW, json!("c"))
+            .failing_write(1, Failure::Call(-125))
+            .failing_write(2, Failure::UnsupportedWrite);
+        let out = run(&cam, &[("A", 1, json!("x")), ("B", 2, json!("y")), ("C", 3, json!("z"))], &[], false);
+        assert_eq!(out.iter().map(tag).collect::<Vec<_>>(), ["write_failed", "unsupported_write_type", "copied"]);
+        assert_eq!(cam.writes(), [(3, json!("z"))]);
+        assert!(matches!(&out[0].result, Err(SkipReason::WriteFailed(m)) if m.contains("-125")));
+    }
+
+    #[test]
+    fn a_range_write_is_read_back_and_a_mismatch_is_a_write_failure() {
+        let range = |v: f64, idx: u64| json!({"value": v, "default": 0.0, "value_index": idx, "default_index": 0, "lower": 0.0, "upper": 2.0, "steps": 3});
+        // Honest body: the written value reads back.
+        let good = FakeCamera::new().with(10, RW, range(0.0, 0));
+        let out = run(&good, &[("R", 10, range(2.0, 2))], &[], false);
+        assert_eq!(out[0].result, Ok(Strategy::RangeClamped));
+        assert_eq!(good.reads(), [10, 10], "one read for translation, one to verify the write");
+        // A body that lands somewhere else after the write (a dependent override of the same code).
+        let bad = FakeCamera::new().with(10, RW, range(0.0, 0)).with_dependent(10, 10, range(0.0, 0));
+        let out = run(&bad, &[("R", 10, range(2.0, 2))], &[], false);
+        assert!(matches!(&out[0].result, Err(SkipReason::WriteFailed(m)) if m.contains("reports")), "{:?}", out[0].result);
+    }
+
+    #[test]
+    fn a_raw_code_enum_that_would_change_the_target_is_gated_and_one_that_would_not_is_a_noop() {
+        let en = |idx: u64, vals: &[u64]| json!({"value_index": idx, "default_index": 0, "elem_count": vals.len(), "elem_type": 2, "elem_bytes": 4, "values": vals});
+        let cam = FakeCamera::new().with(10, RW, en(1, &[5, 3])).with(11, RW, en(0, &[5, 3]));
+        // Source wants code 5; the target is on code 3 (index 1 of [5, 3]): a change.
+        let out = run(&cam, &[("Changes", 10, en(1, &[3, 5])), ("Same", 11, en(0, &[5, 3]))], &[], false);
+        assert_eq!(out.iter().map(tag).collect::<Vec<_>>(), ["raw_code_unconfirmed", "copied"]);
+        let allowed = run(&cam, &[("Changes", 10, en(1, &[3, 5]))], &["Changes"], false);
+        assert_eq!(allowed[0].result, Ok(Strategy::EnumByRawValue));
+    }
+
+    #[test]
+    fn there_is_one_outcome_per_property_in_name_order() {
+        let cam = FakeCamera::new().with(1, RW, json!("a")).with(2, RW, json!("b"));
+        let out = run(&cam, &[("Zeta", 1, json!("x")), ("Alpha", 2, json!("y"))], &[], false);
+        assert_eq!(out.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["kNkMAIDCapability_Alpha", "kNkMAIDCapability_Zeta"]);
     }
 }
