@@ -16,3 +16,4 @@ pub mod readback;
 pub mod restore;
 pub mod retention;
 pub mod target;
+pub mod worker;
