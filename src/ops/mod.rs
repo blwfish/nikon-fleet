@@ -5,6 +5,7 @@
 //! rules. Phase 0 moves them here a piece at a time; each piece returns
 //! structured values, never prints, and is covered without hardware.
 
+pub mod apply;
 pub mod baseline;
 pub mod cameras;
 pub mod capture;

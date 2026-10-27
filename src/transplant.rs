@@ -817,7 +817,7 @@ fn raw_code_gate(
 /// Numeric equality that does not depend on the JSON number's spelling: `3`
 /// and `3.0` are the same value, and two integers beyond 2^53 are compared
 /// as integers, not rounded through `f64`.
-fn numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> bool {
+pub(crate) fn numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> bool {
     if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
         return x == y;
     }

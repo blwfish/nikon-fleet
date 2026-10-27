@@ -62,6 +62,9 @@ pub struct FakeCamera {
     caps: Vec<CapabilityInfo>,
     values: RefCell<BTreeMap<u32, Value>>,
     read_failures: BTreeMap<u32, Failure>,
+    /// Reads of these codes fail once any write has succeeded (a body that stops
+    /// answering after a change).
+    read_failures_after_write: BTreeMap<u32, Failure>,
     write_failures: BTreeMap<u32, Failure>,
     /// code written -> (other code, value it takes) applied after that write succeeds.
     dependents: BTreeMap<u32, Vec<(u32, Value)>>,
@@ -89,6 +92,11 @@ impl FakeCamera {
 
     pub fn failing_read(mut self, id: u32, f: Failure) -> Self {
         self.read_failures.insert(id, f);
+        self
+    }
+
+    pub fn failing_read_after_write(mut self, id: u32, f: Failure) -> Self {
+        self.read_failures_after_write.insert(id, f);
         self
     }
 
@@ -132,6 +140,11 @@ impl CameraPort for FakeCamera {
         self.reads.borrow_mut().push(id);
         if let Some(f) = self.read_failures.get(&id) {
             return Err(f.error("GetCapability", 0));
+        }
+        if !self.writes.borrow().is_empty() {
+            if let Some(f) = self.read_failures_after_write.get(&id) {
+                return Err(f.error("GetCapability", 0));
+            }
         }
         self.values.borrow().get(&id).cloned().ok_or(SdkError::SdkCall { call: "GetCapability", code: -126 })
     }
@@ -220,5 +233,14 @@ mod tests {
         let c = cam().with_dependent(1, 2, json!("nope")).failing_write(1, Failure::Call(-125));
         let _ = c.write_capability(1, 0, &json!(11));
         assert_eq!(c.value(2), Some(json!("x")));
+    }
+
+    #[test]
+    fn a_read_can_start_failing_only_after_a_write_has_happened() {
+        let c = cam().failing_read_after_write(2, Failure::Call(-126));
+        assert!(c.read_capability(2).is_ok(), "before any write");
+        c.write_capability(1, 0, &json!(11)).unwrap();
+        assert!(matches!(c.read_capability(2), Err(SdkError::SdkCall { code: -126, .. })));
+        assert!(c.read_capability(1).is_ok(), "other codes unaffected");
     }
 }
