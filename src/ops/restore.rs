@@ -264,14 +264,18 @@ impl RestoreRun {
     }
 }
 
+/// A range with discrete positions (`steps >= 2`), as opposed to a continuous one.
+fn is_stepped_range(v: &Value) -> bool {
+    v.get("lower").is_some() && v.get("steps").and_then(Value::as_u64).unwrap_or(0) >= 2
+}
+
 /// The struct to hand to the SDK for `stored`. A stepped range's `value` field is
 /// `0.0` in every snapshot (F18), so writing it back as stored would send a
 /// position of `value_index` and a number of 0; which of the two the camera honours
 /// is not known. The number is therefore rewritten to the one the index means, so
 /// the struct is coherent either way. Everything else is written as stored.
 pub(crate) fn coherent_for_write(stored: &Value) -> Value {
-    let stepped = stored.get("lower").is_some() && stored.get("steps").and_then(Value::as_u64).unwrap_or(0) >= 2;
-    if !stepped {
+    if !is_stepped_range(stored) {
         return stored.clone();
     }
     let mut out = stored.clone();
@@ -298,11 +302,20 @@ pub fn execute<P: CameraPort + ?Sized>(
                 Decision::NotSelected => StepOutcome::NotSelected,
                 Decision::Skip(skip) => StepOutcome::Skipped(skip),
                 Decision::Write(_) if dry_run => StepOutcome::WouldWrite,
-                Decision::Write(cap) => match port.write_capability(step.code, cap.kind, &coherent_for_write(&properties[step.name].value)) {
-                    Ok(()) => StepOutcome::Written,
-                    Err(SdkError::UnsupportedWrite(_)) => StepOutcome::UnsupportedWriteType,
-                    Err(e) => StepOutcome::WriteFailed(e.to_string()),
-                },
+                Decision::Write(cap) => {
+                    let value = &properties[step.name].value;
+                    if is_stepped_range(value) {
+                        // A blind write of a stepped range is accepted and ignored by the body (F18);
+                        // the transplant path, which reads the capability first, takes effect. The
+                        // result is not used: the read is what matters.
+                        let _ = port.read_capability(step.code);
+                    }
+                    match port.write_capability(step.code, cap.kind, &coherent_for_write(value)) {
+                        Ok(()) => StepOutcome::Written,
+                        Err(SdkError::UnsupportedWrite(_)) => StepOutcome::UnsupportedWriteType,
+                        Err(e) => StepOutcome::WriteFailed(e.to_string()),
+                    }
+                }
             };
             StepResult { name: step.name.to_string(), code: step.code, outcome }
         })
@@ -733,5 +746,63 @@ mod tests {
         let before = stepped(5);
         let _ = coherent_for_write(&before);
         assert_eq!(before["value"], json!(0.0));
+    }
+    #[test]
+    fn a_stepped_range_is_read_before_it_is_written_but_nothing_else_is() {
+        // F18: a blind write of a stepped range is accepted and ignored by the body; a read first makes it take.
+        let cam = FakeCamera::new().with(1, RW, stepped(100)).with(2, RW, json!("old")).with(3, RW, json!(5));
+        let mut snap = snapshot_of(&[]);
+        snap.insert("A_Range", 1, stepped(612));
+        snap.insert("B_String", 2, json!("new"));
+        snap.insert("C_Number", 3, json!(6));
+        let run = execute(&cam, &snap.properties, None, false);
+        assert_eq!(run.counts().written, 3);
+        assert_eq!(cam.reads(), [1], "only the stepped range is read, and only once");
+        assert_eq!(cam.codes_written(), BTreeSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn the_read_happens_before_the_write_not_after() {
+        // Use a body that refuses reads after the first write: the range read must come first.
+        let cam = FakeCamera::new().with(1, RW, stepped(100)).failing_read_after_write(1, Failure::Call(-126));
+        let mut snap = snapshot_of(&[]);
+        snap.insert("A_Range", 1, stepped(612));
+        let run = execute(&cam, &snap.properties, None, false);
+        assert_eq!(run.counts().written, 1);
+        assert_eq!(cam.events(), [crate::ops::port::Event::Read(1), crate::ops::port::Event::Write(1)]);
+    }
+
+    #[test]
+    fn a_failed_priming_read_does_not_stop_the_write() {
+        let cam = FakeCamera::new().with(1, RW, stepped(100)).failing_read(1, Failure::Call(-106));
+        let mut snap = snapshot_of(&[]);
+        snap.insert("A_Range", 1, stepped(612));
+        let run = execute(&cam, &snap.properties, None, false);
+        assert_eq!(run.counts().written, 1, "the read is a nudge, not a gate");
+    }
+
+    #[test]
+    fn a_dry_run_and_a_skipped_range_read_nothing() {
+        let cam = FakeCamera::new().with(1, RW, stepped(100)).with(2, OP_GET, stepped(100));
+        let mut snap = snapshot_of(&[]);
+        snap.insert("A_Range", 1, stepped(612));
+        snap.insert("B_ReadOnlyRange", 2, stepped(612));
+        let dry = execute(&cam, &snap.properties, None, true);
+        assert!(cam.reads().is_empty() && cam.writes().is_empty(), "dry run touches nothing");
+        assert_eq!(dry.counts().written, 1);
+        // A range not selected by --only is not read either.
+        let only = BTreeSet::from(["B_ReadOnlyRange".to_string()]);
+        let _ = execute(&cam, &snap.properties, Some(&only), false);
+        assert!(cam.reads().is_empty(), "read-only: skipped, so neither read nor written");
+    }
+
+    #[test]
+    fn a_continuous_range_is_written_without_a_priming_read() {
+        let cont = json!({"value": 3.5, "value_index": 0, "lower": 0.0, "upper": 10.0, "steps": 0});
+        let cam = FakeCamera::new().with(1, RW, cont.clone());
+        let mut snap = snapshot_of(&[]);
+        snap.insert("A_Cont", 1, cont);
+        execute(&cam, &snap.properties, None, false);
+        assert!(cam.reads().is_empty());
     }
 }

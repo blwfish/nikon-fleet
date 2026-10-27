@@ -70,6 +70,15 @@ pub struct FakeCamera {
     dependents: BTreeMap<u32, Vec<(u32, Value)>>,
     reads: RefCell<Vec<u32>>,
     writes: RefCell<Vec<(u32, Value)>>,
+    /// Every read attempt and every write attempt, in the order they happened.
+    events: RefCell<Vec<Event>>,
+}
+
+/// One call on a [`FakeCamera`], for tests that care about order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    Read(u32),
+    Write(u32),
 }
 
 impl FakeCamera {
@@ -126,6 +135,11 @@ impl FakeCamera {
         self.reads.borrow().clone()
     }
 
+    /// Reads and writes in the order they were attempted (failed ones included).
+    pub fn events(&self) -> Vec<Event> {
+        self.events.borrow().clone()
+    }
+
     pub fn codes_written(&self) -> BTreeSet<u32> {
         self.writes.borrow().iter().map(|(c, _)| *c).collect()
     }
@@ -138,6 +152,7 @@ impl CameraPort for FakeCamera {
 
     fn read_capability(&self, id: u32) -> Result<Value, SdkError> {
         self.reads.borrow_mut().push(id);
+        self.events.borrow_mut().push(Event::Read(id));
         if let Some(f) = self.read_failures.get(&id) {
             return Err(f.error("GetCapability", 0));
         }
@@ -150,6 +165,7 @@ impl CameraPort for FakeCamera {
     }
 
     fn write_capability(&self, id: u32, kind: u32, value: &Value) -> Result<(), SdkError> {
+        self.events.borrow_mut().push(Event::Write(id));
         if let Some(f) = self.write_failures.get(&id) {
             return Err(f.error("SetCapability", kind));
         }
