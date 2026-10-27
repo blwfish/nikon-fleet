@@ -824,7 +824,8 @@ fn do_snapshot(schema: &MaidLayerConfig, data_dir: &Path, serial: &str, label: &
     let dir = data_dir.join("snapshots");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let filename = snap.suggested_filename();
-    snap.save_to_file(&dir.join(&filename))
+    // create-new: a capture must never replace an existing snapshot.
+    snap.save_new(&dir.join(&filename))
         .map_err(|e| e.to_string())?;
     Ok(Evt::SnapshotDone(filename))
 }

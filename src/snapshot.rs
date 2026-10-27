@@ -122,8 +122,29 @@ impl Snapshot {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
+    /// Write to `path`, replacing whatever is there. Use [`Snapshot::save_new`]
+    /// for captures, which must never overwrite an existing file.
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), SnapshotError> {
         fs::write(path, self.to_pretty_json()?)?;
+        Ok(())
+    }
+
+    /// Write to `path` only if nothing exists there (`O_CREAT | O_EXCL`):
+    /// an existing file, or a symlink at `path` (even a dangling one), fails
+    /// with an `AlreadyExists` I/O error and is left untouched. If the write
+    /// fails after the file was created, the partial file is removed so a
+    /// failed capture does not leave a truncated snapshot behind.
+    pub fn save_new<P: AsRef<Path>>(&self, path: P) -> Result<(), SnapshotError> {
+        use std::io::Write;
+        let json = self.to_pretty_json()?;
+        let path = path.as_ref();
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        if let Err(e) = file.write_all(json.as_bytes()).and_then(|()| file.sync_all()) {
+            drop(file);
+            // Best effort: the write error is what the caller needs to see.
+            let _ = fs::remove_file(path);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -330,5 +351,99 @@ mod tests {
         s.camera.serial = String::new();
         let name = s.suggested_filename();
         assert!(name.starts_with("Z_9_unknown_"), "empty serial must map to 'unknown'");
+    }
+    // ── save_new (create-new) ────────────────────────────────────────────
+
+    fn io_kind(e: SnapshotError) -> std::io::ErrorKind {
+        match e {
+            SnapshotError::Io(e) => e.kind(),
+            other => panic!("expected an I/O error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_new_writes_a_file_that_loads_back_equal() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = d.path().join("s.json");
+        let s = sample_snapshot();
+        s.save_new(&p).unwrap();
+        assert_eq!(Snapshot::load_from_file(&p).unwrap(), s);
+    }
+
+    #[test]
+    fn save_new_refuses_an_existing_file_and_leaves_its_bytes_alone() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = d.path().join("s.json");
+        std::fs::write(&p, "precious").unwrap();
+        let e = sample_snapshot().save_new(&p).unwrap_err();
+        assert_eq!(io_kind(e), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "precious");
+    }
+
+    #[test]
+    fn save_new_refuses_an_existing_empty_file() {
+        // Boundary: zero bytes still counts as "exists".
+        let d = tempfile::TempDir::new().unwrap();
+        let p = d.path().join("s.json");
+        std::fs::write(&p, "").unwrap();
+        let e = sample_snapshot().save_new(&p).unwrap_err();
+        assert_eq!(io_kind(e), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&p).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_new_does_not_follow_a_symlink_to_an_existing_file() {
+        let d = tempfile::TempDir::new().unwrap();
+        let target = d.path().join("target.json");
+        std::fs::write(&target, "precious").unwrap();
+        let link = d.path().join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let e = sample_snapshot().save_new(&link).unwrap_err();
+        assert_eq!(io_kind(e), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "precious");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_new_does_not_create_through_a_dangling_symlink() {
+        let d = tempfile::TempDir::new().unwrap();
+        let target = d.path().join("not-yet.json");
+        let link = d.path().join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let e = sample_snapshot().save_new(&link).unwrap_err();
+        assert_eq!(io_kind(e), std::io::ErrorKind::AlreadyExists);
+        assert!(!target.exists(), "must not create the symlink's target");
+    }
+
+    #[test]
+    fn save_new_with_missing_parent_is_not_found_and_creates_nothing() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = d.path().join("no-such-dir/s.json");
+        let e = sample_snapshot().save_new(&p).unwrap_err();
+        assert_eq!(io_kind(e), std::io::ErrorKind::NotFound);
+        assert!(!d.path().join("no-such-dir").exists());
+    }
+
+    #[test]
+    fn save_new_writes_an_empty_properties_snapshot() {
+        // Whether an empty capture is a failure is the caller's gate, not the
+        // writer's; the writer must not silently skip it.
+        let d = tempfile::TempDir::new().unwrap();
+        let p = d.path().join("empty.json");
+        let mut s = sample_snapshot();
+        s.properties.clear();
+        s.save_new(&p).unwrap();
+        assert!(Snapshot::load_from_file(&p).unwrap().properties.is_empty());
+    }
+
+    #[test]
+    fn save_to_file_still_overwrites() {
+        // Pin the contrast: only captures use save_new.
+        let d = tempfile::TempDir::new().unwrap();
+        let p = d.path().join("s.json");
+        std::fs::write(&p, "old").unwrap();
+        sample_snapshot().save_to_file(&p).unwrap();
+        assert_eq!(Snapshot::load_from_file(&p).unwrap(), sample_snapshot());
     }
 }

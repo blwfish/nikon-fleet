@@ -926,7 +926,9 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     ensure_dir(&dir)?;
     let filename = snap.suggested_filename();
     let path = dir.join(&filename);
-    snap.save_to_file(&path)?;
+    // create-new: a capture must never replace an existing snapshot.
+    snap.save_new(&path)
+        .with_context(|| format!("writing {}", path.display()))?;
     println!("Wrote {}", path.display());
     if snapshot_capture_failed(stats.read_ok) {
         // The file is still written (matches prior behavior), but a
