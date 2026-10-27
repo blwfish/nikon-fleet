@@ -582,7 +582,7 @@ fn names_compatible(code: u32, src: &BTreeSet<String>, tgt: &BTreeSet<String>) -
 // translate_value/translate_enum/translate_range are.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Capabilities `transplant` never copies, by code: they report what the
+/// Capabilities `transplant` and `restore` never write, by code: they report what the
 /// body or its session is doing right now (or lock it), not a setting a person
 /// chose, so "make body B like body A" must not carry them across. A single
 /// table is the source of truth; [`never_copied`] and the real-config test
@@ -592,7 +592,8 @@ fn names_compatible(code: u32, src: &BTreeSet<String>, tgt: &BTreeSet<String>) -
 /// (it does not classify state vs setting): `LiveViewStatus` and
 /// `CurrentItemID` already failed with `SetCapability` -125 on a real Z6III
 /// restore. Judgement calls are marked; add to the table rather than
-/// special-casing elsewhere.
+/// special-casing elsewhere. (`restore` reads the same table via
+/// [`never_copied`], so a full restore stops attempting these too.)
 pub const NEVER_TRANSPLANT: &[(u32, &str, &str)] = &[
     (33089, "kNkMAIDCapability_LockCamera", "camera lock state; copying it could lock or unlock the target"),
     (33342, "kNkMAIDCapability_LiveViewStatus", "whether live view is running; rejected by a real Z6III write (-125)"),

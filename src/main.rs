@@ -1002,6 +1002,39 @@ fn ensure_capabilities_present(count: usize) -> Result<()> {
     Ok(())
 }
 
+/// Why a snapshot property is not written back by `restore`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreSkip {
+    /// On [`transplant::NEVER_TRANSPLANT`]: it reports body/session state (or
+    /// locks it) rather than holding a setting. The same table `transplant`
+    /// uses, so the two commands cannot disagree about what is state. A
+    /// restore point must not generate errors for properties the camera
+    /// refuses to set (`CurrentItemID` and `LiveViewStatus` failed -125 on
+    /// every full restore of a Z6III), or `errors == 0` stops meaning anything.
+    NeverCopied,
+    /// Capability code not present on this camera.
+    Absent,
+    /// Present but `OP_SET` is not allowed.
+    ReadOnly,
+}
+
+/// The device-free checks `restore` applies before writing a property, in
+/// order: the policy skip first (so a state property is reported as such even
+/// on a body that lacks it), then presence, then writability.
+fn restore_precheck<'a>(
+    cap_map: &HashMap<u32, &'a CapabilityInfo>,
+    code: u32,
+) -> std::result::Result<&'a CapabilityInfo, RestoreSkip> {
+    if transplant::never_copied(code).is_some() {
+        return Err(RestoreSkip::NeverCopied);
+    }
+    let cap = *cap_map.get(&code).ok_or(RestoreSkip::Absent)?;
+    if cap.operations & OP_SET == 0 {
+        return Err(RestoreSkip::ReadOnly);
+    }
+    Ok(cap)
+}
+
 /// Whether a restore should be treated as a hard failure: zero writes
 /// succeeded and at least one real error occurred — not a routine skip
 /// (absent/read-only/unsupported-type capabilities are expected and don't
@@ -1894,17 +1927,25 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
     let mut skipped_absent = 0usize;   // cap code not present in this camera
     let mut skipped_read_only = 0usize; // present but OP_SET not allowed
     let mut skipped_type = 0usize;
+    let mut skipped_never = 0usize;     // state/lock properties (transplant::NEVER_TRANSPLANT)
     let mut errors = 0usize;
 
     for (name, prop) in &snap.properties {
-        let Some(cap) = cap_map.get(&prop.code) else {
-            skipped_absent += 1;
-            continue;
+        let cap = match restore_precheck(&cap_map, prop.code) {
+            Ok(cap) => cap,
+            Err(RestoreSkip::NeverCopied) => {
+                skipped_never += 1;
+                continue;
+            }
+            Err(RestoreSkip::Absent) => {
+                skipped_absent += 1;
+                continue;
+            }
+            Err(RestoreSkip::ReadOnly) => {
+                skipped_read_only += 1;
+                continue;
+            }
         };
-        if cap.operations & OP_SET == 0 {
-            skipped_read_only += 1;
-            continue;
-        }
         if args.dry_run {
             println!("  would write  {} [{:#x}]", name, prop.code);
             written += 1;
@@ -1923,7 +1964,7 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, args: &RestoreArgs, no_usb_reset:
     println!(
         "{} written={written}  skipped(absent)={skipped_absent}  \
          skipped(read-only)={skipped_read_only}  \
-         skipped(unsupported-type)={skipped_type}  errors={errors}",
+         skipped(unsupported-type)={skipped_type}  skipped(never-copied)={skipped_never}  errors={errors}",
         if args.dry_run { "Dry run:" } else { "Restore complete:" }
     );
     if !args.dry_run && restore_completely_failed(written, errors) {
@@ -2529,6 +2570,51 @@ mod tests {
         // Boundary: even a single successful read means this isn't a total
         // failure, regardless of how many others failed.
         assert!(!snapshot_capture_failed(1)); // 99 failed reads alongside don't matter
+    }
+
+    // ── restore_precheck (shares transplant::NEVER_TRANSPLANT) ───────────
+
+    fn cap(id: u32, operations: u32) -> CapabilityInfo {
+        CapabilityInfo { id, kind: 0, visibility: 0, operations, description: String::new() }
+    }
+
+    #[test]
+    fn restore_precheck_skips_every_never_transplant_code_even_when_writable() {
+        for (code, name, _) in transplant::NEVER_TRANSPLANT {
+            let c = cap(*code, OP_GET | OP_SET);
+            let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(*code, &c)]);
+            assert_eq!(restore_precheck(&caps, *code), Err(RestoreSkip::NeverCopied), "{name}");
+        }
+    }
+
+    #[test]
+    fn restore_precheck_policy_skip_wins_over_absent_and_read_only() {
+        let code = transplant::NEVER_TRANSPLANT[0].0;
+        // Absent from the camera entirely.
+        let empty: HashMap<u32, &CapabilityInfo> = HashMap::new();
+        assert_eq!(restore_precheck(&empty, code), Err(RestoreSkip::NeverCopied));
+        // Present but not settable.
+        let ro = cap(code, OP_GET);
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(code, &ro)]);
+        assert_eq!(restore_precheck(&caps, code), Err(RestoreSkip::NeverCopied));
+    }
+
+    #[test]
+    fn restore_precheck_ordinary_codes_keep_their_existing_behaviour() {
+        // Neighbours of denylisted codes, a plain writable code, a read-only
+        // one and an absent one: only the denylist changed.
+        let denied: std::collections::BTreeSet<u32> = transplant::NEVER_TRANSPLANT.iter().map(|(c, _, _)| *c).collect();
+        let near: Vec<u32> = denied.iter().flat_map(|c| [c - 1, c + 1]).filter(|c| !denied.contains(c)).collect();
+        assert!(!near.is_empty());
+        for code in near {
+            let rw = cap(code, OP_GET | OP_SET);
+            let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(code, &rw)]);
+            assert_eq!(restore_precheck(&caps, code).unwrap().id, code, "{code} must still be restored");
+        }
+        let ro = cap(7, OP_GET);
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(7, &ro)]);
+        assert_eq!(restore_precheck(&caps, 7), Err(RestoreSkip::ReadOnly));
+        assert_eq!(restore_precheck(&caps, 8), Err(RestoreSkip::Absent));
     }
 
     #[test]
