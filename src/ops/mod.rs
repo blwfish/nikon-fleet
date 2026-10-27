@@ -7,6 +7,7 @@
 
 pub mod baseline;
 pub mod cameras;
+pub mod capture;
 pub mod firmware_latest;
 pub mod list;
 pub mod port;

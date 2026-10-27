@@ -12,7 +12,7 @@ use nikon_fleet::ops::baseline::{GateOutcome, describe_failure, gate as baseline
 use nikon_fleet::ops::list::is_plain_name_component;
 use nikon_fleet::ptp_usb::{self, FtpProfile};
 use nikon_fleet::camera_lock::CameraLock;
-use nikon_fleet::sdk::{DeviceInfo, Sdk, OP_GET, UsbCameraInfo, pair_devices, usb_camera_list};
+use nikon_fleet::sdk::{DeviceInfo, Sdk, UsbCameraInfo, pair_devices, usb_camera_list};
 use nikon_fleet::snapshot::{Camera, Snapshot, SnapshotSummary, Transport};
 use nikon_fleet::vendor_argv::{vendor_read_argv, vendor_write_ftp_argv};
 use serde::{Deserialize, Serialize};
@@ -810,18 +810,10 @@ fn do_snapshot(schema: &MaidLayerConfig, data_dir: &Path, serial: &str, label: &
     let mut snap = Snapshot::new(camera, Transport::Usb, captured_at);
     snap.label = (!label.is_empty()).then(|| label.to_string());
 
-    for cap in &device.capabilities {
-        if cap.operations & OP_GET == 0 {
-            continue;
-        }
-        if let Ok(val) = device.read_capability(cap.id) {
-            let name = name_map
-                .get(&cap.id)
-                .cloned()
-                .unwrap_or_else(|| format!("cap_{:#x}", cap.id));
-            snap.insert(name, cap.id, val);
-        }
-    }
+    // The shared capture (ops::capture): one implementation for the CLI, this GUI
+    // and the MCP. Failed reads are returned in the stats; the baseline gate
+    // below judges completeness, so they need no separate handling here.
+    let _stats = nikon_fleet::ops::capture::capture(&device, &name_map, &mut snap);
 
     // Judge completeness before anything is written. No override here: a
     // body in an unusual state can be captured with the CLI's --allow-partial.

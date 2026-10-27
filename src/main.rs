@@ -29,10 +29,11 @@ use nikon_fleet::firmware_source::{
 };
 use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::ops::cameras::duplicate_models;
+use nikon_fleet::ops::capture::{self as ops_capture, CaptureStats};
 use nikon_fleet::ops::firmware_latest::{LatestReport, ModelSurvey, survey_json};
 use nikon_fleet::ops::list::{EntryState, Listing, list_dir, reference_filename};
 use nikon_fleet::ops::restore;
-use nikon_fleet::sdk::{CapabilityInfo, Device, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list, OP_GET};
+use nikon_fleet::sdk::{CapabilityInfo, Device, DeviceInfo, Sdk, SdkError, UsbCameraInfo, pair_devices, usb_camera_list};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use nikon_fleet::transplant;
 
@@ -835,58 +836,17 @@ fn transplant_target_ambiguous(enriched: &[(DeviceInfo, Option<UsbCameraInfo>)],
     serial.is_none() && enriched.iter().filter(|(d, _)| d.available).count() > 1
 }
 
-/// Read-capability counts from `capture_capabilities`.
-#[derive(Default)]
-struct CaptureStats {
-    read_ok: usize,
-    read_err: usize,
-    skipped_no_get: usize,
-    unknown_schema: usize,
-}
-
-/// Read every OP_GET-capable capability from `device` into `snap`, using
-/// `name_lookup` to resolve symbolic names (falling back to `cap_{:#x}` on
-/// a schema miss). Shared by cmd_snapshot and cmd_check's "live snapshot"
-/// path — cmd_check's own comment used to say "same logic as cmd_snapshot
-/// but in-memory," true only by convention (copy-paste) rather than by
-/// construction, so a fix to one could silently not apply to the other.
+/// Capture through `ops::capture` and show each failed read on stderr, in the
+/// form the CLI has always used. Shared by cmd_snapshot and cmd_check, so a
+/// fix to one cannot silently miss the other.
 fn capture_capabilities(
     device: &Device,
     name_lookup: &HashMap<u32, String>,
     snap: &mut Snapshot,
 ) -> CaptureStats {
-    let mut stats = CaptureStats::default();
-    for cap in &device.capabilities {
-        if cap.operations & OP_GET == 0 {
-            stats.skipped_no_get += 1;
-            continue;
-        }
-        let name = match name_lookup.get(&cap.id) {
-            Some(n) => n.clone(),
-            None => format!("cap_{:#x}", cap.id),
-        };
-        match device.read_capability(cap.id) {
-            Ok(value) => {
-                if !name_lookup.contains_key(&cap.id) {
-                    // Not folded silently into read_ok: a schema miss here
-                    // means the loaded MaidLayer.config is stale relative to
-                    // this camera's firmware, degrading readability with no
-                    // signal unless counted separately (Data-Capture
-                    // Backward-Chaining Rule).
-                    stats.unknown_schema += 1;
-                }
-                snap.insert(name, cap.id, value);
-                stats.read_ok += 1;
-            }
-            Err(e) => {
-                // Previously discarded (cmd_snapshot only counted read_err),
-                // unlike cmd_restore's structurally identical write loop,
-                // which does log each failure — same diagnostic discipline
-                // now on both sides of that read/write pair.
-                eprintln!("  warn: {name} [{:#x}]: {e}", cap.id);
-                stats.read_err += 1;
-            }
-        }
+    let stats = ops_capture::capture(device, name_lookup, snap);
+    for f in &stats.failed {
+        eprintln!("  warn: {} [{:#x}]: {}", f.name, f.code, f.error);
     }
     stats
 }
