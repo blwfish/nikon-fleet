@@ -28,6 +28,7 @@ use nikon_fleet::firmware_source::{
     Release, UreqHttp, assess, camera_relation, fetch_direct,
 };
 use nikon_fleet::maid_layer::MaidLayerConfig;
+use nikon_fleet::ops::cameras::duplicate_models;
 use nikon_fleet::ops::firmware_latest::{LatestReport, ModelSurvey, survey_json};
 use nikon_fleet::ops::list::{EntryState, Listing, list_dir, reference_filename};
 use nikon_fleet::ops::restore;
@@ -501,19 +502,14 @@ fn enrich_devices(devices: Vec<DeviceInfo>) -> Vec<(DeviceInfo, Option<UsbCamera
 /// exactly the condition under which order-based pairing can attach the
 /// wrong serial/firmware to a camera.
 fn warn_if_ambiguous_pairing(enriched: &[(DeviceInfo, Option<UsbCameraInfo>)]) {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for (dev, _) in enriched {
-        *counts.entry(dev.name.as_str()).or_insert(0) += 1;
-    }
-    for (model, count) in counts {
-        if count > 1 {
-            eprintln!(
-                "warning: {count} \"{model}\" bodies connected — serial/firmware assignment \
-                 is based on SDK/USB enumeration order, not a per-unit identifier, and could \
-                 be swapped between them. Verify with `fleet discover` before trusting which \
-                 serial is which."
-            );
-        }
+    // The grouping rule is ops::cameras's, shared with the MCP's refusal.
+    for (model, count) in duplicate_models(enriched.iter().map(|(dev, _)| dev.name.as_str())) {
+        eprintln!(
+            "warning: {count} \"{model}\" bodies connected — serial/firmware assignment \
+             is based on SDK/USB enumeration order, not a per-unit identifier, and could \
+             be swapped between them. Verify with `fleet discover` before trusting which \
+             serial is which."
+        );
     }
 }
 

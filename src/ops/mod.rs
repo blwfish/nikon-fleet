@@ -6,6 +6,7 @@
 //! structured values, never prints, and is covered without hardware.
 
 pub mod baseline;
+pub mod cameras;
 pub mod firmware_latest;
 pub mod list;
 pub mod restore;
