@@ -751,6 +751,16 @@ scratch build with env-var hooks (branch `f3-experiments`, not on master). A run
   *deterministic* hang. Not established: that anything we tried takes the residual rate to zero. The shipped code
   sits at about 7% over 90 snapshots (6 hung), where the pre-fix control was 17 of 56 (30%). The residual hangs may be
   a second cause, or load on this machine at the time (the Z 9 hung on run 1 of its batch, straight after a Z6III batch).
+- **Skip `DisconnectDevice` and `_exit` (read-only experiment, both bodies).** A scratch build (master plus a hook; the
+  patch is not in the repo) left the session open after the snapshot was saved, flushed stdout and stderr and called
+  `_exit`, so neither `DisconnectDevice` nor any exit handler ran. 30 snapshots per body per arm, shuffled with the
+  shipped fix as the control: **skip 0/60 hung** (Z 9 0/30, Z6III 0/30), all exit 0, **1.8 to 3.1 s** per run against
+  3.6 to 4.9 s for the shipped fix (which hung 1/60: Z6III 1/30, Z 9 0/30). All 120 snapshots in the batch were
+  complete (Z 9 196 properties, Z6III 200). **Every run connected normally, 60 consecutive opens after a session that was
+  never closed, with no replug and no USB reset** (`--no-usb-reset`), and `discover` listed both bodies afterwards. So
+  an open session left behind by an exiting process does not wedge either body, matching what killed hung workers
+  already showed (F3, F14). Not tested: a write followed by a skipped disconnect, and a longer idle gap between
+  processes. The cost saved is the fixed 1.5 s the SDK takes to close.
 - **Not yet verified:** the residual-hang cause, a write path (`transplant`/`restore`),
   and the worker process. The supervisor's post-result grace and SIGKILL stay as a backstop regardless; the hang was
   never shown to be impossible, only rare after the pump.
