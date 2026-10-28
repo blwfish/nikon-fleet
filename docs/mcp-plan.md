@@ -818,3 +818,8 @@ automating the firmware licence; FTP profile writes; firmware flashing.
   (null when the gate did not judge the capture), which closes the usability item from F20. The three fields F21 left
   unexplained (`unknown_schema: 5`, `source_label: null`, `changes: null`) are explained in the `unreadable-is-normal`
   and new `reading-a-plan` notes: the five `cap_0x…` names are the same generic device facts on both bodies.
+- **Open: range defaults that differ between bodies (F25, read-only follow-up, 2026-10-28).** `ShootingLimit` (33086,
+  "Continuous Shooting Limit") is a `range_clamped` plan item copied by number, but the Z 9 reports index 0 (default 0)
+  and the Z6III index 200 (default 200); the SDK's `RangeValue.config` says range 1 to 200, default 200. It is the one
+  range of 39 whose default differs. What 0 means is not known, so it has not been written and the strategy is
+  unchanged. Candidate policy, not yet decided: skip a range whose `default_index` differs between source and target.

@@ -827,6 +827,17 @@ property only: `ISOAutoShutterTimeAutoValue` (33584), the same property as F23, 
   is unknown, and the write could not be judged afterwards because a stepped range reports `value: 0.0`. This is a
   candidate defect in the range strategy, not a result: **a range whose defaults differ between source and target may not
   be safe to copy by number.** Unwritten and untested.
+  - **Read-only follow-up (why the defaults differ is not known).** Across the 39 range properties in the two F25 baselines,
+    38 agree on `default_index` (sensible values: 612 of 1225 for the `WBTune*` scales, 0 EV for exposure compensation),
+    and the default is not just the current value echoed back (`MovieRecMicrophoneValue`: Z 9 at 2, default 14), so the
+    default index looks trustworthy for ranges; `ShootingLimit` is the one that differs. The SDK's own files name it:
+    `sdk-runtime/MaidLayer.config` labels it "Continuous Shooting Limit" (frames per burst) and
+    `sdk-runtime/RangeValue.config` gives range 1 to 200, step 1, **default 200** (identical in all five sections, so it
+    does not separate the bodies). The Z6III (index 200) matches that default. The Z 9 reports 0 as value and default,
+    which is outside the config's 1 to 200 and disagrees with its default. Reading: 0 is probably a "no limit / off"
+    position the Z 9 uses as its default; **that is a guess, nothing read says what 0 means or whether the bodies treat it
+    alike.** Copying by number would set the Z6III to 0; harmless if 0 means off, a possible burst blocker if it means zero
+    frames. Settling it needs the two bodies' continuous-shooting-limit menu entries read (no write).
 - **Waiting on the user's naming (the opt-in rule):** the plan holds five `literal_unconfirmed` skips
   (`ElectronicVR`, `MovieRecMicrophone`, `MovieWBAutoType`, `MovieWindNoiseReduction`, `WBAutoType`) and seven
   `raw_code_unconfirmed` skips (`AEBracketingStep`, `AEBracketingType`, `AFSubjectDetection`, `ImageColorSpace`,
