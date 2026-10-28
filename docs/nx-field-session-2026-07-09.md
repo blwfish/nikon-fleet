@@ -322,6 +322,12 @@ no trailing bytes; PTP serial `"00000000000000000000000003021501"` against USB `
 USB serial zero-padded to 32 characters (`differ`, literally). Two bodies of two models now agree on the
 padding.
 
+**Z6III, firmware V2.00 (same day):** the same shape again. 146 operations, 30 events, model `"Z6_3"`,
+device version `"V2.00"`, no trailing bytes; PTP serial `"00000000000000000000000003014527"` against USB
+`"0000003014527"`: zero-padded to 32 characters. Three bodies of three models agree. The PTP `model` string
+is also the SDK's model name on all three (`Z 9`, `Z 5`, `Z6_3`). Still not checked: the second Z 9, and a
+body whose USB descriptor is empty.
+
 ## Open items for next session
 
 - [ ] Still↔video switch side-effect check (both via `fleet check` for MAID-scope, and via a raw PTP/IP
