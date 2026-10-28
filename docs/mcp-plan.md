@@ -647,8 +647,7 @@ To write for the MCP:
 - Whether the USB-only camera list and the SDK's list agree on model and serial for every
   attached body. The model-name mapping question is settled by the survey (identity, §4), and the
   Z 9 case has agreed on every run here; the Z6III spelling `Z6_3` rests on the survey and on
-  `pair_devices` having paired it by equality, and was not re-read this session (the body was not
-  attached).
+  `pair_devices` having paired it by equality, and was re-read live on 2026-10-28 with both bodies attached (F23): the USB and SDK paths agree.
 - **Targeted restore (`only`)** on hardware: verified on the Z 9 for two raw-code enum properties
   (F16); not for a range, literal or string property, not cross-model, and not for a write with
   a side effect.

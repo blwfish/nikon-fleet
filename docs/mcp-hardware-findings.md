@@ -649,6 +649,25 @@ Behaviour changes for CLI users: a real `transplant` or `restore` writes a resto
 any rejected write (before, only when every write failed) or when a written property does not read back. `restore`
 across models, which used to warn and write anyway, is now refused with a pointer to `transplant`.
 
+## F23. Both bodies attached: the Z6III's identity and gate, and the first live cross-model plan (2026-10-28)
+
+The Z6III (serial `0000003014527`, firmware 2.00) was plugged in next to the Z 9. All read-only.
+
+- **The model spelling is settled.** `discover --json` (SDK path) and the worker's `list-cameras` (USB descriptors only)
+  agree on both bodies: `Z6_3` and `Z 9`, same serials and firmware, `known_model: true`, `pairing_ambiguous: false`
+  for both (two bodies of different models do not trigger the refusal), `complete: true`. Until now `Z6_3` rested on
+  the firmware survey; it was last read live before the identity code existed.
+- **The Z6III baseline gate passes live.** A CLI `snapshot --json` of the Z6III read 200 properties and failed 12, gate
+  `passed`: the 200/12 recorded in F5, now confirmed on the shipped baseline file and the current code, not only on the
+  snapshots it was seeded from.
+- **The motivating request, as a plan.** `transplant --dry-run --json` of a fresh Z 9 snapshot onto the Z6III: "7
+  properties would change". Of 200 outcomes: 84 copied (36 by raw value, 21 range-clamped, 16 enum-by-label, 11
+  literal) and 116 skipped: 76 read-only, 10 never-copied, 7 absent on the target, 7 `raw_code_unconfirmed`, 5
+  `literal_unconfirmed`, 4 `no_matching_option`, 2 unsupported value shape, 1 `target_read_failed`. No malformed
+  sources, since the source is a current capture (compare the 67 against the June snapshot in F20). Nothing was written.
+- The read-only `snapshot` hung at teardown after printing its result (killed after 150 s; F3 again), the Z6III this time.
+- **Still not run:** any write to the Z6III, a cross-model apply, an opted-in raw-code enum, a literal.
+
 ## F13. Still unverified
 
 - Whether `available` / `connected_pid` can be obtained, and what they mean while another process
