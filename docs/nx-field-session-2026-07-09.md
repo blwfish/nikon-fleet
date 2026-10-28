@@ -313,8 +313,14 @@ against USB `"0000003023668"` (13 characters). They are the same number: the USB
 characters of the PTP one. The command's `differ` verdict is therefore literal (the strings differ), not a
 disagreement. Anything that wants to use the PTP serial as an identity must normalise it first (the USB
 form is the trailing 13 digits here), and that rule is unverified on other bodies. Still to check: the
-Z 5, Z6III and the second Z 9; and a body whose USB descriptor is empty (a Z 30?), which is the case that
+Z6III and the second Z 9; and a body whose USB descriptor is empty (a Z 30?), which is the case that
 matters.
+
+**Z 5, firmware V1.43 (same day):** the same shape. Vendor extension `0xffffffff`/110
+`"Microsoft.com/DeviceServices: 1.0"`, 89 operations, 27 events, model `"Z 5"`, device version `"V1.43"`,
+no trailing bytes; PTP serial `"00000000000000000000000003021501"` against USB `"0000003021501"`, again the
+USB serial zero-padded to 32 characters (`differ`, literally). Two bodies of two models now agree on the
+padding.
 
 ## Open items for next session
 
