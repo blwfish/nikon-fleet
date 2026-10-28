@@ -853,6 +853,52 @@ mod tests {
         assert_eq!((c.written, c.skipped_read_only, c.skipped_absent, c.skipped_never, c.not_selected, c.errors), (2, 1, 1, 1, 0, 0));
     }
 
+    // ── the camera clock (light-review 1f6c#07): ClockDateTime is not on the never-copy table ──
+
+    const CLOCK: u32 = 33060;
+    /// How a snapshot holds the clock: a Z 9 or Z 5 capture reads `{"_type": "datetime"}`; an early
+    /// Z 5 capture, `{"_unknown_type": 12}`.
+    fn clock_shapes() -> [Value; 2] {
+        [json!({"_type": "datetime"}), json!({"_unknown_type": 12})]
+    }
+
+    #[test]
+    fn no_capability_kind_writes_a_datetime_placeholder() {
+        // The one thing that keeps a snapshot's time off the camera: `prepare_write` builds the data
+        // from the value, and a placeholder object is not a bool, number, string, enum (no
+        // value_index) or range (no value) for any kind, nor is it a kind it writes at all. If a
+        // DateTime kind is ever made writable, this fails and the clock needs a never-copy entry.
+        for shape in clock_shapes() {
+            for kind in (0..=40).chain([u32::MAX]) {
+                assert!(crate::sdk::prepare_write(kind, &shape).is_err(), "kind {kind} would write {shape}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_restore_attempts_the_clock_and_the_write_is_refused_by_kind_never_made() {
+        // A full restore, a restore of another body's snapshot and the undo (`only` = the clock) all
+        // reach the clock as a planned write (it is not on the table) and all end the same way:
+        // `unsupported_write_type`, counted as skipped_type, nothing written, the clock untouched.
+        for shape in clock_shapes() {
+            let only = BTreeSet::from(["kNkMAIDCapability_ClockDateTime".to_string()]);
+            for (only, source) in [(None, Source::SameBody), (None, Source::OtherBody), (Some(&only), Source::SameBody)] {
+                let cam = FakeCamera::new().with(1, RW, json!(0)).with(CLOCK, RW, json!({"_type": "datetime"}));
+                let mut snap = snapshot_of(&[("kNkMAIDCapability_A", 1, 10)]);
+                snap.insert("kNkMAIDCapability_ClockDateTime", CLOCK, shape.clone());
+                let run = execute_from(&cam, &snap.properties, only, false, source);
+                let clock = run.steps.iter().find(|s| s.code == CLOCK).unwrap();
+                assert_eq!(clock.outcome, StepOutcome::UnsupportedWriteType, "{shape} only={only:?} {source:?}");
+                assert_eq!(clock.outcome.tag(), "unsupported_write_type");
+                assert!(!cam.codes_written().contains(&CLOCK), "the clock was written");
+                assert_eq!(cam.value(CLOCK), Some(json!({"_type": "datetime"})), "the clock is untouched");
+                assert_eq!(run.counts().skipped_type, 1);
+                assert_eq!(run.counts().errors, 0, "refused by kind is routine, not an error");
+                assert!(!run.written_names().contains(&clock.name), "never reported as restored");
+            }
+        }
+    }
+
     #[test]
     fn a_targeted_restore_leaves_every_other_value_exactly_as_it_is() {
         let cam = FakeCamera::new().with(1, RW, json!(0)).with(2, RW, json!(0));

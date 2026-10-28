@@ -1278,8 +1278,11 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
 /// Read one vendor-only property via raw USB PTP (`0x943B`), bypassing the
 /// MAID SDK entirely — no --sdk-bundle needed. See `nikon_fleet::ptp_usb`.
 fn cmd_vendor_read(args: &VendorReadArgs) -> Result<()> {
-    let serial = vendor_target_serial(args.serial.as_deref(), usb_camera_list)?;
-    let read = nikon_fleet::ptp_usb::read_vendor_property_report(serial.as_deref(), args.propcode)
+    let read = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
+        .and_then(|(lock, serial)| {
+            nikon_fleet::ptp_usb::read_vendor_property_report_locked(lock, serial.as_deref(), args.propcode)
+                .map_err(anyhow::Error::new)
+        })
         .with_context(|| format!("reading vendor property 0x{:04x} over USB PTP", args.propcode))?;
     let (stdout, warnings) = vendor_read_output(args.propcode, &read);
     for w in warnings {
@@ -1312,6 +1315,20 @@ fn vendor_target_serial(
         _ => Vec::new(),
     };
     raw_usb_serial_arg(serial, &on_bus).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The camera lock and the serial for a raw-USB vendor command, in that order: the lock is taken
+/// first and handed on to the session (`PtpUsbSession::open_locked`), so resolving an `id-N`
+/// (which reads the descriptors of the attached bodies) never touches the bus underneath another
+/// nikon-fleet session. A busy lock is `PtpUsbError::CameraLock`, as it is from `PtpUsbSession::open`.
+fn vendor_locked_target(
+    acquire_lock: impl FnOnce() -> Result<CameraLock, nikon_fleet::camera_lock::LockError>,
+    serial: Option<&str>,
+    attached: impl FnOnce() -> Vec<UsbCameraInfo>,
+) -> Result<(CameraLock, Option<String>)> {
+    let lock = acquire_lock().map_err(nikon_fleet::ptp_usb::PtpUsbError::CameraLock)?;
+    let serial = vendor_target_serial(serial, attached)?;
+    Ok((lock, serial))
 }
 
 /// Strip exactly one trailing `\n` (as `echo`/a shell heredoc would add),
@@ -1368,9 +1385,15 @@ fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
         return Ok(());
     }
 
-    let serial = vendor_target_serial(args.serial.as_deref(), usb_camera_list)?;
-    let receipt = nikon_fleet::ptp_usb::write_ftp_profile(serial.as_deref(), &profile, args.force_unconfirmed_model)
-        .map_err(vendor_write_error)?;
+    let receipt = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
+        .and_then(|(lock, serial)| {
+            nikon_fleet::ptp_usb::write_ftp_profile_locked(lock, serial.as_deref(), &profile, args.force_unconfirmed_model)
+                .map_err(anyhow::Error::new)
+        })
+        .map_err(|e| match e.downcast::<nikon_fleet::ptp_usb::PtpUsbError>() {
+            Ok(e) => vendor_write_error(e),
+            Err(other) => other,
+        })?;
     println!("Wrote FTP profile {:?} ({}@{}:{})", args.profile_name, args.username, args.host, args.port);
     if let Some(note) = ftp_receipt_note(&receipt) {
         eprintln!("{note}");
@@ -3713,6 +3736,54 @@ mod tests {
             let err = vendor_target_serial(Some("id-1"), scan(attached)).unwrap_err().to_string();
             assert!(err.contains("SDK id") && err.contains(&format!("{n} attached")), "{err}");
         }
+    }
+
+    #[test]
+    fn the_camera_lock_is_taken_before_an_id_n_is_resolved_against_the_bus() {
+        use nikon_fleet::camera_lock::LockError;
+        use nikon_fleet::ptp_usb::PtpUsbError;
+        use std::cell::Cell;
+        // Refused lock: the bus scan (which opens devices to read descriptors) never runs, and the
+        // refusal is the same typed `camera_busy` a session open gives.
+        let scanned = Cell::new(false);
+        let busy = || Err(LockError::Busy { path: PathBuf::from("/tmp/camera.lock") });
+        let scan = || {
+            scanned.set(true);
+            vec![usb("")]
+        };
+        let err = vendor_locked_target(busy, Some("id-1"), scan).unwrap_err();
+        assert!(matches!(err.downcast_ref::<PtpUsbError>(), Some(PtpUsbError::CameraLock(LockError::Busy { .. }))), "{err:?}");
+        assert!(!scanned.get(), "the bus was scanned before the lock was taken");
+
+        // Granted lock: it is still held while the bus is scanned, and comes back held.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("camera.lock");
+        let held_during_scan = Cell::new(None);
+        let scan = || {
+            held_during_scan.set(Some(matches!(CameraLock::acquire_at(&path), Err(LockError::Busy { .. }))));
+            vec![usb("")]
+        };
+        let (lock, serial) = vendor_locked_target(|| CameraLock::acquire_at(&path), Some("id-1"), scan).unwrap();
+        assert_eq!(held_during_scan.get(), Some(true), "the lock was not held while the bus was scanned");
+        assert_eq!(serial, None, "the sole serial-less body: the session takes the sole camera");
+        assert!(matches!(CameraLock::acquire_at(&path), Err(LockError::Busy { .. })), "the lock is handed on, still held");
+        drop(lock);
+        assert!(CameraLock::acquire_at(&path).is_ok(), "and released with it");
+    }
+
+    #[test]
+    fn a_refused_id_n_and_a_plain_serial_keep_their_answers_and_release_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("camera.lock");
+        let acquire = || CameraLock::acquire_at(&path);
+        // Refused: the typed refusal is unchanged, and the lock does not outlive the refusal.
+        let err = vendor_locked_target(acquire, Some("id-1"), || vec![usb("AAA")]).unwrap_err().to_string();
+        assert!(err.contains("SDK id") && err.contains("1 attached"), "{err}");
+        assert!(CameraLock::acquire_at(&path).is_ok(), "a refusal must not leave the lock held");
+        // A real serial: passed through, no scan, lock held for the caller.
+        let (lock, serial) = vendor_locked_target(acquire, Some("0000003023668"), || panic!("no scan for a real serial")).unwrap();
+        assert_eq!(serial.as_deref(), Some("0000003023668"));
+        drop(lock);
     }
 
     // ── ref set: the name comes from data, so it is checked ──────────────

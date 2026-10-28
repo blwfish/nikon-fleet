@@ -249,8 +249,14 @@ pub enum PtpUsbError {
     NoDevice,
     #[error("multiple Nikon USB cameras found ({0}); pass a serial to disambiguate")]
     AmbiguousDevice(usize),
-    #[error("no Nikon USB camera with serial {0:?}")]
-    SerialNotFound(String),
+    #[error("{}", serial_not_found_text(.requested, .unreadable))]
+    SerialNotFound {
+        requested: String,
+        /// Attached bodies whose USB serial could not be read, each as `<fallback serial> (<what failed>)`.
+        /// Their real serial is unknown, so the one requested may be among them; empty when every
+        /// attached body was identified.
+        unreadable: Vec<String>,
+    },
     #[error("{count} Nikon USB cameras report serial {requested:?}; refusing to pick one")]
     DuplicateSerial { requested: String, count: usize },
     #[error(
@@ -441,6 +447,21 @@ fn fallback_serial(bus: u8, address: u8) -> String {
     format!("usb-{bus}:{address}")
 }
 
+/// The [`PtpUsbError::SerialNotFound`] text: that no attached body has the serial, and, when some
+/// bodies could not be read, that the serial may be on one of them (their descriptor read failed,
+/// so each stands under its `usb-<bus>:<addr>` fallback and a real serial cannot match it).
+fn serial_not_found_text(requested: &str, unreadable: &[String]) -> String {
+    let base = format!("no Nikon USB camera with serial {requested:?}");
+    if unreadable.is_empty() {
+        return base;
+    }
+    format!(
+        "{base}; {} attached body(ies) could not be read: {}; the serial may be on one of them",
+        unreadable.len(),
+        unreadable.join("; ")
+    )
+}
+
 /// A discovered Nikon USB device, already opened (identifying it needs an
 /// open handle to read its string descriptors) — carried forward so
 /// `PtpUsbSession::open` can reuse this same handle instead of opening the
@@ -453,6 +474,23 @@ struct Candidate {
     /// Descriptor reads that failed while identifying this body (its serial
     /// or model then fell back to the topology serial / `""`).
     warnings: Vec<String>,
+    /// Whether `serial` is the `usb-<bus>:<addr>` fallback because the descriptor gave no serial.
+    serial_from_topology: bool,
+}
+
+impl Candidate {
+    fn unreadable(&self) -> Option<String> {
+        describe_unreadable(&self.serial, self.serial_from_topology, &self.warnings)
+    }
+}
+
+/// A body whose serial stands in for one that could not be read: the descriptor read failed
+/// (`warnings`) and the serial is the topology fallback. A refusal to match a requested serial
+/// must say such a body is there, since its real serial may be the one asked for. A body whose
+/// reads all worked, or one that simply has no serial string, is not unreadable; nor is one that
+/// only failed to read its product string (its serial is the real one).
+fn describe_unreadable(serial: &str, serial_from_topology: bool, warnings: &[String]) -> Option<String> {
+    (serial_from_topology && !warnings.is_empty()).then(|| format!("{serial} ({})", warnings.join(", ")))
 }
 
 /// Everything one pass over the bus found. `skipped` describes each Nikon
@@ -520,7 +558,7 @@ fn candidate_devices() -> Enumeration {
         let (real_serial, product, warnings) = read_identity(&handle, &desc);
         let serial = candidate_serial(&device, &real_serial);
         let model = model_from_product_string(&product);
-        candidates.push(Candidate { device, handle, serial, model, warnings });
+        candidates.push(Candidate { device, handle, serial, model, warnings, serial_from_topology: real_serial.is_empty() });
     }
     Enumeration { candidates, skipped }
 }
@@ -537,17 +575,24 @@ fn candidate_devices() -> Enumeration {
 ///   not "the only camera", it is the only one that could be *looked at*.
 /// - With a serial, a match is used; no match while a body was skipped is
 ///   reported as skipped (the missing one may be the body you named), not as
-///   "no such serial".
+///   "no such serial". No match while a body was seen but its serial could not
+///   be read (`unreadable`) is "no such serial" that says those bodies are
+///   there, with them carried on the error.
 /// - Two candidates with the same serial are an error, never first-wins (the
 ///   same contract as `ops::target::select_by_usb_serial`).
-fn select_candidate<T>(candidates: Vec<(String, T)>, skipped: &[String], serial: Option<&str>) -> Result<T, PtpUsbError> {
+fn select_candidate<T>(
+    candidates: Vec<(String, T)>,
+    skipped: &[String],
+    unreadable: &[String],
+    serial: Option<&str>,
+) -> Result<T, PtpUsbError> {
     let refuse = || PtpUsbError::BodiesSkipped { skipped: skipped.to_vec() };
     match serial {
         Some(s) => {
             let mut hits: Vec<T> = candidates.into_iter().filter(|(ser, _)| ser == s).map(|(_, item)| item).collect();
             match hits.len() {
                 0 if !skipped.is_empty() => Err(refuse()),
-                0 => Err(PtpUsbError::SerialNotFound(s.to_string())),
+                0 => Err(PtpUsbError::SerialNotFound { requested: s.to_string(), unreadable: unreadable.to_vec() }),
                 1 => Ok(hits.remove(0)),
                 count => Err(PtpUsbError::DuplicateSerial { requested: s.to_string(), count }),
             }
@@ -577,8 +622,9 @@ fn find_device(serial: Option<&str>) -> Result<Candidate, PtpUsbError> {
             eprintln!("warning: Nikon USB device {:?}: {w}", c.serial);
         }
     }
+    let unreadable: Vec<String> = candidates.iter().filter_map(Candidate::unreadable).collect();
     let items = candidates.into_iter().map(|c| (c.serial.clone(), c)).collect();
-    select_candidate(items, &skipped, serial)
+    select_candidate(items, &skipped, &unreadable, serial)
 }
 
 /// The PTP (Still Image class) interface number, its bulk IN/OUT endpoint
@@ -1270,6 +1316,13 @@ impl PtpUsbSession {
         Self::open_with(CameraLock::acquire, find_device, serial)
     }
 
+    /// [`Self::open`] for a caller that already holds the [`CameraLock`] (it had to look at the bus
+    /// first, e.g. to resolve an `id-N` serial): the lock is taken over, not taken again, so it
+    /// cannot refuse itself, and is released with the session.
+    pub fn open_locked(lock: CameraLock, serial: Option<&str>) -> Result<Self, PtpUsbError> {
+        Self::open_locked_with(lock, find_device, serial)
+    }
+
     /// [`Self::open`] with the lock and the device lookup injected, so the
     /// order (lock first, bus second) is testable without hardware.
     fn open_with(
@@ -1277,7 +1330,14 @@ impl PtpUsbSession {
         find: impl FnOnce(Option<&str>) -> Result<Candidate, PtpUsbError>,
         serial: Option<&str>,
     ) -> Result<Self, PtpUsbError> {
-        let lock = acquire_lock()?;
+        Self::open_locked_with(acquire_lock()?, find, serial)
+    }
+
+    fn open_locked_with(
+        lock: CameraLock,
+        find: impl FnOnce(Option<&str>) -> Result<Candidate, PtpUsbError>,
+        serial: Option<&str>,
+    ) -> Result<Self, PtpUsbError> {
         let Candidate { device, handle, model, .. } = find(serial)?;
         let endpoints = find_ptp_endpoints(&device)?;
         claim_with_retry(&handle, endpoints.interface)?;
@@ -1738,6 +1798,17 @@ pub fn read_vendor_property_report(serial: Option<&str>, propcode: u16) -> Resul
     session.read_vendor_property_report(propcode)
 }
 
+/// [`read_vendor_property_report`] for a caller already holding the [`CameraLock`]; see
+/// [`PtpUsbSession::open_locked`].
+pub fn read_vendor_property_report_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    propcode: u16,
+) -> Result<VendorRead, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.read_vendor_property_report(propcode)
+}
+
 /// Open a session, write an FTP profile via `0x90EE`, close it. Convenience
 /// wrapper for one-off writes (e.g. the CLI). See
 /// [`PtpUsbSession::write_ftp_profile`] for `force_unconfirmed_model` and
@@ -1748,6 +1819,18 @@ pub fn write_ftp_profile(
     force_unconfirmed_model: bool,
 ) -> Result<FtpWriteReceipt, PtpUsbError> {
     let mut session = PtpUsbSession::open(serial)?;
+    session.write_ftp_profile(profile, force_unconfirmed_model)
+}
+
+/// [`write_ftp_profile`] for a caller already holding the [`CameraLock`]; see
+/// [`PtpUsbSession::open_locked`].
+pub fn write_ftp_profile_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    profile: &FtpProfile,
+    force_unconfirmed_model: bool,
+) -> Result<FtpWriteReceipt, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
     session.write_ftp_profile(profile, force_unconfirmed_model)
 }
 
@@ -2816,31 +2899,31 @@ mod tests {
     #[test]
     fn select_candidate_by_serial_match() {
         let candidates = vec![("AAA".to_string(), 1), ("BBB".to_string(), 2)];
-        assert!(matches!(select_candidate(candidates, &[], Some("BBB")), Ok(2)));
+        assert!(matches!(select_candidate(candidates, &[], &[], Some("BBB")), Ok(2)));
     }
 
     #[test]
     fn select_candidate_by_serial_no_match_errors() {
         let candidates = vec![("AAA".to_string(), 1)];
-        assert!(matches!(select_candidate(candidates, &[], Some("ZZZ")), Err(PtpUsbError::SerialNotFound(_))));
+        assert!(matches!(select_candidate(candidates, &[], &[], Some("ZZZ")), Err(PtpUsbError::SerialNotFound { .. })));
     }
 
     #[test]
     fn select_candidate_no_serial_single_candidate() {
         let candidates = vec![("AAA".to_string(), 1)];
-        assert!(matches!(select_candidate(candidates, &[], None), Ok(1)));
+        assert!(matches!(select_candidate(candidates, &[], &[], None), Ok(1)));
     }
 
     #[test]
     fn select_candidate_no_serial_multiple_candidates_is_ambiguous() {
         let candidates = vec![("AAA".to_string(), 1), ("BBB".to_string(), 2)];
-        assert!(matches!(select_candidate(candidates, &[], None), Err(PtpUsbError::AmbiguousDevice(2))));
+        assert!(matches!(select_candidate(candidates, &[], &[], None), Err(PtpUsbError::AmbiguousDevice(2))));
     }
 
     #[test]
     fn select_candidate_no_candidates_errors() {
         let candidates: Vec<(String, u32)> = vec![];
-        assert!(matches!(select_candidate(candidates, &[], None), Err(PtpUsbError::NoDevice)));
+        assert!(matches!(select_candidate(candidates, &[], &[], None), Err(PtpUsbError::NoDevice)));
     }
 
     #[test]
@@ -2849,7 +2932,7 @@ mod tests {
         // no serial the opened one is not "the only camera"; picking it would
         // let a write go to the wrong body.
         let candidates = vec![("AAA".to_string(), 1)];
-        let err = select_candidate(candidates, &held(1), None).unwrap_err();
+        let err = select_candidate(candidates, &held(1), &[], None).unwrap_err();
         assert!(matches!(&err, PtpUsbError::BodiesSkipped { skipped } if skipped.len() == 1), "{err:?}");
         let text = err.to_string();
         assert!(text.contains("1 Nikon USB device(s) could not be opened"), "{text}");
@@ -2860,14 +2943,14 @@ mod tests {
     #[test]
     fn select_candidate_with_only_skipped_bodies_reports_them_not_no_device() {
         let candidates: Vec<(String, u32)> = vec![];
-        let err = select_candidate(candidates, &held(2), None).unwrap_err();
+        let err = select_candidate(candidates, &held(2), &[], None).unwrap_err();
         assert!(matches!(&err, PtpUsbError::BodiesSkipped { skipped } if skipped.len() == 2), "{err:?}");
     }
 
     #[test]
     fn select_candidate_with_a_serial_uses_the_match_even_when_another_body_was_skipped() {
         let candidates = vec![("AAA".to_string(), 1), ("BBB".to_string(), 2)];
-        assert!(matches!(select_candidate(candidates, &held(1), Some("BBB")), Ok(2)));
+        assert!(matches!(select_candidate(candidates, &held(1), &[], Some("BBB")), Ok(2)));
     }
 
     #[test]
@@ -2875,7 +2958,7 @@ mod tests {
         // The missing serial may well be the held body: "no such serial"
         // would send the user hunting for a typo.
         let candidates = vec![("AAA".to_string(), 1)];
-        let err = select_candidate(candidates, &held(1), Some("ZZZ")).unwrap_err();
+        let err = select_candidate(candidates, &held(1), &[], Some("ZZZ")).unwrap_err();
         assert!(matches!(err, PtpUsbError::BodiesSkipped { .. }), "{err:?}");
     }
 
@@ -2883,32 +2966,104 @@ mod tests {
     fn select_candidate_duplicate_serial_is_an_error_not_first_wins() {
         // Finding #31: mirrors ops::target::select_by_usb_serial's DuplicateSerial.
         let candidates = vec![("AAA".to_string(), 1), ("AAA".to_string(), 2)];
-        let err = select_candidate(candidates, &[], Some("AAA")).unwrap_err();
+        let err = select_candidate(candidates, &[], &[], Some("AAA")).unwrap_err();
         assert!(matches!(&err, PtpUsbError::DuplicateSerial { requested, count: 2 } if requested == "AAA"), "{err:?}");
         assert!(err.to_string().contains("refusing to pick one"));
         let three = vec![("AAA".to_string(), 1), ("BBB".to_string(), 9), ("AAA".to_string(), 2), ("AAA".to_string(), 3)];
-        let err = select_candidate(three, &[], Some("AAA")).unwrap_err();
+        let err = select_candidate(three, &[], &[], Some("AAA")).unwrap_err();
         assert!(matches!(err, PtpUsbError::DuplicateSerial { count: 3, .. }), "{err:?}");
     }
 
     #[test]
     fn select_candidate_a_duplicate_of_another_serial_does_not_block_a_unique_match() {
         let candidates = vec![("AAA".to_string(), 1), ("AAA".to_string(), 2), ("BBB".to_string(), 3)];
-        assert!(matches!(select_candidate(candidates, &[], Some("BBB")), Ok(3)));
+        assert!(matches!(select_candidate(candidates, &[], &[], Some("BBB")), Ok(3)));
     }
 
     #[test]
     fn select_candidate_duplicates_without_a_serial_are_ambiguous() {
         let candidates = vec![("AAA".to_string(), 1), ("AAA".to_string(), 2)];
-        assert!(matches!(select_candidate(candidates, &[], None), Err(PtpUsbError::AmbiguousDevice(2))));
+        assert!(matches!(select_candidate(candidates, &[], &[], None), Err(PtpUsbError::AmbiguousDevice(2))));
     }
 
     #[test]
     fn select_candidate_matches_serials_exactly() {
         let candidates = vec![("AAA".to_string(), 1)];
-        assert!(matches!(select_candidate(candidates, &[], Some("aaa")), Err(PtpUsbError::SerialNotFound(_))));
+        assert!(matches!(select_candidate(candidates, &[], &[], Some("aaa")), Err(PtpUsbError::SerialNotFound { .. })));
         let candidates = vec![("AAA".to_string(), 1)];
-        assert!(matches!(select_candidate(candidates, &[], Some("")), Err(PtpUsbError::SerialNotFound(_))));
+        assert!(matches!(select_candidate(candidates, &[], &[], Some("")), Err(PtpUsbError::SerialNotFound { .. })));
+    }
+
+    // ── a requested serial that matched nothing while a body's serial could not be read ──
+
+    fn unreadable(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("usb-20:{} (reading the USB serial string failed: pipe error)", i + 3)).collect()
+    }
+
+    #[test]
+    fn serial_not_found_with_every_identity_read_says_only_that_no_body_has_it() {
+        let candidates = vec![("AAA".to_string(), 1)];
+        let err = select_candidate(candidates, &[], &[], Some("ZZZ")).unwrap_err();
+        assert!(matches!(&err, PtpUsbError::SerialNotFound { requested, unreadable } if requested == "ZZZ" && unreadable.is_empty()), "{err:?}");
+        assert_eq!(err.to_string(), "no Nikon USB camera with serial \"ZZZ\"");
+    }
+
+    #[test]
+    fn serial_not_found_while_one_identity_fell_back_names_it_as_a_possible_match() {
+        let candidates = vec![("AAA".to_string(), 1), ("usb-20:3".to_string(), 2)];
+        let err = select_candidate(candidates, &[], &unreadable(1), Some("REAL")).unwrap_err();
+        match &err {
+            PtpUsbError::SerialNotFound { requested, unreadable } => {
+                assert_eq!(requested, "REAL");
+                assert_eq!(unreadable.len(), 1, "typed on the variant, not only in the text");
+                assert!(unreadable[0].contains("usb-20:3") && unreadable[0].contains("pipe error"), "{unreadable:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("no Nikon USB camera with serial \"REAL\""), "{text}");
+        assert!(text.contains("1 attached body(ies) could not be read: usb-20:3 (reading the USB serial string failed: pipe error)"), "{text}");
+        assert!(text.ends_with("the serial may be on one of them"), "{text}");
+    }
+
+    #[test]
+    fn serial_not_found_counts_and_lists_every_unreadable_body() {
+        let candidates: Vec<(String, u32)> = vec![];
+        let err = select_candidate(candidates, &[], &unreadable(2), Some("REAL")).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("2 attached body(ies) could not be read: usb-20:3"), "{text}");
+        assert!(text.contains("; usb-20:4 ("), "each body is listed: {text}");
+    }
+
+    #[test]
+    fn serial_not_found_with_no_body_attached_has_no_unreadable_note() {
+        // Nothing attached: nothing to say may be hiding the serial.
+        let candidates: Vec<(String, u32)> = vec![];
+        let err = select_candidate(candidates, &[], &[], Some("REAL")).unwrap_err();
+        assert!(matches!(&err, PtpUsbError::SerialNotFound { unreadable, .. } if unreadable.is_empty()), "{err:?}");
+        assert!(!err.to_string().contains("could not be read"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_body_does_not_change_a_match_or_a_skipped_refusal() {
+        // A match is still used; a skipped body is still reported as skipped, ahead of the note.
+        let candidates = vec![("REAL".to_string(), 1), ("usb-20:3".to_string(), 2)];
+        assert!(matches!(select_candidate(candidates, &[], &unreadable(1), Some("REAL")), Ok(1)));
+        let candidates = vec![("usb-20:3".to_string(), 2)];
+        let err = select_candidate(candidates, &held(1), &unreadable(1), Some("REAL")).unwrap_err();
+        assert!(matches!(err, PtpUsbError::BodiesSkipped { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn only_a_failed_serial_read_makes_a_body_unreadable() {
+        let warn = vec!["reading the USB serial string failed: pipe error".to_string()];
+        let d = describe_unreadable("usb-20:3", true, &warn).expect("fell back after a failed read");
+        assert_eq!(d, "usb-20:3 (reading the USB serial string failed: pipe error)");
+        assert_eq!(describe_unreadable("usb-20:3", true, &[]), None, "a body with no serial string at all is identified");
+        assert_eq!(describe_unreadable("REAL", false, &warn), None, "the serial was read; only the product string failed");
+        assert_eq!(describe_unreadable("REAL", false, &[]), None);
+        let two = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(describe_unreadable("usb-1:2", true, &two).unwrap(), "usb-1:2 (a, b)");
     }
 
     // ── fallback_serial (USB-topology fallback for a serial-less device) ──
@@ -4191,5 +4346,24 @@ mod tests {
         let err = PtpUsbSession::open_with(|| CameraLock::acquire_at(&path), find, None).err().expect("open must fail");
         assert!(matches!(err, PtpUsbError::NoDevice), "{err:?}");
         assert!(finder_ran.get());
+    }
+
+    #[test]
+    fn a_lock_taken_by_the_caller_is_handed_to_the_open_without_being_taken_again() {
+        // open_locked: the caller took the lock first (to resolve an id-N against the bus). It must
+        // still be held while the finder looks at the bus, and the open must not try to take it a
+        // second time (flock refuses a second descriptor in the same process: it would be Busy).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("camera.lock");
+        let lock = CameraLock::acquire_at(&path).unwrap();
+        let held_during_find = std::cell::Cell::new(None);
+        let find = |_: Option<&str>| {
+            held_during_find.set(Some(matches!(CameraLock::acquire_at(&path), Err(LockError::Busy { .. }))));
+            Err(PtpUsbError::NoDevice)
+        };
+        let err = PtpUsbSession::open_locked_with(lock, find, None).err().expect("open must fail");
+        assert!(matches!(err, PtpUsbError::NoDevice), "the finder's error, not a self-inflicted camera_busy: {err:?}");
+        assert_eq!(held_during_find.get(), Some(true), "the lock was not held while the bus was read");
+        assert!(CameraLock::acquire_at(&path).is_ok(), "the failed open released the lock it was handed");
     }
 }

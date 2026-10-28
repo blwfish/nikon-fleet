@@ -99,6 +99,80 @@ impl SnapshotError {
     }
 }
 
+/// Fill the staged file: all of `bytes`, then to disk. A seam so a test can fail the write half way.
+type StageWrite<'a> = &'a dyn Fn(&mut fs::File, &[u8]) -> std::io::Result<()>;
+/// Give the staged file its final name without replacing anything. A seam so a test can see the
+/// directory mid-publish.
+type Publish<'a> = &'a dyn Fn(&Path, &Path) -> std::io::Result<()>;
+/// Hard-link the first path to the second. A seam so a test can make links unsupported.
+type Link<'a> = &'a dyn Fn(&Path, &Path) -> std::io::Result<()>;
+
+fn write_synced(file: &mut fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// `errno`s that mean "this filesystem has no hard links" (macOS FAT/exFAT/SMB give `EPERM`), as
+/// opposed to a real failure. The same set `gui/fleet_archive.py` falls back on.
+fn hard_links_unsupported(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EPERM | libc::ENOTSUP | libc::ENOSYS | libc::EMLINK | libc::EOPNOTSUPP)
+    )
+}
+
+/// Hard-link `tmp` to `dest`, which fails with `AlreadyExists` if `dest` is taken (a symlink, dangling
+/// or not, included). Where links are unsupported: a checked rename.
+fn link_no_replace(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    link_or_rename(&|a, b| fs::hard_link(a, b), tmp, dest)
+}
+
+fn link_or_rename(link: Link<'_>, tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    match link(tmp, dest) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists && hard_links_unsupported(&e) => {
+            if fs::symlink_metadata(dest).is_ok() {
+                return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+            }
+            fs::rename(tmp, dest)
+        }
+        other => other,
+    }
+}
+
+/// Create `dest` holding all of `bytes`, or not at all, never replacing anything. See
+/// [`Snapshot::save_new`]. The temporary file is gone when this returns, success or not.
+fn publish_new(dest: &Path, bytes: &[u8], write: StageWrite<'_>, publish: Publish<'_>) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let dir = dest.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // `create_new`: never reuse a stale temporary left by a process that died with the same pid.
+    let (mut file, tmp) = loop {
+        let tmp = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        match fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => break (f, tmp),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = write(&mut file, bytes).and_then(|()| {
+        drop(file);
+        publish(&tmp, dest)
+    });
+    // The temporary name is always removed: after a link it is the second name of the published
+    // file, after a rename it is already gone (hence ignoring NotFound), after a failure it is debris.
+    // A failure here is not the caller's: `result` is.
+    if let Err(e) = fs::remove_file(&tmp) {
+        if e.kind() != std::io::ErrorKind::NotFound && result.is_ok() {
+            // The file is published whole; only a stray second name remains.
+            eprintln!("warning: could not remove the temporary file {}: {e}", tmp.display());
+        }
+    }
+    result
+}
+
 /// Replace path-separator characters in a free-text value bound for a
 /// filename component. `/` is the dangerous one on any platform this runs
 /// on (macOS/Linux path separator; also treated as a separator by Rust's
@@ -139,29 +213,26 @@ impl Snapshot {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    /// Write to `path`, replacing whatever is there. Use [`Snapshot::save_new`]
-    /// for captures, which must never overwrite an existing file.
+    /// Write to `path`, replacing whatever is there, whole or not at all: staged in a temporary file
+    /// beside `path` and renamed over it ([`crate::ops::paths::write_atomic`]), so a reader or a crash
+    /// sees the old file or the complete new one. Use [`Snapshot::save_new`] for captures, which must
+    /// never overwrite an existing file.
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), SnapshotError> {
-        fs::write(path, self.to_pretty_json()?)?;
+        crate::ops::paths::write_atomic(path.as_ref(), self.to_pretty_json()?.as_bytes())?;
         Ok(())
     }
 
-    /// Write to `path` only if nothing exists there (`O_CREAT | O_EXCL`):
-    /// an existing file, or a symlink at `path` (even a dangling one), fails
-    /// with an `AlreadyExists` I/O error and is left untouched. If the write
-    /// fails after the file was created, the partial file is removed so a
-    /// failed capture does not leave a truncated snapshot behind.
+    /// Write to `path` only if nothing exists there: an existing file, or a symlink at `path` (even
+    /// a dangling one), fails with an `AlreadyExists` I/O error and is left untouched.
+    ///
+    /// The file appears whole or not at all. The bytes are staged in a temporary file in the same
+    /// directory (a `.tmp` name, never a `.json`, so no lister or retention count sees it), synced,
+    /// then given the final name with a hard link, which fails if the name is taken; the temporary
+    /// name is removed afterwards. Where the filesystem has no hard links the publish is a checked
+    /// rename instead, with a small window between the existence check and the rename. A failure at
+    /// any step leaves neither the file nor the temporary.
     pub fn save_new<P: AsRef<Path>>(&self, path: P) -> Result<(), SnapshotError> {
-        use std::io::Write;
-        let json = self.to_pretty_json()?;
-        let path = path.as_ref();
-        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-        if let Err(e) = file.write_all(json.as_bytes()).and_then(|()| file.sync_all()) {
-            drop(file);
-            // Best effort: the write error is what the caller needs to see.
-            let _ = fs::remove_file(path);
-            return Err(e.into());
-        }
+        publish_new(path.as_ref(), self.to_pretty_json()?.as_bytes(), &write_synced, &link_no_replace)?;
         Ok(())
     }
 
@@ -513,5 +584,241 @@ mod tests {
         std::fs::write(&p, "old").unwrap();
         sample_snapshot().save_to_file(&p).unwrap();
         assert_eq!(Snapshot::load_from_file(&p).unwrap(), sample_snapshot());
+    }
+
+    // ── whole-or-nothing writes ──────────────────────────────────────────
+
+    use std::io::Write as _;
+    use std::path::PathBuf;
+
+    fn dir_names(d: &Path) -> Vec<String> {
+        let mut v: Vec<String> =
+            fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    fn sample_bytes() -> Vec<u8> {
+        sample_snapshot().to_pretty_json().unwrap().into_bytes()
+    }
+
+    /// A write that stores the first half of `bytes` and then fails (a full disk, a yanked volume).
+    fn half_then_fail(file: &mut fs::File, bytes: &[u8]) -> std::io::Result<()> {
+        file.write_all(&bytes[..bytes.len() / 2])?;
+        Err(std::io::Error::other("disk full"))
+    }
+
+    fn link(a: &Path, b: &Path) -> std::io::Result<()> {
+        fs::hard_link(a, b)
+    }
+
+    #[test]
+    fn save_new_leaves_only_the_snapshot_behind() {
+        let d = tempfile::TempDir::new().unwrap();
+        sample_snapshot().save_new(d.path().join("s.json")).unwrap();
+        assert_eq!(dir_names(d.path()), ["s.json"], "no staging file may remain after a successful save");
+    }
+
+    #[test]
+    fn a_write_that_fails_half_way_leaves_no_file_and_no_temporary() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dest = d.path().join("s.json");
+        let e = publish_new(&dest, &sample_bytes(), &half_then_fail, &link_no_replace).unwrap_err();
+        assert_eq!(e.to_string(), "disk full");
+        assert_eq!(dir_names(d.path()), Vec::<String>::new(), "neither a truncated snapshot nor its temporary");
+    }
+
+    #[test]
+    fn the_final_name_does_not_exist_until_the_staged_file_is_complete() {
+        // While the bytes are being written, and at the instant of publishing, no `.json` is
+        // visible, so a lister or the retention count cannot meet a partial capture.
+        let d = tempfile::TempDir::new().unwrap();
+        let dest = d.path().join("s.json");
+        let seen_during_write = std::cell::RefCell::new(Vec::new());
+        let seen_at_publish = std::cell::RefCell::new(Vec::new());
+        let bytes = sample_bytes();
+        let counts = std::cell::RefCell::new(None);
+        publish_new(
+            &dest,
+            &bytes,
+            &|f, b| {
+                f.write_all(&b[..b.len() / 2])?;
+                f.flush()?;
+                *seen_during_write.borrow_mut() = dir_names(d.path());
+                *counts.borrow_mut() =
+                    Some(crate::ops::retention::count_for_camera(d.path(), "Z 9", "ABC123").unwrap());
+                f.write_all(&b[b.len() / 2..])?;
+                f.sync_all()
+            },
+            &|tmp, dest| {
+                *seen_at_publish.borrow_mut() = dir_names(d.path());
+                assert_eq!(fs::read(tmp).unwrap(), bytes, "the staged file is complete when it is published");
+                link(tmp, dest)
+            },
+        )
+        .unwrap();
+        for seen in [seen_during_write.borrow(), seen_at_publish.borrow()] {
+            assert_eq!(seen.len(), 1, "exactly the staging file: {seen:?}");
+            assert!(seen[0].starts_with(".s.json.") && seen[0].ends_with(".tmp"), "{seen:?}");
+        }
+        let c = counts.borrow().unwrap();
+        assert_eq!((c.captures, c.restore_points, c.unreadable), (0, 0, 0), "the retention count ignores the staging file");
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+        assert_eq!(dir_names(d.path()), ["s.json"]);
+    }
+
+    #[test]
+    fn a_refused_publish_removes_the_temporary_and_keeps_the_existing_file() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dest = d.path().join("s.json");
+        fs::write(&dest, "precious").unwrap();
+        let e = sample_snapshot().save_new(&dest).unwrap_err();
+        assert_eq!(io_kind(e), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "precious");
+        assert_eq!(dir_names(d.path()), ["s.json"], "no staging file may remain after a refused save");
+    }
+
+    #[test]
+    fn a_publish_error_other_than_exists_is_returned_and_cleans_up() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dest = d.path().join("s.json");
+        let e = publish_new(&dest, &sample_bytes(), &write_synced, &|_, _| {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EIO));
+        assert_eq!(dir_names(d.path()), Vec::<String>::new());
+    }
+
+    fn unsupported_link(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+    }
+
+    #[test]
+    fn where_hard_links_are_unsupported_the_publish_is_a_checked_rename() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dest = d.path().join("s.json");
+        let bytes = sample_bytes();
+        publish_new(&dest, &bytes, &write_synced, &|t, p| link_or_rename(&unsupported_link, t, p)).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+        assert_eq!(dir_names(d.path()), ["s.json"], "the rename leaves no second name");
+    }
+
+    #[test]
+    fn the_rename_fallback_still_refuses_to_replace() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dest = d.path().join("s.json");
+        fs::write(&dest, "precious").unwrap();
+        let e = publish_new(&dest, &sample_bytes(), &write_synced, &|t, p| link_or_rename(&unsupported_link, t, p))
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "precious");
+        assert_eq!(dir_names(d.path()), ["s.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_rename_fallback_refuses_a_dangling_symlink() {
+        let d = tempfile::TempDir::new().unwrap();
+        let target = d.path().join("not-yet.json");
+        let dest = d.path().join("s.json");
+        std::os::unix::fs::symlink(&target, &dest).unwrap();
+        let e = publish_new(&dest, &sample_bytes(), &write_synced, &|t, p| link_or_rename(&unsupported_link, t, p))
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!target.exists(), "must not create through the link");
+    }
+
+    #[test]
+    fn a_link_error_that_is_not_unsupported_does_not_fall_back_to_a_rename() {
+        // EIO is a real failure, and EEXIST is the answer: neither may be turned into a rename.
+        for errno in [libc::EIO, libc::EEXIST, libc::EACCES] {
+            let d = tempfile::TempDir::new().unwrap();
+            let dest = d.path().join("s.json");
+            let failing = move |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(errno));
+            let e = publish_new(&dest, &sample_bytes(), &write_synced, &|t, p| link_or_rename(&failing, t, p))
+                .unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(errno));
+            assert!(!dest.exists(), "errno {errno}");
+        }
+    }
+
+    #[test]
+    fn every_unsupported_errno_takes_the_fallback_and_its_neighbours_do_not() {
+        for errno in [libc::EPERM, libc::ENOTSUP, libc::ENOSYS, libc::EMLINK, libc::EOPNOTSUPP] {
+            assert!(hard_links_unsupported(&std::io::Error::from_raw_os_error(errno)), "errno {errno}");
+        }
+        for errno in [libc::EIO, libc::EEXIST, libc::EACCES, libc::ENOSPC, libc::EXDEV, libc::ENOENT] {
+            assert!(!hard_links_unsupported(&std::io::Error::from_raw_os_error(errno)), "errno {errno}");
+        }
+        assert!(!hard_links_unsupported(&std::io::Error::other("no os error")));
+    }
+
+    /// A read-only directory, or `None` when this process can write into one anyway (root).
+    #[cfg(unix)]
+    fn read_only_dir() -> Option<(tempfile::TempDir, PathBuf)> {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::TempDir::new().unwrap();
+        let ro = d.path().join("ro");
+        fs::create_dir(&ro).unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::File::create(ro.join("probe")).is_ok() {
+            return None;
+        }
+        Some((d, ro))
+    }
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    /// Lets `TempDir` delete a directory this test made read-only.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf);
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_into_a_read_only_directory_fails_and_creates_nothing() {
+        let Some((_keep, ro)) = read_only_dir() else { return };
+        let _restore = RestoreMode(ro.clone());
+        let e = sample_snapshot().save_new(ro.join("s.json")).unwrap_err();
+        assert_eq!(io_kind(e), std::io::ErrorKind::PermissionDenied);
+        let e = sample_snapshot().save_to_file(ro.join("s.json")).unwrap_err();
+        assert_eq!(io_kind(e), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(dir_names(&ro), Vec::<String>::new());
+    }
+
+    #[test]
+    fn save_to_file_onto_a_directory_fails_and_leaves_nothing_behind() {
+        let d = tempfile::TempDir::new().unwrap();
+        let target = d.path().join("s.json");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("inside"), "x").unwrap();
+        assert!(sample_snapshot().save_to_file(&target).is_err());
+        assert_eq!(dir_names(d.path()), ["s.json"], "no staging file may remain after a failed save");
+        assert_eq!(dir_names(&target), ["inside"]);
+    }
+
+    #[test]
+    fn save_to_file_replaces_whole_so_an_open_reader_keeps_the_old_complete_file() {
+        // `fs::write` truncates in place: a reader that already has the file open sees it emptied and
+        // refilled. A staged file renamed over it leaves that reader the old bytes, intact.
+        let d = tempfile::TempDir::new().unwrap();
+        let p = d.path().join("s.json");
+        let mut old = sample_snapshot();
+        old.label = Some("old".into());
+        old.save_to_file(&p).unwrap();
+        let mut reader = fs::File::open(&p).unwrap();
+        let mut new = sample_snapshot();
+        new.label = Some("new".into());
+        new.save_to_file(&p).unwrap();
+        let mut seen = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut seen).unwrap();
+        assert_eq!(Snapshot::from_json(&seen).unwrap().label.as_deref(), Some("old"));
+        assert_eq!(Snapshot::load_from_file(&p).unwrap().label.as_deref(), Some("new"));
+        assert_eq!(dir_names(d.path()), ["s.json"]);
     }
 }

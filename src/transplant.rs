@@ -3295,6 +3295,23 @@ mod tests {
     }
 
     #[test]
+    fn the_clock_is_never_written_by_a_transplant_whatever_shape_a_snapshot_holds_it_in() {
+        // ClockDateTime (33060) is not on NEVER_TRANSPLANT: what keeps a snapshot's time off the body
+        // is that a datetime is not a shape a transplant can translate (the Z 9 and Z 5 snapshots hold
+        // `{"_type": "datetime"}`; an early Z 5 snapshot holds `{"_unknown_type": 12}`). Pin that both
+        // are skipped with a stable tag, so the clock cannot start being written without a test failing.
+        assert_eq!(never_copied(33060), None, "the reason is the value's shape, not the table");
+        for shape in [json!({"_type": "datetime"}), json!({"_unknown_type": 12})] {
+            let cam = FakeCamera::new().with(33060, RW, shape.clone());
+            let out = run(&cam, &[("ClockDateTime", 33060, shape.clone())], &[], false);
+            assert_eq!(tag(&out[0]), "unsupported_value_shape", "{shape}");
+            assert_eq!(out[0].result, Err(SkipReason::UnsupportedValueShape));
+            assert!(cam.writes().is_empty(), "the clock must not be written ({shape})");
+            assert_eq!(cam.value(33060), Some(shape));
+        }
+    }
+
+    #[test]
     fn never_copied_absent_and_read_only_properties_touch_the_camera_not_at_all() {
         let never = NEVER_TRANSPLANT[0].0;
         let cam = FakeCamera::new().with(never, RW, json!(0)).with(200, OP_GET, json!(1));

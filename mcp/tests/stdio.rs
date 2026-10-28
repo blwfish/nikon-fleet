@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
@@ -45,8 +46,8 @@ case "$op" in
     echo '{"type":"result","ok":true,"data":{"status":"applied_verified"}}' >&3 ;;
   restore-apply)
     case "$*" in
-      *early*) p restore_point_written; sleep 60 ;;
-      *) p writing; sleep 60 ;;
+      *early*) p restore_point_written; sleep 0.5; echo yes > "$2/early-emitted"; sleep 60 ;;
+      *) p writing; sleep 0.5; echo yes > "$2/writing-emitted"; sleep 60 ;;
     esac ;;
 esac
 echo "end $op" >> "$2/order.log"
@@ -57,7 +58,7 @@ struct Server {
     stdin: Option<ChildStdin>,
     rx: Receiver<Result<Value, String>>,
     next_id: u64,
-    pub dir: TempDir,
+    pub dir: Arc<TempDir>,
     pub notifications: Vec<Value>,
     /// Responses that arrived while waiting for a different request.
     pending: Vec<Value>,
@@ -74,8 +75,19 @@ fn write_worker(dir: &Path) -> PathBuf {
 
 impl Server {
     fn start(extra: &[&str]) -> Server {
-        let dir = TempDir::new().unwrap();
+        Server::start_in(Arc::new(TempDir::new().unwrap()), extra)
+    }
+
+    /// A server whose data directory is `dir`: a second session over the first one's leftovers.
+    /// Its stderr is `stderr.log` in `dir` (unless MCP_TEST_STDERR is set).
+    fn start_in(dir: Arc<TempDir>, extra: &[&str]) -> Server {
         let worker = write_worker(dir.path());
+        let stderr = if std::env::var_os("MCP_TEST_STDERR").is_some() {
+            Stdio::inherit()
+        } else {
+            let n = (0..).find(|n| !dir.path().join(format!("stderr-{n}.log")).exists()).unwrap();
+            Stdio::from(std::fs::File::create(dir.path().join(format!("stderr-{n}.log"))).unwrap())
+        };
         let mut child = Command::new(BIN)
             .arg("--data-dir")
             .arg(dir.path())
@@ -84,7 +96,7 @@ impl Server {
             .args(extra)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(if std::env::var_os("MCP_TEST_STDERR").is_some() { Stdio::inherit() } else { Stdio::null() })
+            .stderr(stderr)
             .spawn()
             .unwrap();
         let stdin = child.stdin.take();
@@ -170,6 +182,35 @@ impl Server {
 
     fn log(&self, name: &str) -> String {
         std::fs::read_to_string(self.dir.path().join(name)).unwrap_or_default()
+    }
+
+    /// Everything this data directory's servers have written to stderr, oldest session first.
+    fn stderr(&self) -> String {
+        (0..)
+            .map_while(|n| std::fs::read_to_string(self.dir.path().join(format!("stderr-{n}.log"))).ok())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Wait for the process to exit on its own.
+    fn wait_exit(&mut self, within: Duration) -> std::process::ExitStatus {
+        let end = Instant::now() + within;
+        loop {
+            if let Some(s) = self.child.try_wait().unwrap() {
+                return s;
+            }
+            assert!(Instant::now() < end, "the server did not exit within {within:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_for_file(&self, name: &str) {
+        let path = self.dir.path().join(name);
+        let end = Instant::now() + Duration::from_secs(20);
+        while !path.exists() {
+            assert!(Instant::now() < end, "the worker never wrote {name}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn shutdown(mut self) -> std::process::ExitStatus {
@@ -458,6 +499,107 @@ fn a_client_that_disconnects_mid_apply_does_not_abandon_the_worker() {
     };
     assert!(status.success(), "{status:?}");
     assert!(s.dir.path().join("apply-finished").exists(), "the server exited before the apply worker finished");
+}
+
+// ── an exit with an apply in flight ──────────────────────────────────────
+
+const APPLY: fn() -> Value = || json!({"source": "a.json", "serial": "S1", "plan_digest": "d", "summary": "s"});
+
+fn marker_path(s: &Server) -> PathBuf {
+    s.dir.path().join("in-flight-apply.json")
+}
+
+#[test]
+fn an_apply_still_writing_when_the_server_leaves_is_recorded_and_the_next_session_reports_it_once() {
+    let mut s = Server::start(&["--enable-writes", "--exit-wait-secs", "1"]);
+    s.send_request("tools/call", json!({"name": "restore_apply", "arguments": APPLY()}));
+    s.wait_for_file("writing-emitted");
+    drop(s.stdin.take());
+    assert!(s.wait_exit(Duration::from_secs(30)).success());
+
+    let marker: Value = serde_json::from_str(&std::fs::read_to_string(marker_path(&s)).expect("a marker")).unwrap();
+    assert_eq!(marker["reason"], json!("client_gone_wait_expired"));
+    let f = &marker["in_flight"];
+    assert_eq!((f["op"].clone(), f["serial"].clone()), (json!("restore-apply"), json!("S1")));
+    assert_eq!((f["last_phase"].clone(), f["writing_seen"].clone(), f["may_write"].clone()), (json!("writing"), json!(true), json!(true)));
+    let log = s.stderr();
+    assert!(log.contains("a camera call was still running after 1 s"), "{log}");
+    assert!(log.contains("restore-apply") && log.contains("S1") && log.contains("writing seen: true"), "{log}");
+    assert!(log.contains("may have been left half-done"), "{log}");
+
+    // The next session over the same data directory: the first result carries the note, once.
+    let mut next = Server::start_in(s.dir.clone(), &[]);
+    let r = next.call("list_snapshots", json!({}));
+    let note = &structured(&r)["previous_session_incomplete"];
+    assert_eq!(note["reason"], json!("client_gone_wait_expired"), "{r}");
+    assert_eq!(note["marker_unreadable"], json!(false));
+    assert_eq!((note["in_flight"]["op"].clone(), note["in_flight"]["serial"].clone()), (json!("restore-apply"), json!("S1")));
+    assert_eq!(note["in_flight"]["last_phase"], json!("writing"));
+    assert!(structured(&r)["entries"].is_array(), "the tool's own result is still there");
+    assert!(text_of(&r).contains("previous_session_incomplete"), "the text a client shows carries it too: {r}");
+    assert!(!marker_path(&s).exists() && s.dir.path().join("in-flight-apply.seen.json").exists());
+    let again = next.call("list_snapshots", json!({}));
+    assert!(structured(&again).get("previous_session_incomplete").is_none(), "reported once: {again}");
+    // A third session finds nothing to report.
+    drop(next);
+    let mut third = Server::start_in(s.dir.clone(), &[]);
+    assert!(structured(&third.call("list_snapshots", json!({}))).get("previous_session_incomplete").is_none());
+}
+
+#[test]
+fn an_apply_that_had_not_begun_writing_is_logged_but_leaves_no_marker() {
+    let mut s = Server::start(&["--enable-writes", "--exit-wait-secs", "1"]);
+    let mut args = APPLY();
+    args["source"] = json!("early.json");
+    s.send_request("tools/call", json!({"name": "restore_apply", "arguments": args}));
+    s.wait_for_file("early-emitted");
+    drop(s.stdin.take());
+    assert!(s.wait_exit(Duration::from_secs(30)).success());
+    let log = s.stderr();
+    assert!(log.contains("restore-apply") && log.contains("writing seen: false") && log.contains("restore_point_written"), "{log}");
+    assert!(!marker_path(&s).exists(), "nothing was written to the camera: no marker");
+}
+
+#[test]
+fn a_termination_signal_mid_write_records_the_call_and_exits_without_waiting() {
+    let mut s = Server::start(&["--enable-writes"]);
+    s.send_request("tools/call", json!({"name": "restore_apply", "arguments": APPLY()}));
+    s.wait_for_file("writing-emitted");
+    let t = Instant::now();
+    assert_eq!(unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) }, 0);
+    let status = s.wait_exit(Duration::from_secs(30));
+    assert!(t.elapsed() < Duration::from_secs(20), "a signal does not wait for the apply: {:?}", t.elapsed());
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{status:?}");
+    let marker: Value = serde_json::from_str(&std::fs::read_to_string(marker_path(&s)).expect("a marker")).unwrap();
+    assert_eq!(marker["reason"], json!("sigterm"));
+    assert_eq!(marker["in_flight"]["writing_seen"], json!(true));
+    assert!(s.stderr().contains("exiting"), "{}", s.stderr());
+}
+
+#[test]
+fn a_termination_signal_with_nothing_in_flight_exits_quietly_with_no_marker() {
+    for (sig, reason) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGINT, "SIGINT"), (libc::SIGHUP, "SIGHUP")] {
+        let mut s = Server::start(&[]);
+        assert_eq!(unsafe { libc::kill(s.child.id() as i32, sig) }, 0);
+        let status = s.wait_exit(Duration::from_secs(30));
+        assert_eq!(status.code(), Some(128 + sig), "{reason}: {status:?}");
+        assert!(!marker_path(&s).exists(), "{reason}");
+    }
+}
+
+#[test]
+fn a_client_that_leaves_after_the_apply_finished_leaves_no_marker() {
+    // The existing disconnect case: the apply completes within the wait, so nothing is lost.
+    let mut s = Server::start(&["--enable-writes"]);
+    s.send_request(
+        "tools/call",
+        json!({"name": "transplant_apply", "arguments": {"source": "slow.json", "serial": "S", "plan_digest": "d", "summary": "s"}}),
+    );
+    s.wait_for_file("writing-emitted");
+    drop(s.stdin.take());
+    assert!(s.wait_exit(Duration::from_secs(60)).success());
+    assert!(s.dir.path().join("apply-finished").exists());
+    assert!(!marker_path(&s).exists());
 }
 
 // ── what the server tells every client about itself ─────────────────────

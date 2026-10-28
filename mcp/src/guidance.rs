@@ -270,6 +270,63 @@ pub fn notes() -> Vec<Note> {
         .tags(&["camera"])
         .addresses(&["no camera", "camera not found", "not detected", "enumeration", "asleep", "replug"]),
         Note::new(
+            "firmware-status-unknowns",
+            date!(2026 - 10 - 28),
+            Medium,
+            Tactic,
+            "firmware_status says what it could not read: `archive_unreadable` and `usb_scan` qualify \"not archived\" and \"no body attached\".",
+        )
+        .detail(
+            "Each model in the result has `archive_holds_latest`, and each of its cameras `running_version_archived`: true, false, or null. null means unknown: \
+             the version was not among the archive entries that could be read, but some could not be, so it may be in one of them. \
+             `archive_unreadable` lists each archive directory for that model that could not be listed (`directory`, a closed `error_kind` of \
+             metadata_unreadable, metadata_corrupt, unsupported_version or incomplete_archive, and `error` for a human); `archive_unreadable_dir_entries` \
+             counts directories under firmware/ that could not be read at all, any of which may hold this model's entry. While either is non-empty do \
+             not report a version as missing from the archive; tell the user the archive needs attention (they repair it by hand, there is no tool for it).\n\
+             `usb_scan` says how the bus pass behind `cameras` went: `complete: true` with `cameras: []` means no body of that model is attached; \
+             `complete: false` means the bus could not be fully read (`enumeration_error` when it could not be enumerated at all, `unreadable` for devices \
+             that are attached but could not be identified), so `cameras` may be partial or empty because of the failure: ask the user to replug or \
+             power-cycle, as for list_cameras.",
+        )
+        .tags(&["firmware"])
+        .addresses(&[
+            "firmware_status",
+            "not archived",
+            "archive_unreadable",
+            "archive_holds_latest",
+            "running_version_archived",
+            "usb_scan",
+            "no body attached",
+            "firmware archive",
+        ]),
+        Note::new(
+            "previous-session-incomplete",
+            date!(2026 - 10 - 28),
+            Medium,
+            Tactic,
+            "A `previous_session_incomplete` field on a tool result means an earlier session exited mid-apply: the camera may be half-written, so capture or check it and tell the user.",
+        )
+        .detail(
+            "When this server exits (the client went away and the apply outlived the wait, or it was sent SIGTERM, SIGINT or SIGHUP) while an apply that had reached \
+             `writing` is still running, it writes `in-flight-apply.json` in the data directory. The next server start puts its content on the first tool result \
+             that can carry it (any tool but get_usage_guidance), as `previous_session_incomplete`, once: the file is then renamed to `in-flight-apply.seen.json` and kept. \
+             `reason` is client_gone_wait_expired, sigterm, sigint or sighup. `in_flight` says what was running: `op` (restore-apply or transplant-apply), `serial`, \
+             `last_phase`, `writing_seen`, `may_write` and `started_at`. `recorded_at` is when the server left. `marker_unreadable: true` means the marker could not be read \
+             at all (`file`, `error`): treat that the same way.\n\
+             What it does not tell you is how far the apply got, or whether the worker finished after the server left. Do not run the apply again from the same plan. Capture the \
+             body (capture_snapshot) or check it against its reference (check_against_reference), compare with the restore point the apply stored first \
+             (list_snapshots with label_prefix `mcp-restore-`), and tell the user what you find.",
+        )
+        .tags(&["camera"])
+        .addresses(&[
+            "previous_session_incomplete",
+            "in-flight-apply.json",
+            "half-written camera",
+            "server exited during apply",
+            "earlier session",
+            "marker_unreadable",
+        ]),
+        Note::new(
             "slow-and-deadlines",
             d,
             Medium,
@@ -529,5 +586,125 @@ mod tests {
                 assert_eq!(x.kind, NoteKind::Strategy, "{}", x.id);
             }
         }
+    }
+
+    #[test]
+    fn the_firmware_status_fields_the_note_names_are_the_ones_really_serialised() {
+        use nikon_fleet::firmware::ArchiveSkipKind;
+        use nikon_fleet::firmware_source::{SourceError, assess};
+        use nikon_fleet::ops::firmware_latest::{LatestArchiveUnreadable, LatestUsbScan, ModelSurvey, survey_json};
+        use nikon_fleet::sdk::{UsbStage, UsbUnreadable};
+        let release = Err(SourceError::Parse { url: "u".into(), reason: "r".into() });
+        let status = assess(&release, &[]);
+        let survey = ModelSurvey {
+            model: "Z 9".into(),
+            release,
+            archived: vec![],
+            archive_notes: vec![],
+            cameras: vec![("A".into(), "5.31".into())],
+            archive_unreadable: vec![LatestArchiveUnreadable {
+                directory: "d".into(),
+                error_kind: ArchiveSkipKind::MetadataCorrupt,
+                error: "e".into(),
+            }],
+            archive_unreadable_dir_entries: 1,
+            usb_scan: LatestUsbScan {
+                complete: false,
+                enumeration_error: Some("x".into()),
+                unreadable: vec![UsbUnreadable { bus: 1, address: 2, stage: UsbStage::Open, error: "e".into() }],
+            },
+            status,
+        };
+        let v = serde_json::to_value(survey_json(&survey)).unwrap();
+        let text: String = notes().iter().map(|n| format!("{} {}", n.summary, n.detail)).collect::<Vec<_>>().join("\n");
+        let mentioned = |k: &str| text.contains(&format!("`{k}`")) || text.contains(&format!("`{k}:"));
+        // The keys the note says to read exist where it says they are.
+        for k in ["archive_holds_latest", "archive_unreadable", "archive_unreadable_dir_entries", "usb_scan", "cameras"] {
+            assert!(v.get(k).is_some() && mentioned(k), "model key {k}");
+        }
+        assert!(v["cameras"][0].get("running_version_archived").is_some() && mentioned("running_version_archived"));
+        for k in ["directory", "error_kind", "error"] {
+            assert!(v["archive_unreadable"][0].get(k).is_some() && mentioned(k), "archive_unreadable key {k}");
+        }
+        for k in ["complete", "enumeration_error", "unreadable"] {
+            assert!(v["usb_scan"].get(k).is_some() && mentioned(k), "usb_scan key {k}");
+        }
+        // The other direction: a key added to either object fails here until a note explains it.
+        let archive_keys: BTreeSet<&str> = v["archive_unreadable"][0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(archive_keys, BTreeSet::from(["directory", "error_kind", "error"]));
+        let usb_keys: BTreeSet<&str> = v["usb_scan"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(usb_keys, BTreeSet::from(["complete", "enumeration_error", "unreadable"]));
+        // The closed vocabulary of `error_kind` is the note's list. No wildcard: a new kind must be added here.
+        for kind in [
+            ArchiveSkipKind::MetadataUnreadable,
+            ArchiveSkipKind::MetadataCorrupt,
+            ArchiveSkipKind::UnsupportedVersion,
+            ArchiveSkipKind::IncompleteArchive,
+        ] {
+            let tag = serde_json::to_value(kind).unwrap();
+            assert!(text.contains(tag.as_str().unwrap()), "the note never names error_kind {tag}");
+            match kind {
+                ArchiveSkipKind::MetadataUnreadable
+                | ArchiveSkipKind::MetadataCorrupt
+                | ArchiveSkipKind::UnsupportedVersion
+                | ArchiveSkipKind::IncompleteArchive => {}
+            }
+        }
+    }
+
+    #[test]
+    fn the_previous_session_fields_the_note_names_are_the_ones_really_serialised() {
+        use crate::server::PREVIOUS_SESSION_KEY;
+        use crate::supervisor::{ExitReason, InFlight, MARKER_FILE, MARKER_SEEN_FILE, previous_session_note, record_in_flight_at_exit};
+        let d = tempfile::TempDir::new().unwrap();
+        let lost = InFlight {
+            op: "restore-apply".into(),
+            serial: Some("S".into()),
+            may_write: true,
+            last_phase: Some("writing".into()),
+            writing_seen: true,
+            started_at: "2026-10-28T10:00:00Z".into(),
+        };
+        record_in_flight_at_exit(d.path(), ExitReason::Sigterm, Some(&lost)).unwrap();
+        let note = previous_session_note(d.path()).unwrap();
+        let unreadable = {
+            std::fs::write(d.path().join(MARKER_FILE), "{ torn").unwrap();
+            previous_session_note(d.path()).unwrap()
+        };
+        let text: String = notes().iter().map(|n| format!("{} {}", n.summary, n.detail)).collect::<Vec<_>>().join("\n");
+        let mentioned = |k: &str| text.contains(&format!("`{k}`")) || text.contains(&format!("`{k}:"));
+        assert!(text.contains(PREVIOUS_SESSION_KEY) && text.contains(MARKER_FILE) && text.contains(MARKER_SEEN_FILE));
+        // Every key of the note, and of what was in flight, is explained; a key added to either fails here.
+        let keys = |v: &serde_json::Value| -> BTreeSet<String> { v.as_object().unwrap().keys().cloned().collect() };
+        assert_eq!(keys(&note), ["in_flight", "marker_unreadable", "message", "reason", "recorded_at"].map(String::from).into());
+        assert_eq!(
+            keys(&note["in_flight"]),
+            ["last_phase", "may_write", "op", "serial", "started_at", "writing_seen"].map(String::from).into()
+        );
+        for k in keys(&note).iter().chain(keys(&note["in_flight"]).iter()).filter(|k| *k != "message") {
+            assert!(mentioned(k), "the note never explains `{k}`");
+        }
+        assert_eq!(keys(&unreadable), ["error", "file", "marker_unreadable", "message"].map(String::from).into());
+        for k in ["error", "file"] {
+            assert!(text.contains(&format!("`{k}`")), "{k}");
+        }
+        // The closed vocabulary of `reason`. No wildcard: a new reason must be added here and to the note.
+        for r in [ExitReason::ClientGoneWaitExpired, ExitReason::Sigterm, ExitReason::Sigint, ExitReason::Sighup] {
+            let tag = serde_json::to_value(r).unwrap();
+            assert!(text.contains(tag.as_str().unwrap()), "the note never names reason {tag}");
+            match r {
+                ExitReason::ClientGoneWaitExpired | ExitReason::Sigterm | ExitReason::Sigint | ExitReason::Sighup => {}
+            }
+        }
+        // The worker operations the note names are the ones an apply tool really sends.
+        let argv = crate::server::ops_args::restore_apply(&crate::server::RestoreApplyArgs {
+            source: "s".into(),
+            serial: "S".into(),
+            only: None,
+            plan_digest: "d".into(),
+            summary: "x".into(),
+        });
+        assert_eq!(argv[0], "restore-apply");
+        assert!(text.contains(&argv[0]));
     }
 }

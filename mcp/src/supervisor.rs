@@ -19,17 +19,24 @@
 //! - dropping the future kills the child (`kill_on_drop`); a caller that must
 //!   not abandon a half-applied camera runs the future detached instead;
 //! - calls are served one at a time in arrival order, so `camera_busy` from a
-//!   worker means a holder outside this server.
+//!   worker means a holder outside this server;
+//! - the call a worker is running is visible ([`Supervisor::in_flight`]): its operation, serial,
+//!   last phase and whether `writing` was seen. A server that must exit while one runs records it
+//!   ([`record_in_flight_at_exit`]), and the next server start reports it once
+//!   ([`previous_session_note`], [`acknowledge_previous_session`]).
 
 use std::ffi::OsString;
 use std::future::Future;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
+use nikon_fleet::ops::paths::write_atomic;
 use nikon_fleet::ops::worker::{Line, Outcome};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::net::unix::pipe;
 use tokio::process::{Child, Command};
@@ -117,6 +124,60 @@ impl std::fmt::Display for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
+/// The call a worker is running right now, as far as the supervisor has seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InFlight {
+    /// The worker operation (`restore-apply`, `capture`, ...): the first of the call's arguments.
+    pub op: String,
+    /// The call's `--serial`, if it has one.
+    pub serial: Option<String>,
+    /// The call can write to the camera (an apply), whatever phase it has reached.
+    pub may_write: bool,
+    /// The last progress phase the worker reported.
+    pub last_phase: Option<String>,
+    /// The worker reported `writing` (or `read_back`): camera writes may have happened.
+    pub writing_seen: bool,
+    /// RFC 3339, UTC.
+    pub started_at: String,
+}
+
+impl InFlight {
+    fn begin(spec: &Spec) -> Self {
+        let serial = spec.op_args.iter().position(|a| a == "--serial").and_then(|i| spec.op_args.get(i + 1)).cloned();
+        InFlight {
+            op: spec.op_args.first().cloned().unwrap_or_default(),
+            serial,
+            may_write: spec.cancel == CancelPolicy::UntilWriting,
+            last_phase: None,
+            writing_seen: false,
+            started_at: now_rfc3339(),
+        }
+    }
+
+    /// A write may have been left half-done if this call is lost: an apply that reached `writing`.
+    pub fn write_may_be_incomplete(&self) -> bool {
+        self.may_write && self.writing_seen
+    }
+}
+
+fn now_rfc3339() -> String {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|e| format!("unavailable ({e})"))
+}
+
+fn lock<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Clears the in-flight slot when a call ends or its future is dropped.
+struct InFlightGuard<'a>(&'a StdMutex<Option<InFlight>>);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        *lock(self.0) = None;
+    }
+}
+
 pub struct Supervisor {
     program: PathBuf,
     /// Global flags placed before `worker` (`--data-dir`, `--sdk-bundle`, ...).
@@ -129,9 +190,12 @@ pub struct Supervisor {
     /// How long a killed worker may take to be reaped. SIGKILL cannot be caught, but a process
     /// in uninterruptible I/O (a wedged USB transfer) does not die until the I/O returns.
     pub reap: Duration,
+    /// The call whose worker is running (calls are serial, so at most one).
+    in_flight: StdMutex<Option<InFlight>>,
 }
 
-fn pipe_pair() -> std::io::Result<(OwnedFd, OwnedFd)> {
+/// A pipe with both ends close-on-exec (read end, write end).
+pub fn pipe_pair() -> std::io::Result<(OwnedFd, OwnedFd)> {
     use std::os::fd::FromRawFd;
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -156,6 +220,20 @@ impl Supervisor {
             grace: Duration::from_secs(3),
             drain: Duration::from_secs(2),
             reap: Duration::from_secs(5),
+            in_flight: StdMutex::new(None),
+        }
+    }
+
+    /// The call whose worker is running now, with the phase it has reached. `None` between calls
+    /// and while a call is still queued behind another.
+    pub fn in_flight(&self) -> Option<InFlight> {
+        lock(&self.in_flight).clone()
+    }
+
+    fn note_progress(&self, last_phase: &Option<String>, writing_seen: bool) {
+        if let Some(f) = lock(&self.in_flight).as_mut() {
+            f.last_phase = last_phase.clone();
+            f.writing_seen = writing_seen;
         }
     }
 
@@ -204,6 +282,8 @@ impl Supervisor {
             _ = ct.cancelled() => return Ok(Finished::CancelledBeforeStart),
         };
         let (mut child, rx) = self.spawn(&spec.op_args)?;
+        *lock(&self.in_flight) = Some(InFlight::begin(spec));
+        let _in_flight = InFlightGuard(&self.in_flight);
         let mut lines = ChannelLines::new(BufReader::new(rx));
         let deadline = tokio::time::sleep(spec.deadline);
         tokio::pin!(deadline);
@@ -221,7 +301,10 @@ impl Supervisor {
             tokio::select! {
                 biased;
                 line = lines.next_line() => match line {
-                    Ok(Some(l)) => absorb(&l, &mut last_phase, &mut garbage, &mut writing_seen, &mut answer, on_progress),
+                    Ok(Some(l)) => {
+                        absorb(&l, &mut last_phase, &mut garbage, &mut writing_seen, &mut answer, on_progress);
+                        self.note_progress(&last_phase, writing_seen);
+                    }
                     Ok(None) => stop = Some(NoResultCause::WorkerDied),
                     Err(e) => {
                         eprintln!("fleet-mcp: reading the worker's result channel: {e}");
@@ -233,6 +316,7 @@ impl Supervisor {
                     // Whatever the worker has already flushed counts before the decision: `writing`
                     // is emitted before its first write, so if it is not in the pipe, no write began.
                     drain_ready(&mut lines, &mut last_phase, &mut garbage, &mut writing_seen, &mut answer, on_progress).await;
+                    self.note_progress(&last_phase, writing_seen);
                     if answer.is_some() {
                         // The worker finished first: that is the outcome.
                     } else if spec.cancel == CancelPolicy::UntilWriting && writing_seen {
@@ -397,6 +481,107 @@ fn absorb(
     }
 }
 
+// ── a call lost to the server's own exit ─────────────────────────────────
+
+/// Written into the data directory when the server exits while an apply that had reached
+/// `writing` is still running: the camera may have been left half-written.
+pub const MARKER_FILE: &str = "in-flight-apply.json";
+/// What [`MARKER_FILE`] is renamed to once a session has been told about it.
+pub const MARKER_SEEN_FILE: &str = "in-flight-apply.seen.json";
+
+/// Why the server is exiting with a call still running. Closed vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitReason {
+    /// The client closed stdin and the call outlived the wait (`--exit-wait-secs`).
+    ClientGoneWaitExpired,
+    Sigterm,
+    Sigint,
+    Sighup,
+}
+
+/// What the exiting server knew about the lost call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncompleteMarker {
+    pub reason: ExitReason,
+    pub recorded_at: String,
+    pub in_flight: InFlight,
+}
+
+/// Say on stderr which call is in flight as the server exits and, when it is an apply that had
+/// reached `writing`, write [`MARKER_FILE`] (atomically; an earlier unreported marker is named on
+/// stderr before it is replaced). Returns whether a marker was written. A call that was only
+/// reading, or an apply that had not yet begun writing, changed nothing on the camera: stderr
+/// only.
+pub fn record_in_flight_at_exit(data_dir: &Path, reason: ExitReason, in_flight: Option<&InFlight>) -> std::io::Result<bool> {
+    let Some(f) = in_flight else { return Ok(false) };
+    eprintln!(
+        "fleet-mcp: exiting ({reason:?}) with a camera call in flight: {} serial {} since {}, last phase {}, writing seen: {}",
+        f.op,
+        f.serial.as_deref().unwrap_or("(none)"),
+        f.started_at,
+        f.last_phase.as_deref().unwrap_or("(none)"),
+        f.writing_seen,
+    );
+    if !f.write_may_be_incomplete() {
+        return Ok(false);
+    }
+    let path = data_dir.join(MARKER_FILE);
+    if let Ok(earlier) = std::fs::read_to_string(&path) {
+        eprintln!("fleet-mcp: replacing an earlier marker that no session has reported yet: {}", earlier.trim());
+    }
+    let marker = IncompleteMarker { reason, recorded_at: now_rfc3339(), in_flight: f.clone() };
+    let bytes = serde_json::to_vec_pretty(&marker).map_err(std::io::Error::other)?;
+    write_atomic(&path, &bytes)?;
+    eprintln!(
+        "fleet-mcp: a write to the camera may have been left half-done; recorded in {}",
+        path.display()
+    );
+    Ok(true)
+}
+
+/// The typed `previous_session_incomplete` note for a marker left by an earlier server, or `None`
+/// when there is none. A marker that cannot be read or parsed is still reported (as
+/// `marker_unreadable`): it exists because something went wrong. Does not touch the file; call
+/// [`acknowledge_previous_session`] once the note has been delivered.
+pub fn previous_session_note(data_dir: &Path) -> Option<Value> {
+    let path = data_dir.join(MARKER_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(unreadable_marker(&path, &e.to_string())),
+    };
+    match serde_json::from_str::<IncompleteMarker>(&text) {
+        Ok(m) => Some(json!({
+            "reason": m.reason,
+            "recorded_at": m.recorded_at,
+            "in_flight": m.in_flight,
+            "marker_unreadable": false,
+            "message": "An earlier fleet-mcp session exited while an apply was running and had reached `writing`: \
+                        the camera may have been left half-written. Capture it (capture_snapshot) or check it against its \
+                        reference (check_against_reference) to see what state it is in, and tell the user. \
+                        This note is shown once; the marker is kept as in-flight-apply.seen.json."
+        })),
+        Err(e) => Some(unreadable_marker(&path, &e.to_string())),
+    }
+}
+
+fn unreadable_marker(path: &Path, error: &str) -> Value {
+    json!({
+        "marker_unreadable": true,
+        "file": path.display().to_string(),
+        "error": error,
+        "message": "An earlier fleet-mcp session left a marker that this one cannot read, which means it exited with an apply in \
+                    flight. Treat the camera as possibly half-written: capture it or check it against its reference, and tell the user."
+    })
+}
+
+/// Mark the marker as reported: rename it to [`MARKER_SEEN_FILE`] (replacing an older acknowledged
+/// one). It is kept, not deleted.
+pub fn acknowledge_previous_session(data_dir: &Path) -> std::io::Result<()> {
+    std::fs::rename(data_dir.join(MARKER_FILE), data_dir.join(MARKER_SEEN_FILE))
+}
+
 /// The data of a worker `ok` result, for callers that only care about that.
 pub fn ok_data(o: &Outcome) -> Option<&Value> {
     match o {
@@ -409,6 +594,7 @@ pub fn ok_data(o: &Outcome) -> Option<&Value> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
     use std::time::Instant;
     use tempfile::TempDir;
 
@@ -823,5 +1009,248 @@ mod tests {
         ] {
             assert_eq!(writes_possible(p), want, "{p:?}");
         }
+    }
+
+    // ── the call in flight, and the marker a lost apply leaves ───────────
+
+    fn apply_spec(deadline_ms: u64) -> Spec {
+        Spec {
+            op_args: ["restore-apply", "--serial", "S1", "--source", "x.json"].map(String::from).to_vec(),
+            deadline: Duration::from_millis(deadline_ms),
+            cancel: CancelPolicy::UntilWriting,
+        }
+    }
+
+    /// A worker that emits each phase only once the test has created the file that gates it, so
+    /// the test sees every intermediate state without racing the worker.
+    fn gated_worker(d: &TempDir) -> Arc<Supervisor> {
+        let dir = d.path().display();
+        let wait = |n: u8| format!("while [ ! -f {dir}/g{n} ]; do sleep 0.02; done");
+        let body = format!(
+            "{}\necho '{{\"type\":\"progress\",\"phase\":\"starting\"}}' >&3\n{}\necho '{{\"type\":\"progress\",\"phase\":\"writing\"}}' >&3\n{}\necho '{OK_LINE}' >&3",
+            wait(1),
+            wait(2),
+            wait(3)
+        );
+        Arc::new(fake(d, "w", &body))
+    }
+
+    async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("never saw: {what}");
+    }
+
+    fn gate(d: &TempDir, n: u8) {
+        std::fs::write(d.path().join(format!("g{n}")), "").unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_call_in_flight_is_visible_with_its_phase_and_gone_when_it_ends() {
+        let d = TempDir::new().unwrap();
+        let s = gated_worker(&d);
+        assert_eq!(s.in_flight(), None, "nothing before a call");
+        let (s2, spec) = (s.clone(), apply_spec(20_000));
+        let call = tokio::spawn(async move { s2.run(&spec, &CancellationToken::new(), &mut |_| {}).await });
+
+        until("the call is in flight", || s.in_flight().is_some()).await;
+        let f = s.in_flight().unwrap();
+        assert_eq!((f.op.as_str(), f.serial.as_deref(), f.may_write), ("restore-apply", Some("S1"), true));
+        assert_eq!((f.last_phase, f.writing_seen), (None, false), "no phase yet");
+
+        gate(&d, 1);
+        until("starting", || s.in_flight().is_some_and(|f| f.last_phase.as_deref() == Some("starting"))).await;
+        assert!(!s.in_flight().unwrap().writing_seen && !s.in_flight().unwrap().write_may_be_incomplete());
+
+        gate(&d, 2);
+        until("writing", || s.in_flight().is_some_and(|f| f.writing_seen)).await;
+        let f = s.in_flight().unwrap();
+        assert_eq!(f.last_phase.as_deref(), Some("writing"));
+        assert!(f.write_may_be_incomplete());
+
+        gate(&d, 3);
+        assert!(matches!(call.await.unwrap().unwrap(), Finished::Result { .. }));
+        assert_eq!(s.in_flight(), None, "cleared when the call ends");
+    }
+
+    #[tokio::test]
+    async fn a_call_whose_future_is_dropped_is_no_longer_in_flight() {
+        let d = TempDir::new().unwrap();
+        let s = gated_worker(&d);
+        let (s2, spec) = (s.clone(), apply_spec(20_000));
+        let call = tokio::spawn(async move { s2.run(&spec, &CancellationToken::new(), &mut |_| {}).await });
+        until("the call is in flight", || s.in_flight().is_some()).await;
+        call.abort();
+        let _ = call.await;
+        assert_eq!(s.in_flight(), None);
+    }
+
+    #[tokio::test]
+    async fn a_read_is_never_a_write_that_may_be_incomplete() {
+        let d = TempDir::new().unwrap();
+        let s = gated_worker(&d);
+        let (s2, mut spec) = (s.clone(), apply_spec(20_000));
+        spec.cancel = CancelPolicy::Always;
+        let call = tokio::spawn(async move { s2.run(&spec, &CancellationToken::new(), &mut |_| {}).await });
+        gate(&d, 1);
+        gate(&d, 2);
+        until("writing", || s.in_flight().is_some_and(|f| f.writing_seen)).await;
+        let f = s.in_flight().unwrap();
+        assert!(!f.may_write && f.writing_seen && !f.write_may_be_incomplete(), "{f:?}");
+        gate(&d, 3);
+        let _ = call.await;
+    }
+
+    #[test]
+    fn the_serial_is_the_value_after_serial_and_absent_otherwise() {
+        let begin = |args: &[&str]| {
+            InFlight::begin(&Spec {
+                op_args: args.iter().map(|a| a.to_string()).collect(),
+                deadline: Duration::from_secs(1),
+                cancel: CancelPolicy::Always,
+            })
+        };
+        let f = begin(&["capture", "--serial", "S9", "--label", "x"]);
+        assert_eq!((f.op.as_str(), f.serial.as_deref()), ("capture", Some("S9")));
+        assert_eq!(begin(&["capture"]).serial, None, "no --serial");
+        assert_eq!(begin(&["capture", "--serial"]).serial, None, "--serial with no value after it");
+        assert_eq!(begin(&["check", "--label", "--serial", "S2"]).serial.as_deref(), Some("S2"));
+        let none = begin(&[]);
+        assert_eq!((none.op.as_str(), none.serial), ("", None), "an empty argument list is an empty op, not a panic");
+    }
+
+    fn lost_apply(writing_seen: bool, may_write: bool) -> InFlight {
+        InFlight {
+            op: "restore-apply".into(),
+            serial: Some("S1".into()),
+            may_write,
+            last_phase: Some(if writing_seen { "writing" } else { "restore_point_written" }.into()),
+            writing_seen,
+            started_at: "2026-10-28T10:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn only_an_apply_that_reached_writing_leaves_a_marker() {
+        for (writing_seen, may_write, marker) in [(true, true, true), (false, true, false), (true, false, false), (false, false, false)] {
+            let d = TempDir::new().unwrap();
+            let written = record_in_flight_at_exit(d.path(), ExitReason::Sigterm, Some(&lost_apply(writing_seen, may_write))).unwrap();
+            assert_eq!(written, marker, "writing_seen={writing_seen} may_write={may_write}");
+            assert_eq!(d.path().join(MARKER_FILE).exists(), marker, "writing_seen={writing_seen} may_write={may_write}");
+        }
+    }
+
+    #[test]
+    fn nothing_in_flight_leaves_nothing() {
+        let d = TempDir::new().unwrap();
+        assert!(!record_in_flight_at_exit(d.path(), ExitReason::ClientGoneWaitExpired, None).unwrap());
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_marker_holds_what_was_in_flight_and_why_the_server_left() {
+        let d = TempDir::new().unwrap();
+        let f = lost_apply(true, true);
+        record_in_flight_at_exit(d.path(), ExitReason::ClientGoneWaitExpired, Some(&f)).unwrap();
+        let m: IncompleteMarker = serde_json::from_str(&std::fs::read_to_string(d.path().join(MARKER_FILE)).unwrap()).unwrap();
+        assert_eq!((m.reason, m.in_flight), (ExitReason::ClientGoneWaitExpired, f));
+        assert!(!m.recorded_at.is_empty());
+        let leftovers: Vec<_> = std::fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers, [std::ffi::OsString::from(MARKER_FILE)], "written atomically: no staging file left");
+    }
+
+    #[test]
+    fn the_exit_reasons_serialise_to_the_closed_vocabulary() {
+        for (r, want) in [
+            (ExitReason::ClientGoneWaitExpired, "client_gone_wait_expired"),
+            (ExitReason::Sigterm, "sigterm"),
+            (ExitReason::Sigint, "sigint"),
+            (ExitReason::Sighup, "sighup"),
+        ] {
+            assert_eq!(serde_json::to_value(r).unwrap(), json!(want));
+            // No wildcard: a new reason must be added to this list.
+            match r {
+                ExitReason::ClientGoneWaitExpired | ExitReason::Sigterm | ExitReason::Sigint | ExitReason::Sighup => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_written_is_an_error_not_a_silent_success() {
+        let d = TempDir::new().unwrap();
+        let missing = d.path().join("no-such-dir");
+        let e = record_in_flight_at_exit(&missing, ExitReason::Sigint, Some(&lost_apply(true, true))).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_second_marker_replaces_an_unreported_first_one() {
+        let d = TempDir::new().unwrap();
+        record_in_flight_at_exit(d.path(), ExitReason::Sigterm, Some(&lost_apply(true, true))).unwrap();
+        let mut second = lost_apply(true, true);
+        second.serial = Some("S2".into());
+        record_in_flight_at_exit(d.path(), ExitReason::Sighup, Some(&second)).unwrap();
+        let note = previous_session_note(d.path()).unwrap();
+        assert_eq!((note["reason"].as_str(), note["in_flight"]["serial"].as_str()), (Some("sighup"), Some("S2")));
+    }
+
+    #[test]
+    fn the_note_is_typed_and_carries_the_recorded_fields() {
+        let d = TempDir::new().unwrap();
+        assert_eq!(previous_session_note(d.path()), None, "no marker, no note");
+        record_in_flight_at_exit(d.path(), ExitReason::ClientGoneWaitExpired, Some(&lost_apply(true, true))).unwrap();
+        let note = previous_session_note(d.path()).unwrap();
+        assert_eq!(note["marker_unreadable"], json!(false));
+        assert_eq!(note["reason"], json!("client_gone_wait_expired"));
+        assert_eq!(note["in_flight"]["op"], json!("restore-apply"));
+        assert_eq!(note["in_flight"]["serial"], json!("S1"));
+        assert_eq!(note["in_flight"]["last_phase"], json!("writing"));
+        assert_eq!(note["in_flight"]["writing_seen"], json!(true));
+        assert!(note["recorded_at"].is_string() && note["message"].is_string());
+        assert!(d.path().join(MARKER_FILE).exists(), "reading the note does not consume the marker");
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_parsed_is_reported_as_unreadable_not_ignored() {
+        let d = TempDir::new().unwrap();
+        std::fs::write(d.path().join(MARKER_FILE), "{ torn").unwrap();
+        let note = previous_session_note(d.path()).unwrap();
+        assert_eq!(note["marker_unreadable"], json!(true));
+        assert!(note["error"].as_str().is_some_and(|e| !e.is_empty()) && note["file"].is_string());
+        // And an empty file, the other way a crash can leave it.
+        std::fs::write(d.path().join(MARKER_FILE), "").unwrap();
+        assert_eq!(previous_session_note(d.path()).unwrap()["marker_unreadable"], json!(true));
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_read_at_all_is_reported_too() {
+        // A directory where the file should be: a read error that is not "not found".
+        let d = TempDir::new().unwrap();
+        std::fs::create_dir(d.path().join(MARKER_FILE)).unwrap();
+        assert_eq!(previous_session_note(d.path()).unwrap()["marker_unreadable"], json!(true));
+    }
+
+    #[test]
+    fn acknowledging_renames_the_marker_so_it_is_reported_once_and_kept() {
+        let d = TempDir::new().unwrap();
+        record_in_flight_at_exit(d.path(), ExitReason::Sigterm, Some(&lost_apply(true, true))).unwrap();
+        let before = std::fs::read(d.path().join(MARKER_FILE)).unwrap();
+        acknowledge_previous_session(d.path()).unwrap();
+        assert_eq!(previous_session_note(d.path()), None, "reported once");
+        assert!(!d.path().join(MARKER_FILE).exists());
+        assert_eq!(std::fs::read(d.path().join(MARKER_SEEN_FILE)).unwrap(), before, "kept, byte for byte");
+        let e = acknowledge_previous_session(d.path()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "nothing left to acknowledge is an error, not a success");
+        // A later marker is reported again, and replaces the older acknowledged one.
+        record_in_flight_at_exit(d.path(), ExitReason::Sighup, Some(&lost_apply(true, true))).unwrap();
+        assert!(previous_session_note(d.path()).is_some());
+        acknowledge_previous_session(d.path()).unwrap();
+        let seen: IncompleteMarker = serde_json::from_slice(&std::fs::read(d.path().join(MARKER_SEEN_FILE)).unwrap()).unwrap();
+        assert_eq!(seen.reason, ExitReason::Sighup);
     }
 }

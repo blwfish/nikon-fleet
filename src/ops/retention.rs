@@ -321,6 +321,29 @@ mod tests {
     }
 
     #[test]
+    fn counting_ignores_staging_leftovers_and_counts_only_complete_snapshots() {
+        // A crash between staging and publishing leaves `.<name>.<pid>.<n>.tmp` (what
+        // `Snapshot::save_new` and `write_atomic` stage under). It is neither a capture nor an
+        // "unreadable" file: the cap counts complete snapshots only.
+        let d = TempDir::new().unwrap();
+        put(d.path(), "1.json", "Z 9", "A", Some("mcp-one"));
+        std::fs::write(d.path().join(".2.json.4242.0.tmp"), "{\"format_version\": 1, \"camera\": {\"mod").unwrap();
+        let full = {
+            put(d.path(), "whole.json", "Z 9", "A", Some("mcp-whole"));
+            std::fs::read_to_string(d.path().join("whole.json")).unwrap()
+        };
+        std::fs::remove_file(d.path().join("whole.json")).unwrap();
+        std::fs::write(d.path().join(".3.json.4242.1.tmp"), &full).unwrap(); // complete, never published
+        assert_eq!(
+            count_for_camera(d.path(), "Z 9", "A").unwrap(),
+            Counts { captures: 1, restore_points: 0, unreadable: 0 }
+        );
+        // The contrast: the same bytes under a .json name are what the old non-atomic write left.
+        std::fs::write(d.path().join("torn.json"), &full[..full.len() / 2]).unwrap();
+        assert_eq!(count_for_camera(d.path(), "Z 9", "A").unwrap().unreadable, 1);
+    }
+
+    #[test]
     fn counting_goes_by_content_not_file_name() {
         let d = TempDir::new().unwrap();
         // A renamed file, and a file named like an MCP capture of another camera.
