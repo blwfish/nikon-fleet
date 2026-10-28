@@ -208,7 +208,10 @@ impl Supervisor {
         let mut answer: Option<Outcome> = None;
 
         while answer.is_none() && stop.is_none() {
+            // Biased: a line already in the pipe is read before a deadline or a cancellation is
+            // acted on, so a `writing` or `result` line the worker has flushed is never missed.
             tokio::select! {
+                biased;
                 line = lines.next_line() => match line {
                     Ok(Some(l)) => absorb(&l, &mut last_phase, &mut garbage, &mut writing_seen, &mut answer, on_progress),
                     Ok(None) => stop = Some(NoResultCause::WorkerDied),
@@ -219,7 +222,12 @@ impl Supervisor {
                 },
                 _ = &mut deadline => stop = Some(NoResultCause::Deadline),
                 _ = ct.cancelled(), if !cancel_ignored => {
-                    if spec.cancel == CancelPolicy::UntilWriting && writing_seen {
+                    // Whatever the worker has already flushed counts before the decision: `writing`
+                    // is emitted before its first write, so if it is not in the pipe, no write began.
+                    drain_ready(&mut lines, &mut last_phase, &mut garbage, &mut writing_seen, &mut answer, on_progress).await;
+                    if answer.is_some() {
+                        // The worker finished first: that is the outcome.
+                    } else if spec.cancel == CancelPolicy::UntilWriting && writing_seen {
                         cancel_ignored = true;
                     } else {
                         stop = Some(NoResultCause::Cancelled);
@@ -260,6 +268,23 @@ impl Supervisor {
             Some(outcome) => Finished::Result { outcome, last_phase, garbage_lines: garbage },
             None => Finished::NoResult { cause, last_phase, garbage_lines: garbage },
         })
+    }
+}
+
+/// Absorb the lines that are available right now, without waiting for more.
+async fn drain_ready<R: tokio::io::AsyncBufRead + Unpin>(
+    lines: &mut tokio::io::Lines<R>,
+    last_phase: &mut Option<String>,
+    garbage: &mut usize,
+    writing_seen: &mut bool,
+    answer: &mut Option<Outcome>,
+    on_progress: &mut (dyn FnMut(&str) + Send),
+) {
+    while answer.is_none() {
+        match tokio::time::timeout(Duration::from_millis(20), lines.next_line()).await {
+            Ok(Ok(Some(l))) => absorb(&l, last_phase, garbage, writing_seen, answer, on_progress),
+            _ => break,
+        }
     }
 }
 

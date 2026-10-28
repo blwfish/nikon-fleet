@@ -3,4 +3,5 @@
 //! Nothing else in the repository depends on this crate; deleting it leaves the
 //! CLI and GUI unchanged.
 
+pub mod server;
 pub mod supervisor;

@@ -1,6 +1,12 @@
 # Plan: optional MCP server for nikon-fleet
 
-**Status: plan only. The MCP server itself is not built.** Written and revised 2026-10-27.
+**Status: built (2026-10-27/28), in `mcp/` (crate `fleet-mcp`, install notes in `mcp/AGENT-INSTALL.md`).**
+All twelve tools exist; the camera ones go through the worker and have been run against a fake
+worker and, read-only, against a Z 9 (list, capture, restore plan). The two `*_apply` tools have been
+tested only with a fake worker through the real server (the same ops ran on hardware directly, F18,
+F19). Not yet run: a real MCP client other than a scripted one, Claude Desktop, and an apply through
+the server on hardware. Written and revised 2026-10-27; the sections below are the design, kept as
+written, with "as built" notes in §3 and at the end of §6.
 
 - Hardware evidence behind every "measured" claim below is in
   [mcp-hardware-findings.md](mcp-hardware-findings.md) (findings F1-F13, cited inline).
@@ -733,3 +739,37 @@ To write for the MCP:
 
 Any dependence of the CLI/GUI on this crate; remote/HTTP transport; Windows camera access;
 automating the firmware licence; FTP profile writes; firmware flashing.
+
+## 10. As built: `fleet-mcp` (2026-10-28)
+
+- **Layout.** `mcp/src/supervisor.rs` (the worker process model of §3), `mcp/src/server.rs` (the tools),
+  `mcp/src/main.rs` (flags, `--enable-writes`, shutdown). Library support added for it: `ops::views`
+  (paginated `get_snapshot` and `diff_snapshots`, `truncated`/`next`), `ops::firmware_latest::survey_models`,
+  `ops::cameras::list_cameras`.
+- **Tools.** Offline, in process: `list_cameras`, `list_snapshots` (with `label_prefix`, for example
+  `mcp-restore-`), `list_references`, `get_snapshot`, `diff_snapshots`, `firmware_status`. Through the
+  worker: `capture_snapshot`, `check_against_reference`, `transplant_plan`, `restore_plan`. With
+  `--enable-writes` only: `transplant_apply`, `restore_apply` (otherwise removed from the router: absent
+  from `tools/list`, `-32602` on a direct call, tested). Results are structured content; a failure is
+  `isError` with `{"error": {"tag", "message", "detail"?}}`.
+- **Worker supervision.** Result on a private pipe as fd 3 in the child only (both ends close-on-exec in the
+  server); calls queue FIFO; a deadline or a cancellation kills (SIGKILL) and reaps the worker; once the
+  `result` line is read the worker gets a 3 s grace and is then killed whatever it is doing. Lines already in
+  the pipe are read before a deadline or cancellation is acted on, and the pipe is drained after a kill, so a
+  `writing` or `result` line that was flushed is never missed. Deadlines: capture 90 s, check 120 s, plans
+  150 s, applies 300 s (`--deadline-secs` overrides all).
+- **Apply semantics.** Cancellation of an apply is ignored once the worker has reported `writing` (or
+  `read_back`), and the supervision runs in a task the request does not own, which `main` waits for after
+  the client goes (bounded, 400 s). An apply with no result is `status: indeterminate` only if the last
+  phase was `writing` or `read_back`; earlier, the worker had not begun writing, so it is `not_applied`
+  (the worker emits `writing` before its first write; the one window left is the instant between the
+  supervisor's last look at the pipe and the kill taking effect).
+- **Found while testing.** The end-to-end disconnect test only discriminated detached supervision once the
+  fake apply outlived rmcp's few-second wait for in-flight handlers (8 s, not 2 s). A cancellation test that
+  started the cancel on a timer depended on how fast the worker started on a loaded machine; they now fire
+  from the progress callback.
+- **Survivors accepted.** The drain after a kill (a result flushed in the instant before the kill) cannot be
+  provoked deterministically; the mapping of each tool to its own deadline field is not asserted per tool.
+- **Live, read-only, on the Z 9:** `tools/list`, `list_cameras` (0.0 s), `capture_snapshot` (3.7 s, 196
+  properties, gate passed, five progress notifications), `list_snapshots`, `restore_plan` (4.1 s). No
+  teardown hang occurred in this run.
