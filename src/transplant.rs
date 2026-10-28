@@ -802,10 +802,7 @@ fn names_compatible(code: u32, src: &BTreeSet<String>, tgt: &BTreeSet<String>) -
 
 /// Capabilities `transplant` and `restore` never write, by code: they report what the
 /// body or its session is doing right now (or lock it), not a setting a person
-/// chose, so "make body B like body A" must not carry them across. The one
-/// exception in kind is `ShootingLimit`, a real setting whose value this SDK
-/// reads back differently on different bodies (F25), so no write of it can be
-/// trusted to mean what was read. A single
+/// chose, so "make body B like body A" must not carry them across. A single
 /// table is the source of truth; [`never_copied`] and the real-config test
 /// both read it, so a code and its name cannot drift apart unnoticed.
 ///
@@ -826,12 +823,31 @@ pub const NEVER_TRANSPLANT: &[(u32, &str, &str)] = &[
     (33165, "kNkMAIDCapability_ShootingMode", "exposure mode, set by the body's mode dial (judgement call)"),
     (34147, "kNkMAIDCapability_Viewmode", "which display the body is showing (judgement call)"),
     (33108, "kNkMAIDCapability_ShootNoCard", "flipped on its own across a power cycle with nothing writing to the camera, so state-like or reset by the body (judgement call, hardware observation F10)"),
-    (33086, "kNkMAIDCapability_ShootingLimit", "max shots per burst (Custom Setting d2): the same setting reads as different positions on different bodies, so a copy or a restore can leave 1 shot per burst instead of infinity (infinity is index 0 on a Z 9, index 1 on a Z6III where it cannot be told from 1, and a Z5 has no infinity; hardware observation F25)"),
 ];
 
 /// Why `code` is never transplanted, if it is on [`NEVER_TRANSPLANT`].
 pub fn never_copied(code: u32) -> Option<&'static str> {
     NEVER_TRANSPLANT.iter().find(|(c, _, _)| *c == code).map(|(_, _, why)| *why)
+}
+
+/// Settings that a `transplant` between bodies never writes, but that `restore` of the same body
+/// still brings back. Unlike [`NEVER_TRANSPLANT`] these are real settings: the trouble is only in
+/// carrying a value from one body to another, because this SDK reads the same menu setting as a
+/// different position on different bodies. A restore returns a body to what that same body stored,
+/// so there is nothing to interpret.
+///
+/// `ShootingLimit` (max shots per burst, Custom Setting d2): infinity is index 0 on a Z 9 and index 1
+/// on a Z6III, where it cannot be told from 1 shot, and a Z5 has no infinity (F25). Caveat for restore,
+/// not tested: a Z6III snapshot taken at infinity stores index 1, so restoring it may leave 1 shot per burst.
+pub const NEVER_TRANSLATED: &[(u32, &str, &str)] = &[(
+    33086,
+    "kNkMAIDCapability_ShootingLimit",
+    "max shots per burst (Custom Setting d2): the same setting reads as different positions on different bodies, so a copy to another body can leave 1 shot per burst instead of infinity (infinity is index 0 on a Z 9, index 1 on a Z6III where it cannot be told from 1, and a Z5 has no infinity; hardware observation F25). A restore of the same body still brings it back",
+)];
+
+/// Why `code` is never translated between bodies, if it is on [`NEVER_TRANSLATED`].
+pub fn never_translated(code: u32) -> Option<&'static str> {
+    NEVER_TRANSLATED.iter().find(|(c, _, _)| *c == code).map(|(_, _, why)| *why)
 }
 
 /// Per-run choices that make `transplant` do more than its safe default.
@@ -1136,7 +1152,7 @@ pub fn transplant<P: CameraPort + ?Sized>(
 }
 
 /// The device-free checks that must pass before any live read or write, in
-/// order: the capability is not on [`NEVER_TRANSPLANT`], it exists on the target, its code names the same
+/// order: the capability is not on [`NEVER_TRANSPLANT`] or [`NEVER_TRANSLATED`], it exists on the target, its code names the same
 /// setting on both models, and it's writable. Split out of `transplant_one`
 /// so the ordering (and that the name guard is wired in at all) is
 /// unit-testable without a `Device`.
@@ -1145,7 +1161,7 @@ fn precheck<'a>(
     guard: &CodeNameGuard,
     prop: &PropertyEntry,
 ) -> Result<&'a CapabilityInfo, SkipReason> {
-    if let Some(reason) = never_copied(prop.code) {
+    if let Some(reason) = never_copied(prop.code).or_else(|| never_translated(prop.code)) {
         return Err(SkipReason::NeverCopied { reason });
     }
     let cap = *cap_map.get(&prop.code).ok_or(SkipReason::AbsentOnTarget)?;
@@ -1687,20 +1703,42 @@ mod tests {
     }
 
     #[test]
-    fn shooting_limit_is_never_copied_and_its_neighbours_are_not() {
-        // 33086 reads as a different index for the same menu setting on the Z 9,
-        // Z6III and Z5 (F25). Pin the code and both sides of it, and the reason
-        // a user will read, which names the failure rather than just the policy.
-        assert!(never_copied(33086).is_some_and(|why| why.contains("burst") && why.contains("infinity")));
-        assert_eq!(never_copied(33085), None);
-        assert_eq!(never_copied(33087), None);
-        assert!(NEVER_TRANSPLANT.iter().any(|(c, n, _)| *c == 33086 && *n == "kNkMAIDCapability_ShootingLimit"));
+    fn shooting_limit_is_never_translated_but_not_never_copied_so_a_restore_brings_it_back() {
+        // 33086 reads as a different index for the same menu setting on the Z 9, Z6III and Z5 (F25).
+        // Pin the code and both sides of it, and the reason a user will read.
+        assert!(never_translated(33086).is_some_and(|why| why.contains("burst") && why.contains("infinity")));
+        assert!(never_translated(33086).is_some_and(|why| why.contains("restore")), "the reason says a restore still works");
+        assert_eq!(never_translated(33085), None);
+        assert_eq!(never_translated(33087), None);
+        assert!(NEVER_TRANSLATED.iter().any(|(c, n, _)| *c == 33086 && *n == "kNkMAIDCapability_ShootingLimit"));
+        // restore reads `never_copied` only: a restore of the same body is not refused (user decision, 2026-10-28).
+        assert_eq!(never_copied(33086), None);
+        assert!(!NEVER_TRANSPLANT.iter().any(|(c, _, _)| *c == 33086));
+    }
+
+    #[test]
+    fn never_translated_table_has_unique_codes_and_names_a_reason_and_is_disjoint_from_never_copied() {
+        let codes: BTreeSet<u32> = NEVER_TRANSLATED.iter().map(|(c, _, _)| *c).collect();
+        assert_eq!(codes.len(), NEVER_TRANSLATED.len(), "duplicate code");
+        assert!(NEVER_TRANSLATED.iter().all(|(_, n, w)| n.starts_with("kNkMAIDCapability_") && !w.is_empty()));
+        // One table per kind of exclusion: a code on both would be refused by a restore.
+        assert!(NEVER_TRANSLATED.iter().all(|(c, _, _)| never_copied(*c).is_none()));
+    }
+
+    #[test]
+    fn real_config_never_translated_names_match_their_codes() {
+        let Some(c) = real_config() else { return };
+        let z: Vec<String> = c.known_models().into_iter().filter(|m| is_z_series_model(&c, m)).collect();
+        for (code, name, _) in NEVER_TRANSLATED {
+            let found = z.iter().any(|m| c.name_sets_for_model(m).get(code).is_some_and(|names| names.contains(*name)));
+            assert!(found, "{name} is not named at code {code} in any Z-series section");
+        }
     }
 
     #[test]
     fn precheck_refuses_shooting_limit_for_a_range_between_any_two_models() {
-        // Same model on both sides is refused too: a Z6III at infinity reads 1, so copying
-        // it to a second Z6III writes 1 shot per burst.
+        // Same model on both sides is refused too: a Z6III at infinity reads 1, so a transplant
+        // onto a second Z6III writes 1 shot per burst. (A restore of one body is a different path.)
         let range = json!({"value": 0.0, "default": 0.0, "value_index": 1, "default_index": 200, "lower": 0.0, "upper": 200.0, "steps": 201});
         for (src, tgt) in [("Z 9", "Z6_3"), ("Z6_3", "Z6_3"), ("Z 9", "Z 5")] {
             let c = parse_config(&[(src, &[("ShootingLimit", 33086)]), (tgt, &[("ShootingLimit", 33086)])]);

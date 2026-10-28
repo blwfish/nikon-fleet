@@ -875,8 +875,9 @@ property only: `ISOAutoShutterTimeAutoValue` (33584), the same property as F23, 
 - **Still not run:** Claude Desktop and other clients, an apply through Claude Code, a label that moves index between
   bodies, and an opted-in raw-code or literal write.
 
-- **What was done about it (2026-10-28).** The user decided to translate only verified ranges. `ShootingLimit` is now on the
-  never-copy table (transplant and restore), and ranges between two different models are default-deny: a range is copied
+- **What was done about it (2026-10-28).** The user decided to translate only verified ranges. `ShootingLimit` is now excluded from
+  transplant only (`NEVER_TRANSLATED`); the user decided a restore of the same body should still bring it back, so the
+  restore hazard above (a Z6III snapshot taken at infinity stores index 1) stands as an untested caveat. Ranges between two different models are default-deny: a range is copied
   only when it is on `range_policy::VERIFIED_RANGES` for both models, with a live scale check on top (plan §5.3a). The table
   came from the scan above (38 ranges). A read-only plan of a Z 9 snapshot onto the Z5, run with the new binary, planned 21
   range copies, 2 of which would change (`ISOAutoShutterTimeAutoValue` and `MovieRecMicrophoneValue`, the two settings that

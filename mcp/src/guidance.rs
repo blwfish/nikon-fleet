@@ -171,8 +171,8 @@ pub fn notes() -> Vec<Note> {
         .detail(
             "Copying a bare number or a raw option code between bodies assumes both bodies mean the same thing by it, which nothing guarantees. \
              Such properties are skipped unless they are named in `allow_raw_code`, and only if the value would actually change. \
-             Opt in only on the user's say-so, naming the properties. `never_copied` is policy and has no override: state-like settings, and `ShootingLimit` (max shots per burst), \
-             which the SDK reads differently on different bodies so no copy or restore of it can be trusted; \
+             Opt in only on the user's say-so, naming the properties. `never_copied` is policy and has no override: state-like settings, and in a transplant `ShootingLimit` (max shots per burst), \
+             which the SDK reads differently on different bodies so it is not carried between them (a restore of the same body still brings it back); \
              read_only and absent_on_target are routine.",
         )
         .tags(&["apply"])

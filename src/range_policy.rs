@@ -191,6 +191,7 @@ mod tests {
     fn no_verified_range_is_also_on_the_never_copy_table() {
         for (code, name, _) in VERIFIED_RANGES {
             assert!(crate::transplant::never_copied(*code).is_none(), "{name} is verified and never copied");
+            assert!(crate::transplant::never_translated(*code).is_none(), "{name} is verified and never translated");
         }
     }
 }

@@ -314,10 +314,12 @@ either, which is right for an undo but a change for a backup/firmware-rollback r
 (§9): keep one table, since a second one is a second source of truth. `ShootNoCard` joins it
 (Phase 0): it flipped across a power cycle with nothing writing to the camera (F10), so it is
 state-like or reset by the body, and omitting one property from a copy costs little. `CCDDataMode` was deliberately left out (its meaning is unclear). Tests and notes that quote `never-copied=9` become 10.
-`ShootingLimit` (33086, "maximum shots per burst", Custom Setting d2) joins it too, though it is a setting, not state: the SDK
-reads the same menu setting as a different index on each body (infinity is index 0 on a Z 9, index 1 on a Z6III where it is
-indistinguishable from 1 shot, and the Z5 has no infinity; F25), so neither a copy nor a restore can be trusted, and the table
-is the one place both read. Consequence: a restore, including a firmware rollback, does not bring this one setting back.
+`ShootingLimit` (33086, "maximum shots per burst", Custom Setting d2) is **not** on this table, because it is a setting and a
+restore should bring it back. It is on a second, transplant-only table, `NEVER_TRANSLATED`, read by the transplant precheck and not
+by `restore`: the SDK reads the same menu setting as a different index on each body (infinity is index 0 on a Z 9, index 1 on a
+Z6III where it is indistinguishable from 1 shot, and the Z5 has no infinity; F25), which only matters when a value is carried from
+one body to another. Decided 2026-10-28 (the user): a restore returns a body to what the same body stored, so there is nothing to
+interpret. Caveat, not tested: a Z6III snapshot taken at infinity stores index 1, so its restore may leave 1 shot per burst.
 
 ### 5.3a Ranges: default-deny between models (2026-10-28)
 
@@ -333,7 +335,7 @@ earlier clamping into a narrower target scale no longer happens.
 "Verified" means exactly this and no more: `lower`, `upper`, `steps` and `default_index` were read identical in a capture from
 each listed model (32 ranges on the Z 5, Z 9 and Z6_3, six movie WB presets on the Z 9 and Z6_3; `PixelShiftShootingInterval`
 was seen on one model only). It does **not** show that each position means the same thing, which only someone at the camera can
-show, and `ShootingLimit` is the proof that identical bounds are not enough (it is on the never-copy table, §5.2). To add a
+show, and `ShootingLimit` is the proof that identical bounds are not enough (it is on the transplant-only table, §5.2). To add a
 model: capture it, compare every range against the listed models, and add the model to each range that matches. The check
 runs after the read-only test, so a range the target cannot write is reported `read_only`, not as a policy skip.
 
@@ -863,7 +865,8 @@ automating the firmware licence; FTP profile writes; firmware flashing.
   as a 1 to 100 range (index 99 = 100 shots, confirmed at its display), so a Z 9 at infinity copied onto it would be
   clamped to 1 shot per burst with nothing in the plan to warn of it. This strengthens the case for excluding
   `ShootingLimit` by name rather than by a general rule.
-- **Ranges are default-deny between models (F25, 2026-10-28).** Two commits: `ShootingLimit` joined `NEVER_TRANSPLANT`, and
+- **Ranges are default-deny between models (F25, 2026-10-28).** Two commits: `ShootingLimit` was excluded from transplant (first on the shared never-copy table, then moved to the
+  transplant-only `NEVER_TRANSLATED` so a restore brings it back, at the user's instruction), and
   `range_policy::VERIFIED_RANGES` plus the live scale check made every other range between two different models
   verified-only (§5.3a). The new skips are `range_unverified` (policy) and `range_scale_differs` (warn), counted in the CLI
   summary and described in the guidance note `range-copy-is-default-deny`. A read-only plan of a Z 9 snapshot onto the Z5
