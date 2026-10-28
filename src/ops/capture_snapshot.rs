@@ -49,6 +49,16 @@ pub struct CaptureOutcome {
     /// `Passed`, or `NoBaseline` (the capture was written but not judged).
     pub gate: GateOutcome,
     pub property_count: usize,
+    /// Of `stats.failed`, how many the model's baseline also does not read, so a
+    /// healthy body of this model fails them too (200 read / 12 failed is normal
+    /// on the Z6III). `None` when the capture was not judged (`gate` is
+    /// `no_baseline`), because then nothing says which failures are normal.
+    pub expected_unreadable: Option<usize>,
+    /// `stats.failed` minus `expected_unreadable`: reads that failed although the
+    /// baseline reads them. Always `Some(0)` after a passed gate (a baseline
+    /// capability that failed would have failed the gate); kept so a non-zero
+    /// value is visible rather than assumed away. `None` when not judged.
+    pub unexpected_unreadable: Option<usize>,
 }
 
 impl CaptureOutcome {
@@ -62,7 +72,15 @@ impl CaptureOutcome {
         stats: CaptureStats,
         gate: GateOutcome,
     ) -> Self {
-        CaptureOutcome { file, label, camera, stats, gate, property_count }
+        let (expected_unreadable, unexpected_unreadable) = match (&gate, crate::ops::baseline::baseline_for(&camera.model)) {
+            (GateOutcome::Passed, Some(b)) => {
+                let unexpected =
+                    stats.failed.iter().filter(|f| b.readable.iter().any(|c| c.code == f.code)).count();
+                (Some(stats.failed.len() - unexpected), Some(unexpected))
+            }
+            _ => (None, None),
+        };
+        CaptureOutcome { file, label, camera, stats, gate, property_count, expected_unreadable, unexpected_unreadable }
     }
 }
 
@@ -346,5 +364,32 @@ mod tests {
         assert_eq!(b["label"], serde_json::Value::Null);
         let keys = |v: &serde_json::Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
         assert_eq!(keys(&a), keys(&b));
+    }
+    fn failed(code: u32) -> crate::ops::capture::FailedRead {
+        crate::ops::capture::FailedRead { code, name: format!("P{code}"), error: "e".into() }
+    }
+
+    #[test]
+    fn failures_outside_the_baseline_are_expected_and_inside_it_are_not() {
+        let cam = Camera { model: "Z 9".into(), serial: "S".into(), firmware: "5.31".into() };
+        let inside = crate::ops::baseline::baseline_for("Z 9").unwrap().readable[0].code;
+        let outside = (0u32..).find(|c| !crate::ops::baseline::baseline_for("Z 9").unwrap().readable.iter().any(|r| r.code == *c)).unwrap();
+        let mk = |failed_codes: &[u32], gate| {
+            let stats = CaptureStats { failed: failed_codes.iter().map(|c| failed(*c)).collect(), ..Default::default() };
+            let o = CaptureOutcome::new("f".into(), None, cam.clone(), 1, stats, gate);
+            (o.expected_unreadable, o.unexpected_unreadable)
+        };
+        assert_eq!(mk(&[], GateOutcome::Passed), (Some(0), Some(0)), "no failures is a judged zero, not unknown");
+        assert_eq!(mk(&[outside], GateOutcome::Passed), (Some(1), Some(0)));
+        assert_eq!(mk(&[outside, inside], GateOutcome::Passed), (Some(1), Some(1)), "a baseline code that failed is surfaced");
+        let unjudged = GateOutcome::NoBaseline(crate::ops::baseline::NoBaselineReason::UnknownModel);
+        assert_eq!(mk(&[outside], unjudged), (None, None));
+    }
+
+    #[test]
+    fn a_model_with_no_baseline_is_not_judged_even_when_the_gate_is_passed_by_hand() {
+        let cam = Camera { model: "Nonexistent".into(), serial: "S".into(), firmware: "1".into() };
+        let o = CaptureOutcome::new("f".into(), None, cam, 1, CaptureStats::default(), GateOutcome::Passed);
+        assert_eq!((o.expected_unreadable, o.unexpected_unreadable), (None, None));
     }
 }

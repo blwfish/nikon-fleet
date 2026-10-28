@@ -105,6 +105,12 @@ pub fn notes() -> Vec<Note> {
         .detail(
             "`gate.outcome: passed` means every property that is readable on a healthy body of this model was read. The listed failed reads \
              (SDK error -126 and similar) are the normal ones and are not a problem to report.\n\
+             The capture result says it outright: `expected_unreadable` counts the failed reads that a healthy body of this model also fails, and \
+             `unexpected_unreadable` counts any the baseline reads (always 0 after a passed gate; non-zero is worth reporting). Both are null when \
+             `gate` is `no_baseline`, because then nothing says which failures are normal.\n\
+             `stats.unknown_schema` (5 on both the Z 9 and the Z6III) counts readable properties that have no name in the schema and are stored \
+             as `cap_0x1`, `cap_0x6`, `cap_0x9`, `cap_0xb` and `cap_0xc`: generic device facts (the model name, the interface \"USB\") that are the \
+             same on both bodies. That is normal; a different count, or other `cap_0x` names, means the schema file is out of date for this firmware.\n\
              `capture_incomplete` means the gate failed and nothing was written. The usual cause is a body that is asleep, mid-reset or in \
              an unusual state: ask the user to wake it, then try once more.\n\
              Some settings cannot be read through this SDK at all, notably Picture Controls. They are never copied or restored; \
@@ -112,6 +118,21 @@ pub fn notes() -> Vec<Note> {
         )
         .tags(&["capture"])
         .addresses(&["failed reads", "capture incomplete", "capture_incomplete", "read errors", "-126", "gate", "unreadable properties"]),
+        Note::new(
+            "reading-a-plan",
+            d,
+            Medium,
+            Tactic,
+            "In a plan, `changes: null` means the current value could not be read so a change cannot be ruled out, and `source_label: null` only means the source snapshot has no label.",
+        )
+        .detail(
+            "`changes` is true or false when the body's current value was read and compared. It is null for properties written without a prior read \
+             (for example EnableBracketing, IsoControl and MovieISOControl): the write would happen, and whether it alters anything is unknown. \
+             `counts.would_change` already counts those as possible changes, and the digest covers them, so no action is needed beyond telling the user. \
+             `source_label` is the label stored in the snapshot file; snapshots from before labels existed, and CLI captures without --label, have none.",
+        )
+        .tags(&["plan"])
+        .addresses(&["changes null", "changes: null", "source_label null", "null in the plan", "would_change"]),
         Note::new(
             "undoing-a-change",
             d,
