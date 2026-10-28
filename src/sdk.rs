@@ -824,9 +824,28 @@ impl<'sdk> Device<'sdk> {
     }
 }
 
+/// How long the main run loop is serviced before `DisconnectDevice`.
+///
+/// F24: the SDK's close spins its own run loop on the calling thread and
+/// waits for a reply that never comes if events queued on the main loop's
+/// default mode went unserviced while we were idle. Any idle gap before the
+/// disconnect (0.3 s of sleep: 16/16 hangs) triggers it; servicing the loop
+/// for 0.2 s first gave 0/16 and 1.5 s gave 1/40. 300 ms keeps a margin over
+/// the smallest length that was tried.
+const PRE_DISCONNECT_PUMP: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Pump, then disconnect — the order is the point (see `PRE_DISCONNECT_PUMP`).
+fn teardown(pump: impl FnOnce(), disconnect: impl FnOnce()) {
+    pump();
+    disconnect();
+}
+
 impl<'sdk> Drop for Device<'sdk> {
     fn drop(&mut self) {
-        let _ = unsafe { (self.sdk.disconnect_device)() };
+        teardown(
+            || pump_cf_runloop(PRE_DISCONNECT_PUMP),
+            || { let _ = unsafe { (self.sdk.disconnect_device)() }; },
+        );
     }
 }
 
@@ -1107,6 +1126,42 @@ unsafe fn write_cap_value(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── teardown (F24) ───────────────────────────────────────────────────
+
+    #[test]
+    fn teardown_pumps_before_disconnecting() {
+        let log = std::cell::RefCell::new(Vec::new());
+        teardown(|| log.borrow_mut().push("pump"), || log.borrow_mut().push("disconnect"));
+        assert_eq!(*log.borrow(), ["pump", "disconnect"]);
+    }
+
+    #[test]
+    fn pre_disconnect_pump_stays_in_the_measured_window() {
+        // F24 measured 200 ms (0/16 hangs) .. 1.5 s (1/40); below 200 ms is
+        // untested, and a long pump only delays every exit.
+        assert!(PRE_DISCONNECT_PUMP >= std::time::Duration::from_millis(200));
+        assert!(PRE_DISCONNECT_PUMP <= std::time::Duration::from_millis(1500));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pump_runs_for_about_the_requested_time_without_an_sdk() {
+        let t = std::time::Instant::now();
+        pump_cf_runloop(std::time::Duration::from_millis(150));
+        let took = t.elapsed();
+        // An empty default-mode loop returns immediately on some systems
+        // (no sources); either way it must not hang or overrun.
+        assert!(took < std::time::Duration::from_millis(1500), "pump overran: {took:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pump_with_zero_duration_returns_promptly() {
+        let t = std::time::Instant::now();
+        pump_cf_runloop(std::time::Duration::ZERO);
+        assert!(t.elapsed() < std::time::Duration::from_millis(500));
+    }
 
     // ── callback stubs ───────────────────────────────────────────────────
     // The SDK reads the return value of the UI-request and data stubs, so pin
