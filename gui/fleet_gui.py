@@ -368,6 +368,9 @@ class FleetApp:
     def _on_cam_select(self, _evt) -> None:
         sel = self._cam_lb.curselection()
         if sel:
+            if sel[0] != self.selected:
+                # A label typed for one body must not end up on another body's snapshot.
+                self._label.set("")
             self.selected = sel[0]
             self._render_snapshots()
 

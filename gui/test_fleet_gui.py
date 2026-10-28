@@ -1302,3 +1302,29 @@ class TestMessagesBoxIsResizable:
         app.root.update()
         after = app._notes.master.winfo_height()
         assert after >= before + 60, (before, after)
+
+
+class TestLabelDoesNotFollowTheSelection:
+    def _select(self, app, model, serial):
+        idx = next(i for i, c in enumerate(app.cameras) if (c["model"], c["serial"]) == (model, serial))
+        app._cam_lb.selection_clear(0, "end")
+        app._cam_lb.selection_set(idx)
+        app._on_cam_select(None)
+        return idx
+
+    def test_a_label_typed_for_one_camera_is_cleared_when_another_is_selected(self, tk_root, fake_cli):
+        app = make_app(tk_root, fake_cli)
+        first, second = app.cameras[0], app.cameras[1]
+        assert (first["model"], first["serial"]) != (second["model"], second["serial"])
+        self._select(app, first["model"], first["serial"])
+        app._label.set("z9a-reference")
+        self._select(app, second["model"], second["serial"])
+        assert app._label.get() == ""
+
+    def test_selecting_the_already_selected_camera_keeps_the_label(self, tk_root, fake_cli):
+        app = make_app(tk_root, fake_cli)
+        first = app.cameras[0]
+        self._select(app, first["model"], first["serial"])
+        app._label.set("z9a-reference")
+        self._select(app, first["model"], first["serial"])
+        assert app._label.get() == "z9a-reference"

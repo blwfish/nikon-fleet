@@ -867,6 +867,7 @@ impl FleetApp {
             }
         });
         if let Some(i) = cam_select {
+            self.label = label_after_selection(self.selected, i, std::mem::take(&mut self.label));
             self.selected = Some(i);
         }
     }
@@ -1367,6 +1368,17 @@ fn snapshot_refusal(camera: &CameraRow, scan: &CameraList) -> Option<SnapshotRef
     let on_bus = duplicate_models(scan.cameras.iter().map(|c| c.model.as_str()));
     let count = on_bus.get(&camera.model).copied().unwrap_or(0).max(camera.model_count);
     (count > 1).then(|| SnapshotRefusal::AmbiguousPairing(AmbiguousPairing { model: camera.model.clone(), count }))
+}
+
+/// The snapshot label after a click on camera `chosen`: kept when the click is on the camera that is
+/// already selected, cleared when it is a different one (a label typed for one body must not end
+/// up on another body's snapshot).
+fn label_after_selection(previous: Option<usize>, chosen: usize, label: String) -> String {
+    if previous == Some(chosen) {
+        label
+    } else {
+        String::new()
+    }
 }
 
 fn snapshot_argv(data_dir: &Path, serial: &str, label: &str) -> Result<Vec<String>, String> {
@@ -2625,6 +2637,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_label_does_not_follow_the_selection_to_another_camera() {
+        // The bug: a label typed for the Z 9 stayed in the box after clicking the Z 5.
+        assert_eq!(label_after_selection(Some(0), 1, "z9a-reference".into()), "");
+        assert_eq!(label_after_selection(Some(1), 0, "x".into()), "");
+        // Nothing was selected before: the box is cleared too (it was typed for no camera).
+        assert_eq!(label_after_selection(None, 0, "x".into()), "");
+        // Clicking the camera that is already selected keeps what was typed.
+        assert_eq!(label_after_selection(Some(1), 1, "z9a-reference".into()), "z9a-reference");
+        // An empty label stays empty either way.
+        assert_eq!(label_after_selection(Some(0), 1, String::new()), "");
+    }
     use nikon_fleet::ops::baseline::{GateOutcome, NoBaselineReason};
     use nikon_fleet::ops::capture::CaptureStats;
     use nikon_fleet::ops::capture_snapshot::CaptureOutcome;
