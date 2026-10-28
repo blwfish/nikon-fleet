@@ -6,7 +6,7 @@ worker and, read-only, against a Z 9 (list, capture, restore plan), and through 
 2.1.308: list, capture, transplant plan; F20). The two `*_apply` tools have been tested only with a fake worker
 through the real server (the same ops ran on hardware directly, F18, F19). Not yet run: Claude Desktop, and
 an apply through the server on hardware. Written and revised 2026-10-27; the sections below are the design, kept as
-written, with "as built" notes in §3 and at the end of §6.
+written, with the as-built notes in §11.
 
 - Hardware evidence behind every "measured" claim below is in
   [mcp-hardware-findings.md](mcp-hardware-findings.md) (findings F1-F13, cited inline).
@@ -461,8 +461,8 @@ snapshot" as meaningful, or filter them from the default lists.
 | Gate numeric literal scalars like raw codes: `SkipReason::literal_unconfirmed`, same opt-in list (§5.3) | **done** (`6d412c7`); the opt-in was confirmed in a live dry run (F15), but the opted-in write itself has not been run on hardware |
 | Add `ShootNoCard` to `NEVER_TRANSPLANT` (and its real-config name check) | **done** (`c619f23`); the table has 10 entries |
 | `Serialize` on `Strategy`/`SkipReason` as closed tags (exhaustive match) and on outcomes | **done** (`8b2bcd7`): `tag()` and a new `Severity` (`routine`/`policy`/`warn`/`error`, the table's column); `{tag, severity, detail?}` with `detail` omitted when empty; outcomes are `{name, code, status: copied\|skipped, strategy\|reason, choice?}`; the CLI's warn decision now reads `severity()` |
-| `--json` on `ls`, `ref list`, `check`, `snapshot`, `transplant`, `restore`; `discover --json` gains `available`/`connected_pid` | `ls` and `ref list` **done** (`0c551a7`, through `ops::list::list_dir`; entries have no `is_reference` until the byte-identity rule lands); the rest todo |
-| `ops::capture` returns `read_ok`/`read_err`/failed codes, uses create-new writes | create-new writes **done** (`e50e43c`: `Snapshot::save_new`, used by the CLI and GUI captures); the returned stats are todo |
+| `--json` on `ls`, `ref list`, `check`, `snapshot`, `transplant`, `restore`; `discover --json` gains `available`/`connected_pid` | `ls` and `ref list` **done** (`0c551a7`, through `ops::list::list_dir`; `is_reference` since `72a7eb5`); the rest **still todo** and not needed by the MCP, which goes through the worker; the CLI-vs-MCP parity test (§7) therefore does not exist |
+| `ops::capture` returns `read_ok`/`read_err`/failed codes, uses create-new writes | create-new writes **done** (`e50e43c`); the returned stats **done** (`ops::capture_snapshot` returns them) |
 | Per-model baseline file (readable-capability sets, seeded from F5) and the superset gate (also useful to the CLI: a partial capture still exits 0) | **done**: `ops::baseline` and `baselines/{Z6_3,Z_9}.json` (200 and 196 capabilities, seeded from real captures with `nikon-fleet baseline seed`, embedded at build time); the CLI `snapshot` and `check` and the GUI capture refuse an incomplete capture before writing anything (`--allow-partial` on the CLI). live on the Z 9: a real capture passes, and a baseline with one extra capability makes `snapshot` fail with nothing written (F15); the Z6III was not attached |
 | One `ops::list` byte-identity rule, new for the CLI. The GUIs keep their copies; parity test only (§2) | **done** (`72a7eb5`, `7155886`): `ls --json` carries `is_reference`; all three implementations are checked against `tests/fixtures/reference_parity`, which found and fixed two divergences (below §2) |
 | Cross-process `flock` on an open fd at a fixed per-user local path (not `--data-dir`), taken by CLI, GUI and MCP worker (§3) | **done** (`a8b5c95`): `nikon_fleet::camera_lock`, taken in the CLI's `open_sdk` and the Rust GUI's discover and snapshot; the MCP worker takes it the same way once it exists. `vendor-read`/`vendor-write-ftp` are raw USB PTP and do not take it |
@@ -473,15 +473,15 @@ snapshot" as meaningful, or filter them from the default lists.
 | Read-back in `ops`: transplant returns `side_effects`, restore returns `residual` (§5.5-5.6) | **done** (`1c83fcb`, `ops::readback::{side_effects, residual}`), and the whole apply/undo sequence is tested on a fake body (`48c9b90`) |
 | Capture gate evaluated in memory before the file is written (a failed gate leaves no file) | **done** in the CLI and GUI (`d786333`); `ops::capture` returns the stats and the failed reads |
 
-**Where the work stands (end of the 2026-10-27 session).** Everything the Phase 2 and 3 tools need
+**Where the work stands (updated 2026-10-28; the server is built, §11).** Everything the Phase 2 and 3 tools need
 below the MCP server exists and is tested on an in-memory body: capture (`ops::capture_snapshot`), check
 (`ops::check`), transplant plan and apply (`ops::plan`, `ops::apply`), restore plan and apply
 (`ops::restore_flow`: same shape, same-body only, its own `mcp-restore-pre-restore-<ts>` restore point,
 read-back judged by `ops::readback::residual`), restore decisions and execution (`ops::restore`), the
 retention rules, the read-back comparisons, names-not-paths, the camera lock and the worker protocol. The
 hidden `worker` subcommand runs `list-cameras`, `capture`, `check`, `transplant-plan`, `transplant-apply`,
-`restore-plan` and `restore-apply`; the first three have been run read-only on a Z 9, the two restore ops have only been
-run against fake bodies and the binary's no-hardware refusals. **One transplant (a single stepped range,
+`restore-plan` and `restore-apply`; `list-cameras`, `capture`, `check` and the plans have been run read-only on a Z 9, and
+a one-property `transplant-apply` and `restore-apply` (with their undos) have been run on it (F18, F19). **One transplant (a single stepped range,
 `WBTuneAuto` 612 to 613) has been applied to hardware by this code and undone, with a restore point and a
 verified read-back (F18); nothing larger has, and it also showed that a blind range write is silently
 ignored, so `restore` now reads a stepped range first.** The CLI's `restore` also reads the body back and
@@ -491,7 +491,7 @@ descriptors only: no SDK, no lock, no bundle, and it ran against the Z 9 with no
 besides the bodies, `unreadable` (a Nikon device that is attached but whose descriptor or open failed) and
 `enumeration_error` (the bus could not be listed), and `complete` is false for either, because
 `usb_camera_list` used to drop both silently and an agent would have read an empty list as "nothing
-attached". Not written yet: the `mcp/` crate and the parent-side watchdog.
+attached". The `mcp/` crate and the parent-side supervisor are built (§11).
 
 **Restore flow decisions (as built).** A restore that changes nothing (every selected property already
 holds the stored value) is a `no_op`: no restore point, no write, `applied_verified`, so a retry after
@@ -740,7 +740,7 @@ To write for the MCP:
 Any dependence of the CLI/GUI on this crate; remote/HTTP transport; Windows camera access;
 automating the firmware licence; FTP profile writes; firmware flashing.
 
-## 10. As built: `fleet-mcp` (2026-10-28)
+## 11. As built: `fleet-mcp` (2026-10-28)
 
 - **Layout.** `mcp/src/supervisor.rs` (the worker process model of §3), `mcp/src/server.rs` (the tools),
   `mcp/src/main.rs` (flags, `--enable-writes`, shutdown). Library support added for it: `ops::views`
