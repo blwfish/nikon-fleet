@@ -268,7 +268,7 @@ compile until mapped.
 | `literal` | scalar copied as-is |
 | `enum_by_label` | packed-string enum matched on the whole label |
 | `enum_by_raw_value` | enum matched by raw numeric code (weaker; see `raw_code_unconfirmed`) |
-| `range_clamped` | range position carried to the same position on the same scale (the name is from when it also clamped into a differing scale; that is now `range_scale_differs`, §5.3a) |
+| `range_clamped` | range position carried to the same position on the same scale (the name is from when it also clamped into a differing scale; that is now `range_scale_differs`, §5.3a). A range with no span (FocalLength, 0..0) is a read-out and is never copied |
 
 | `SkipReason` tag | Routine? | Meaning |
 |---|---|---|
@@ -300,23 +300,30 @@ field) and the plan still proceeds.
 
 ### 5.2 Never-copy table
 
+A second table, `NEVER_TRANSLATED` (today only `ShootingLimit`), holds real settings that read as a different
+position per body. A transplant between bodies skips them; a restore of the body's own snapshot writes them; a
+restore of **another body's** snapshot (the CLI's `restore --serial`, `ops::restore::Source::OtherBody`) skips them
+too. Whether a snapshot is the body's own is decided from the serials: an empty serial or the `id-N` fallback never
+identifies a body, so it is treated as another body's (fail closed).
+
 `NEVER_TRANSPLANT` (code, name, reason) is the single source of truth, read by `precheck` in
 transplant **and** `restore_precheck` in restore through `never_copied`. It is checked before any
 live read or write and has no override. It holds properties that report what the body or session
 is doing, or lock it: `LockCamera`, `LiveViewStatus`, `CurrentItemID` (these two already failed
 -125 on a real restore), `ExternalFlashStatus`, `RawJpegTransferStatus`, `ChangeMonitorOffStatus`,
-`LiveViewPhotoShootingMode`, `ShootingMode`, `Viewmode`. Only the two -125 entries have hardware
-evidence; the other seven rest on their names (the SDK config does not classify state vs setting),
-and the code marks four of those (`ChangeMonitorOffStatus`, `LiveViewPhotoShootingMode`,
-`ShootingMode`, `Viewmode`) as explicit judgement calls. A real-config test checks every
+`LiveViewPhotoShootingMode`, `ShootingMode`, `Viewmode`, `ShootNoCard`, and (2026-10-28) `FlexibleProgram` (a transient
+shift the body resets) and `FocalLength` (the lens's read-out, a 0..0 range). Only the two -125 entries have hardware
+evidence, and `ShootNoCard` has hardware observation F10; the others rest on their names (the SDK config does not classify state vs
+setting), and the code marks most of those (`ChangeMonitorOffStatus`, `LiveViewPhotoShootingMode`, `ShootingMode`, `Viewmode`,
+`FlexibleProgram`) as explicit judgement calls. A real-config test checks every
 (code, name) pair against the Z-series sections. Consequence for `restore`: these are not restored
 either, which is right for an undo but a change for a backup/firmware-rollback restore. Decided
 (§9): keep one table, since a second one is a second source of truth. `ShootNoCard` joins it
 (Phase 0): it flipped across a power cycle with nothing writing to the camera (F10), so it is
 state-like or reset by the body, and omitting one property from a copy costs little. `CCDDataMode` was deliberately left out (its meaning is unclear). Tests and notes that quote `never-copied=9` become 10.
 `ShootingLimit` (33086, "maximum shots per burst", Custom Setting d2) is **not** on this table, because it is a setting and a
-restore should bring it back. It is on a second, transplant-only table, `NEVER_TRANSLATED`, read by the transplant precheck and not
-by `restore`: the SDK reads the same menu setting as a different index on each body (infinity is index 0 on a Z 9, index 1 on a
+restore should bring it back. It is on a second table, `NEVER_TRANSLATED`, read by the transplant precheck and, for a snapshot of
+*another* body, by `restore` (a restore of the body's own snapshot does not read it): the SDK reads the same menu setting as a different index on each body (infinity is index 0 on a Z 9, index 1 on a
 Z6III where it is indistinguishable from 1 shot, and the Z5 has no infinity; F25), which only matters when a value is carried from
 one body to another. Decided 2026-10-28 (the user): a restore returns a body to what the same body stored, so there is nothing to
 interpret. Caveat, not tested: a Z6III snapshot taken at infinity stores index 1, so its restore may leave 1 shot per burst.
@@ -333,7 +340,7 @@ same by identity). A model nobody has captured, such as a Z8, is refused until s
 earlier clamping into a narrower target scale no longer happens.
 
 "Verified" means exactly this and no more: `lower`, `upper`, `steps` and `default_index` were read identical in a capture from
-each listed model (32 ranges on the Z 5, Z 9 and Z6_3, six movie WB presets on the Z 9 and Z6_3; `PixelShiftShootingInterval`
+each listed model (30 ranges on the Z 5, Z 9 and Z6_3 after `FocalLength` and `FlexibleProgram` moved to the never-copy table, six movie WB presets on the Z 9 and Z6_3; `PixelShiftShootingInterval`
 was seen on one model only). It does **not** show that each position means the same thing, which only someone at the camera can
 show, and `ShootingLimit` is the proof that identical bounds are not enough (it is on the transplant-only table, §5.2). To add a
 model: capture it, compare every range against the listed models, and add the model to each range that matches. The check
@@ -410,11 +417,14 @@ the digest only as the unchanged/changed bit of each resolved choice.
    - `applied_verified`;
    - `applied_unverified`: writes reported success but the read-back capture failed the gate or
      did not complete;
-   - `failed`: with how many properties were written before the failure;
+   - `failed`: with how many properties were written before the failure (also when nothing could be copied because of
+     problems, which is a `no_op: true` result with no restore point; returned as an error result that still carries the report);
    - `indeterminate`: the worker produced no `result` (killed at the deadline, or died; §3), so
      writes may or may not have happened and the count is unknown. The tool result names the last
      progress phase and tells the caller to capture or `check` to find out. It is never reported
-     as `failed`.
+     as `failed`;
+   - `not_applied`: the same, but before the first write, so nothing changed. Both of these two are set by the supervisor,
+     never by the worker.
 
    The result also carries the written property names, the restore point's name, and
    **`side_effects`**: properties that differ in the read-back against the restore point, were not
@@ -530,7 +540,8 @@ success is harmless, as for a transplant; naming only properties that cannot be 
 quiet success. The plan lists only the selected properties (the rest are in `counts`). A write the body
 accepts and ignores is `applied_unverified` with the residual, never `applied_verified`; a rejected write,
 or a named property that could not be restored, is `failed` (with whatever did take still verified). The
-undo set is written plus side effects, and its restore is a restore of the restore point.
+undo set is what was written, anything whose write may have landed, and side effects, limited to what the restore
+point holds and the body will take (`undo_not_restorable` names the rest), and its restore is a restore of the restore point.
 
 Phase 0 touches `src/main.rs`, `lib.rs` and `gui/`; the firmware session's earlier edits there are
 committed, so nothing blocks it.
@@ -794,7 +805,8 @@ automating the firmware licence; FTP profile writes; firmware flashing.
   worker: `capture_snapshot`, `check_against_reference`, `transplant_plan`, `restore_plan`. With
   `--enable-writes` only: `transplant_apply`, `restore_apply` (otherwise removed from the router: absent
   from `tools/list`, `-32602` on a direct call, tested). Results are structured content; a failure is
-  `isError` with `{"error": {"tag", "message", "detail"?}}`.
+  `isError` with `{"error": {"tag", "message", "detail"?}}`. The one exception is an apply that ran and
+  `failed`: `isError: true` with the whole report as structured content and no `error` key.
 - **Worker supervision.** Result on a private pipe as fd 3 in the child only (both ends close-on-exec in the
   server); calls queue FIFO; a deadline or a cancellation kills (SIGKILL) and reaps the worker; once the
   `result` line is read the worker gets a 3 s grace and is then killed whatever it is doing. Lines already in

@@ -13,9 +13,11 @@ when both are on a verified list (`src/range_policy.rs`, `docs/mcp-plan.md` §5.
 Z 5, Z 9 and Z6_3. You are adding another model's evidence. The models the maintainer expects are the
 **ZR, Z8, Z6II and Z30**.
 
-"Verified" means the range's bounds, step count and default position read identical on each listed
-model **and** the person confirmed at the camera that the positions mean what the menu says. The script
-checks the first; only the person can give you the second (step 5).
+For a new model, "verified" means the range's bounds, step count and default position read identical on
+each listed model **and** the person confirmed at the camera that the positions mean what the menu says.
+The script checks the first; only the person can give you the second (step 5). Be aware that the entries
+already on the list (the first 36) were added on the first condition only: the bounds matched, and
+`ShootingLimit` was the one range anyone checked by hand (and it failed; it is not on the list).
 
 ## Rules
 
@@ -138,7 +140,7 @@ gives. They should agree, and the special entries (infinity, off, auto) are the 
 
 Then, only if the person is willing and the model has them, spot-check **one** white-balance fine-tune
 axis (set one step from neutral on one axis) and one of the other ranges the compare listed as SAME.
-Say which. Do not try to check all 38; the list above covers the families that could hide a special
+Say which. Do not try to check all 36; the list above covers the families that could hide a special
 value.
 
 For anything the person cannot find, write "not checked". An unchecked property is not a failure,
@@ -172,10 +174,11 @@ To add a model once its report is in: put the report in `docs/range-scales/`, ad
 `src/range_policy.rs` (tests), add the model string to each `VERIFIED_RANGES` entry that compare shows as
 SAME and the person confirmed (a new set constant per distinct group of models), and run `cargo test`.
 The tests check the table against the reports in both directions, so a range that matches but is left
-off, or listed but not backed by a report, fails. A range that matched but failed the meaning check
-(infinity landing somewhere unexpected, for example) stays off the table, or goes on
-`NEVER_TRANSPLANT` (or `NEVER_TRANSLATED` if only a transplant between bodies is the trouble) if copying
-it could do harm.
+off, or listed but not backed by a report, fails, with one exception: a scale shared by two models whose
+code is on `NEVER_TRANSPLANT` or `NEVER_TRANSLATED` is accepted (the table test asks `never_skip`). So a range that matched but failed the
+meaning check (infinity landing somewhere unexpected, for example) cannot just be left off: put it on
+`NEVER_TRANSLATED` if only carrying it between bodies is the trouble (a restore of the same body still
+works), or on `NEVER_TRANSPLANT` if it is state or a read-out and should never be copied.
 
 Making the MCP server capture the model is separate: add a row to `docs/firmware-archive-spec.md` §2 from
 the probe in step 1, then add the stripped USB product string to `KNOWN_MODELS` in `src/ops/cameras.rs`

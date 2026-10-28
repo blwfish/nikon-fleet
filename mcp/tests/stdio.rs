@@ -261,6 +261,22 @@ fn with_enable_writes_both_apply_tools_are_registered_and_marked_destructive() {
     }
 }
 
+#[test]
+fn an_empty_only_list_is_refused_by_both_restore_tools_before_any_worker_runs() {
+    // `only: []` would reach the worker as no `--only` at all, which restores every property.
+    let mut s = Server::start(&["--enable-writes"]);
+    let plan = s.call("restore_plan", json!({"serial": "0000003023668", "source": "snap.json", "only": []}));
+    assert!(is_error(&plan), "{plan}");
+    assert_eq!(structured(&plan)["error"]["tag"], json!("empty_selection"));
+    let apply = s.call(
+        "restore_apply",
+        json!({"serial": "0000003023668", "source": "snap.json", "only": [], "plan_digest": "d", "summary": "s"}),
+    );
+    assert!(is_error(&apply), "{apply}");
+    assert_eq!(structured(&apply)["error"]["tag"], json!("empty_selection"));
+    assert!(s.log("args.log").is_empty(), "no worker was started: {}", s.log("args.log"));
+}
+
 // ── offline tools ────────────────────────────────────────────────────────
 
 #[test]

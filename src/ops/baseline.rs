@@ -527,7 +527,14 @@ mod tests {
     #[test]
     fn shipped_baseline_names_match_the_real_config_at_their_codes() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk-runtime/MaidLayer.config");
-        let Ok(cfg) = crate::maid_layer::MaidLayerConfig::parse_file(&path) else { return };
+        if !path.exists() {
+            // `sdk-runtime/` is gitignored; absence is loud, and a failure where it must exist.
+            assert!(std::env::var_os("REQUIRE_SDK_RUNTIME").is_none(), "REQUIRE_SDK_RUNTIME is set but {path:?} does not exist");
+            eprintln!("SKIPPED baseline-names sweep: {path:?} not present (run scripts/setup-sdk-runtime.sh)");
+            return;
+        }
+        // Present but unparseable is a failure, never a quiet pass.
+        let cfg = crate::maid_layer::MaidLayerConfig::parse_file(&path).expect("the real MaidLayer.config parses");
         for b in builtin_baselines() {
             let names = cfg.name_sets_for_model(&b.model);
             let mut checked = 0;

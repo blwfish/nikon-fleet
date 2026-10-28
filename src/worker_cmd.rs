@@ -35,7 +35,7 @@ use nikon_fleet::ops::restore_flow::{
     BodyPolicy, RestoreApplyError, RestoreApplyRequest, RestorePlanInput, apply_restore, build_restore_plan,
 };
 use nikon_fleet::ops::target::select_by_usb_serial;
-use nikon_fleet::ops::worker::{Emitter, Outcome, open_result_fd};
+use nikon_fleet::ops::worker::{Emitter, Outcome, PHASE_WRITING, open_result_fd};
 use nikon_fleet::ops::port::CameraPort;
 use nikon_fleet::sdk::Device;
 use nikon_fleet::snapshot::{Camera, Snapshot};
@@ -189,7 +189,7 @@ pub fn run(data_dir: &Path, bundle: &Path, schema: &Path, args: &WorkerArgs) -> 
         WorkerOp::ListCameras => {
             progress(&mut em, "starting");
             let list = nikon_fleet::ops::cameras::list_cameras();
-            finish(&mut em, Outcome::ok(serde_json::to_value(&list).unwrap_or(json!(null))))
+            finish(&mut em, Outcome::ok_report(&list))
         }
         WorkerOp::Capture { serial, label } => capture(&mut em, teardown, data_dir, bundle, schema, serial, label.as_deref()),
         WorkerOp::Check { serial } => op_check(&mut em, teardown, data_dir, bundle, schema, serial),
@@ -240,6 +240,30 @@ fn finish(em: &mut Emitter<File>, outcome: Outcome) -> i32 {
 fn progress(em: &mut Emitter<File>, phase: &str) {
     if let Err(e) = em.progress(phase) {
         eprintln!("worker: {e}");
+    }
+}
+
+/// Progress for an apply. The `writing` line is the supervisor's proof that no write happened if it
+/// never arrives, so if it cannot be delivered the apply must not go on to write: returns `false`
+/// for that case. Any other line that cannot be delivered is only logged, as before.
+fn progress_for_apply<W: std::io::Write>(em: &mut Emitter<W>, phase: &str) -> bool {
+    match em.progress(phase) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("worker: {e}");
+            phase != PHASE_WRITING
+        }
+    }
+}
+
+/// The progress callback an apply is given: ends the process before the first write if the line
+/// announcing writes could not be sent.
+fn apply_progress<'a>(em: &'a mut Emitter<File>) -> impl FnMut(&str) + 'a {
+    move |phase| {
+        if !progress_for_apply(em, phase) {
+            eprintln!("worker: the `writing` progress line could not be sent; stopping before any write");
+            nikon_fleet::process_exit::exit_now(2);
+        }
     }
 }
 
@@ -381,7 +405,7 @@ fn capture(
             progress(em, p);
         }
         match result {
-            Ok(outcome) => Outcome::ok(serde_json::to_value(&outcome).unwrap_or(json!(null))),
+            Ok(outcome) => Outcome::ok_report(&outcome),
             Err(e) => {
                 let detail = match &e {
                     CaptureError::Incomplete { missing, stats } => {
@@ -424,7 +448,7 @@ fn op_check(em: &mut Emitter<File>, teardown: Teardown, data_dir: &Path, bundle:
         };
         progress(em, "reading");
         match check(body.device, &req) {
-            Ok(report) => Outcome::ok(serde_json::to_value(&report).unwrap_or(json!(null))),
+            Ok(report) => Outcome::ok_report(&report),
             Err(e) => {
                 let detail = match &e {
                     CheckError::Incomplete { missing, stats } => {
@@ -490,7 +514,7 @@ fn op_transplant(
             None => {
                 progress(em, "planning");
                 let report = build_plan(body.device, &guard, &input);
-                Outcome::ok(serde_json::to_value(&report).unwrap_or(json!(null)))
+                Outcome::ok_report(&report)
             }
             Some((digest, summary)) => {
                 let name_lookup = body.schema.name_map_for_model(&body.camera.model);
@@ -510,9 +534,9 @@ fn op_transplant(
                 };
                 // Each phase is emitted as it happens: the parent decides what a cancellation
                 // can still do from the last one it has seen, and "writing" is the last safe point.
-                let result = apply_transplant(body.device, &req, &mut |p| progress(em, p));
+                let result = apply_transplant(body.device, &req, &mut apply_progress(em));
                 match result {
-                    Ok(report) => Outcome::ok(serde_json::to_value(&report).unwrap_or(json!(null))),
+                    Ok(report) => Outcome::ok_report(&report),
                     Err(e) => {
                         let detail = match &e {
                             ApplyError::RestorePointIncomplete { missing, stats } => {
@@ -586,7 +610,7 @@ fn op_restore(
             None => {
                 progress(em, "planning");
                 match build_restore_plan(body.device, &input) {
-                    Ok(report) => Outcome::ok(serde_json::to_value(&report).unwrap_or(json!(null))),
+                    Ok(report) => Outcome::ok_report(&report),
                     Err(e) => Outcome::err(e.tag(), e.to_string(), None),
                 }
             }
@@ -606,11 +630,11 @@ fn op_restore(
                     gate_policy: GatePolicy::Strict,
                 };
                 // As for the transplant: "writing" is the last phase at which cancelling is safe.
-                match apply_restore(body.device, &req, &mut |p| progress(em, p)) {
-                    Ok(report) => Outcome::ok(serde_json::to_value(&report).unwrap_or(json!(null))),
+                match apply_restore(body.device, &req, &mut apply_progress(em)) {
+                    Ok(report) => Outcome::ok_report(&report),
                     Err(e) => {
                         let detail = match &e {
-                            RestoreApplyError::RestorePointIncomplete { missing, stats } => {
+                            RestoreApplyError::Apply(ApplyError::RestorePointIncomplete { missing, stats }) => {
                                 Some(json!({"missing": missing, "read_ok": stats.read_ok, "read_err": stats.read_err}))
                             }
                             _ => None,
@@ -626,6 +650,28 @@ fn op_restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sink that fails every write, like a pipe whose reader has gone.
+    struct Broken;
+    impl std::io::Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("broken pipe"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_apply_must_not_write_if_the_line_announcing_writes_could_not_be_sent() {
+        let mut em = Emitter::new(Broken);
+        assert!(!progress_for_apply(&mut em, PHASE_WRITING), "the supervisor would read silence as 'nothing was written'");
+        assert!(progress_for_apply(&mut em, "plan_verified"), "other lines are only logged");
+        assert!(progress_for_apply(&mut em, "read_back"));
+        let mut ok = Emitter::new(Vec::new());
+        assert!(progress_for_apply(&mut ok, PHASE_WRITING), "delivered: go ahead");
+    }
+
 
     fn s(v: &str) -> String {
         v.to_string()

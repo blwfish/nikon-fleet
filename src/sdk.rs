@@ -90,7 +90,7 @@ struct NkMAIDDeviceInfo {
 const _: () = assert!(std::mem::size_of::<NkMAIDDeviceInfo>() == 140);
 
 #[repr(C)]
-struct NkMAIDEnumDevices {
+pub(crate) struct NkMAIDEnumDevices {
     ul_elements: u32,
     ul_value: u32,
     p_device_data: *mut NkMAIDDeviceInfo,
@@ -120,7 +120,7 @@ const _: () = assert!(std::mem::size_of::<NkMAIDEnumCapInfo>() == 16);
 /// Layout verified against Maid3.h (Mac 64-bit / LP64):
 ///   offsets 0–15: four u32 fields; offset 16: i16; 6-byte pad; offset 24: *mut c_void.
 #[repr(C)]
-struct NkMAIDEnum {
+pub(crate) struct NkMAIDEnum {
     ul_type: u32,          // eNkMAIDArrayType of the element data
     ul_elements: u32,      // number of valid choices
     ul_value: u32,         // CURRENT index — the only field changed on Set
@@ -133,7 +133,7 @@ const _: () = assert!(std::mem::size_of::<NkMAIDEnum>() == 32);
 
 /// NkMAIDRange — returned by GetCapability for kNkMAIDCapType_Range capabilities.
 #[repr(C)]
-struct NkMAIDRange {
+pub(crate) struct NkMAIDRange {
     lf_value: f64,
     lf_default: f64,
     ul_value_index: u32,
@@ -224,13 +224,13 @@ pub const OP_SET: u32 = 0x0004;
 
 // kNkMAIDCapType_* — capability type codes (CapabilityInfo.kind).
 // Used by write_capability to choose the right SetCapability data type.
-const CAP_TYPE_BOOLEAN: u32 = 1;
-const CAP_TYPE_INTEGER: u32 = 2;
-const CAP_TYPE_UNSIGNED: u32 = 3;
-const CAP_TYPE_FLOAT: u32 = 4;
-const CAP_TYPE_STRING: u32 = 8;
-const CAP_TYPE_ENUM: u32 = 12;
-const CAP_TYPE_RANGE: u32 = 13;
+pub const CAP_TYPE_BOOLEAN: u32 = 1;
+pub const CAP_TYPE_INTEGER: u32 = 2;
+pub const CAP_TYPE_UNSIGNED: u32 = 3;
+pub const CAP_TYPE_FLOAT: u32 = 4;
+pub const CAP_TYPE_STRING: u32 = 8;
+pub const CAP_TYPE_ENUM: u32 = 12;
+pub const CAP_TYPE_RANGE: u32 = 13;
 
 // ─────────────────────────────────────────────────────────────────────────
 // SDK function pointer types.
@@ -973,6 +973,18 @@ unsafe fn decode_value(data_ptr: *mut c_void, data_type: u32) -> Value {
     }
 }
 
+/// The keys of the objects `decode_enum_values` returns in place of a `values` array when it cannot
+/// decode one. `transplant` recognises them by these constants, so the two sides cannot drift.
+pub const ENUM_INVALID_PHYSICAL_BYTES: &str = "_invalid_physical_bytes";
+pub const ENUM_PACKED_LENGTH_OVERFLOW: &str = "_overflow_computing_packed_string_length";
+pub const ENUM_UNSUPPORTED_TYPE: &str = "_unsupported_enum_type";
+
+fn sentinel(key: &str, value: Value) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert(key.to_string(), value);
+    Value::Object(m)
+}
+
 /// Decode the element array of an NkMAIDEnum into a JSON array.
 ///
 /// kNkMAIDArrayType values: 0=Boolean, 1=Integer, 2=Unsigned, 3=Float,
@@ -990,7 +1002,7 @@ fn decode_enum_values(st: &NkMAIDEnum) -> Value {
     // write side for CAP_TYPE_STRING.
     const MAX_PLAUSIBLE_STRIDE: i16 = 4096;
     if st.w_physical_bytes <= 0 || st.w_physical_bytes > MAX_PLAUSIBLE_STRIDE {
-        return json!({ "_invalid_physical_bytes": st.w_physical_bytes });
+        return sentinel(ENUM_INVALID_PHYSICAL_BYTES, json!(st.w_physical_bytes));
     }
     let bytes = st.w_physical_bytes as usize;
     match (st.ul_type, bytes) {
@@ -1014,7 +1026,7 @@ fn decode_enum_values(st: &NkMAIDEnum) -> Value {
             // For PackedString, w_physical_bytes is the per-element stride:
             // each string occupies exactly `bytes` bytes in the SDK allocation.
             let Some(total) = n.checked_mul(bytes) else {
-                return json!({ "_overflow_computing_packed_string_length": true });
+                return sentinel(ENUM_PACKED_LENGTH_OVERFLOW, json!(true));
             };
             let raw = unsafe { std::slice::from_raw_parts(st.p_data as *const u8, total) };
             let mut out = Vec::with_capacity(n);
@@ -1024,7 +1036,7 @@ fn decode_enum_values(st: &NkMAIDEnum) -> Value {
             }
             Value::Array(out)
         }
-        _ => json!({ "_unsupported_enum_type": st.ul_type }), // index still stored above
+        _ => sentinel(ENUM_UNSUPPORTED_TYPE, json!(st.ul_type)), // index still stored above
     }
 }
 
@@ -1055,67 +1067,65 @@ fn range_write_data(value: &Value) -> Result<NkMAIDRange, SdkError> {
     })
 }
 
-/// Marshal a JSON value back to the camera via SetCapability.
+/// A value built for `SetCapability`: what the SDK is handed, after every check on the JSON.
+pub(crate) enum WriteData {
+    Boolean(u8),
+    Integer(i32),
+    Unsigned(u32),
+    Float(f64),
+    /// A NUL-terminated string in the SDK's fixed 256-byte buffer.
+    Text([u8; 256]),
+    Enum(NkMAIDEnum),
+    Range(NkMAIDRange),
+}
+
+/// The longest string `SetCapability` is given (the SDK's buffer is 256 bytes, one of them the NUL).
+pub(crate) const MAX_WRITE_STRING_LEN: usize = 255;
+
+/// Build the data to hand to `SetCapability` for `value` on a capability of kind `cap_kind`
+/// (kNkMAIDCapType_*), with no SDK call: every way the JSON can be unwritable is decided here,
+/// so the in-memory test camera (`ops::port::FakeCamera`) refuses exactly what the real one does.
 ///
-/// Dispatches on `cap_kind` (kNkMAIDCapType_*) to select the right data type
-/// and struct layout. For Enum and Range, `value` must be the JSON that
-/// `decode_value` produced (containing the full struct fields needed for Set).
+/// For an enum or a range, `value` must be the JSON `decode_value` produced.
+pub(crate) fn prepare_write(cap_kind: u32, value: &Value) -> Result<WriteData, SdkError> {
+    match cap_kind {
+        CAP_TYPE_BOOLEAN => Ok(WriteData::Boolean(if value.as_bool().ok_or(SdkError::InvalidValue)? { 1 } else { 0 })),
+        CAP_TYPE_INTEGER => Ok(WriteData::Integer(value.as_i64().ok_or(SdkError::InvalidValue)? as i32)),
+        CAP_TYPE_UNSIGNED => Ok(WriteData::Unsigned(value.as_u64().ok_or(SdkError::InvalidValue)? as u32)),
+        CAP_TYPE_FLOAT => Ok(WriteData::Float(value.as_f64().ok_or(SdkError::InvalidValue)?)),
+        CAP_TYPE_STRING => {
+            let s = value.as_str().ok_or(SdkError::InvalidValue)?;
+            if s.len() > MAX_WRITE_STRING_LEN {
+                return Err(SdkError::StringTooLong { len: s.len() });
+            }
+            let mut buf = [0u8; 256];
+            buf[..s.len()].copy_from_slice(s.as_bytes());
+            Ok(WriteData::Text(buf))
+        }
+        CAP_TYPE_ENUM => Ok(WriteData::Enum(enum_write_data(value)?)),
+        CAP_TYPE_RANGE => Ok(WriteData::Range(range_write_data(value)?)),
+        other => Err(SdkError::UnsupportedWrite(other)),
+    }
+}
+
+/// Marshal a JSON value back to the camera via SetCapability (see [`prepare_write`]).
 unsafe fn write_cap_value(
     sdk: &Sdk,
     capability_id: u32,
     cap_kind: u32,
     value: &Value,
 ) -> Result<(), SdkError> {
-    match cap_kind {
-        CAP_TYPE_BOOLEAN => {
-            let b: u8 = if value.as_bool().ok_or(SdkError::InvalidValue)? { 1 } else { 0 };
-            check("SetCapability", unsafe {
-                (sdk.set_capability)(capability_id, &b as *const _ as *const c_void, DT_BOOLEAN_PTR)
-            })
-        }
-        CAP_TYPE_INTEGER => {
-            let v = value.as_i64().ok_or(SdkError::InvalidValue)? as i32;
-            check("SetCapability", unsafe {
-                (sdk.set_capability)(capability_id, &v as *const _ as *const c_void, DT_INTEGER_PTR)
-            })
-        }
-        CAP_TYPE_UNSIGNED => {
-            let v = value.as_u64().ok_or(SdkError::InvalidValue)? as u32;
-            check("SetCapability", unsafe {
-                (sdk.set_capability)(capability_id, &v as *const _ as *const c_void, DT_UNSIGNED_PTR)
-            })
-        }
-        CAP_TYPE_FLOAT => {
-            let v = value.as_f64().ok_or(SdkError::InvalidValue)?;
-            check("SetCapability", unsafe {
-                (sdk.set_capability)(capability_id, &v as *const _ as *const c_void, DT_FLOAT_PTR)
-            })
-        }
-        CAP_TYPE_STRING => {
-            let s = value.as_str().ok_or(SdkError::InvalidValue)?;
-            if s.len() > 255 {
-                return Err(SdkError::StringTooLong { len: s.len() });
-            }
-            let mut buf = [0u8; 256];
-            buf[..s.len()].copy_from_slice(s.as_bytes());
-            check("SetCapability", unsafe {
-                (sdk.set_capability)(capability_id, buf.as_ptr() as *const c_void, DT_STRING_PTR)
-            })
-        }
-        CAP_TYPE_ENUM => {
-            let st = enum_write_data(value)?;
-            check("SetCapability", unsafe {
-                (sdk.set_capability)(capability_id, &st as *const _ as *const c_void, DT_ENUM_PTR)
-            })
-        }
-        CAP_TYPE_RANGE => {
-            let st = range_write_data(value)?;
-            check("SetCapability", unsafe {
-                (sdk.set_capability)(capability_id, &st as *const _ as *const c_void, DT_RANGE_PTR)
-            })
-        }
-        other => Err(SdkError::UnsupportedWrite(other)),
-    }
+    let data = prepare_write(cap_kind, value)?;
+    let (ptr, data_type): (*const c_void, _) = match &data {
+        WriteData::Boolean(b) => (b as *const _ as *const c_void, DT_BOOLEAN_PTR),
+        WriteData::Integer(v) => (v as *const _ as *const c_void, DT_INTEGER_PTR),
+        WriteData::Unsigned(v) => (v as *const _ as *const c_void, DT_UNSIGNED_PTR),
+        WriteData::Float(v) => (v as *const _ as *const c_void, DT_FLOAT_PTR),
+        WriteData::Text(buf) => (buf.as_ptr() as *const c_void, DT_STRING_PTR),
+        WriteData::Enum(st) => (st as *const _ as *const c_void, DT_ENUM_PTR),
+        WriteData::Range(st) => (st as *const _ as *const c_void, DT_RANGE_PTR),
+    };
+    check("SetCapability", unsafe { (sdk.set_capability)(capability_id, ptr, data_type) })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1204,29 +1214,36 @@ mod tests {
         assert!(check("TestCall", 1).is_ok(), "code=1 must be success");
     }
 
-    // ── string write length guard ────────────────────────────────────────
+    // ── what can be written: one definition, `prepare_write` ──────────────
 
     #[test]
-    fn string_write_255_bytes_is_ok() {
-        // 255 bytes is the maximum; must not return StringTooLong.
-        let s = serde_json::Value::String("x".repeat(255));
-        // Can't call write_cap_value without a live SDK, but check the guard directly.
-        let len = s.as_str().unwrap().len();
-        assert!(len <= 255, "255-byte string should be within limit");
-        assert!(!matches!(
-            if len > 255 { Err(SdkError::StringTooLong { len }) } else { Ok(()) },
-            Err(SdkError::StringTooLong { .. })
-        ));
+    fn string_write_255_bytes_is_ok_and_256_is_too_long() {
+        // Through the function the real write path uses, so removing or moving its guard fails this.
+        let ok = prepare_write(CAP_TYPE_STRING, &serde_json::Value::String("x".repeat(MAX_WRITE_STRING_LEN)));
+        assert!(matches!(ok, Ok(WriteData::Text(buf)) if buf[254] == b'x' && buf[255] == 0), "255 bytes fit, NUL-terminated");
+        let long = prepare_write(CAP_TYPE_STRING, &serde_json::Value::String("x".repeat(MAX_WRITE_STRING_LEN + 1)));
+        assert!(matches!(long, Err(SdkError::StringTooLong { len: 256 })));
+        let empty = prepare_write(CAP_TYPE_STRING, &serde_json::Value::String(String::new()));
+        assert!(matches!(empty, Ok(WriteData::Text(buf)) if buf[0] == 0));
     }
 
     #[test]
-    fn string_write_256_bytes_is_too_long() {
-        let s = "x".repeat(256);
-        let len = s.len();
-        assert!(matches!(
-            if len > 255 { Err(SdkError::StringTooLong { len }) } else { Ok::<(), SdkError>(()) },
-            Err(SdkError::StringTooLong { len: 256 })
-        ));
+    fn prepare_write_refuses_a_value_of_the_wrong_json_type_for_the_kind() {
+        use serde_json::json;
+        assert!(matches!(prepare_write(CAP_TYPE_INTEGER, &json!(3)), Ok(WriteData::Integer(3))));
+        assert!(matches!(prepare_write(CAP_TYPE_INTEGER, &json!(3.5)), Err(SdkError::InvalidValue)), "a float is not an integer");
+        assert!(matches!(prepare_write(CAP_TYPE_INTEGER, &json!("3")), Err(SdkError::InvalidValue)));
+        assert!(matches!(prepare_write(CAP_TYPE_UNSIGNED, &json!(-1)), Err(SdkError::InvalidValue)));
+        assert!(matches!(prepare_write(CAP_TYPE_FLOAT, &json!(2)), Ok(WriteData::Float(f)) if f == 2.0));
+        assert!(matches!(prepare_write(CAP_TYPE_BOOLEAN, &json!(1)), Err(SdkError::InvalidValue)));
+        assert!(matches!(prepare_write(CAP_TYPE_BOOLEAN, &json!(true)), Ok(WriteData::Boolean(1))));
+        assert!(matches!(prepare_write(CAP_TYPE_STRING, &json!(5)), Err(SdkError::InvalidValue)));
+        // An enum needs its index; a range needs its value.
+        assert!(matches!(prepare_write(CAP_TYPE_ENUM, &json!({"values": []})), Err(SdkError::InvalidValue)));
+        assert!(matches!(prepare_write(CAP_TYPE_RANGE, &json!({"value_index": 3})), Err(SdkError::InvalidValue)));
+        // A kind nothing writes (datetime, array...), including the fake's placeholder kind 0.
+        assert!(matches!(prepare_write(0, &json!(1)), Err(SdkError::UnsupportedWrite(0))));
+        assert!(matches!(prepare_write(99, &json!(1)), Err(SdkError::UnsupportedWrite(99))));
     }
 
     // ── bcd_decode_version ───────────────────────────────────────────────

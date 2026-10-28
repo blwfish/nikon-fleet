@@ -122,11 +122,7 @@ pub fn values_differ(a: &serde_json::Value, b: &serde_json::Value, opts: &DiffOp
     strip_default_index(a) != strip_default_index(b)
 }
 
-fn is_enum_shape(v: &serde_json::Value) -> bool {
-    v.as_object().is_some_and(|o| {
-        o.contains_key("value_index") && o.contains_key("default_index") && o.contains_key("values")
-    })
-}
+use crate::value_shape::is_enum_shape;
 
 fn strip_default_index(v: &serde_json::Value) -> serde_json::Value {
     let mut v = v.clone();

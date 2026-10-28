@@ -21,6 +21,7 @@ pub mod range_value;
 pub mod sdk;
 pub mod snapshot;
 pub mod transplant;
+pub(crate) mod value_shape;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod vendor_argv;

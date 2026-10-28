@@ -61,9 +61,16 @@ pub fn notes() -> Vec<Note> {
         )
         .detail(
             "- applied_verified: written and a fresh read-back agrees.\n\
-             - applied_unverified: the writes were accepted but the read-back disagrees (`verification.residual` lists what) or could not be \
-               completed. A camera can accept a write and ignore it. Do not report success; offer the undo.\n\
-             - failed: a write was rejected or a named property could not be restored. `written` says what did go through.\n\
+             - applied_unverified: the writes were accepted but the read-back disagrees or could not be completed. For a transplant look at \
+               `readback.not_taken` and `readback.unverifiable`; for a restore at `verification.residual` (and `verification.verdict`, where `unjudged` \
+               means nothing written could be compared). A camera can accept a write and ignore it. Do not report success; offer the undo.\n\
+             - failed: a write was rejected, a planned write was not performed, a named property could not be restored, or nothing could be \
+               copied because of problems. `written` says what did go through. A failed apply comes back as an error result that still carries \
+               the whole report.\n\
+             - `no_op: true`: nothing was changed and no restore point was made. With applied_verified it means there was nothing to change (a \
+               value already held is not a change); with failed it means nothing could be copied because of problems, see `outcomes`.\n\
+             - `rejected_by_kind` lists properties the body would not take by kind (`unsupported_write_type`): routine, and a failure only if \
+               nothing at all was written.\n\
              - indeterminate (in `status`, with error worker_no_result): the worker gave no result AFTER writes began. Some, all or none happened. \
                Run capture_snapshot or check_against_reference to find out. Do not run the apply again from the same plan.\n\
              - not_applied: no result, but before any write began. Nothing was changed.\n\
@@ -142,8 +149,11 @@ pub fn notes() -> Vec<Note> {
         )
         .detail(
             "Every apply stores a restore point first (a snapshot labelled mcp-restore-...; its file name is in the result). \
-             `undo_set` is what was written plus anything that changed as a side effect. Restoring with `only` = undo_set puts back just those; \
-             a restore without `only` overwrites every writable setting with the old value, including changes made since. \
+             `undo_set` is what was written, anything whose write may have landed, and anything that changed as a side effect, limited to what the \
+             restore point holds and the body will take; `undo_not_restorable` names what was touched but cannot be put back (read-only, state-like, \
+             or not in the restore point). Restoring with `only` = undo_set puts back just those; a restore without `only` overwrites every writable \
+             setting with the old value, including changes made since. If `undo_set` is empty there is nothing to put back: do not send `only: []`, \
+             it is refused as empty_selection because an empty list would otherwise mean every property. \
              The undo stores its own restore point and reports its own status, so it can be undone too; check that status.",
         )
         .tags(&["restore"])
@@ -189,7 +199,8 @@ pub fn notes() -> Vec<Note> {
              the same bounds on a Z 9 and a Z6III yet reads infinity as a different position on each. So a range is copied between two models \
              only when both were captured and their scale matched (`range_unverified` otherwise, for any model nobody has captured, such as a Z8); \
              a copy within one model is always allowed. `range_scale_differs` means this body's live range has different bounds or steps from the source's, \
-             so a position cannot be carried across. There is no opt-in for either. Do not work around them by editing a snapshot. \
+             so a position cannot be carried across (a restore skips such a range the same way). A range with no span at all (FocalLength is 0..0) is a \
+             read-out and is never copied. There is no opt-in for either. Do not work around them by editing a snapshot. \
              The fix is to capture the other model and have its ranges added to the verified list, which is a repository change, not a tool option.",
         )
         .tags(&["apply", "plan"])
@@ -327,11 +338,48 @@ mod tests {
     #[test]
     fn every_note_that_names_a_tool_status_or_tag_names_a_real_one() {
         // The notes are prose; this pins the vocabulary they depend on to the code that produces it.
+        use nikon_fleet::ops::apply::{ApplyError, ApplyStatus};
+        use nikon_fleet::transplant::SkipReason;
         let text: String = notes().iter().map(|n| format!("{} {}", n.summary, n.detail)).collect::<Vec<_>>().join("\n");
-        for status in ["applied_verified", "applied_unverified", "failed", "indeterminate", "not_applied"] {
-            assert!(text.contains(status), "{status}");
+        // Every status the server can return is named, and the names are the enum's own tags.
+        for status in ApplyStatus::ALL {
+            // As a bullet of the statuses note, not merely as a word that happens to appear.
+            let bullet = format!("- {}:", status.tag());
+            let named = text.contains(&bullet) || text.contains(&format!("({}", status.tag())) || text.contains(&format!("{} (", status.tag()));
+            assert!(named || text.contains(&format!("- {} ", status.tag())), "the statuses note never describes {}", status.tag());
+            // `ALL` must list every variant: this match has no wildcard, so a new status fails to
+            // compile here until it is added, and the next line fails until it is in `ALL`.
+            let index = match status {
+                ApplyStatus::AppliedVerified => 0,
+                ApplyStatus::AppliedUnverified => 1,
+                ApplyStatus::Failed => 2,
+                ApplyStatus::Indeterminate => 3,
+                ApplyStatus::NotApplied => 4,
+            };
+            assert!(index < ApplyStatus::ALL.len());
         }
-        for tag in ["stale_plan", "ambiguous_pairing", "no_usb_serial", "camera_busy", "capture_incomplete", "data_dir_full", "worker_no_result", "malformed_source"] {
+        assert_eq!(ApplyStatus::ALL.len(), 5, "update the match above and ALL together");
+        // The skip tags the notes name are real `SkipReason` tags (not merely words in the notes).
+        let skips = [
+            SkipReason::NeverCopied { reason: "" }.tag(),
+            SkipReason::MalformedSource.tag(),
+            SkipReason::RangeScaleDiffers { source: String::new(), target: String::new() }.tag(),
+            SkipReason::RangeUnverified { source_model: String::new(), target_model: String::new() }.tag(),
+            SkipReason::LiteralUnconfirmed { proposed: String::new() }.tag(),
+            SkipReason::RawCodeUnconfirmed { proposed: String::new() }.tag(),
+            SkipReason::UnsupportedWriteType.tag(),
+            SkipReason::ReadOnly.tag(),
+            SkipReason::AbsentOnTarget.tag(),
+        ];
+        for tag in skips {
+            assert!(text.contains(tag), "the notes never mention the real skip tag {tag}");
+        }
+        for named in ["never_copied", "malformed_source", "range_scale_differs", "range_unverified", "literal_unconfirmed", "raw_code_unconfirmed", "read_only", "absent_on_target"] {
+            assert!(skips.contains(&named), "the notes name {named}, which is not a SkipReason tag");
+        }
+        // And the apply refusals they name.
+        assert_eq!(ApplyError::StalePlan { what: "digest" }.tag(), "stale_plan");
+        for tag in ["stale_plan", "ambiguous_pairing", "no_usb_serial", "camera_busy", "capture_incomplete", "data_dir_full", "worker_no_result", "empty_selection"] {
             assert!(text.contains(tag), "{tag}");
         }
     }

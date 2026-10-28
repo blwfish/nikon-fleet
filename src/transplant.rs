@@ -31,8 +31,12 @@
 //!   bodies for these — so it's reported as a distinct strategy
 //!   (`EnumByRawValue`) rather than silently treated the same as a label
 //!   match.
-//! - **Range**: source value clamped into the target's `[lower, upper]`,
-//!   snapped to the target's own step count.
+//! - **Range**: copied only onto the same scale (`lower`, `upper`, `steps` equal on both
+//!   sides, `check_range_scale`) and, between two models, only if both are on
+//!   `range_policy::VERIFIED_RANGES`. Within that, the source position is mapped onto the
+//!   target's own scale (clamped and snapped, which is the identity on an equal scale) and
+//!   each write is read back (`verify_range_write`). A range with no span (FocalLength is 0..0)
+//!   is a read-out and is skipped.
 //!
 //! A capability the target doesn't have, doesn't expose for writing, or
 //! whose translated value has no match on the target (an enum choice that
@@ -84,6 +88,23 @@ const KNOWN_ELEM_TYPES: &[u64] = &[0, 1, 2, 3, 7, 8];
 /// carry the same text, so it can never identify one.
 const UNRESOLVED_LABEL: &str = "Resource String not found";
 
+/// Which side of a transplant a value came from. A closed pair rather than a string so that a
+/// misspelling cannot silently take the other side's branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Source,
+    Target,
+}
+
+impl Side {
+    fn as_str(self) -> &'static str {
+        match self {
+            Side::Source => "source",
+            Side::Target => "target",
+        }
+    }
+}
+
 /// The option labels of a packed-string (`elem_type` 7) enum, in index order,
 /// recovered from the `values` array `sdk::decode_enum_values` stored.
 ///
@@ -107,10 +128,12 @@ const UNRESOLVED_LABEL: &str = "Resource String not found";
 ///   layout here would reintroduce the silent mismatch, so it is an error.
 ///
 /// `side` ("source"/"target") only chooses which `SkipReason` carries the error.
-fn packed_string_options(enum_value: &Value, side: &'static str) -> Result<Vec<String>, SkipReason> {
+fn packed_string_options(enum_value: &Value, side: Side) -> Result<Vec<String>, SkipReason> {
     let bad = |reason: &str| match side {
-        "source" => SkipReason::MalformedSource,
-        _ => SkipReason::EnumUndecodedBySdk { side, reason: reason.to_string() },
+        // A source is a snapshot file: malformed means the file is, and capturing again is the fix.
+        Side::Source => SkipReason::MalformedSource,
+        // A target is a live read: the SDK's decode failed.
+        Side::Target => SkipReason::EnumUndecodedBySdk { side: side.as_str(), reason: reason.to_string() },
     };
     let elems = enum_value.get("values").and_then(Value::as_array).ok_or_else(|| bad("no values array"))?;
     let strs: Vec<&str> =
@@ -143,13 +166,13 @@ fn packed_string_options(enum_value: &Value, side: &'static str) -> Result<Vec<S
 /// via `SdkError::to_string()`) is kept in a `SkipReason` — an unusually
 /// verbose or malformed error string shouldn't be able to bloat the
 /// transplant summary/log output without bound.
-const MAX_ERROR_MESSAGE_LEN: usize = 500;
+pub(crate) const MAX_ERROR_MESSAGE_LEN: usize = 500;
 
 /// Truncate `s` to at most `max` bytes (on a char boundary, never splitting
 /// a UTF-8 sequence), appending a marker with the original length so
 /// truncation is visible rather than silent — never a bare cap with no
 /// signal that anything was cut.
-fn truncate_with_marker(s: String, max: usize) -> String {
+pub(crate) fn truncate_with_marker(s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
     }
@@ -170,7 +193,8 @@ pub enum Strategy {
     /// Non-packed-string enum, matched by raw numeric code — a weaker
     /// heuristic than a label match (see module docs).
     EnumByRawValue,
-    /// Range value clamped into the target's own bounds/step count.
+    /// Range value mapped onto the target's own scale. Between bodies the scale must already be
+    /// equal, so in practice this is the identity; the name is kept for the wire format.
     RangeClamped,
 }
 
@@ -459,17 +483,12 @@ impl std::fmt::Display for SkipReason {
     }
 }
 
-/// Is `value` an enum shape (as produced by `sdk::decode_value` for
-/// `DT_ENUM_PTR`)? Distinguished from a range shape by the absence of
-/// "lower" — both are JSON objects with several similarly-named numeric
-/// fields (`value_index`, `default_index`) otherwise.
-fn is_enum_shape(value: &Value) -> bool {
-    value.is_object() && value.get("values").is_some() && value.get("lower").is_none()
-}
+/// The prefix of every capability's property name in a snapshot (`kNkMAIDCapability_Aperture`);
+/// the short form a person types omits it. Defined once.
+pub const PROPERTY_PREFIX: &str = "kNkMAIDCapability_";
 
-fn is_range_shape(value: &Value) -> bool {
-    value.is_object() && value.get("lower").is_some() && value.get("upper").is_some()
-}
+pub(crate) use crate::value_shape::{is_enum_shape, is_range_shape, range_scale, range_value};
+use crate::value_shape::{has_no_span, is_stepped_range, range_values_agree, value_at};
 
 /// If `values` is one of `sdk::decode_enum_values`'s SDK-decode-failure
 /// sentinel objects (not a real element array), a short description of
@@ -477,16 +496,23 @@ fn is_range_shape(value: &Value) -> bool {
 /// at all, which the caller's own `.as_array()` check handles.
 fn enum_values_sdk_decode_failure(values: &Value) -> Option<String> {
     let obj = values.as_object()?;
-    if let Some(v) = obj.get("_invalid_physical_bytes") {
+    if let Some(v) = obj.get(crate::sdk::ENUM_INVALID_PHYSICAL_BYTES) {
         return Some(format!("invalid element stride ({v})"));
     }
-    if obj.get("_overflow_computing_packed_string_length").is_some() {
+    if obj.get(crate::sdk::ENUM_PACKED_LENGTH_OVERFLOW).is_some() {
         return Some("packed-string length overflow".to_string());
     }
-    if let Some(v) = obj.get("_unsupported_enum_type") {
+    if let Some(v) = obj.get(crate::sdk::ENUM_UNSUPPORTED_TYPE) {
         return Some(format!("unsupported enum element type ({v})"));
     }
     None
+}
+
+/// A description of the disagreement if `elem_count` says a different number of options than the
+/// decoded `values` array holds; `None` if they agree or there is no count to compare.
+fn elem_count_mismatch(enum_value: &Value, values: &[Value]) -> Option<String> {
+    let count = enum_value.get("elem_count").and_then(Value::as_u64)?;
+    (count != values.len() as u64).then(|| format!("the SDK reports {count} options but {} were decoded", values.len()))
 }
 
 /// `elem_type` if present and one of `KNOWN_ELEM_TYPES`; `None` if the field
@@ -520,9 +546,35 @@ fn translate_enum(source: &Value, target_live: &Value) -> Result<(Value, Strateg
         return Err(SkipReason::EnumUndecodedBySdk { side: "target", reason });
     }
     let tgt_values = tgt_values_raw.as_array().ok_or(SkipReason::NoMatchingOption)?;
+    // `elem_count` is how many options the SDK says there are. A decoded array of a different
+    // length is a partial or failed decode, not "the option is absent". A live target read that
+    // came back empty with a nonzero count (a failed `GET_ARRAY`) is the same. A *source* with an
+    // empty array and a nonzero count is an old snapshot written before values were decoded:
+    // that stays `malformed_source`, which is what tells the caller to capture again.
+    if let Some(reason) = elem_count_mismatch(source, src_values).filter(|_| !src_values.is_empty()) {
+        return Err(SkipReason::EnumUndecodedBySdk { side: "source", reason });
+    }
+    if let Some(reason) = elem_count_mismatch(target_live, tgt_values) {
+        return Err(SkipReason::EnumUndecodedBySdk { side: "target", reason });
+    }
 
     let src_elem_type = parse_known_elem_type(source)?;
     let tgt_elem_type = parse_known_elem_type(target_live)?;
+    // An absent `elem_type` has always meant "raw codes" (a legacy or hand-built value). But a
+    // one-byte-per-element array is the packed-string layout, whose elements are single characters:
+    // matching those as raw codes (and `--allow-raw-code` would let it write) picks an option by one
+    // letter. The SDK always emits `elem_type`, so this shape is a corrupt value, not a raw enum.
+    for (value, elem_type, side) in [(source, src_elem_type, Side::Source), (target_live, tgt_elem_type, Side::Target)] {
+        if elem_type.is_none() && value.get("elem_bytes").and_then(Value::as_u64) == Some(1) {
+            return Err(match side {
+                Side::Source => SkipReason::MalformedSource,
+                Side::Target => SkipReason::EnumUndecodedBySdk {
+                    side: side.as_str(),
+                    reason: "one byte per element but no elem_type: not a raw-code enum".to_string(),
+                },
+            });
+        }
+    }
     // A source/target disagreement on packed-string vs. raw-code would
     // otherwise just fail to find a match below (a string label never
     // equals a numeric code) and get reported as an ordinary
@@ -542,8 +594,8 @@ fn translate_enum(source: &Value, target_live: &Value) -> Result<(Value, Strateg
         // `src_label` above is one element of the stored array, which for the
         // real byte layout is a single character: not usable here. Match on
         // whole strings (see `packed_string_options`).
-        let src_options = packed_string_options(source, "source")?;
-        let tgt_options = packed_string_options(target_live, "target")?;
+        let src_options = packed_string_options(source, Side::Source)?;
+        let tgt_options = packed_string_options(target_live, Side::Target)?;
         let label = src_options.get(src_idx).ok_or(SkipReason::MalformedSource)?;
         if label == UNRESOLVED_LABEL {
             return Err(SkipReason::EnumUndecodedBySdk {
@@ -562,6 +614,16 @@ fn translate_enum(source: &Value, target_live: &Value) -> Result<(Value, Strateg
         let idx = tgt_options.iter().position(|o| o == label).ok_or(SkipReason::NoMatchingOption)?;
         (idx, Strategy::EnumByLabel)
     } else {
+        // The same refusal as a label: a code that appears twice on either side does not identify
+        // one option, so the first match is not the answer.
+        let source_count = src_values.iter().filter(|v| *v == src_label).count();
+        let target_count = tgt_values.iter().filter(|v| *v == src_label).count();
+        if target_count == 0 {
+            return Err(SkipReason::NoMatchingOption);
+        }
+        if source_count > 1 || target_count > 1 {
+            return Err(SkipReason::AmbiguousLabel { label: src_label.to_string(), source_count, target_count });
+        }
         let idx = tgt_values.iter().position(|v| v == src_label).ok_or(SkipReason::NoMatchingOption)?;
         (idx, Strategy::EnumByRawValue)
     };
@@ -574,36 +636,15 @@ fn translate_enum(source: &Value, target_live: &Value) -> Result<(Value, Strateg
     Ok((out, strategy))
 }
 
-/// The number a range value actually holds.
-///
-/// The SDK fills `value` (`lfValue`) only for continuous ranges. On every
-/// stepped range (`steps >= 2`) read from a Z 9 it is `0.0` whatever the
-/// setting is, and the position is in `value_index` (docs/mcp-hardware-findings.md
-/// F18: 33 of 39 ranges, among them every `WBTune*`). So a stepped range's
-/// value is derived from its index: `lower + index * (upper - lower) / (steps - 1)`.
-/// A continuous range, or one with no usable index, is its `value` field.
-pub(crate) fn range_value(v: &Value) -> Option<f64> {
-    let steps = v.get("steps").and_then(Value::as_u64).unwrap_or(0);
-    if steps >= 2 {
-        if let (Some(lo), Some(hi), Some(idx)) = (
-            v.get("lower").and_then(Value::as_f64),
-            v.get("upper").and_then(Value::as_f64),
-            v.get("value_index").and_then(Value::as_u64),
-        ) {
-            if hi != lo {
-                return Some(lo + idx.min(steps - 1) as f64 * (hi - lo) / (steps as f64 - 1.0));
-            }
-        }
-    }
-    v.get("value").and_then(Value::as_f64)
-}
-
 /// Clamp a range value from `source` into the target's `[lower, upper]`,
 /// snapping to the target's own step count if it has discrete steps. The source's
 /// number is [`range_value`], not its raw `value` field (which is `0.0` on a
 /// stepped range); the result carries the target's index and the value at that
 /// index, so the two fields agree.
 fn translate_range(source: &Value, target_live: &Value) -> Result<(Value, Strategy), SkipReason> {
+    // The source must be a complete range: with no `steps` or a null bound there is no scale to
+    // read its position against, and its `value` field is 0.0 on a stepped range.
+    range_scale(source).ok_or(SkipReason::MalformedSource)?;
     let src_value = range_value(source).ok_or(SkipReason::MalformedSource)?;
     // A missing lower/upper here means the read itself succeeded but the
     // target's live value isn't actually range-shaped (e.g. this capability
@@ -616,28 +657,12 @@ fn translate_range(source: &Value, target_live: &Value) -> Result<(Value, Strate
                 .to_string(),
         )
     };
-    let lower = target_live.get("lower").and_then(Value::as_f64).ok_or_else(shape_mismatch)?;
-    let upper = target_live.get("upper").and_then(Value::as_f64).ok_or_else(shape_mismatch)?;
-    // Same strict treatment as lower/upper above, not a silent
-    // unwrap_or(0): sdk::decode_value's DT_RANGE_PTR branch always
-    // populates all three together on a real live read, so a genuinely
-    // range-shaped target_live missing just `steps` would itself be a
-    // signal something's wrong, not an ordinary "continuous range" case
-    // (which is instead steps PRESENT with value 0 — as_u64() still
-    // returns Some(0) for that, so this doesn't affect the normal
-    // continuous-range path at all).
-    let steps = target_live.get("steps").and_then(Value::as_u64).ok_or_else(shape_mismatch)?;
+    let (lower, upper, steps) = range_scale(target_live).ok_or_else(shape_mismatch)?;
 
     let (lo, hi) = (lower.min(upper), lower.max(upper));
     let clamped = src_value.clamp(lo, hi);
-    // steps>=2 guards against a divide-by-(steps-1)-that's-zero — but note
-    // steps==1 degenerates to the same value_index=0 either way (the
-    // formula's own `*(steps-1.0)` term already zeroes out at steps==1),
-    // so this guard's exact boundary (>=2 vs >=1) has no observable effect
-    // on output; kept at >=2 because it states the real invariant clearly
-    // ("need at least 2 positions for an index to mean anything") rather
-    // than relying on the formula's incidental degeneracy.
-    let value_index = if steps >= 2 && upper != lower {
+    let stepped = is_stepped_range(target_live);
+    let value_index = if stepped {
         (((clamped - lower) / (upper - lower)) * (steps as f64 - 1.0))
             .round()
             .clamp(0.0, (steps - 1) as f64) as u64
@@ -646,11 +671,7 @@ fn translate_range(source: &Value, target_live: &Value) -> Result<(Value, Strate
     };
 
     // What the target holds at that index (stepped), or the clamped number (continuous).
-    let value = if steps >= 2 && upper != lower {
-        lower + value_index as f64 * (upper - lower) / (steps as f64 - 1.0)
-    } else {
-        clamped
-    };
+    let value = if stepped { value_at(lower, upper, steps, value_index) } else { clamped };
     let mut out = target_live.clone();
     out["value"] = json!(value);
     out["value_index"] = json!(value_index);
@@ -822,6 +843,8 @@ pub const NEVER_TRANSPLANT: &[(u32, &str, &str)] = &[
     (33606, "kNkMAIDCapability_LiveViewPhotoShootingMode", "live-view session mode (judgement call: state by name)"),
     (33165, "kNkMAIDCapability_ShootingMode", "exposure mode, set by the body's mode dial (judgement call)"),
     (34147, "kNkMAIDCapability_Viewmode", "which display the body is showing (judgement call)"),
+    (33044, "kNkMAIDCapability_FlexibleProgram", "program shift: a transient exposure shift the body resets, not a stored setting (judgement call, like ShootingMode)"),
+    (33059, "kNkMAIDCapability_FocalLength", "the mounted lens's focal length, a read-out: a range with no span (0..0 in 0 steps on all three bodies), so there is nothing to set"),
     (33108, "kNkMAIDCapability_ShootNoCard", "flipped on its own across a power cycle with nothing writing to the camera, so state-like or reset by the body (judgement call, hardware observation F10)"),
 ];
 
@@ -831,14 +854,15 @@ pub fn never_copied(code: u32) -> Option<&'static str> {
 }
 
 /// Settings that a `transplant` between bodies never writes, but that `restore` of the same body
-/// still brings back. Unlike [`NEVER_TRANSPLANT`] these are real settings: the trouble is only in
+/// still brings back. (A `restore` of another body's snapshot skips them too:
+/// `ops::restore::Source::OtherBody`.) Unlike [`NEVER_TRANSPLANT`] these are real settings: the trouble is only in
 /// carrying a value from one body to another, because this SDK reads the same menu setting as a
 /// different position on different bodies. A restore returns a body to what that same body stored,
 /// so there is nothing to interpret.
 ///
 /// `ShootingLimit` (max shots per burst, Custom Setting d2): infinity is index 0 on a Z 9 and index 1
 /// on a Z6III, where it cannot be told from 1 shot, and a Z5 has no infinity (F25). Caveat for restore,
-/// not tested: a Z6III snapshot taken at infinity stores index 1, so restoring it may leave 1 shot per burst.
+/// not tested: a Z6III snapshot taken at infinity stores index 1, so restoring it onto that body may leave 1 shot per burst.
 pub const NEVER_TRANSLATED: &[(u32, &str, &str)] = &[(
     33086,
     "kNkMAIDCapability_ShootingLimit",
@@ -848,6 +872,14 @@ pub const NEVER_TRANSLATED: &[(u32, &str, &str)] = &[(
 /// Why `code` is never translated between bodies, if it is on [`NEVER_TRANSLATED`].
 pub fn never_translated(code: u32) -> Option<&'static str> {
     NEVER_TRANSLATED.iter().find(|(c, _, _)| *c == code).map(|(_, _, why)| *why)
+}
+
+/// Why `code` must not be written from a snapshot, if it must not: on [`NEVER_TRANSPLANT`]
+/// always, and on [`NEVER_TRANSLATED`] when the value would cross from one body to another
+/// (`between_bodies`). The one question `transplant` and `restore` both ask before a write, so
+/// they cannot answer it from two hand-combined tables.
+pub fn never_skip(code: u32, between_bodies: bool) -> Option<&'static str> {
+    never_copied(code).or_else(|| if between_bodies { never_translated(code) } else { None })
 }
 
 /// Per-run choices that make `transplant` do more than its safe default.
@@ -871,10 +903,9 @@ pub fn resolve_allow_raw_code(
     requested: &[String],
     properties: &BTreeMap<String, PropertyEntry>,
 ) -> Result<BTreeSet<String>, String> {
-    const PREFIX: &str = "kNkMAIDCapability_";
     let mut out = BTreeSet::new();
     for r in requested {
-        let full = if properties.contains_key(r.as_str()) { r.clone() } else { format!("{PREFIX}{r}") };
+        let full = if properties.contains_key(r.as_str()) { r.clone() } else { format!("{PROPERTY_PREFIX}{r}") };
         let Some(prop) = properties.get(&full) else {
             return Err(format!("--allow-raw-code {r:?}: no property by that name in the source snapshot"));
         };
@@ -995,9 +1026,12 @@ fn write_changes(
     match strategy {
         Strategy::EnumByLabel | Strategy::EnumByRawValue => choice.map(|c| !c.is_unchanged()),
         Strategy::RangeClamped => {
-            let want = range_value(translated)?;
-            let have = range_value(live?)?;
-            Some((want - have).abs() > 1e-6)
+            // `None` when either side has no number (unreadable), as before; otherwise a change
+            // exactly when the two do not hold the same position (see `range_values_agree`).
+            range_value(translated)?;
+            let live = live?;
+            range_value(live)?;
+            Some(!range_values_agree(translated, live))
         }
         Strategy::Literal => match (translated, live?) {
             (Value::Number(a), Value::Number(b)) => Some(!numbers_equal(a, b)),
@@ -1087,7 +1121,7 @@ impl std::fmt::Display for ResolvedChoice {
 pub fn resolve_choice(translated: &Value, live: &Value, strategy: Strategy) -> Option<ResolvedChoice> {
     let name_at = |v: &Value, idx: u64| -> Option<String> {
         match strategy {
-            Strategy::EnumByLabel => packed_string_options(v, "target").ok()?.get(idx as usize).cloned(),
+            Strategy::EnumByLabel => packed_string_options(v, Side::Target).ok()?.get(idx as usize).cloned(),
             Strategy::EnumByRawValue => {
                 let code = v.get("values")?.as_array()?.get(idx as usize)?;
                 Some(format!("code {code}"))
@@ -1153,7 +1187,9 @@ pub fn transplant<P: CameraPort + ?Sized>(
 
 /// The device-free checks that must pass before any live read or write, in
 /// order: the capability is not on [`NEVER_TRANSPLANT`] or [`NEVER_TRANSLATED`], it exists on the target, its code names the same
-/// setting on both models, and it's writable. Split out of `transplant_one`
+/// setting on both models, it's writable, and (last, so a property the target cannot write is
+/// reported as read-only, not as a policy skip) a range between two models is on the verified
+/// list (`CodeNameGuard::check_range`). Split out of `transplant_one`
 /// so the ordering (and that the name guard is wired in at all) is
 /// unit-testable without a `Device`.
 fn precheck<'a>(
@@ -1161,7 +1197,7 @@ fn precheck<'a>(
     guard: &CodeNameGuard,
     prop: &PropertyEntry,
 ) -> Result<&'a CapabilityInfo, SkipReason> {
-    if let Some(reason) = never_copied(prop.code).or_else(|| never_translated(prop.code)) {
+    if let Some(reason) = never_skip(prop.code, true) {
         return Err(SkipReason::NeverCopied { reason });
     }
     let cap = *cap_map.get(&prop.code).ok_or(SkipReason::AbsentOnTarget)?;
@@ -1176,12 +1212,6 @@ fn precheck<'a>(
     Ok(cap)
 }
 
-/// `lower`, `upper` and `steps` of a range-shaped value, or `None` if any is
-/// missing or the wrong type.
-fn range_scale(value: &Value) -> Option<(f64, f64, u64)> {
-    Some((value.get("lower")?.as_f64()?, value.get("upper")?.as_f64()?, value.get("steps")?.as_u64()?))
-}
-
 fn describe_scale((lower, upper, steps): (f64, f64, u64)) -> String {
     format!("{lower}..{upper} in {steps} steps")
 }
@@ -1193,7 +1223,18 @@ fn describe_scale((lower, upper, steps): (f64, f64, u64)) -> String {
 /// clamped. A value that is not range-shaped on either side is left for
 /// `translate_value` to report.
 fn check_range_scale(source_value: &Value, target_live: Option<&Value>) -> Result<(), SkipReason> {
-    let (Some(src), Some(tgt)) = (range_scale(source_value), target_live.and_then(range_scale)) else {
+    // A range-shaped source must say what its scale is. One without a usable lower/upper/steps
+    // used to pass this gate and be clamped into the target's scale from a junk `value`.
+    let src = if is_range_shape(source_value) {
+        range_scale(source_value).ok_or(SkipReason::MalformedSource)?
+    } else {
+        return Ok(());
+    };
+    // Nothing to choose between: a read-out (FocalLength is 0..0), not a setting.
+    if has_no_span(source_value) {
+        return Err(SkipReason::UnsupportedValueShape);
+    }
+    let Some(tgt) = target_live.and_then(range_scale) else {
         return Ok(());
     };
     if src == tgt {
@@ -1237,6 +1278,8 @@ fn transplant_one<P: CameraPort + ?Sized>(
         // The numeric-literal gate needs the target's current value to tell a
         // no-op from a change. A failed read is not a skip: the gate treats an
         // unknown current value as a change, and an opted-in write still goes.
+        // (Strings and booleans are not read: a plan's digest deliberately does not depend on the
+        // target's current value of a property that can vary on its own, so they count as changes.)
         device.read_capability(prop.code).ok()
     } else {
         None
@@ -1258,34 +1301,32 @@ fn transplant_one<P: CameraPort + ?Sized>(
     Ok((strategy, choice, PlannedWrite { value: translated, changes }))
 }
 
-/// Read a just-written range capability back and confirm it landed close to
-/// the intended value. `translate_range`'s discrete-step formula (mapping a
-/// clamped value into the target's `value_index`) is an unverified
-/// assumption about how the Nikon MAID SDK's step index actually works —
-/// see the module docs. Rather than trust that assumption silently, spend
-/// one extra live read per range write to catch it empirically: if the
-/// camera reports back something meaningfully different from what was
-/// intended, that's surfaced as a write failure instead of a silent,
-/// possibly-wrong success.
+/// Read a just-written range capability back and confirm it landed on the intended position
+/// (`range_values_agree`: the same step for a stepped range, float precision for a continuous
+/// one). The write has already been made when this runs, so every failure says so. One extra live
+/// read per range write catches a body that accepts a write and ignores it or lands one step off,
+/// which the SDK's success code cannot. A mismatch is a write failure, not a silent success.
 fn verify_range_write<P: CameraPort + ?Sized>(device: &P, code: u32, translated: &Value) -> Result<(), SkipReason> {
-    let intended = range_value(translated);
-    let Some(intended) = intended else { return Ok(()) }; // translate_range always sets this; defensive only
-    let readback = device.read_capability(code).map_err(|e| {
-        SkipReason::WriteFailed(format!("write succeeded but read-back verification failed: {e}"))
-    })?;
-    let Some(actual) = range_value(&readback) else {
-        return Err(SkipReason::WriteFailed(
-            "write succeeded but read-back value was not the expected range shape".to_string(),
-        ));
+    // The write has already been made when this runs, so every failure below says so: the
+    // property may have changed even though it is reported as not written.
+    let landed = |what: String| {
+        SkipReason::WriteFailed(truncate_with_marker(
+            format!("the write was made but could not be confirmed: {what}"),
+            MAX_ERROR_MESSAGE_LEN,
+        ))
     };
-    // Generous tolerance: this only needs to catch the step-formula being
-    // grossly wrong (e.g. landing on the wrong step entirely), not chase
-    // float rounding noise.
-    const TOLERANCE: f64 = 1e-6;
-    if (actual - intended).abs() > TOLERANCE.max(intended.abs() * 1e-3) {
-        return Err(SkipReason::WriteFailed(format!(
-            "write succeeded but camera reports {actual} instead of the intended {intended} — \
-             the range step-index formula may not match this camera's actual behavior"
+    let Some(intended) = range_value(translated) else {
+        // translate_range always sets the index and value it derived from the target's scale.
+        return Err(landed("the intended value has no number".to_string()));
+    };
+    let readback = device.read_capability(code).map_err(|e| landed(format!("read-back failed: {e}")))?;
+    let Some(actual) = range_value(&readback) else {
+        return Err(landed("the read-back is not the expected range shape".to_string()));
+    };
+    if !range_values_agree(translated, &readback) {
+        return Err(landed(format!(
+            "the camera reports {actual} instead of the intended {intended} (the range step-index \
+             formula may not match this camera's behaviour)"
         )));
     }
     Ok(())
@@ -1445,7 +1486,7 @@ mod tests {
 
     #[test]
     fn packed_string_options_rebuilds_real_capture_strings() {
-        let opts = packed_string_options(&fx("z9", "CompressionLevel"), "source").unwrap();
+        let opts = packed_string_options(&fx("z9", "CompressionLevel"), Side::Source).unwrap();
         assert_eq!(opts.len(), 13, "178 bytes hold 13 NUL-terminated labels: {opts:?}");
         assert_eq!(opts[6], "RAW");
         // value_index counts strings, not bytes: the old bug read values[6] == "a".
@@ -1501,7 +1542,7 @@ mod tests {
         // matching picked the first NUL separator on the target = index 3 =
         // "200".
         let (v, _) = translate_value(&fx("z9", "MovieSensitivity"), Some(&fx("z6iii", "MovieSensitivity"))).unwrap();
-        let opts = packed_string_options(&v, "target").unwrap();
+        let opts = packed_string_options(&v, Side::Target).unwrap();
         assert_eq!(opts[v["value_index"].as_u64().unwrap() as usize], "100");
     }
 
@@ -1581,8 +1622,79 @@ mod tests {
     fn byte_layout_final_string_without_terminating_nul_still_counts() {
         let mut v = byte_layout(1, &["Off", "On"]);
         v["values"].as_array_mut().unwrap().pop(); // drop the final NUL
+        v["elem_count"] = json!(v["values"].as_array().unwrap().len()); // the SDK's count is of what it decoded
         let target = byte_layout(0, &["On", "Off"]);
         assert_eq!(translate_value(&v, Some(&target)).unwrap().0["value_index"], json!(0));
+    }
+
+    #[test]
+    fn a_decoded_array_that_disagrees_with_the_sdks_own_count_is_a_failed_decode_not_an_absent_option() {
+        let mut short = byte_layout(0, &["Off", "On"]);
+        short["values"].as_array_mut().unwrap().pop();
+        let target = byte_layout(0, &["Off", "On"]);
+        // Source side, array partly decoded.
+        assert!(matches!(translate_value(&short, Some(&target)), Err(SkipReason::EnumUndecodedBySdk { side: "source", .. })));
+        // Target side: a live read whose GET_ARRAY failed leaves `values` empty with a nonzero count.
+        let mut empty = target.clone();
+        empty["values"] = json!([]);
+        let src = byte_layout(0, &["Off", "On"]);
+        let Err(SkipReason::EnumUndecodedBySdk { side: "target", reason }) = translate_value(&src, Some(&empty)) else {
+            panic!("expected a target decode failure");
+        };
+        assert!(reason.contains("reports") && reason.contains("0 were decoded"), "{reason}");
+    }
+
+    #[test]
+    fn a_one_byte_per_element_enum_with_no_elem_type_is_never_matched_as_raw_codes() {
+        // The packed-string layout with its `elem_type` missing: single characters would be matched
+        // as raw codes, and an opted-in write would pick an option by one letter.
+        let mut no_type = byte_layout(0, &["Off", "On"]);
+        no_type.as_object_mut().unwrap().remove("elem_type");
+        let target = byte_layout(0, &["Off", "On"]);
+        assert_eq!(translate_value(&no_type, Some(&target)), Err(SkipReason::MalformedSource));
+        let mut no_type_target = target.clone();
+        no_type_target.as_object_mut().unwrap().remove("elem_type");
+        let src = byte_layout(0, &["Off", "On"]);
+        assert!(matches!(translate_value(&src, Some(&no_type_target)), Err(SkipReason::EnumUndecodedBySdk { side: "target", .. })));
+        // A raw-code enum (4 bytes per element) with no elem_type is still a raw-code enum, as before.
+        let raw = json!({"value_index": 0, "default_index": 0, "elem_count": 2, "elem_bytes": 4, "values": [7, 8]});
+        assert_eq!(translate_value(&raw, Some(&raw)).unwrap().1, Strategy::EnumByRawValue);
+    }
+
+    #[test]
+    fn a_source_with_an_empty_array_and_a_count_is_an_old_snapshot_and_stays_malformed() {
+        // Snapshots written before values were decoded: the guidance for malformed_source is to capture again.
+        let mut old = byte_layout(0, &["Off", "On"]);
+        old["values"] = json!([]);
+        let target = byte_layout(0, &["Off", "On"]);
+        assert_eq!(translate_value(&old, Some(&target)), Err(SkipReason::MalformedSource));
+    }
+
+    #[test]
+    fn the_same_raw_code_twice_is_ambiguous_not_first_match_wins() {
+        let raw = |idx: u64, values: &[i64]| json!({"value_index": idx, "default_index": 0, "elem_count": values.len(), "elem_type": 2, "elem_bytes": 4, "values": values});
+        let source = raw(1, &[10, 20, 30]);
+        // Target lists 20 twice.
+        let dup_target = raw(0, &[20, 10, 20]);
+        assert!(matches!(
+            translate_value(&source, Some(&dup_target)),
+            Err(SkipReason::AmbiguousLabel { source_count: 1, target_count: 2, .. })
+        ));
+        // Source lists the selected code twice.
+        let dup_source = raw(0, &[10, 10, 30]);
+        assert!(matches!(translate_value(&dup_source, Some(&raw(0, &[10, 30]))), Err(SkipReason::AmbiguousLabel { source_count: 2, target_count: 1, .. })));
+        // Distinct codes still match.
+        assert_eq!(translate_value(&source, Some(&raw(0, &[30, 20, 10]))).unwrap().0["value_index"], json!(1));
+    }
+
+    #[test]
+    fn the_sdks_failure_keys_and_the_transplant_detector_are_one_set_of_names() {
+        use crate::sdk::{ENUM_INVALID_PHYSICAL_BYTES, ENUM_PACKED_LENGTH_OVERFLOW, ENUM_UNSUPPORTED_TYPE};
+        for key in [ENUM_INVALID_PHYSICAL_BYTES, ENUM_PACKED_LENGTH_OVERFLOW, ENUM_UNSUPPORTED_TYPE] {
+            let sentinel = json!({ key: 1 });
+            assert!(enum_values_sdk_decode_failure(&sentinel).is_some(), "{key}");
+        }
+        assert!(enum_values_sdk_decode_failure(&json!({"something_else": 1})).is_none());
     }
 
     #[test]
@@ -1717,6 +1829,16 @@ mod tests {
     }
 
     #[test]
+    fn never_skip_is_the_two_tables_combined_by_whether_the_value_crosses_bodies() {
+        let state = NEVER_TRANSPLANT[0].0;
+        let limit = 33086; // ShootingLimit, on NEVER_TRANSLATED
+        assert!(never_skip(state, false).is_some() && never_skip(state, true).is_some(), "state is never written");
+        assert!(never_skip(limit, true).is_some(), "ShootingLimit does not cross bodies");
+        assert_eq!(never_skip(limit, false), None, "and is restored onto its own body");
+        assert_eq!(never_skip(33049, true), None, "an ordinary setting is on neither table");
+    }
+
+    #[test]
     fn never_translated_table_has_unique_codes_and_names_a_reason_and_is_disjoint_from_never_copied() {
         let codes: BTreeSet<u32> = NEVER_TRANSLATED.iter().map(|(c, _, _)| *c).collect();
         assert_eq!(codes.len(), NEVER_TRANSLATED.len(), "duplicate code");
@@ -1780,7 +1902,7 @@ mod tests {
             ("upper above", scale(0.0, 201.0, 201)),
             ("lower below", scale(-1.0, 200.0, 201)),
             ("lower above", scale(1.0, 200.0, 201)),
-            ("lower by one ulp", scale(f64::EPSILON, 200.0, 201)),
+            ("lower by the smallest float above 0", scale(f64::from_bits(1), 200.0, 201)),
             ("the Z5's ShootingLimit", scale(1.0, 100.0, 100)),
         ] {
             assert!(
@@ -1805,10 +1927,44 @@ mod tests {
         assert_eq!(check_range_scale(&json!(5), Some(&r)), Ok(()), "a number source");
         assert_eq!(check_range_scale(&r, None), Ok(()), "no live value");
         assert_eq!(check_range_scale(&r, Some(&json!("text"))), Ok(()), "a non-range target");
-        // Missing fields are not a scale mismatch; translation reports the malformed shape.
+        // A target that is missing fields is not a scale mismatch; translation reports its shape.
         let no_steps = json!({"lower": 0.0, "upper": 10.0});
         assert_eq!(check_range_scale(&r, Some(&no_steps)), Ok(()));
-        assert_eq!(check_range_scale(&no_steps, Some(&r)), Ok(()));
+    }
+
+    #[test]
+    fn a_source_range_that_does_not_say_its_scale_is_malformed_not_waved_through() {
+        // lower/upper present, steps absent or a bound null: there is no scale to compare, and the
+        // `value` field is 0.0 on a stepped range, so translating it would write the bottom of the
+        // target's scale. (It used to pass this gate.)
+        let r = scale(0.0, 10.0, 11);
+        for bad in [
+            json!({"value": 5.0, "lower": 0.0, "upper": 10.0}),
+            json!({"value": 5.0, "lower": 0.0, "upper": 10.0, "steps": null}),
+            json!({"value": 5.0, "lower": null, "upper": 10.0, "steps": 11}),
+            json!({"value": 5.0, "lower": 0.0, "upper": "10", "steps": 11}),
+        ] {
+            assert_eq!(check_range_scale(&bad, Some(&r)), Err(SkipReason::MalformedSource), "{bad}");
+            assert_eq!(check_range_scale(&bad, None), Err(SkipReason::MalformedSource), "{bad}: with no live value too");
+            assert_eq!(translate_value(&bad, Some(&r)).unwrap_err(), SkipReason::MalformedSource, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_range_with_no_span_is_a_read_out_not_something_to_copy() {
+        // FocalLength is 0..0 in 0 steps on all three bodies (docs/range-scales).
+        let focal = scale(0.0, 0.0, 0);
+        assert_eq!(check_range_scale(&focal, Some(&focal)), Err(SkipReason::UnsupportedValueShape));
+        assert_eq!(check_range_scale(&focal, None), Err(SkipReason::UnsupportedValueShape));
+        // One unit of span is a range.
+        assert_eq!(check_range_scale(&scale(0.0, 1.0, 0), Some(&scale(0.0, 1.0, 0))), Ok(()));
+    }
+
+    #[test]
+    fn a_source_index_past_the_last_step_is_malformed_not_clamped() {
+        let live = scale(0.0, 10.0, 11);
+        let past = json!({"value": 0.0, "default": 0.0, "value_index": 11, "default_index": 0, "lower": 0.0, "upper": 10.0, "steps": 11});
+        assert_eq!(translate_value(&past, Some(&live)).unwrap_err(), SkipReason::MalformedSource);
     }
 
     #[test]
@@ -1853,10 +2009,13 @@ mod tests {
 
     #[test]
     fn the_range_policy_never_touches_enums_or_scalars() {
-        // Only range-shaped values are gated: a number or a string between unlisted models still copies.
-        let cam = FakeCamera::new().with(1, RW, json!("a")).with(2, RW, json!(3));
-        let out = run_between("Z 9", "Z 8", &cam, &[("S", 1, json!("x")), ("N", 2, json!(3))], &[], true);
-        assert_eq!(out.iter().map(tag).collect::<Vec<_>>(), ["copied", "copied"]);
+        // Only range-shaped values are gated: a number, a string or an enum between unlisted models
+        // still copies (the enum here is the same option on both sides, which needs no opt-in).
+        let en = json!({"value_index": 1, "default_index": 0, "elem_count": 3, "elem_type": 2, "elem_bytes": 4, "values": [10, 20, 30]});
+        let cam = FakeCamera::new().with(1, RW, json!("a")).with(2, RW, json!(3)).with(3, RW, en.clone());
+        let out = run_between("Z 9", "Z 8", &cam, &[("S", 1, json!("x")), ("N", 2, json!(3)), ("E", 3, en)], &[], true);
+        assert_eq!(out.iter().map(tag).collect::<Vec<_>>(), ["copied", "copied", "copied"]);
+        assert!(out.iter().all(|o| !matches!(o.result, Err(SkipReason::RangeUnverified { .. }))));
     }
 
     #[test]
@@ -2702,6 +2861,17 @@ mod tests {
     }
 
     #[test]
+    fn error_text_is_capped_at_the_constant_the_write_paths_use() {
+        // Through MAX_ERROR_MESSAGE_LEN itself, not a literal 500: a changed cap must fail here.
+        let at = "e".repeat(MAX_ERROR_MESSAGE_LEN);
+        assert_eq!(truncate_with_marker(at.clone(), MAX_ERROR_MESSAGE_LEN), at);
+        let over = "e".repeat(MAX_ERROR_MESSAGE_LEN + 1);
+        let out = truncate_with_marker(over, MAX_ERROR_MESSAGE_LEN);
+        assert!(out.contains("truncated") && out.len() < MAX_ERROR_MESSAGE_LEN + 60, "{}", out.len());
+        assert_eq!(MAX_ERROR_MESSAGE_LEN, 500, "the documented cap (docs/mcp-plan.md): change both together");
+    }
+
+    #[test]
     fn truncate_with_marker_truncates_and_marks_over_the_limit() {
         let s = "x".repeat(501);
         let out = truncate_with_marker(s, 500);
@@ -3249,6 +3419,41 @@ mod tests {
     }
 
     #[test]
+    fn a_range_one_step_away_is_a_change_at_every_point_of_the_scale() {
+        // `changes` is the plan's claim, `took_effect` the read-back's: they must agree on one step,
+        // including at the top of WBTune (0..1224, 1 per step) where a relative tolerance did not.
+        for (live, wanted) in [(0, 1), (611, 612), (999, 1000), (1223, 1224)] {
+            let cam = FakeCamera::new().with(10, RW, stepped(live, 0.0, 1224.0, 1225));
+            let out = run_same_model(&cam, &[("WBTuneAuto", 10, stepped(wanted, 0.0, 1224.0, 1225))], &[], true);
+            assert_eq!(planned(&out[0]).changes, Some(true), "{live} -> {wanted}");
+            let same = run_same_model(&cam, &[("WBTuneAuto", 10, stepped(live, 0.0, 1224.0, 1225))], &[], true);
+            assert_eq!(planned(&same[0]).changes, Some(false), "{live} -> {live}");
+        }
+    }
+
+    #[test]
+    fn a_continuous_range_changes_at_one_micro_unit_and_not_below() {
+        let range = |v: f64| json!({"value": v, "default": 0.0, "value_index": 0, "default_index": 0, "lower": 0.0, "upper": 5000.0, "steps": 0});
+        let cam = FakeCamera::new().with(10, RW, range(1000.0));
+        for (wanted, changes) in [(1000.0 + 5e-7, false), (1000.0 + 2e-6, true), (1000.5, true)] {
+            let out = run_same_model(&cam, &[("Exposure", 10, range(wanted))], &[], true);
+            assert_eq!(planned(&out[0]).changes, Some(changes), "{wanted}");
+        }
+    }
+
+    #[test]
+    fn a_range_write_that_lands_one_step_off_is_reported_even_at_the_top_of_the_scale() {
+        // The body accepts the write and puts the property one step short of what was asked.
+        let cam = FakeCamera::new()
+            .with(10, RW, stepped(100, 0.0, 1224.0, 1225))
+            .with_dependent(10, 10, stepped(1223, 0.0, 1224.0, 1225));
+        let out = run_same_model(&cam, &[("WBTuneAuto", 10, stepped(1224, 0.0, 1224.0, 1225))], &[], false);
+        assert!(matches!(&out[0].result, Err(SkipReason::WriteFailed(m)) if m.contains("reports")), "{:?}", out[0].result);
+        // And the message says the write was made, so the caller knows the body may have changed.
+        assert!(matches!(&out[0].result, Err(SkipReason::WriteFailed(m)) if m.contains("was made")), "{:?}", out[0].result);
+    }
+
+    #[test]
     fn a_number_onto_a_target_holding_something_else_is_a_change() {
         let cam = FakeCamera::new().with(1, RW, json!("not a number"));
         let out = run(&cam, &[("N", 1, json!(7))], &["N"], true);
@@ -3288,10 +3493,13 @@ mod tests {
         assert_eq!(super::range_value(&json!({"value": 9.0, "value_index": 0, "lower": 0.0, "upper": 10.0, "steps": 2})), Some(0.0));
         // lower == upper: nothing to interpolate.
         assert_eq!(super::range_value(&json!({"value": 4.0, "value_index": 3, "lower": 2.0, "upper": 2.0, "steps": 5})), Some(4.0));
-        // an index past the last step is held at the last step.
-        assert_eq!(super::range_value(&json!({"value": 0.0, "value_index": 99, "lower": 0.0, "upper": 10.0, "steps": 3})), Some(10.0));
-        // a missing index falls back to value; a missing value is None.
-        assert_eq!(super::range_value(&json!({"value": 6.0, "lower": 0.0, "upper": 10.0, "steps": 3})), Some(6.0));
+        // an index at the last step is that step; one past it has no number (it used to be held
+        // at the last step, which hid a corrupt snapshot).
+        assert_eq!(super::range_value(&json!({"value": 0.0, "value_index": 2, "lower": 0.0, "upper": 10.0, "steps": 3})), Some(10.0));
+        assert_eq!(super::range_value(&json!({"value": 0.0, "value_index": 3, "lower": 0.0, "upper": 10.0, "steps": 3})), None);
+        assert_eq!(super::range_value(&json!({"value": 0.0, "value_index": 99, "lower": 0.0, "upper": 10.0, "steps": 3})), None);
+        // a stepped range with no index has no number: its `value` is 0.0 whatever it holds (F18).
+        assert_eq!(super::range_value(&json!({"value": 6.0, "lower": 0.0, "upper": 10.0, "steps": 3})), None);
         assert_eq!(super::range_value(&json!({"lower": 0.0, "upper": 10.0, "steps": 3})), None);
         // reversed bounds interpolate downwards.
         assert_eq!(super::range_value(&json!({"value": 0.0, "value_index": 1, "lower": 10.0, "upper": 0.0, "steps": 3})), Some(5.0));

@@ -35,10 +35,9 @@ use tokio_util::sync::CancellationToken;
 const CHANNEL_FD: i32 = 3;
 
 /// The phase after which camera writes may have happened. The worker emits it
-/// (flushed) before its first write, so its absence proves none did.
-pub const PHASE_WRITING: &str = "writing";
-/// Emitted after the writes, before the read-back.
-pub const PHASE_READ_BACK: &str = "read_back";
+/// (flushed) before its first write, so its absence proves none did. Defined once, in the
+/// worker's own module, so a rename cannot leave the two sides disagreeing.
+pub use nikon_fleet::ops::worker::{PHASE_READ_BACK, PHASE_WRITING};
 
 /// Whether any camera write could have happened by the time the worker last
 /// reported `last_phase`.

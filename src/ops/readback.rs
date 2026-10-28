@@ -95,6 +95,13 @@ pub struct Residual {
     pub changed: Vec<String>,
     /// Not readable in the read-back at all.
     pub missing: Vec<String>,
+    /// Written, but not compared: the name is on the volatile list (a substring match, so a real
+    /// setting can land here), the property is never-copy, or the snapshot does not hold it.
+    /// `verified` says nothing about these.
+    pub unjudged: Vec<String>,
+    /// How many written properties were compared at all. Zero means nothing was checked, however
+    /// empty the other lists are.
+    pub judged: usize,
 }
 
 impl Residual {
@@ -116,10 +123,15 @@ pub fn residual(
     let opts = DiffOptions::default();
     let mut out = Residual::default();
     for name in written {
-        let Some(want) = source.properties.get(name) else { continue };
+        let Some(want) = source.properties.get(name) else {
+            out.unjudged.push(name.clone());
+            continue;
+        };
         if skipped(name, want.code) {
+            out.unjudged.push(name.clone());
             continue;
         }
+        out.judged += 1;
         match readback.properties.get(name) {
             Some(got) => {
                 if values_differ(&want.value, &got.value, &opts) {
@@ -219,8 +231,8 @@ mod tests {
         assert!(!only(&[], &["x"], &[]).is_empty());
         assert!(!only(&[], &[], &["x"]).is_empty());
         assert!(Residual::default().is_empty());
-        assert!(!Residual { changed: vec!["x".into()], missing: vec![] }.is_empty());
-        assert!(!Residual { changed: vec![], missing: vec!["x".into()] }.is_empty());
+        assert!(!Residual { changed: vec!["x".into()], ..Default::default() }.is_empty());
+        assert!(!Residual { missing: vec!["x".into()], ..Default::default() }.is_empty());
     }
 
     #[test]
@@ -299,9 +311,24 @@ mod tests {
     }
 
     #[test]
-    fn a_written_name_the_source_does_not_have_is_ignored() {
+    fn a_written_property_on_the_volatile_list_is_reported_unjudged_not_silently_verified() {
+        // `AutoFocusPositionPreset` is a real setting that the substring list flags volatile
+        // (diff.rs pins the false positive). If the body ignored its write, the verdict cannot
+        // say so; it must at least say it did not look.
+        let source = snap(&[("kNkMAIDCapability_AutoFocusPositionPreset", 1, json!(1)), ("A", 2, json!(1))]);
+        let readback = snap(&[("kNkMAIDCapability_AutoFocusPositionPreset", 1, json!(9)), ("A", 2, json!(1))]);
+        let r = residual(&source, &readback, &set(&["kNkMAIDCapability_AutoFocusPositionPreset", "A"])).unwrap();
+        assert!(r.is_empty(), "unjudged is not a difference");
+        assert_eq!(r.unjudged, ["kNkMAIDCapability_AutoFocusPositionPreset"]);
+        assert_eq!(r.judged, 1, "A was compared");
+    }
+
+    #[test]
+    fn a_written_name_the_source_does_not_have_is_unjudged_not_dropped() {
         let source = snap(&[("A", 1, json!(1))]);
-        assert!(residual(&source, &source.clone(), &set(&["Nope"])).unwrap().is_empty());
+        let r = residual(&source, &source.clone(), &set(&["Nope"])).unwrap();
+        assert!(r.is_empty());
+        assert_eq!((r.unjudged.as_slice(), r.judged), (&["Nope".to_string()][..], 0));
     }
 
     #[test]
@@ -332,7 +359,7 @@ mod tests {
     fn json_shapes() {
         let se = SideEffects { changed: vec!["A".into()], vanished: vec![], appeared: vec!["N".into()] };
         assert_eq!(serde_json::to_value(&se).unwrap(), json!({"changed": ["A"], "vanished": [], "appeared": ["N"]}));
-        let r = Residual { changed: vec![], missing: vec!["M".into()] };
-        assert_eq!(serde_json::to_value(&r).unwrap(), json!({"changed": [], "missing": ["M"]}));
+        let r = Residual { changed: vec![], missing: vec!["M".into()], ..Default::default() };
+        assert_eq!(serde_json::to_value(&r).unwrap(), json!({"changed": [], "missing": ["M"], "unjudged": [], "judged": 0}));
     }
 }

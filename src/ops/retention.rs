@@ -124,6 +124,12 @@ impl RestoreOp {
     }
 }
 
+/// The compact form of an RFC 3339 `captured_at` for a label or file name: no colons, no dashes
+/// (`2026-10-27T17:26:00.688812Z` becomes `20261027T172600.688812Z`).
+pub fn compact_timestamp(captured_at: &str) -> String {
+    captured_at.replace([':', '-'], "")
+}
+
 /// `mcp-restore-<op>-<timestamp>`. The timestamp is the caller's compact
 /// form (e.g. `20261027T172600Z`); it must be a plain label fragment.
 pub fn restore_point_label(op: RestoreOp, timestamp: &str) -> Result<String, LabelError> {

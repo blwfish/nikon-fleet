@@ -11,10 +11,15 @@
 //!
 //! What "verified" means here, exactly, and no more: the range's `lower`,
 //! `upper`, `steps` and `default_index` were read identical in a capture from
-//! each listed model. That rules out a different scale; it does **not** show
-//! that each position means the same thing, which only a person at the camera
-//! can show. The `ShootingLimit` case is why bounds alone are not trusted
-//! elsewhere (it is on `NEVER_TRANSPLANT`). To add a model, capture it, compare
+//! each listed model (the table's evidence tests check all four). That rules
+//! out a different scale; it does **not** show that each position means the
+//! same thing, which only a person at the camera can show, and for most of
+//! the entries nobody has. `ShootingLimit` is the case that was meaning-checked
+//! by hand and failed; it is on `NEVER_TRANSLATED`, not on this table. The live
+//! check a transplant makes against the target body (`check_range_scale`) compares
+//! `lower`, `upper` and `steps`. A shared scale that is not a setting at all (a
+//! read-out such as `FocalLength`, a transient such as `FlexibleProgram`) is on
+//! `NEVER_TRANSPLANT` and deliberately not here. To add a model, capture it, compare
 //! every range against the listed models, and add the model to each range that
 //! matches.
 
@@ -28,7 +33,6 @@ const Z9_AND_Z6III: &[&str] = &["Z 9", "Z6_3"];
 /// A range read on one model only has no pair to verify and is left out; a copy
 /// within one model needs no entry.
 pub const VERIFIED_RANGES: &[(u32, &str, &[&str])] = &[
-    (33044, "kNkMAIDCapability_FlexibleProgram", ALL_THREE),
     (33045, "kNkMAIDCapability_ExposureComp", ALL_THREE),
     (33049, "kNkMAIDCapability_WBTuneAuto", ALL_THREE),
     (33051, "kNkMAIDCapability_WBTuneFluorescent", ALL_THREE),
@@ -36,7 +40,6 @@ pub const VERIFIED_RANGES: &[(u32, &str, &[&str])] = &[
     (33053, "kNkMAIDCapability_WBTuneFlash", ALL_THREE),
     (33054, "kNkMAIDCapability_WBTuneShade", ALL_THREE),
     (33055, "kNkMAIDCapability_WBTuneCloudy", ALL_THREE),
-    (33059, "kNkMAIDCapability_FocalLength", ALL_THREE),
     (33214, "kNkMAIDCapability_InternalFlashComp", ALL_THREE),
     (33215, "kNkMAIDCapability_ExternalFlashComp", ALL_THREE),
     (33352, "kNkMAIDCapability_MFDriveStep", ALL_THREE),
@@ -118,9 +121,12 @@ mod tests {
 
     #[test]
     fn the_first_table_is_what_the_f25_scan_found() {
-        // 32 ranges on all three captured models, six (the movie WB presets) on the Z 9 and Z6III only.
+        // 30 ranges on all three captured models, six (the movie WB presets) on the Z 9 and Z6III only.
+        // The F25 scan found 32 on all three; FocalLength (a zero-span read-out) and FlexibleProgram
+        // (a transient) are shared scales that are never copied, so they are on the never-copy table
+        // instead (see transplant::NEVER_TRANSPLANT).
         let on = |n| VERIFIED_RANGES.iter().filter(|(_, _, m)| m.len() == n).count();
-        assert_eq!((on(3), on(2), VERIFIED_RANGES.len()), (32, 6, 38));
+        assert_eq!((on(3), on(2), VERIFIED_RANGES.len()), (30, 6, 36));
         assert!(VERIFIED_RANGES.iter().all(|(_, _, m)| m.iter().all(|x| ["Z 5", "Z 9", "Z6_3"].contains(x))));
     }
 
@@ -259,6 +265,10 @@ mod tests {
             let listed = VERIFIED_RANGES.iter().find(|(c, _, _)| *c == code).map(|(_, _, m)| *m);
             match (shared.as_slice(), listed) {
                 ([], None) => {}
+                // A scale that is shared but belongs to a setting that is never copied at all
+                // (a read-out such as FocalLength, a transient such as FlexibleProgram) is not a
+                // range anyone may copy, so it is deliberately not on this table.
+                ([_], None) if crate::transplant::never_skip(code, true).is_some() => {}
                 ([group], Some(models)) => {
                     let mut want = group.clone();
                     let mut got = models.to_vec();

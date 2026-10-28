@@ -29,7 +29,7 @@
 //! - `indeterminate`: never produced here. The parent reports it when the worker
 //!   died or was killed before sending a result, so nothing is known.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use serde::Serialize;
@@ -42,9 +42,12 @@ use crate::ops::list::ListError;
 use crate::ops::plan::{PlanInput, digest, summary_text, would_change};
 use crate::ops::port::CameraPort;
 use crate::ops::readback::{SideEffects, side_effects};
+use crate::ops::restore::undo_set;
+use crate::ops::worker::{PHASE_PLAN_VERIFIED, PHASE_READ_BACK, PHASE_RESTORE_POINT_WRITTEN, PHASE_WRITING};
 use crate::ops::retention::{self, DataDirFull, LabelError, RestoreOp};
-use crate::snapshot::{Snapshot, SnapshotError, Transport};
-use crate::transplant::{CodeNameGuard, SkipReason, TransplantOutcome, numbers_equal, range_value, transplant};
+use crate::snapshot::{PropertyEntry, Snapshot, SnapshotError, Transport};
+use crate::transplant::{CodeNameGuard, Severity, SkipReason, TransplantOutcome, numbers_equal, transplant};
+use crate::value_shape::{is_range_shape, range_values_agree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,8 +55,33 @@ pub enum ApplyStatus {
     AppliedVerified,
     AppliedUnverified,
     Failed,
-    /// Produced by the caller of the worker, never by this module.
+    /// Produced by the caller of the worker (the MCP supervisor), never by this module: the worker
+    /// gave no result after it began writing.
     Indeterminate,
+    /// Likewise: the worker gave no result before it began writing, so nothing was changed.
+    NotApplied,
+}
+
+impl ApplyStatus {
+    /// Every status, for tests and for anything that must name them all.
+    pub const ALL: [ApplyStatus; 5] = [
+        ApplyStatus::AppliedVerified,
+        ApplyStatus::AppliedUnverified,
+        ApplyStatus::Failed,
+        ApplyStatus::Indeterminate,
+        ApplyStatus::NotApplied,
+    ];
+
+    /// The closed tag clients read in `status` (the same string serde writes).
+    pub fn tag(&self) -> &'static str {
+        match self {
+            ApplyStatus::AppliedVerified => "applied_verified",
+            ApplyStatus::AppliedUnverified => "applied_unverified",
+            ApplyStatus::Failed => "failed",
+            ApplyStatus::Indeterminate => "indeterminate",
+            ApplyStatus::NotApplied => "not_applied",
+        }
+    }
 }
 
 pub struct ApplyRequest<'a> {
@@ -110,11 +138,18 @@ pub struct ApplyReport {
     /// Properties actually written, in name order.
     pub written: Vec<String>,
     pub write_errors: Vec<WriteError>,
+    /// Planned properties the body would not take by kind (`unsupported_write_type`): routine,
+    /// as in a restore, and a failure only when nothing at all was written.
+    pub rejected_by_kind: Vec<String>,
     pub outcomes: Vec<TransplantOutcome>,
     pub readback: Option<Readback>,
-    /// What `restore_apply(restore_point, only=...)` needs to undo this:
-    /// the written properties plus the side effects.
+    /// What `restore_apply(restore_point, only=...)` needs to undo this: the written properties,
+    /// any whose write may have landed, and the side effects, each only if the restore point
+    /// holds it and the body will take a write of it. Always accepted as `only`.
     pub undo_set: Vec<String>,
+    /// Properties this apply touched or changed that an undo cannot put back (not in the restore
+    /// point, read-only, or never copied): they are not in `undo_set`.
+    pub undo_not_restorable: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -202,12 +237,9 @@ pub fn require_confirmation(digest: &str, summary: &str) -> Result<(), ApplyErro
 
 /// Does `got` (read back) show the effect of writing `planned`?
 pub(crate) fn took_effect(planned: &Value, got: &Value) -> bool {
-    if planned.get("lower").is_some() {
-        // A range: the value, within the tolerance the per-write check uses.
-        return match (range_value(planned), range_value(got)) {
-            (Some(a), Some(b)) => (a - b).abs() <= 1e-6_f64.max(a.abs() * 1e-3),
-            _ => false,
-        };
+    if is_range_shape(planned) {
+        // A range: the same position, by the one comparator every range check uses.
+        return range_values_agree(planned, got);
     }
     if let (Some(a), Some(b)) = (planned.get("value_index"), got.get("value_index")) {
         // An enum: which option is selected.
@@ -219,8 +251,53 @@ pub(crate) fn took_effect(planned: &Value, got: &Value) -> bool {
     }
 }
 
-fn compact_timestamp(captured_at: &str) -> String {
-    captured_at.replace([':', '-'], "")
+/// A restore point that has been captured, held to the baseline and stored.
+pub(crate) struct MadeRestorePoint {
+    pub snapshot: Snapshot,
+    /// File name within the snapshots directory.
+    pub file: String,
+    pub label: String,
+    /// It failed or could not be judged against the baseline and the caller allowed that
+    /// (`GatePolicy::AllowPartial`).
+    pub gate_waived: bool,
+}
+
+/// Capture the body as it is now and store it, before any write: refuse if the data directory is
+/// at its restore-point cap, if nothing could be read, or (under `Strict`) if the capture is not
+/// complete against the model's baseline. Shared by a transplant and a restore, so the two cannot
+/// drift on what a usable restore point is or on what they say when it is not.
+pub(crate) fn make_restore_point<P: CameraPort + ?Sized>(
+    port: &P,
+    target: &crate::snapshot::Camera,
+    op: RestoreOp,
+    name_lookup: &HashMap<u32, String>,
+    captured_at: &str,
+    snapshots_dir: &Path,
+    gate_policy: GatePolicy,
+) -> Result<MadeRestorePoint, ApplyError> {
+    let label = retention::restore_point_label(op, &retention::compact_timestamp(captured_at)).map_err(ApplyError::Label)?;
+    let counts = retention::count_for_camera(snapshots_dir, &target.model, &target.serial).map_err(ApplyError::List)?;
+    retention::check_restore_point_cap(&counts).map_err(ApplyError::RestorePointCap)?;
+
+    let mut snapshot = Snapshot::new(target.clone(), Transport::Usb, captured_at.to_string());
+    snapshot.label = Some(label.clone());
+    let stats = capture(port, name_lookup, &mut snapshot);
+    if stats.read_ok == 0 {
+        return Err(ApplyError::NothingReadable { read_err: stats.read_err });
+    }
+    let mut gate_waived = false;
+    match (gate(&snapshot), gate_policy) {
+        (GateOutcome::Passed, _) => {}
+        (GateOutcome::Failed { .. } | GateOutcome::NoBaseline(_), GatePolicy::AllowPartial) => gate_waived = true,
+        (GateOutcome::Failed { missing }, GatePolicy::Strict) => {
+            return Err(ApplyError::RestorePointIncomplete { missing, stats });
+        }
+        (GateOutcome::NoBaseline(reason), GatePolicy::Strict) => return Err(ApplyError::NoBaseline(reason)),
+    }
+    std::fs::create_dir_all(snapshots_dir).map_err(|e| ApplyError::RestorePointWrite(SnapshotError::Io(e)))?;
+    let file = snapshot.suggested_filename();
+    snapshot.save_new(snapshots_dir.join(&file)).map_err(ApplyError::RestorePointWrite)?;
+    Ok(MadeRestorePoint { snapshot, file, label, gate_waived })
 }
 
 /// Run the apply. `progress` is told `plan_verified`, `restore_point_written`,
@@ -244,70 +321,96 @@ pub fn apply_transplant<P: CameraPort + ?Sized>(
     if summary_text(req.plan.target, n_change, allow) != req.expected_summary.trim() {
         return Err(ApplyError::StalePlan { what: "summary" });
     }
-    progress("plan_verified");
+    progress(PHASE_PLAN_VERIFIED);
 
-    // 2. Nothing to copy: say so, touch nothing.
-    if !planned.iter().any(|o| o.result.is_ok()) {
+    // 2. Nothing to change: say so, touch nothing. A copied value the body already holds is not a
+    //    change (a retry after success lands here instead of making another restore point, the
+    //    same rule as `restore`). But if nothing was copied *because of problems* (a read that
+    //    failed, no matching option, an unreadable shape) the request did not succeed: "applied,
+    //    verified" would be false.
+    if n_change == 0 {
+        let copies = planned.iter().any(|o| o.result.is_ok());
+        // Routine skips (absent on the target, read-only) mean the two bodies simply have nothing in
+        // common. Anything else (a policy refusal such as `range_unverified`, or a real problem)
+        // means something the caller asked for was not copied, so nothing is "applied, verified".
+        let blocked = !copies
+            && planned.iter().any(|o| o.result.as_ref().err().is_some_and(|r| r.severity() != Severity::Routine));
         return Ok(ApplyReport {
-            status: ApplyStatus::AppliedVerified,
+            status: if blocked { ApplyStatus::Failed } else { ApplyStatus::AppliedVerified },
             no_op: true,
             plan_digest: now_digest,
             restore_point: None,
             restore_point_gate_waived: false,
             written: Vec::new(),
             write_errors: Vec::new(),
+            rejected_by_kind: Vec::new(),
             outcomes: planned,
             readback: None,
             undo_set: Vec::new(),
+            undo_not_restorable: Vec::new(),
         });
     }
 
     // 3. The restore point, before any write.
-    let stamp = compact_timestamp(&req.captured_at);
-    let label = retention::restore_point_label(RestoreOp::PreTransplant, &stamp).map_err(ApplyError::Label)?;
-    let counts = retention::count_for_camera(req.snapshots_dir, &req.plan.target.model, &req.plan.target.serial)
-        .map_err(ApplyError::List)?;
-    retention::check_restore_point_cap(&counts).map_err(ApplyError::RestorePointCap)?;
-
-    let mut restore_point = Snapshot::new(req.plan.target.clone(), Transport::Usb, req.captured_at.clone());
-    restore_point.label = Some(label.clone());
-    let rp_stats = capture(port, req.name_lookup, &mut restore_point);
-    if rp_stats.read_ok == 0 {
-        return Err(ApplyError::NothingReadable { read_err: rp_stats.read_err });
-    }
-    let mut gate_waived = false;
-    match (gate(&restore_point), req.gate_policy) {
-        (GateOutcome::Passed, _) => {}
-        (GateOutcome::Failed { .. } | GateOutcome::NoBaseline(_), GatePolicy::AllowPartial) => gate_waived = true,
-        (GateOutcome::Failed { missing }, GatePolicy::Strict) => {
-            return Err(ApplyError::RestorePointIncomplete { missing, stats: rp_stats });
-        }
-        (GateOutcome::NoBaseline(reason), GatePolicy::Strict) => return Err(ApplyError::NoBaseline(reason)),
-    }
-    std::fs::create_dir_all(req.snapshots_dir).map_err(|e| ApplyError::RestorePointWrite(SnapshotError::Io(e)))?;
-    let rp_file = restore_point.suggested_filename();
-    restore_point.save_new(req.snapshots_dir.join(&rp_file)).map_err(ApplyError::RestorePointWrite)?;
-    progress("restore_point_written");
+    let made = make_restore_point(
+        port,
+        req.plan.target,
+        RestoreOp::PreTransplant,
+        req.name_lookup,
+        &req.captured_at,
+        req.snapshots_dir,
+        req.gate_policy,
+    )?;
+    let MadeRestorePoint { snapshot: restore_point, file: rp_file, label, gate_waived } = made;
+    progress(PHASE_RESTORE_POINT_WRITTEN);
 
     // 4. The writes. From here on there is always a report.
-    progress("writing");
-    let outcomes = transplant(port, props, req.guard, req.plan.options, false);
+    progress(PHASE_WRITING);
+    // Only what the caller confirmed. The real run re-evaluates every property on the live body,
+    // so a property the verified dry run skipped (a read that failed that time, a gate that did
+    // not trip) must not be written now: it was never in the plan whose digest was echoed.
+    let planned_names: BTreeSet<&str> = planned.iter().filter(|o| o.result.is_ok()).map(|o| o.name.as_str()).collect();
+    let confirmed: BTreeMap<String, PropertyEntry> =
+        props.iter().filter(|(name, _)| planned_names.contains(name.as_str())).map(|(n, p)| (n.clone(), p.clone())).collect();
+    let outcomes = transplant(port, &confirmed, req.guard, req.plan.options, false);
+    // The restore point and the read-back are keyed by the TARGET model's names, which can differ
+    // from the source's for one code (`names_compatible`, e.g. 33200); everything compared with
+    // them is keyed the same way.
+    let target_name = |o: &TransplantOutcome| crate::ops::capture::property_key(req.name_lookup, o.code);
     let mut written: BTreeSet<String> = BTreeSet::new();
     let mut write_errors = Vec::new();
+    let mut may_have_landed: BTreeSet<String> = BTreeSet::new();
+    let mut rejected_by_kind = Vec::new();
     for o in &outcomes {
+        let name = target_name(o);
         match &o.result {
             Ok(_) => {
-                written.insert(o.name.clone());
+                written.insert(name);
             }
+            // The write was made and failed, or was made and could not be confirmed: the body may
+            // have changed.
             Err(SkipReason::WriteFailed(msg)) => {
-                write_errors.push(WriteError { name: o.name.clone(), message: msg.clone() });
+                may_have_landed.insert(name.clone());
+                write_errors.push(WriteError { name, message: msg.clone() });
             }
-            Err(_) => {}
+            // The dry run cannot see a write being rejected, and a full restore treats a kind the
+            // body will not take as routine (a few are on every run); so does this. Reported, and a
+            // failure only if it left nothing written (below).
+            Err(SkipReason::UnsupportedWriteType) => rejected_by_kind.push(name),
+            // Every outcome here was planned as a copy. Any other reason it was not (a live read
+            // failed, the live shape changed) is a planned write that did not happen, and the
+            // report must say so rather than omit it. Nothing was written, so nothing to undo.
+            Err(other) => {
+                write_errors.push(WriteError {
+                    name,
+                    message: format!("planned write not performed: {} ({other})", other.tag()),
+                });
+            }
         }
     }
 
     // 5. Read back, with the same gate.
-    progress("read_back");
+    progress(PHASE_READ_BACK);
     let mut after = Snapshot::new(req.plan.target.clone(), Transport::Usb, req.captured_at.clone());
     after.label = Some("readback".into());
     let after_stats = capture(port, req.name_lookup, &mut after);
@@ -324,40 +427,46 @@ pub fn apply_transplant<P: CameraPort + ?Sized>(
         _ => false,
     };
 
-    let (diff_vs_rp, effects) = if complete {
-        let d = diff(&restore_point, &after, &DiffOptions::default()).ok();
-        let se = side_effects(&restore_point, &after, &written).ok();
-        (d, se)
+    // The comparison can only fail on a model mismatch, which two snapshots of one Camera cannot
+    // have; if it ever did, the read-back is not one this report can stand behind.
+    let (diff_vs_rp, effects, complete) = if complete {
+        match (diff(&restore_point, &after, &DiffOptions::default()), side_effects(&restore_point, &after, &written)) {
+            (Ok(d), Ok(se)) => (Some(d), Some(se), true),
+            _ => (None, None, false),
+        }
     } else {
-        (None, None)
+        (None, None, false)
     };
 
     let mut not_taken = Vec::new();
     let mut unverifiable = Vec::new();
     for o in &outcomes {
         let (Ok(_), Some(p)) = (&o.result, &o.planned) else { continue };
-        match after.properties.get(&o.name) {
+        let name = target_name(o);
+        match after.properties.get(&name) {
             Some(got) if complete => {
                 if !took_effect(&p.value, &got.value) {
-                    not_taken.push(o.name.clone());
+                    not_taken.push(name);
                 }
             }
-            _ => unverifiable.push(o.name.clone()),
+            _ => unverifiable.push(name),
         }
     }
 
-    let status = if !write_errors.is_empty() {
+    let status = if !write_errors.is_empty() || (written.is_empty() && !rejected_by_kind.is_empty()) {
         ApplyStatus::Failed
-    } else if !complete || !not_taken.is_empty() || !unverifiable.is_empty() {
+    } else if !complete || !not_taken.is_empty() || !unverifiable.is_empty() || !rejected_by_kind.is_empty() {
+        // A planned change that the body would not take by kind was never judged by the read-back
+        // (it was not written), so the apply cannot be called verified.
         ApplyStatus::AppliedUnverified
     } else {
         ApplyStatus::AppliedVerified
     };
 
-    let mut undo: BTreeSet<String> = written.clone();
-    if let Some(se) = &effects {
-        undo.extend(se.names());
-    }
+    // What an undo can put back: what was written, what may have landed, and what changed as a
+    // side effect, limited to what the restore point holds and the body will take.
+    let touched: BTreeSet<String> = written.union(&may_have_landed).cloned().collect();
+    let undo = undo_set(&restore_point, port.capabilities(), &touched, effects.as_ref(), complete.then_some(&after));
 
     Ok(ApplyReport {
         status,
@@ -367,6 +476,7 @@ pub fn apply_transplant<P: CameraPort + ?Sized>(
         restore_point_gate_waived: gate_waived,
         written: written.into_iter().collect(),
         write_errors,
+        rejected_by_kind,
         outcomes,
         readback: Some(Readback {
             gate: after_gate,
@@ -376,7 +486,8 @@ pub fn apply_transplant<P: CameraPort + ?Sized>(
             not_taken,
             unverifiable,
         }),
-        undo_set: undo.into_iter().collect(),
+        undo_set: undo.names,
+        undo_not_restorable: undo.not_restorable,
     })
 }
 
@@ -412,17 +523,25 @@ mod tests {
         let b = baseline_for("Z 9").unwrap();
         let mut cam = FakeCamera::new();
         let mut names = HashMap::new();
+        // Plan targets: three string properties and one numeric, from among the readable ones. A
+        // string target holds a string on the body: the real write refuses a string for an integer.
+        let codes: Vec<(String, u32)> = b.readable.iter().skip(6).take(4).map(|c| (c.name.clone(), c.code)).collect();
         for c in &b.readable[..b.readable.len() - drop_tail] {
-            cam = cam.with(c.code, RW, json!(1));
+            let held = codes.iter().position(|(_, code)| *code == c.code).map_or(json!(1), initial);
+            cam = cam.with(c.code, RW, held);
             names.insert(c.code, c.name.clone());
         }
-        // Plan targets: three string properties and one numeric, from among the readable ones.
-        let codes: Vec<(String, u32)> = b.readable.iter().skip(6).take(4).map(|c| (c.name.clone(), c.code)).collect();
         World { cam: cam_builder(cam, &codes), names, codes, dir: TempDir::new().unwrap() }
     }
 
     fn world() -> World {
         world_with(|c, _| c, 0)
+    }
+
+    /// What plan target `i` (see `world_with`) holds before an apply: strings for the first three,
+    /// a number for the fourth.
+    fn initial(i: usize) -> serde_json::Value {
+        if i < 3 { json!("old") } else { json!(1) }
     }
 
     struct Fixture {
@@ -538,9 +657,9 @@ mod tests {
         let saved = Snapshot::load_from_file(w.dir.path().join(&rp.file)).unwrap();
         assert_eq!(saved.label.as_deref(), Some(rp.label.as_str()));
         assert_eq!(saved.properties.len(), 196);
-        for (_, code) in &w.codes {
+        for (i, (_, code)) in w.codes.iter().enumerate() {
             let p = saved.properties.values().find(|p| p.code == *code).unwrap();
-            assert_eq!(p.value, json!(1), "the value before the apply, not after");
+            assert_eq!(p.value, initial(i), "the value before the apply, not after");
         }
         assert_eq!(dir_files(&w), [rp.file]);
     }
@@ -610,9 +729,68 @@ mod tests {
     }
 
     #[test]
-    fn applying_the_same_plan_twice_cannot_write_twice() {
-        // Retry safety after a client timeout: the second call finds every outcome already
-        // unchanged, so its digest differs and it is refused as stale.
+    fn a_plan_that_copied_nothing_because_of_a_problem_is_a_failure_not_a_verified_no_op() {
+        // The source range does not say its scale, so nothing can be copied: `malformed_source`, a
+        // skip that needs attention. Reporting "applied, verified" would be false.
+        let st = json!({"value": 0.0, "default": 0.0, "value_index": 612, "default_index": 612, "lower": 0.0, "upper": 1224.0, "steps": 1225});
+        let (name, code) = (WB_TUNE_AUTO.0.to_string(), WB_TUNE_AUTO.1);
+        let w = world_with(|c, _| c.with(code, RW, st.clone()), 0);
+        let mut f = fixture(&w, true);
+        f.source.properties.clear();
+        f.source.insert(name, code, json!({"value": 5.0, "lower": 0.0, "upper": 1224.0}));
+        f.bytes = f.source.to_pretty_json().unwrap().into_bytes();
+        let r = apply_planned(&w, &f).unwrap();
+        assert!(r.no_op);
+        assert_eq!(r.status, ApplyStatus::Failed);
+        assert!(w.cam.writes().is_empty() && dir_files(&w).is_empty(), "nothing was touched");
+    }
+
+    #[test]
+    fn a_plan_that_copied_nothing_because_policy_refused_it_is_not_a_verified_no_op_either() {
+        // The only property is a numeric literal that was not opted in (`literal_unconfirmed`, a
+        // policy skip): nothing was copied, and the caller asked for it. Not "applied, verified".
+        let w = world();
+        let mut f = fixture(&w, false);
+        let (name, code) = w.codes[3].clone();
+        let value = f.source.properties[&name].value.clone();
+        f.source.properties.clear();
+        f.source.insert(name, code, value);
+        f.bytes = f.source.to_pretty_json().unwrap().into_bytes();
+        let r = apply_planned(&w, &f).unwrap();
+        assert!(r.no_op);
+        assert!(matches!(r.outcomes[0].result, Err(SkipReason::LiteralUnconfirmed { .. })), "{:?}", r.outcomes[0].result);
+        assert_eq!(r.status, ApplyStatus::Failed);
+        assert!(w.cam.writes().is_empty());
+    }
+
+    #[test]
+    fn a_retry_with_a_fresh_plan_after_success_is_a_no_op_when_every_copied_value_is_known_unchanged() {
+        // The numeric property is read, so a fresh plan after success says `0 properties would
+        // change`; like a restore, that is a no-op: no second restore point, no rewrite. (Strings and
+        // booleans are written without a read and always count as changes: a plan's digest does not
+        // depend on the current value of a property that can vary on its own.)
+        let w = world();
+        let mut f = fixture(&w, true);
+        let (name, code) = w.codes[3].clone();
+        let value = f.source.properties[&name].value.clone();
+        f.source.properties.clear();
+        f.source.insert(name, code, value);
+        f.bytes = f.source.to_pretty_json().unwrap().into_bytes();
+        let first = apply_planned(&w, &f).unwrap();
+        assert!(!first.no_op && first.written.len() == 1, "{:?}", first.written);
+        let writes = w.cam.writes().len();
+        let again = apply_planned(&w, &f).unwrap();
+        assert!(again.no_op && again.written.is_empty());
+        assert_eq!(again.status, ApplyStatus::AppliedVerified);
+        assert_eq!(w.cam.writes().len(), writes, "no rewrite");
+        assert_eq!(dir_files(&w).len(), 1, "one restore point, not two");
+    }
+
+    #[test]
+    fn applying_the_same_plan_twice_is_refused_as_stale_and_writes_nothing() {
+        // A client that retries the SAME plan after a timeout: the second call finds every outcome
+        // already unchanged, so its digest differs and it is refused as stale. (A fresh plan after
+        // success is a no-op: see the retry test above.)
         let w = world();
         let f = fixture(&w, true);
         let p = plan(&w, &f);
@@ -688,8 +866,7 @@ mod tests {
         std::fs::write(&rp_path, "precious").unwrap();
         // Rewind the body so the same plan is valid again, then apply at the same timestamp.
         for (i, (_, code)) in w.codes.iter().enumerate() {
-            let _ = i;
-            w.cam.write_capability(*code, 0, &json!(1)).unwrap();
+            w.cam.write_capability(*code, 0, &initial(i)).unwrap();
         }
         let writes = w.cam.writes().len();
         let p2 = plan(&w, &f);
@@ -825,7 +1002,133 @@ mod tests {
         assert!(r.write_errors[0].message.contains("-125"));
         assert!(r.restore_point.is_some(), "the restore point exists whatever happened after");
         assert!(r.readback.is_some(), "the body is still read back");
-        assert_eq!(w.cam.value(w.codes[1].1), Some(json!(1)), "the failed property kept its old value");
+        assert_eq!(w.cam.value(w.codes[1].1), Some(initial(1)), "the failed property kept its old value");
+    }
+
+    #[test]
+    fn one_property_the_body_rejects_by_kind_is_reported_and_the_apply_is_not_called_verified() {
+        // The dry run cannot see a write being rejected. The rest was written, so it is not a
+        // failure, but a planned change that never happened was never judged by the read-back:
+        // `applied_unverified`, with the property named in `rejected_by_kind`.
+        let w = world_with(|c, codes| c.failing_write(codes[0].1, Failure::UnsupportedWrite), 0);
+        let f = fixture(&w, true);
+        let r = apply_planned(&w, &f).unwrap();
+        assert_eq!(r.status, ApplyStatus::AppliedUnverified);
+        assert!(r.write_errors.is_empty());
+        assert_eq!(r.rejected_by_kind, [w.codes[0].0.clone()]);
+        assert_eq!(r.written.len(), 3);
+        assert!(!r.undo_set.contains(&w.codes[0].0), "never written, nothing to undo");
+    }
+
+    #[test]
+    fn nothing_written_because_every_planned_property_was_rejected_by_kind_is_a_failure() {
+        let w = world_with(
+            |c, codes| codes.iter().fold(c, |c, (_, code)| c.failing_write(*code, Failure::UnsupportedWrite)),
+            0,
+        );
+        let f = fixture(&w, true);
+        let r = apply_planned(&w, &f).unwrap();
+        assert_eq!(r.status, ApplyStatus::Failed, "writes were attempted and none landed");
+        assert!(r.written.is_empty());
+        assert_eq!(r.rejected_by_kind.len(), 4);
+        assert!(r.undo_set.is_empty());
+    }
+
+    #[test]
+    fn a_planned_property_that_cannot_be_written_for_any_other_reason_is_a_failure_and_not_in_the_undo_set() {
+        // The dry run read the range; at write time that read fails. The property was in the plan the
+        // caller confirmed and was not written: that must show, and there is nothing to undo for it.
+        let st = |i: u64| json!({"value": 0.0, "default": 0.0, "value_index": i, "default_index": 612, "lower": 0.0, "upper": 1224.0, "steps": 1225});
+        let (name, code) = (WB_TUNE_AUTO.0.to_string(), WB_TUNE_AUTO.1);
+        let w = world_with(|c, _| c.with(code, RW, st(612)).with_sdk_range_quirk().failing_read_after_write(code, Failure::Call(-126)), 0);
+        let mut f = fixture(&w, true);
+        f.source.insert(name.clone(), code, st(613));
+        f.bytes = f.source.to_pretty_json().unwrap().into_bytes();
+        let r = apply_planned(&w, &f).unwrap();
+        // The other properties were written first (name order puts WBTuneAuto last), so the read at
+        // write time fails only after a write has happened.
+        assert_eq!(r.status, ApplyStatus::Failed, "{:?}", r.write_errors);
+        let e = r.write_errors.iter().find(|e| e.name == name).expect("the range is reported");
+        assert!(e.message.contains("planned write not performed"), "{}", e.message);
+        assert!(!r.undo_set.contains(&name), "it was never written, so there is nothing to undo: {:?}", r.undo_set);
+        assert!(!r.written.contains(&name));
+    }
+
+    #[test]
+    fn the_real_write_run_is_limited_to_what_the_confirmed_plan_copied() {
+        // Plan: the numeric property (55 on the source) is NOT opted in and differs from the body's
+        // 1, so the dry run skips it (`literal_unconfirmed`). Writing any of the three string
+        // properties makes the body hold 55 there, which the literal gate treats as a no-op and lets
+        // through — so a real run that re-evaluates everything would write it, though it was never
+        // in the plan whose digest the caller echoed.
+        let probe = world_with(|c, _| c, 0);
+        let numeric = probe.codes[3].clone();
+        let w = world_with(
+            |c, codes| codes[..3].iter().fold(c, |c, (_, code)| c.with_dependent(*code, numeric.1, json!(55))),
+            0,
+        );
+        let f = fixture(&w, false);
+        let r = apply_planned(&w, &f).unwrap();
+        assert_eq!(r.written.len(), 3, "only the three confirmed properties: {:?}", r.written);
+        assert!(!r.written.contains(&numeric.0));
+        assert!(w.cam.writes().iter().all(|(code, _)| *code != numeric.1), "the numeric property was never written");
+        assert!(r.outcomes.iter().all(|o| o.name != numeric.0), "not in the planned set, not in the real run");
+    }
+
+    #[test]
+    fn the_undo_set_of_an_apply_with_a_read_only_side_effect_is_accepted_by_the_undo() {
+        // Writing the first property makes a read-only property on the body change. It lands in the
+        // side effects, and an undo that was told to put it back would have failed (a read-only
+        // property is skipped, an unrestored named property is a failure).
+        let probe = world();
+        let read_only = baseline_for("Z 9").unwrap().readable[50].code;
+        let w = world_with(
+            |c, codes| c.with(read_only, OP_GET, json!(1)).with_dependent(codes[0].1, read_only, json!(9)),
+            0,
+        );
+        let f = fixture(&w, true);
+        let r = apply_planned(&w, &f).unwrap();
+        let ro_name = probe.names[&read_only].clone();
+        assert!(r.readback.as_ref().unwrap().side_effects.as_ref().unwrap().changed.contains(&ro_name), "a side effect");
+        assert!(!r.undo_set.contains(&ro_name), "{:?}", r.undo_set);
+        assert!(r.undo_not_restorable.contains(&ro_name), "{:?}", r.undo_not_restorable);
+        // The documented undo: resolve `only` against the restore point, then restore it.
+        let rp = Snapshot::load_from_file(w.dir.path().join(&r.restore_point.as_ref().unwrap().file)).unwrap();
+        let only = crate::ops::restore::resolve_only(&r.undo_set, &rp.properties).expect("every undo_set name is in the restore point");
+        let run = crate::ops::restore::execute(&w.cam, &rp.properties, Some(&only), false);
+        assert!(run.unrestored().is_empty(), "{:?}", run.unrestored());
+    }
+
+    #[test]
+    fn a_property_named_differently_on_the_target_is_judged_and_undone_under_the_targets_name() {
+        // `names_compatible` accepts one code under two names (BracketingType on the Z6III,
+        // AEBracketingType on the Z 9). The restore point and the read-back are keyed by the
+        // target's name, so the apply must look the property up by that, or it can never be verified.
+        let w = world();
+        let mut f = fixture(&w, true);
+        let (target_name, code) = w.codes[0].clone();
+        let source_name = "kNkMAIDCapability_SourceSideName".to_string();
+        let moved = f.source.properties.remove(&target_name).unwrap();
+        f.source.insert(source_name.clone(), code, moved.value);
+        f.bytes = f.source.to_pretty_json().unwrap().into_bytes();
+        // The guard knows the code only on the source model, so it does not object to the names.
+        let caps: Vec<(&str, u32)> = w.codes[1..].iter().map(|(n, c)| (n.trim_start_matches("kNkMAIDCapability_"), *c)).collect();
+        let src_caps: Vec<(&str, u32)> = std::iter::once(("SourceSideName", code)).chain(caps.iter().copied()).collect();
+        let cfg = parse_config(&[("Z6_3", &src_caps), ("Z 9", &caps)]);
+        f.guard = CodeNameGuard::new(&cfg, "Z6_3", "Z 9").unwrap();
+        let r = apply_planned(&w, &f).unwrap();
+        assert_eq!(r.status, ApplyStatus::AppliedVerified, "{:?}", r.readback.as_ref().map(|rb| (&rb.not_taken, &rb.unverifiable)));
+        assert!(r.written.contains(&target_name) && !r.written.contains(&source_name), "{:?}", r.written);
+        assert!(r.undo_set.contains(&target_name) && !r.undo_set.contains(&source_name), "{:?}", r.undo_set);
+        assert!(r.readback.as_ref().unwrap().side_effects.as_ref().unwrap().is_empty(), "no false side effect");
+    }
+
+    #[test]
+    fn a_failed_write_that_may_have_landed_stays_in_the_undo_set() {
+        let w = world_with(|c, codes| c.failing_write(codes[1].1, Failure::Call(-125)), 0);
+        let f = fixture(&w, true);
+        let r = apply_planned(&w, &f).unwrap();
+        assert!(r.undo_set.contains(&w.codes[1].0), "{:?}", r.undo_set);
     }
 
     #[test]
@@ -905,8 +1208,8 @@ mod tests {
         let only: BTreeSet<String> = r.undo_set.iter().cloned().collect();
         let run = crate::ops::restore::execute(&w.cam, &rp.properties, Some(&only), false);
         assert_eq!(run.counts().errors, 0);
-        for (_, code) in &w.codes {
-            assert_eq!(w.cam.value(*code), Some(json!(1)));
+        for (i, (_, code)) in w.codes.iter().enumerate() {
+            assert_eq!(w.cam.value(*code), Some(initial(i)));
         }
     }
 
@@ -994,6 +1297,19 @@ mod tests {
         let st = |i: u64| json!({"value": 0.0, "value_index": i, "lower": 0.0, "upper": 1224.0, "steps": 1225});
         assert!(took_effect(&st(612), &st(612)));
         assert!(!took_effect(&st(612), &st(0)), "index 0 is not 612 even though both `value` fields read 0.0");
+        // The scale's own top end, where the old relative tolerance (0.1% of the value) exceeded one
+        // step: adjacent positions are different positions at every point of a stepped scale.
+        assert!(!took_effect(&st(1224), &st(1223)), "WBTune top: 1224 vs 1223");
+        assert!(!took_effect(&st(1223), &st(1224)));
+        assert!(!took_effect(&st(1000), &st(999)), "where the old tolerance first reached 1.0");
+        assert!(took_effect(&st(1224), &st(1224)));
+        let kelvin = |i: u64| json!({"value": 0.0, "value_index": i, "lower": 2500.0, "upper": 10000.0, "steps": 751});
+        assert!(!took_effect(&kelvin(750), &kelvin(749)), "10000 K vs 9990 K, which the old tolerance accepted at exactly 10 <= 10");
+        // A continuous range: at, below and above the float tolerance, and no relative leg.
+        let big = |v: f64| json!({"value": v, "lower": 0.0, "upper": 5000.0, "steps": 0, "value_index": 0});
+        assert!(took_effect(&big(1000.0), &big(1000.0 + 5e-7)), "below 1e-6");
+        assert!(!took_effect(&big(1000.0), &big(1000.0 + 2e-6)), "above 1e-6");
+        assert!(!took_effect(&big(1000.0), &big(1000.5)), "0.05% apart: inside the old relative tolerance");
         // numbers: 3 is 3.0
         assert!(took_effect(&json!(3), &json!(3.0)));
         assert!(!took_effect(&json!(3), &json!(4)));
@@ -1010,6 +1326,13 @@ mod tests {
         assert_eq!(serde_json::to_value(ApplyStatus::AppliedUnverified).unwrap(), json!("applied_unverified"));
         assert_eq!(serde_json::to_value(ApplyStatus::Failed).unwrap(), json!("failed"));
         assert_eq!(serde_json::to_value(ApplyStatus::Indeterminate).unwrap(), json!("indeterminate"));
+        assert_eq!(serde_json::to_value(ApplyStatus::NotApplied).unwrap(), json!("not_applied"));
+        // `tag()` is the one place the strings are written by hand; serde must agree for every status.
+        for status in ApplyStatus::ALL {
+            assert_eq!(serde_json::to_value(status).unwrap(), json!(status.tag()));
+        }
+        let tags: BTreeSet<_> = ApplyStatus::ALL.iter().map(ApplyStatus::tag).collect();
+        assert_eq!(tags.len(), ApplyStatus::ALL.len());
         let errs = [
             ApplyError::MissingConfirmation { which: "digest" },
             ApplyError::StalePlan { what: "digest" },

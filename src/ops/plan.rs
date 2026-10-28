@@ -69,6 +69,10 @@ pub struct PlanCounts {
     pub by_tag: BTreeMap<String, usize>,
 }
 
+/// The array in a serialised [`PlanReport`] a client pages through. The MCP server pages by this
+/// name; a test pins it to the report's real field.
+pub const PLAN_LIST_KEY: &str = "outcomes";
+
 #[derive(Debug, Serialize)]
 pub struct PlanReport {
     pub digest: String,
@@ -99,13 +103,17 @@ pub fn summary_text(target: &Camera, would_change: usize, allow_raw_code: &BTree
         allow_raw_code.iter().cloned().collect::<Vec<_>>().join(", ")
     };
     format!(
-        "{} {}: {would_change} propert{} would change; opted in: {optins}",
+        "{} {}: {} would change; opted in: {optins}",
         target.model,
         target.serial,
-        if would_change == 1 { "y" } else { "ies" },
+        property_count_phrase(would_change),
     )
 }
 
+/// A value as the plan digest sees it: without `default_index`, which the SDK leaves uninitialised
+/// on some bodies, so it would make a digest depend on garbage. This is deliberately wider than
+/// `diff`'s rule (which strips it from enum shapes only): a range's `default_index` is just as
+/// uninitialised, and a digest that included it would differ between two reads of one body.
 fn strip_default_index(v: &Value) -> Value {
     let mut v = v.clone();
     if let Some(o) = v.as_object_mut() {
@@ -154,8 +162,16 @@ pub fn digest(
     hex(&Sha256::digest(serde_json::to_vec(&doc).expect("a Value always serialises")))
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// Lower-case hex of `bytes`, for digests.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `1 property` / `3 properties`, as a plan's summary words it. The summary is echoed back to
+/// confirm a plan, so every summary builds this phrase here: a pluralisation that differed between
+/// two places would make apply refuse a plan as stale.
+pub(crate) fn property_count_phrase(n: usize) -> String {
+    format!("{n} propert{}", if n == 1 { "y" } else { "ies" })
 }
 
 fn rank(o: &TransplantOutcome) -> u8 {
@@ -419,10 +435,14 @@ mod tests {
         let last_routine = tags.iter().rposition(|t| matches!(*t, "read_only" | "absent_on_target")).unwrap();
         let first_policy = tags.iter().position(|t| *t == "literal_unconfirmed").unwrap();
         assert!(first_policy < last_routine, "policy before routine: {tags:?}");
-        let first_warn = tags.iter().position(|t| *t == "target_read_failed" || *t == "no_matching_option" || *t == "enum_undecoded_by_sdk");
-        if let Some(w) = first_warn {
-            assert!(w < first_policy, "warn before policy: {tags:?}");
-        }
+        // The enum whose target holds a non-enum is a warn-severity skip (`no_matching_option`); it
+        // must exist, and come before the policy skips. (Error severity, `write_failed`, cannot occur
+        // in a plan: nothing is written.)
+        let first_warn = tags
+            .iter()
+            .position(|t| *t == "target_read_failed" || *t == "no_matching_option" || *t == "enum_undecoded_by_sdk")
+            .unwrap_or_else(|| panic!("the fixture must produce a warn-severity skip: {tags:?}"));
+        assert!(first_warn < first_policy, "warn before policy: {tags:?}");
     }
 
     #[test]
@@ -462,6 +482,13 @@ mod tests {
         let (c, entries) = world(3, "old");
         let _ = plan_with(&c, &entries, "T", &["Num"]);
         assert!(c.writes().is_empty());
+    }
+
+    #[test]
+    fn the_list_a_client_pages_is_a_real_array_in_the_report() {
+        let (c, entries) = world(3, "old");
+        let v = serde_json::to_value(plan_with(&c, &entries, "T", &["Num"])).unwrap();
+        assert!(v[PLAN_LIST_KEY].is_array(), "{PLAN_LIST_KEY} must name an array in the serialised plan");
     }
 
     #[test]

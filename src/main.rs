@@ -562,6 +562,22 @@ fn serial_matches(dev: &DeviceInfo, usb: &Option<UsbCameraInfo>, s: &str) -> boo
         || format!("id-{}", dev.id) == s
 }
 
+/// Who the body being written to is, for a restore point and for deciding whether a snapshot is
+/// of this very body. Built from the body itself, never from the snapshot being applied: taking
+/// the snapshot's serial when no USB descriptor was read made every other body look like the
+/// snapshot's own, and an unreadable (empty) descriptor made a body's own snapshot look foreign.
+fn target_identity(target: &DeviceInfo, usb_info: &Option<UsbCameraInfo>) -> Camera {
+    Camera {
+        model: target.name.clone(),
+        serial: snapshot_serial(usb_info, target.id),
+        firmware: usb_info
+            .as_ref()
+            .map(|u| u.firmware.clone())
+            .filter(|f| !f.is_empty())
+            .unwrap_or_else(|| target.version.clone()),
+    }
+}
+
 /// The serial to record for a captured snapshot: the real USB serial if one
 /// was read (and non-empty — the SDK/USB layer can return `Some("")` for an
 /// unreadable descriptor, which must NOT be treated as a valid serial), else
@@ -1877,11 +1893,7 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Restor
     let schema = MaidLayerConfig::parse_file(schema_path)
         .with_context(|| format!("loading schema from {}", schema_path.display()))?;
     let name_lookup = schema.name_map_for_model(&target.name);
-    let identity = Camera {
-        model: target.name.clone(),
-        serial: usb_info.as_ref().map(|u| u.serial.clone()).unwrap_or_else(|| snap.camera.serial.clone()),
-        firmware: usb_info.as_ref().map(|u| u.firmware.clone()).unwrap_or_else(|| snap.camera.firmware.clone()),
-    };
+    let identity = target_identity(&target, &usb_info);
     // The CLI picked the body by serial above (including the id-N and SDK-id forms the MCP refuses),
     // so only the model is checked here. A different model is a transplant, not a restore.
     let input = RestorePlanInput {
@@ -1955,6 +1967,12 @@ fn restore_verification_text(v: &restore::Verification) -> (String, bool) {
             false,
         ),
         restore::Verdict::NothingWritten => ("Read-back: nothing was written, nothing to verify".to_string(), false),
+        restore::Verdict::Unjudged => (
+            "Read-back: UNVERIFIED — none of the written properties could be compared (volatile-listed, \
+             never-copy or absent from the snapshot); nothing is claimed"
+                .to_string(),
+            false,
+        ),
         restore::Verdict::ReadbackIncomplete => (
             "Read-back: INCOMPLETE — the camera could not be read back well enough to verify the writes; \
              nothing is claimed"
@@ -2040,8 +2058,9 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
         say(
             json,
             &format!(
-                "note: source and target are both {:?} — transplant works the same either way, \
-                 but `fleet restore` is the simpler/faster tool for a same-model copy.\n",
+                "note: source and target are both {:?} — `fleet restore` is the simpler/faster tool for a \
+                 same-model copy. Like transplant, it leaves out settings that read as a different \
+                 position per body (ShootingLimit) when the snapshot is of another body.\n",
                 target.name
             ),
         );
@@ -2051,11 +2070,7 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
     let device = sdk.connect(target.id)?;
     ensure_capabilities_present(device.capabilities.len())?;
 
-    let identity = Camera {
-        model: target.name.clone(),
-        serial: snapshot_serial(&usb_info, target.id),
-        firmware: usb_info.as_ref().map(|u| u.firmware.clone()).unwrap_or_else(|| target.version.clone()),
-    };
+    let identity = target_identity(&target, &usb_info);
     let input = PlanInput { source: &snap, source_bytes: &source_bytes, target: &identity, options: &options };
     let plan = build_plan(&device, &guard, &input);
 
@@ -2155,6 +2170,40 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
     use serde_json::json;
+
+    // ── the identity of the body being written to ────────────────────────
+
+    fn device(id: u32) -> DeviceInfo {
+        DeviceInfo { id, name: "Z6_3".into(), available: true, connected_pid: 0, version: "2.00".into() }
+    }
+
+    #[test]
+    fn the_target_identity_is_the_bodys_own_never_the_snapshots() {
+        // restore --serial reaches a body that has a USB record: its serial and firmware are its own.
+        let own = target_identity(&device(3), &Some(usb("0000003023668")));
+        assert_eq!((own.serial.as_str(), own.firmware.as_str(), own.model.as_str()), ("0000003023668", "5.31", "Z6_3"));
+        // No USB record (the `id-N` and SDK-id forms): the id fallback, which no snapshot's real
+        // serial can equal, so the restore reads as another body's and ShootingLimit is not written.
+        let none = target_identity(&device(3), &None);
+        assert_eq!((none.serial.as_str(), none.firmware.as_str()), ("id-3", "2.00"));
+        // An unreadable descriptor (Some("")) is not a serial either.
+        let empty = target_identity(&device(3), &Some(usb("")));
+        assert_eq!(empty.serial, "id-3");
+    }
+
+    #[test]
+    fn a_restore_onto_a_body_with_no_usb_record_is_never_the_snapshots_own_body() {
+        use nikon_fleet::ops::restore::Source;
+        let snapshot_serial = "0000003023668";
+        let identity = target_identity(&device(3), &None);
+        assert_eq!(Source::of(snapshot_serial, &identity.serial), Source::OtherBody);
+        // With the descriptor read and equal, it is the same body.
+        let identity = target_identity(&device(3), &Some(usb(snapshot_serial)));
+        assert_eq!(Source::of(snapshot_serial, &identity.serial), Source::SameBody);
+        // With the descriptor unreadable, a body's own snapshot is not provably its own: fail closed.
+        let identity = target_identity(&device(3), &Some(usb("")));
+        assert_eq!(Source::of(snapshot_serial, &identity.serial), Source::OtherBody);
+    }
 
     // ── firmware latest --json shape ─────────────────────────────────────
 
@@ -2530,6 +2579,8 @@ mod tests {
             residual: Some(nikon_fleet::ops::readback::Residual {
                 changed: changed.iter().map(|s| s.to_string()).collect(),
                 missing: missing.iter().map(|s| s.to_string()).collect(),
+                unjudged: Vec::new(),
+                judged: 1,
             }),
         }
     }

@@ -57,7 +57,7 @@ impl std::fmt::Display for TargetError {
 impl std::error::Error for TargetError {}
 
 /// Whether `s` is the `id-N` fallback form (`id-` then one or more ASCII digits).
-fn is_id_fallback(s: &str) -> bool {
+pub(crate) fn is_id_fallback(s: &str) -> bool {
     s.strip_prefix("id-")
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }

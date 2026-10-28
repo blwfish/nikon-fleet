@@ -131,12 +131,12 @@ pub fn render_restore_dry_run(steps: &[PlanStep], counts: &Counts, only_selected
 
 /// The tally line shared by a dry run and a real restore.
 pub fn restore_tally(heading: &str, c: &Counts, only_selected: bool) -> String {
-    let Counts { written, skipped_absent, skipped_read_only, skipped_type, skipped_never, not_selected, errors } = *c;
+    let Counts { written, skipped_absent, skipped_read_only, skipped_type, skipped_never, skipped_scale, not_selected, errors } = *c;
     let not_selected_note = if only_selected { format!("  skipped(not-selected)={not_selected}") } else { String::new() };
     format!(
         "{heading} written={written}  skipped(absent)={skipped_absent}  \
          skipped(read-only)={skipped_read_only}  \
-         skipped(unsupported-type)={skipped_type}  skipped(never-copied)={skipped_never}{not_selected_note}  errors={errors}\n"
+         skipped(unsupported-type)={skipped_type}  skipped(never-copied)={skipped_never}  skipped(range-scale)={skipped_scale}{not_selected_note}  errors={errors}\n"
     )
 }
 
@@ -165,17 +165,12 @@ pub fn undo_command(restore_point_file: &str, undo_set: &[String]) -> String {
             undo_set.len()
         );
     }
-    let only: String = undo_set.iter().map(|n| format!(" --only {}", n.trim_start_matches("kNkMAIDCapability_"))).collect();
+    let only: String = undo_set.iter().map(|n| format!(" --only {}", n.trim_start_matches(nikon_fleet::transplant::PROPERTY_PREFIX))).collect();
     format!("nikon-fleet restore {restore_point_file}{only}")
 }
 
 fn status_word(s: ApplyStatus) -> &'static str {
-    match s {
-        ApplyStatus::AppliedVerified => "applied_verified",
-        ApplyStatus::AppliedUnverified => "applied_unverified",
-        ApplyStatus::Failed => "failed",
-        ApplyStatus::Indeterminate => "indeterminate",
-    }
+    s.tag()
 }
 
 /// What a finished apply says about itself, and whether the command must exit non-zero.
@@ -208,6 +203,16 @@ fn readback_lines(rb: &Readback, s: &mut String) {
 pub fn render_transplant_apply(r: &ApplyReport) -> ApplyText {
     let mut s = String::new();
     if r.no_op {
+        if r.status == ApplyStatus::Failed {
+            // Nothing to write, but not because there was nothing to copy: the skip reasons say what
+            // stopped it, and the command must not exit as if it had succeeded.
+            s.push_str("Nothing was copied, and not because there was nothing to change; no restore point was taken.\n");
+            s.push_str(&format!("Status: {}\n", status_word(r.status)));
+            return ApplyText {
+                stdout: s,
+                failing: Some("nothing could be copied: every candidate was skipped for a reason that needs attention (see the skipped properties above)".to_string()),
+            };
+        }
         s.push_str("Nothing to write; no restore point was taken.\n");
         return ApplyText { stdout: s, failing: None };
     }
@@ -218,15 +223,30 @@ pub fn render_transplant_apply(r: &ApplyReport) -> ApplyText {
         s.push_str("note: the restore point did not pass the model's completeness check (or the model has no baseline); continuing because --allow-partial was given.\n");
     }
     s.push_str(&format!("Status: {}\n", status_word(r.status)));
+    if !r.rejected_by_kind.is_empty() {
+        s.push_str(&format!(
+            "Rejected by kind: {} planned propert{} the body would not take (not written): {}\n",
+            r.rejected_by_kind.len(),
+            if r.rejected_by_kind.len() == 1 { "y" } else { "ies" },
+            r.rejected_by_kind.join(", ")
+        ));
+    }
     if let Some(rb) = &r.readback {
         readback_lines(rb, &mut s);
     }
     if let Some(rp) = &r.restore_point {
         s.push_str(&format!("To undo: {}\n", undo_command(&rp.file, &r.undo_set)));
     }
+    if !r.undo_not_restorable.is_empty() {
+        s.push_str(&format!("Not undoable (an undo cannot put these back): {}\n", r.undo_not_restorable.join(", ")));
+    }
     let not_taken = r.readback.as_ref().map(|rb| rb.not_taken.len()).unwrap_or(0);
     let failing = if r.status == ApplyStatus::Failed {
-        Some(format!("{} capability write(s) failed (see warnings above)", r.write_errors.len()))
+        if r.write_errors.is_empty() {
+            Some("no property could be written: the body rejected every write by kind".to_string())
+        } else {
+            Some(format!("{} capability write(s) failed (see warnings above)", r.write_errors.len()))
+        }
     } else if not_taken > 0 {
         Some("the transplant did not take effect as reported; see the read-back above".to_string())
     } else {
@@ -260,6 +280,9 @@ pub fn render_restore_apply(r: &RestoreApplyReport) -> String {
     }
     if let Some(rp) = &r.restore_point {
         s.push_str(&format!("To undo: {}\n", undo_command(&rp.file, &r.undo_set)));
+    }
+    if !r.undo_not_restorable.is_empty() {
+        s.push_str(&format!("Not undoable (an undo cannot put these back): {}\n", r.undo_not_restorable.join(", ")));
     }
     s
 }
@@ -296,7 +319,13 @@ pub fn restore_failure(r: &RestoreApplyReport, named: Option<usize>, readback_fa
     if let Some(msg) = unrestored_error(named, &r.unrestored) {
         return Some(msg);
     }
-    readback_failed.then(|| "the restore did not take effect as reported; see the read-back above".to_string())
+    if readback_failed {
+        return Some("the restore did not take effect as reported; see the read-back above".to_string());
+    }
+    // The report's own verdict is the last word: an untargeted restore where every write was
+    // rejected by kind has no write error and nothing named, but its status is `failed`.
+    (r.status == ApplyStatus::Failed)
+        .then(|| "the restore failed: writes were attempted and none was made (see the counts above)".to_string())
 }
 
 /// A hint to append to an apply refusal, keyed by its closed tag.
@@ -428,9 +457,11 @@ mod tests {
             restore_point_gate_waived: false,
             written: written.iter().map(|s| s.to_string()).collect(),
             write_errors: vec![],
+            rejected_by_kind: vec![],
             outcomes: vec![],
             readback: rb,
             undo_set: written.iter().map(|s| s.to_string()).collect(),
+            undo_not_restorable: vec![],
         }
     }
 
@@ -529,7 +560,36 @@ mod tests {
             verification: None,
             side_effects: None,
             undo_set: vec![],
+            undo_not_restorable: vec![],
         }
+    }
+
+    #[test]
+    fn a_transplant_that_copied_nothing_because_of_problems_fails_the_command() {
+        let mut r = apply_report(ApplyStatus::AppliedVerified, &[], None);
+        r.no_op = true;
+        r.status = ApplyStatus::Failed;
+        let t = render_transplant_apply(&r);
+        assert!(t.failing.as_deref().unwrap().contains("nothing could be copied"), "{:?}", t.failing);
+        assert!(t.stdout.contains("Status: failed"), "{}", t.stdout);
+        // A genuine nothing-to-do is still a clean exit.
+        let mut ok = apply_report(ApplyStatus::AppliedVerified, &[], None);
+        ok.no_op = true;
+        assert_eq!(render_transplant_apply(&ok).failing, None);
+    }
+
+    #[test]
+    fn rejected_by_kind_and_what_an_undo_cannot_restore_are_printed_and_a_kind_only_failure_is_worded_truthfully() {
+        let mut r = apply_report(ApplyStatus::AppliedVerified, &[], None);
+        r.rejected_by_kind = vec!["Clock".into()];
+        r.undo_not_restorable = vec!["Appeared".into()];
+        let t = render_transplant_apply(&r);
+        assert!(t.stdout.contains("Rejected by kind: 1 planned property the body would not take (not written): Clock"), "{}", t.stdout);
+        assert!(t.stdout.contains("Not undoable") && t.stdout.contains("Appeared"), "{}", t.stdout);
+        // Failed with no write errors (every write rejected by kind) does not say "0 writes failed".
+        r.status = ApplyStatus::Failed;
+        let failing = render_transplant_apply(&r).failing.unwrap();
+        assert!(failing.contains("rejected every write by kind") && !failing.contains("0 capability"), "{failing}");
     }
 
     #[test]
@@ -545,6 +605,12 @@ mod tests {
         assert!(restore_failure(&u, Some(2), false).unwrap().contains("targeted restore incomplete: 1 of 2"));
         assert_eq!(restore_failure(&u, None, false), None, "a full restore never fails for routine skips");
         assert!(restore_failure(&ok, None, true).unwrap().contains("did not take effect"));
+        // Status `failed` with nothing named and no write error (every write rejected by kind): the
+        // command must still fail, from the report's own verdict.
+        let mut f = restore_report();
+        f.status = ApplyStatus::Failed;
+        assert!(restore_failure(&f, None, false).unwrap().contains("none was made"));
+        assert_eq!(restore_failure(&restore_report(), None, false), None, "and a verified one does not");
     }
 
     #[test]

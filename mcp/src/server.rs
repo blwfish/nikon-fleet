@@ -11,7 +11,10 @@
 //!
 //! Every result is structured content. A failure is `isError: true` with
 //! `{"error": {"tag", "message", "detail"?}}`, `tag` from a closed vocabulary; nothing
-//! here branches on the text of a message. Anything that came from a camera or a
+//! here branches on the text of a message. The one exception is an apply that ran and
+//! `failed`: it is `isError: true` too, but its structured content is the whole report
+//! (`status`, `written`, `write_errors`, `undo_set`...), with no `error` key. A client
+//! that reads `error.tag` must check for it. Anything that came from a camera or a
 //! file (labels, artist and copyright strings, scraped firmware pages) is data.
 
 use std::path::PathBuf;
@@ -21,6 +24,7 @@ use std::time::Duration;
 use nikon_fleet::diff::{DiffOptions, diff_with_schema};
 use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::ops::firmware_latest::{LatestReport, survey_json, survey_models, watch_models};
+use nikon_fleet::ops::apply::ApplyStatus;
 use nikon_fleet::ops::list::list_dir;
 use nikon_fleet::ops::paths::resolve_existing;
 use nikon_fleet::ops::views::{diff_view, snapshot_view};
@@ -145,7 +149,14 @@ pub fn to_result(kind: CallKind, f: Finished) -> CallToolResult {
             if garbage_lines > 0 {
                 eprintln!("fleet-mcp: the worker wrote {garbage_lines} line(s) that were not protocol lines");
             }
-            CallToolResult::structured(data)
+            // A failed apply is an error to a client that only looks at `isError`; the full report
+            // (written, write_errors, undo_set...) is still the structured content. applied_unverified
+            // is not an error: the writes went in, and `status` says it could not be confirmed.
+            if kind == CallKind::Apply && data.get("status").and_then(Value::as_str) == Some(ApplyStatus::Failed.tag()) {
+                CallToolResult::structured_error(data)
+            } else {
+                CallToolResult::structured(data)
+            }
         }
         Finished::Result { outcome: Outcome::Err { error, .. }, .. } => {
             failure(&error.tag, &error.message, error.detail)
@@ -167,7 +178,7 @@ pub fn to_result(kind: CallKind, f: Finished) -> CallToolResult {
                          Capture or check the camera to find out; do not retry the apply from the same plan.",
                         Some(detail),
                     );
-                    r.structured_content.as_mut().map(|v| v["status"] = json!("indeterminate"));
+                    r.structured_content.as_mut().map(|v| v["status"] = json!(ApplyStatus::Indeterminate.tag()));
                     r
                 }
                 CallKind::Apply => {
@@ -176,7 +187,7 @@ pub fn to_result(kind: CallKind, f: Finished) -> CallToolResult {
                         "the apply worker gave no result before it began writing: nothing was written to the camera",
                         Some(detail),
                     );
-                    r.structured_content.as_mut().map(|v| v["status"] = json!("not_applied"));
+                    r.structured_content.as_mut().map(|v| v["status"] = json!(ApplyStatus::NotApplied.tag()));
                     r
                 }
             }
@@ -363,6 +374,20 @@ pub struct GuidanceArgs {
 
 fn flag_each(flag: &str, values: &Option<Vec<String>>) -> Vec<String> {
     values.iter().flatten().flat_map(|v| [flag.to_string(), v.clone()]).collect()
+}
+
+/// `only: []` reaches the worker as no `--only` flag at all, which means "restore everything". A
+/// caller that means "nothing" (an undo whose `undo_set` is empty has nothing to put back) must be
+/// told so, not given a full restore plan.
+fn empty_only(only: &Option<Vec<String>>) -> Option<CallToolResult> {
+    only.as_ref().filter(|v| v.is_empty()).map(|_| {
+        failure(
+            "empty_selection",
+            "`only` is an empty list. An empty list would mean every property, not none: omit `only` to restore everything, \
+             or name the properties. If you are undoing an apply whose undo_set is empty there is nothing to put back.",
+            None,
+        )
+    })
 }
 
 fn strs(v: &[&str]) -> Vec<String> {
@@ -736,7 +761,7 @@ impl FleetMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         Ok(self
-            .camera_call(CallKind::Read, ops_args::transplant_plan(&p.0), self.cfg.deadlines.plan, Some(Paging::for_plan("outcomes", p.0.offset, p.0.limit)), &meta, &peer, &ctx.ct)
+            .camera_call(CallKind::Read, ops_args::transplant_plan(&p.0), self.cfg.deadlines.plan, Some(Paging::for_plan(nikon_fleet::ops::plan::PLAN_LIST_KEY, p.0.offset, p.0.limit)), &meta, &peer, &ctx.ct)
             .await)
     }
 
@@ -754,8 +779,11 @@ impl FleetMcp {
         peer: Peer<RoleServer>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(refused) = empty_only(&p.0.only) {
+            return Ok(refused);
+        }
         Ok(self
-            .camera_call(CallKind::Read, ops_args::restore_plan(&p.0), self.cfg.deadlines.plan, Some(Paging::for_plan("steps", p.0.offset, p.0.limit)), &meta, &peer, &ctx.ct)
+            .camera_call(CallKind::Read, ops_args::restore_plan(&p.0), self.cfg.deadlines.plan, Some(Paging::for_plan(nikon_fleet::ops::restore_flow::RESTORE_PLAN_LIST_KEY, p.0.offset, p.0.limit)), &meta, &peer, &ctx.ct)
             .await)
     }
 
@@ -763,7 +791,7 @@ impl FleetMcp {
         name = "transplant_apply",
         description = "WRITES TO THE CAMERA. Applies a transplant_plan: stores a restore point, writes, reads back. \
                        Needs the plan's `plan_digest` and its `summary` copied unchanged; refuses `stale_plan` if the body or snapshot changed since. \
-                       `status` is applied_verified, applied_unverified, failed or indeterminate (no result: capture or check to find out). \
+                       `status` is applied_verified, applied_unverified, failed (also an error result, still carrying the whole report), indeterminate (no result after writes began: capture or check to find out) or not_applied (no result before any write). `no_op: true` means nothing needed changing (verified) or nothing could be copied (failed). \
                        To undo, restore_plan then restore_apply the returned restore point with `only` = `undo_set`.",
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false)
     )]
@@ -793,6 +821,9 @@ impl FleetMcp {
         peer: Peer<RoleServer>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(refused) = empty_only(&p.0.only) {
+            return Ok(refused);
+        }
         Ok(self
             .camera_call(CallKind::Apply, ops_args::restore_apply(&p.0), self.cfg.deadlines.apply, None, &meta, &peer, &ctx.ct)
             .await)
@@ -854,5 +885,60 @@ mod paging_tests {
         let err = result_of(Outcome::err("stale_plan", "x".to_string(), None));
         assert!(matches!(page_finished(err, &p), Finished::Result { outcome: Outcome::Err { .. }, .. }));
         assert!(matches!(page_finished(Finished::CancelledBeforeStart, &p), Finished::CancelledBeforeStart));
+    }
+}
+
+#[cfg(test)]
+mod status_and_selection_tests {
+    use super::*;
+
+    fn finished(data: Value) -> Finished {
+        Finished::Result { outcome: Outcome::ok(data), last_phase: None, garbage_lines: 0 }
+    }
+
+    #[test]
+    fn a_failed_apply_is_an_error_result_that_still_carries_the_whole_report() {
+        let r = to_result(CallKind::Apply, finished(json!({"status": "failed", "written": ["A"], "write_errors": [{"name": "B"}]})));
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(r.structured_content.as_ref().unwrap()["written"], json!(["A"]));
+    }
+
+    #[test]
+    fn verified_unverified_and_planning_results_are_not_errors() {
+        for status in ["applied_verified", "applied_unverified"] {
+            let r = to_result(CallKind::Apply, finished(json!({"status": status})));
+            assert_ne!(r.is_error, Some(true), "{status}");
+        }
+        let plan = to_result(CallKind::Read, finished(json!({"digest": "d"})));
+        assert_ne!(plan.is_error, Some(true));
+    }
+
+    #[test]
+    fn the_no_result_statuses_are_the_enums_tags() {
+        let no_result = |last_phase: Option<&str>| Finished::NoResult {
+            cause: crate::supervisor::NoResultCause::WorkerDied,
+            last_phase: last_phase.map(str::to_string),
+            garbage_lines: 0,
+        };
+        let before = to_result(CallKind::Apply, no_result(None));
+        assert_eq!(before.structured_content.as_ref().unwrap()["status"], json!(ApplyStatus::NotApplied.tag()));
+        let after = to_result(CallKind::Apply, no_result(Some("writing")));
+        assert_eq!(after.structured_content.as_ref().unwrap()["status"], json!(ApplyStatus::Indeterminate.tag()));
+    }
+
+    #[test]
+    fn an_empty_only_list_is_refused_because_it_would_mean_everything() {
+        assert!(empty_only(&None).is_none(), "no `only` is the documented 'all'");
+        assert!(empty_only(&Some(vec!["A".to_string()])).is_none());
+        let r = empty_only(&Some(vec![])).expect("an empty list is refused");
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(r.structured_content.as_ref().unwrap()["error"]["tag"], json!("empty_selection"));
+    }
+
+    #[test]
+    fn the_worker_argv_for_a_named_selection_still_carries_it() {
+        let a = RestorePlanArgs { serial: "S".into(), source: "snap.json".into(), only: Some(vec!["A".into(), "B".into()]), offset: None, limit: None };
+        let argv = ops_args::restore_plan(&a);
+        assert_eq!(argv.iter().filter(|x| *x == "--only").count(), 2);
     }
 }

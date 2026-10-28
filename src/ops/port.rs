@@ -12,7 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::sdk::{CapabilityInfo, Device, SdkError};
+use crate::sdk::{
+    CAP_TYPE_BOOLEAN, CAP_TYPE_ENUM, CAP_TYPE_FLOAT, CAP_TYPE_INTEGER, CAP_TYPE_RANGE, CAP_TYPE_STRING, CapabilityInfo, Device,
+    SdkError, prepare_write,
+};
+use crate::value_shape::{is_enum_shape, is_range_shape, is_stepped_range};
 
 pub trait CameraPort {
     /// Every capability the body reports.
@@ -208,15 +212,34 @@ impl CameraPort for FakeCamera {
             self.ignored.borrow_mut().push((id, value.clone()));
             return Ok(());
         }
-        let stored = if self.zero_range_value
-            && value.get("lower").is_some()
-            && value.get("steps").and_then(Value::as_u64).unwrap_or(0) >= 2
-        {
-            let mut v = value.clone();
+        // The real write builds its data from the capability's kind and refuses a value that does
+        // not fit it (a float for an integer, a missing index, a 256-byte string...). The fake's
+        // capabilities carry kind 0, which the real path would refuse outright, so the kind is
+        // taken from the value the body holds, and then the same `prepare_write` decides.
+        let held = self.values.borrow().get(&id).cloned();
+        let effective_kind = if kind != 0 { kind } else { held.as_ref().map_or(0, kind_of) };
+        prepare_write(effective_kind, value)?;
+        // A body keeps its own scale and option list: a write sets the position, not the scale.
+        let merged = match &held {
+            Some(h) if is_range_shape(h) && is_range_shape(value) => {
+                let mut v = h.clone();
+                v["value"] = value["value"].clone();
+                v["value_index"] = value["value_index"].clone();
+                v
+            }
+            Some(h) if is_enum_shape(h) && is_enum_shape(value) => {
+                let mut v = h.clone();
+                v["value_index"] = value["value_index"].clone();
+                v
+            }
+            _ => value.clone(),
+        };
+        let stored = if self.zero_range_value && is_stepped_range(&merged) {
+            let mut v = merged;
             v["value"] = serde_json::json!(0.0);
             v
         } else {
-            value.clone()
+            merged
         };
         self.values.borrow_mut().insert(id, stored);
         self.writes.borrow_mut().push((id, value.clone()));
@@ -226,6 +249,25 @@ impl CameraPort for FakeCamera {
             }
         }
         Ok(())
+    }
+}
+
+/// The kind a capability holding `v` has on a real body (kNkMAIDCapType_*), or 0 if none writes.
+fn kind_of(v: &Value) -> u32 {
+    if is_enum_shape(v) {
+        CAP_TYPE_ENUM
+    } else if is_range_shape(v) {
+        CAP_TYPE_RANGE
+    } else if v.is_boolean() {
+        CAP_TYPE_BOOLEAN
+    } else if v.is_i64() || v.is_u64() {
+        CAP_TYPE_INTEGER
+    } else if v.is_f64() {
+        CAP_TYPE_FLOAT
+    } else if v.is_string() {
+        CAP_TYPE_STRING
+    } else {
+        0
     }
 }
 
@@ -246,6 +288,97 @@ mod tests {
         assert_eq!(c.read_capability(2).unwrap(), json!("x"));
         assert_eq!(c.reads(), [1, 2]);
         assert_eq!(c.capabilities().len(), 2);
+    }
+
+    // ── the fake refuses what the real write refuses ─────────────────────
+
+    fn range(value: f64, index: u64) -> Value {
+        json!({"value": value, "default": 0.0, "value_index": index, "default_index": 0, "lower": 0.0, "upper": 10.0, "steps": 11})
+    }
+
+    fn enum_of(index: u64) -> Value {
+        json!({"value_index": index, "default_index": 0, "elem_count": 3, "elem_type": 2, "elem_bytes": 4, "values": [1, 2, 3]})
+    }
+
+    #[test]
+    fn the_fake_and_the_real_write_path_accept_and_refuse_the_same_values() {
+        // (what the body holds, what is written): both go through `prepare_write`, so the fake can
+        // never accept a write the real path would refuse.
+        let long = Value::String("x".repeat(256));
+        let cases: Vec<(Value, Value)> = vec![
+            (json!(10), json!(11)),
+            (json!(10), json!(11.5)),
+            (json!(10), json!("11")),
+            (json!(10.5), json!(2)),
+            (json!("old"), json!("new")),
+            (json!("old"), long.clone()),
+            (json!("old"), json!(5)),
+            (json!(true), json!(false)),
+            (json!(true), json!(1)),
+            (range(3.0, 3), range(4.0, 4)),
+            (range(3.0, 3), json!({"value_index": 4})),
+            (range(3.0, 3), json!(4)),
+            (enum_of(0), enum_of(2)),
+            (enum_of(0), json!({"values": [1]})),
+            (enum_of(0), json!(2)),
+        ];
+        for (held, written) in cases {
+            let cam = FakeCamera::new().with(1, OP_GET | OP_SET, held.clone());
+            let fake = cam.write_capability(1, 0, &written);
+            let real = prepare_write(kind_of(&held), &written);
+            assert_eq!(fake.is_ok(), real.is_ok(), "held {held}, written {written}: fake {fake:?}");
+            if let (Err(f), Err(r)) = (&fake, &real) {
+                assert_eq!(std::mem::discriminant(f), std::mem::discriminant(r), "same refusal for {held} <- {written}");
+            }
+            if fake.is_err() {
+                assert_eq!(cam.value(1), Some(held), "a refused write changes nothing");
+                assert!(cam.writes().is_empty(), "and is not recorded as a write");
+            }
+        }
+    }
+
+    #[test]
+    fn the_kind_the_fake_infers_from_a_held_value_is_the_kind_a_body_reports_for_it() {
+        // The parity test above feeds the same inferred kind to both sides, so this pins the inference
+        // itself to the SDK's kind numbers (kNkMAIDCapType_*: Boolean 1, Integer 2, Float 4, String 8,
+        // Enum 12, Range 13).
+        assert_eq!(kind_of(&json!(true)), 1);
+        assert_eq!(kind_of(&json!(7)), 2);
+        assert_eq!(kind_of(&json!(7.5)), 4);
+        assert_eq!(kind_of(&json!("s")), 8);
+        assert_eq!(kind_of(&enum_of(0)), 12);
+        assert_eq!(kind_of(&range(1.0, 1)), 13);
+        assert_eq!(kind_of(&json!({"_type": "datetime"})), 0, "nothing writes it");
+    }
+
+    #[test]
+    fn a_string_of_256_bytes_is_too_long_on_the_fake_as_on_the_body() {
+        let cam = FakeCamera::new().with(1, OP_GET | OP_SET, json!("old"));
+        assert!(matches!(cam.write_capability(1, 0, &Value::String("x".repeat(256))), Err(SdkError::StringTooLong { len: 256 })));
+        assert!(cam.write_capability(1, 0, &Value::String("x".repeat(255))).is_ok());
+    }
+
+    #[test]
+    fn a_write_to_a_range_or_enum_sets_the_position_and_keeps_the_bodys_own_scale() {
+        let cam = FakeCamera::new().with(1, OP_GET | OP_SET, range(3.0, 3)).with(2, OP_GET | OP_SET, enum_of(0));
+        // A stale scale in what is written (another firmware, a hand-edited snapshot): the body keeps
+        // its own lower/upper/steps, so the read-back reports the position on ITS scale.
+        let stale = json!({"value": 7.0, "default": 0.0, "value_index": 7, "default_index": 9, "lower": 100.0, "upper": 2000.0, "steps": 5});
+        cam.write_capability(1, 0, &stale).unwrap();
+        let held = cam.value(1).unwrap();
+        assert_eq!((held["lower"].clone(), held["upper"].clone(), held["steps"].clone()), (json!(0.0), json!(10.0), json!(11)));
+        assert_eq!(held["value_index"], json!(7));
+        let other = json!({"value_index": 2, "default_index": 0, "elem_count": 1, "elem_type": 2, "elem_bytes": 4, "values": [9]});
+        cam.write_capability(2, 0, &other).unwrap();
+        assert_eq!(cam.value(2).unwrap()["values"], json!([1, 2, 3]), "the option list is the body's own");
+        assert_eq!(cam.value(2).unwrap()["value_index"], json!(2));
+    }
+
+    #[test]
+    fn a_capability_that_holds_nothing_writable_is_refused_by_kind_like_the_real_write() {
+        // A datetime or array placeholder: no kind writes it.
+        let cam = FakeCamera::new().with(1, OP_GET | OP_SET, json!({"_type": "datetime"}));
+        assert!(matches!(cam.write_capability(1, 0, &json!("2026")), Err(SdkError::UnsupportedWrite(0))));
     }
 
     #[test]

@@ -2,7 +2,10 @@
 //!
 //! `restore` writes every snapshotted property that is not on the never-copy
 //! table, so anything changed on the camera after the snapshot was taken is
-//! overwritten. A targeted restore (`--only`) writes back just the named
+//! overwritten. A snapshot of *another* body (the CLI's `restore --serial` onto a second
+//! body of one model) also leaves out the settings that read as a different position per
+//! body ([`transplant::NEVER_TRANSLATED`], i.e. `ShootingLimit`); see [`Source`]. A range
+//! is written back only onto the scale it was read on. A targeted restore (`--only`) writes back just the named
 //! properties and leaves everything else alone; that is the undo of a
 //! transplant (docs/mcp-plan.md §5.6): restore the properties the apply wrote
 //! (and the ones it changed indirectly) from the restore point, and nothing
@@ -13,20 +16,22 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
-use crate::ops::baseline::{GateOutcome, gate};
+use crate::ops::baseline::{GateOutcome, GatePolicy, gate};
 use crate::ops::capture::{CaptureStats, capture};
 use crate::ops::port::CameraPort;
 use crate::ops::readback::{Residual, residual};
 use crate::sdk::{CapabilityInfo, OP_SET, SdkError};
 use crate::snapshot::{Camera, PropertyEntry, Snapshot, Transport};
-use crate::transplant;
+use crate::transplant::{self, MAX_ERROR_MESSAGE_LEN, truncate_with_marker};
+use crate::value_shape::{is_range_shape, is_stepped_range, range_scale, range_value};
 
 /// Why a snapshot property is not written back by `restore`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreSkip {
-    /// On [`transplant::NEVER_TRANSPLANT`]: it reports body/session state (or
-    /// locks it) rather than holding a setting. The same table `transplant`
-    /// uses, so the two commands cannot disagree about what is state. A
+    /// On [`transplant::NEVER_TRANSPLANT`] (it reports body/session state, or locks it, rather
+    /// than holding a setting), or, for a snapshot of another body ([`Source::OtherBody`]), on
+    /// [`transplant::NEVER_TRANSLATED`] (a setting that reads as a different position per body).
+    /// The same tables `transplant` uses, so the two commands cannot disagree about what is state. A
     /// restore point must not generate errors for properties the camera
     /// refuses to set (`CurrentItemID` and `LiveViewStatus` failed -125 on
     /// every full restore of a Z6III), or `errors == 0` stops meaning anything.
@@ -35,6 +40,10 @@ pub enum RestoreSkip {
     Absent,
     /// Present but `OP_SET` is not allowed.
     ReadOnly,
+    /// A range whose scale on the body now differs from the one the snapshot read it on (a
+    /// firmware change, or a setting such as the EV step that rescales it). Its stored position
+    /// would mean a different value on the new scale, so it is left alone, as a transplant does.
+    RangeScaleDiffers,
 }
 
 impl RestoreSkip {
@@ -44,18 +53,57 @@ impl RestoreSkip {
             RestoreSkip::NeverCopied => "never_copied",
             RestoreSkip::Absent => "absent_on_target",
             RestoreSkip::ReadOnly => "read_only",
+            RestoreSkip::RangeScaleDiffers => "range_scale_differs",
+        }
+    }
+}
+
+/// Whose settings a restore is carrying: the body's own, or another body's.
+///
+/// [`transplant::NEVER_TRANSLATED`] settings read as different positions on different bodies, so
+/// they come back only when the snapshot is of the very body being restored. A snapshot of another
+/// body of the same model (the CLI's `restore --serial`) carries nothing the target can interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    SameBody,
+    OtherBody,
+}
+
+impl Source {
+    /// A snapshot of `snapshot_serial` restored onto `target_serial`. A serial that does not
+    /// identify a body (empty, or the `id-N` fallback the CLI uses when no USB descriptor was
+    /// read) cannot show that two records are of one body, so it is `OtherBody`: the settings
+    /// that read differently per body are then left alone rather than written.
+    pub fn of(snapshot_serial: &str, target_serial: &str) -> Source {
+        let identifies = |s: &str| !s.is_empty() && !crate::ops::target::is_id_fallback(s);
+        if identifies(snapshot_serial) && identifies(target_serial) && snapshot_serial == target_serial {
+            Source::SameBody
+        } else {
+            Source::OtherBody
         }
     }
 }
 
 /// The device-free checks `restore` applies before writing a property, in
 /// order: the policy skip first (so a state property is reported as such even
-/// on a body that lacks it), then presence, then writability.
+/// on a body that lacks it), then presence, then writability. For a snapshot of
+/// the body itself; see [`restore_precheck_from`]. Tests only: a production caller must say whose
+/// snapshot it is restoring, never get `SameBody` by default.
+#[cfg(test)]
 pub fn restore_precheck<'a>(
     cap_map: &HashMap<u32, &'a CapabilityInfo>,
     code: u32,
 ) -> Result<&'a CapabilityInfo, RestoreSkip> {
-    if transplant::never_copied(code).is_some() {
+    restore_precheck_from(cap_map, code, Source::SameBody)
+}
+
+/// [`restore_precheck`] for a snapshot of `source`'s body.
+pub fn restore_precheck_from<'a>(
+    cap_map: &HashMap<u32, &'a CapabilityInfo>,
+    code: u32,
+    source: Source,
+) -> Result<&'a CapabilityInfo, RestoreSkip> {
+    if transplant::never_skip(code, source == Source::OtherBody).is_some() {
         return Err(RestoreSkip::NeverCopied);
     }
     let cap = *cap_map.get(&code).ok_or(RestoreSkip::Absent)?;
@@ -63,6 +111,55 @@ pub fn restore_precheck<'a>(
         return Err(RestoreSkip::ReadOnly);
     }
     Ok(cap)
+}
+
+/// What an undo can put back, and what it cannot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UndoSet {
+    /// Sorted names a targeted restore of the restore point accepts as `only` and writes.
+    pub names: Vec<String>,
+    /// Sorted names the apply touched or changed that an undo cannot restore: absent from the
+    /// restore point (they appeared only after the write), read-only or state-like on the body,
+    /// or never copied. Passing them as `only` would refuse the whole undo or fail it.
+    pub not_restorable: Vec<String>,
+}
+
+/// The `only` for undoing an apply, from the restore point it made.
+///
+/// `touched` is what the apply wrote or may have written; `side_effects` is what changed that it
+/// did not write. A name goes in `names` only if the restore point holds it and a restore of it
+/// would be written (the same check a restore makes, for the body's own snapshot); every other
+/// candidate is reported in `not_restorable`, never silently dropped and never passed to restore.
+pub fn undo_set(
+    restore_point: &Snapshot,
+    capabilities: &[CapabilityInfo],
+    touched: &BTreeSet<String>,
+    side_effects: Option<&crate::ops::readback::SideEffects>,
+    readback: Option<&Snapshot>,
+) -> UndoSet {
+    let cap_map: HashMap<u32, &CapabilityInfo> = capabilities.iter().map(|c| (c.id, c)).collect();
+    // The undo restores the restore point onto the body it was taken from, so whether that counts as
+    // "the body's own snapshot" is decided the way the undo will decide it: from the serial the
+    // restore point carries (an empty or `id-N` serial identifies no body, so a setting that reads
+    // differently per body would be skipped by the undo and must not be listed).
+    let source = Source::of(&restore_point.camera.serial, &restore_point.camera.serial);
+    let mut candidates: BTreeSet<String> = touched.clone();
+    if let Some(se) = side_effects {
+        candidates.extend(se.names());
+    }
+    let mut out = UndoSet::default();
+    for name in candidates {
+        let restorable = restore_point.properties.get(&name).is_some_and(|prop| {
+            restore_precheck_from(&cap_map, prop.code, source).is_ok()
+                // A range whose scale the apply itself changed (a setting that rescales it) cannot be
+                // written back until that setting is: the undo would skip it as `range_scale_differs`.
+                && !readback
+                    .and_then(|after| after.properties.get(&name))
+                    .is_some_and(|now| range_scale(&prop.value) != range_scale(&now.value) && is_range_shape(&prop.value))
+        });
+        if restorable { out.names.push(name) } else { out.not_restorable.push(name) }
+    }
+    out
 }
 
 /// Why a `--only` selection was refused.
@@ -98,7 +195,6 @@ impl std::fmt::Display for OnlyError {
 
 impl std::error::Error for OnlyError {}
 
-const PREFIX: &str = "kNkMAIDCapability_";
 
 /// Turn `--only` names into full property names, checked against the
 /// snapshot. A name is taken as written if the snapshot has it, else with the
@@ -113,7 +209,7 @@ pub fn resolve_only(
     }
     let mut out = BTreeSet::new();
     for r in requested {
-        let full = if properties.contains_key(r.as_str()) { r.clone() } else { format!("{PREFIX}{r}") };
+        let full = if properties.contains_key(r.as_str()) { r.clone() } else { format!("{}{r}", transplant::PROPERTY_PREFIX) };
         if !properties.contains_key(&full) {
             return Err(OnlyError::NoSuchProperty { requested: r.clone() });
         }
@@ -141,11 +237,23 @@ pub struct PlannedRestore<'a> {
 /// Decide every property of the snapshot, in the snapshot's (name) order.
 /// With `only = None` every property is a candidate; with `Some`, a property
 /// outside the set is `NotSelected` before any camera check. Nothing is
-/// dropped: the result has one entry per property.
+/// dropped: the result has one entry per property. For a snapshot of the body
+/// itself; see [`plan_from`]. Tests only, for the same reason as [`restore_precheck`].
+#[cfg(test)]
 pub fn plan<'a>(
     properties: &'a BTreeMap<String, PropertyEntry>,
     only: Option<&BTreeSet<String>>,
     cap_map: &HashMap<u32, &'a CapabilityInfo>,
+) -> Vec<PlannedRestore<'a>> {
+    plan_from(properties, only, cap_map, Source::SameBody)
+}
+
+/// [`plan`] for a snapshot of `source`'s body.
+pub fn plan_from<'a>(
+    properties: &'a BTreeMap<String, PropertyEntry>,
+    only: Option<&BTreeSet<String>>,
+    cap_map: &HashMap<u32, &'a CapabilityInfo>,
+    source: Source,
 ) -> Vec<PlannedRestore<'a>> {
     properties
         .iter()
@@ -153,7 +261,7 @@ pub fn plan<'a>(
             let decision = if only.is_some_and(|set| !set.contains(name)) {
                 Decision::NotSelected
             } else {
-                match restore_precheck(cap_map, prop.code) {
+                match restore_precheck_from(cap_map, prop.code, source) {
                     Ok(cap) => Decision::Write(cap),
                     Err(skip) => Decision::Skip(skip),
                 }
@@ -217,6 +325,7 @@ pub struct Counts {
     pub skipped_read_only: usize,
     pub skipped_type: usize,
     pub skipped_never: usize,
+    pub skipped_scale: usize,
     pub not_selected: usize,
     pub errors: usize,
 }
@@ -236,6 +345,7 @@ impl RestoreRun {
                 StepOutcome::Skipped(RestoreSkip::NeverCopied) => c.skipped_never += 1,
                 StepOutcome::Skipped(RestoreSkip::Absent) => c.skipped_absent += 1,
                 StepOutcome::Skipped(RestoreSkip::ReadOnly) => c.skipped_read_only += 1,
+                StepOutcome::Skipped(RestoreSkip::RangeScaleDiffers) => c.skipped_scale += 1,
                 StepOutcome::WouldWrite | StepOutcome::Written => c.written += 1,
                 StepOutcome::UnsupportedWriteType => c.skipped_type += 1,
                 StepOutcome::WriteFailed(_) => c.errors += 1,
@@ -267,11 +377,6 @@ impl RestoreRun {
     }
 }
 
-/// A range with discrete positions (`steps >= 2`), as opposed to a continuous one.
-fn is_stepped_range(v: &Value) -> bool {
-    v.get("lower").is_some() && v.get("steps").and_then(Value::as_u64).unwrap_or(0) >= 2
-}
-
 /// The struct to hand to the SDK for `stored`. A stepped range's `value` field is
 /// `0.0` in every snapshot (F18), so writing it back as stored would send a
 /// position of `value_index` and a number of 0; which of the two the camera honours
@@ -282,7 +387,7 @@ pub(crate) fn coherent_for_write(stored: &Value) -> Value {
         return stored.clone();
     }
     let mut out = stored.clone();
-    if let Some(v) = transplant::range_value(stored) {
+    if let Some(v) = crate::value_shape::range_value(stored) {
         out["value"] = json!(v);
     }
     out
@@ -290,33 +395,70 @@ pub(crate) fn coherent_for_write(stored: &Value) -> Value {
 
 /// Run a restore of `properties` onto `port`: [`plan`], then write each
 /// `Write` decision (or only report it, if `dry_run`). A failed write does not
-/// stop the rest.
+/// stop the rest. Tests only, for the same reason as [`restore_precheck`].
+#[cfg(test)]
 pub fn execute<P: CameraPort + ?Sized>(
     port: &P,
     properties: &BTreeMap<String, PropertyEntry>,
     only: Option<&BTreeSet<String>>,
     dry_run: bool,
 ) -> RestoreRun {
+    execute_from(port, properties, only, dry_run, Source::SameBody)
+}
+
+/// [`execute`] for a snapshot of `source`'s body.
+pub fn execute_from<P: CameraPort + ?Sized>(
+    port: &P,
+    properties: &BTreeMap<String, PropertyEntry>,
+    only: Option<&BTreeSet<String>>,
+    dry_run: bool,
+    source: Source,
+) -> RestoreRun {
     let cap_map: HashMap<u32, &CapabilityInfo> = port.capabilities().iter().map(|c| (c.id, c)).collect();
-    let steps = plan(properties, only, &cap_map)
+    let steps = plan_from(properties, only, &cap_map, source)
         .into_iter()
         .map(|step| {
             let outcome = match step.decision {
                 Decision::NotSelected => StepOutcome::NotSelected,
                 Decision::Skip(skip) => StepOutcome::Skipped(skip),
-                Decision::Write(_) if dry_run => StepOutcome::WouldWrite,
                 Decision::Write(cap) => {
                     let value = &properties[step.name].value;
-                    if is_stepped_range(value) {
-                        // A blind write of a stepped range is accepted and ignored by the body (F18);
-                        // the transplant path, which reads the capability first, takes effect. The
-                        // result is not used: the read is what matters.
-                        let _ = port.read_capability(step.code);
+                    // A stored range with no usable position (a stepped range whose index is missing
+                    // or past its last step) is a corrupt snapshot: writing it would hand the body a
+                    // struct whose `value` is 0.0. A transplant refuses the same shape as malformed.
+                    if is_range_shape(value) && range_value(value).is_none() {
+                        return StepResult {
+                            name: step.name.to_string(),
+                            code: step.code,
+                            outcome: StepOutcome::WriteFailed(
+                                "the snapshot's range has no usable position (a stepped range with no valid index); not written".to_string(),
+                            ),
+                        };
                     }
-                    match port.write_capability(step.code, cap.kind, &coherent_for_write(value)) {
-                        Ok(()) => StepOutcome::Written,
-                        Err(SdkError::UnsupportedWrite(_)) => StepOutcome::UnsupportedWriteType,
-                        Err(e) => StepOutcome::WriteFailed(e.to_string()),
+                    // A range is read first, for two reasons. A body ignores a blind write of a
+                    // stepped range and honours one made after a read (F18), so the read is the
+                    // priming read (its result is not used for that). And a stored position only
+                    // means the same value on the scale it was read on: if the body's scale for
+                    // this range differs now, the range is left alone, as a transplant does.
+                    let scale_differs = is_range_shape(value) && {
+                        let live = port.read_capability(step.code).ok();
+                        match (range_scale(value), live.as_ref().and_then(range_scale)) {
+                            (Some(stored), Some(now)) => stored != now,
+                            // No scale on one side (the read failed, or a malformed value): nothing
+                            // to compare, so nothing to refuse on; the write and read-back judge it.
+                            _ => false,
+                        }
+                    };
+                    if scale_differs {
+                        StepOutcome::Skipped(RestoreSkip::RangeScaleDiffers)
+                    } else if dry_run {
+                        StepOutcome::WouldWrite
+                    } else {
+                        match port.write_capability(step.code, cap.kind, &coherent_for_write(value)) {
+                            Ok(()) => StepOutcome::Written,
+                            Err(SdkError::UnsupportedWrite(_)) => StepOutcome::UnsupportedWriteType,
+                            Err(e) => StepOutcome::WriteFailed(truncate_with_marker(e.to_string(), MAX_ERROR_MESSAGE_LEN)),
+                        }
                     }
                 }
             };
@@ -339,6 +481,11 @@ pub enum Verdict {
     ReadbackIncomplete,
     /// Nothing was written, so there was nothing to check.
     NothingWritten,
+    /// Something was written but none of it could be compared (`Residual::judged` is 0: every
+    /// written name is volatile-listed, never-copy, or absent from the snapshot). Nothing was
+    /// checked, so nothing is claimed. (Some written properties being unjudged among compared ones
+    /// is reported in `Residual::unjudged` and does not change the verdict.)
+    Unjudged,
 }
 
 impl Verdict {
@@ -348,6 +495,7 @@ impl Verdict {
             Verdict::ResidualFound => "residual_found",
             Verdict::ReadbackIncomplete => "readback_incomplete",
             Verdict::NothingWritten => "nothing_written",
+            Verdict::Unjudged => "unjudged",
         }
     }
 }
@@ -369,13 +517,14 @@ pub struct Verification {
 /// Read the body back after a restore and compare what was written with the
 /// snapshot it was restored from. A write call that returned success proves
 /// nothing (F18): only this does. `written` is [`RestoreRun::written_names`].
-pub fn verify<P: CameraPort + ?Sized>(
+pub fn verify_with<P: CameraPort + ?Sized>(
     port: &P,
     name_lookup: &HashMap<u32, String>,
     camera: &Camera,
     source: &Snapshot,
     written: &BTreeSet<String>,
     captured_at: &str,
+    gate_policy: GatePolicy,
 ) -> Verification {
     if written.is_empty() {
         return Verification { verdict: Verdict::NothingWritten, gate: None, stats: None, residual: None, readback: None };
@@ -387,12 +536,25 @@ pub fn verify<P: CameraPort + ?Sized>(
         return Verification { verdict: Verdict::ReadbackIncomplete, gate: None, stats: Some(stats), residual: None, readback: None };
     }
     let verdict_gate = gate(&after);
-    if matches!(verdict_gate, GateOutcome::Failed { .. }) {
+    // The same completeness rule as a transplant's read-back: a read-back that cannot be held to a
+    // baseline is judged only if the caller waived that judgement (`AllowPartial`).
+    let incomplete = match (&verdict_gate, gate_policy) {
+        (GateOutcome::Failed { .. }, _) => true,
+        (GateOutcome::NoBaseline(_), GatePolicy::Strict) => true,
+        _ => false,
+    };
+    if incomplete {
         return Verification { verdict: Verdict::ReadbackIncomplete, gate: Some(verdict_gate), stats: Some(stats), residual: None, readback: None };
     }
     match residual(source, &after, written) {
         Ok(r) => Verification {
-            verdict: if r.is_empty() { Verdict::Verified } else { Verdict::ResidualFound },
+            verdict: if !r.is_empty() {
+                Verdict::ResidualFound
+            } else if r.judged == 0 {
+                Verdict::Unjudged
+            } else {
+                Verdict::Verified
+            },
             gate: Some(verdict_gate),
             stats: Some(stats),
             residual: Some(r),
@@ -400,6 +562,19 @@ pub fn verify<P: CameraPort + ?Sized>(
         },
         Err(_) => Verification { verdict: Verdict::ReadbackIncomplete, gate: Some(verdict_gate), stats: Some(stats), residual: None, readback: None },
     }
+}
+
+/// [`verify_with`] without a baseline requirement, for tests.
+#[cfg(test)]
+pub fn verify<P: CameraPort + ?Sized>(
+    port: &P,
+    name_lookup: &HashMap<u32, String>,
+    camera: &Camera,
+    source: &Snapshot,
+    written: &BTreeSet<String>,
+    captured_at: &str,
+) -> Verification {
+    verify_with(port, name_lookup, camera, source, written, captured_at, GatePolicy::AllowPartial)
 }
 
 #[cfg(test)]
@@ -868,6 +1043,143 @@ mod tests {
     }
 
     #[test]
+    fn source_is_same_body_only_when_both_serials_identify_one_body_and_match() {
+        // Equal and different real serials.
+        assert_eq!(Source::of("0000003023668", "0000003023668"), Source::SameBody);
+        assert_eq!(Source::of("0000003023668", "0000003023669"), Source::OtherBody);
+        assert_eq!(Source::of("A", "a"), Source::OtherBody, "no case folding");
+        // Empty: nothing identifies a body, so two empties are not 'the same'.
+        assert_eq!(Source::of("", ""), Source::OtherBody);
+        assert_eq!(Source::of("", "0000003023668"), Source::OtherBody);
+        assert_eq!(Source::of("0000003023668", ""), Source::OtherBody);
+        // The id-N fallback is a handle for one session, not a serial.
+        assert_eq!(Source::of("id-3", "id-3"), Source::OtherBody);
+        assert_eq!(Source::of("id-3", "0000003023668"), Source::OtherBody);
+        assert_eq!(Source::of("0000003023668", "id-3"), Source::OtherBody);
+        // A serial that merely starts like the fallback is a serial.
+        assert_eq!(Source::of("id-3x", "id-3x"), Source::SameBody);
+        assert_eq!(Source::of("id-", "id-"), Source::SameBody);
+        // A bare number is a plausible serial (see target::require_usb_serial).
+        assert_eq!(Source::of("7", "7"), Source::SameBody);
+    }
+
+    // ── undo_set: what an undo can put back ──────────────────────────────
+
+    #[test]
+    fn the_undo_set_holds_only_what_the_restore_point_has_and_the_body_will_take() {
+        // A restore point that holds 1 (writable), 2 (read-only) and 33108 (never copied).
+        let rp = snap_z5(&[("Setting", 1, json!(1)), ("ReadOnly", 2, json!(2)), ("ShootNoCard", 33108, json!(0))]);
+        let caps = [cap(1, RW), cap(2, OP_GET), cap(33108, RW)];
+        let touched: BTreeSet<String> = ["Setting", "Appeared"].iter().map(|s| s.to_string()).collect();
+        // The side effects: ReadOnly changed, ShootNoCard changed, Appeared is only in the read-back.
+        let se = crate::ops::readback::SideEffects {
+            changed: vec!["ReadOnly".into(), "ShootNoCard".into()],
+            vanished: vec![],
+            appeared: vec!["Appeared".into()],
+        };
+        let u = undo_set(&rp, &caps, &touched, Some(&se), None);
+        assert_eq!(u.names, ["Setting"]);
+        assert_eq!(u.not_restorable, ["Appeared", "ReadOnly", "ShootNoCard"], "reported, not silently dropped");
+        // Everything in `names` is accepted by `resolve_only` against the restore point (this was the
+        // whole undo being refused as `no_such_property` before).
+        assert!(resolve_only(&u.names, &rp.properties).is_ok());
+    }
+
+    #[test]
+    fn an_undo_set_name_the_restore_point_lacks_would_have_refused_the_whole_undo() {
+        let rp = snap_z5(&[("Setting", 1, json!(1))]);
+        let both = vec!["Setting".to_string(), "Appeared".to_string()];
+        assert_eq!(resolve_only(&both, &rp.properties), Err(OnlyError::NoSuchProperty { requested: "Appeared".into() }));
+    }
+
+    #[test]
+    fn a_setting_that_reads_differently_per_body_is_not_in_the_undo_set_when_the_undo_cannot_tell_it_is_the_same_body() {
+        // ShootingLimit (33086) is restored onto the body's own snapshot, but an empty or `id-N`
+        // serial identifies no body, so the undo would skip it as never_copied: listing it would make
+        // the undo fail by construction. With a real serial it is listed.
+        let touched: BTreeSet<String> = ["Limit".to_string()].into();
+        let caps = [cap(33086, RW)];
+        for (serial, listed) in [("0000003023668", true), ("", false), ("id-3", false)] {
+            let mut rp = snap_z5(&[("Limit", 33086, json!(1))]);
+            rp.camera.serial = serial.to_string();
+            let u = undo_set(&rp, &caps, &touched, None, None);
+            assert_eq!(u.names.contains(&"Limit".to_string()), listed, "serial {serial:?}: {u:?}");
+            assert_eq!(u.not_restorable.contains(&"Limit".to_string()), !listed, "serial {serial:?}");
+        }
+    }
+
+    #[test]
+    fn a_range_the_apply_rescaled_is_not_in_the_undo_set_until_its_scale_is_back() {
+        // The apply changed a setting that rescales ExposureComp (EV step): the read-back holds the
+        // new scale, the restore point the old. Writing the old index onto the new scale is refused
+        // by the undo (range_scale_differs), so listing it would fail the undo.
+        let stepped = |steps: u64| json!({"value": 0.0, "default": 0.0, "value_index": 3, "default_index": 0, "lower": 0.0, "upper": 10.0, "steps": steps});
+        let rp = snap_z5(&[("Comp", 1, stepped(11))]);
+        let touched: BTreeSet<String> = ["Comp".to_string()].into();
+        let caps = [cap(1, RW)];
+        let same = snap_z5(&[("Comp", 1, stepped(11))]);
+        assert_eq!(undo_set(&rp, &caps, &touched, None, Some(&same)).names, ["Comp"], "scale unchanged");
+        let rescaled = snap_z5(&[("Comp", 1, stepped(21))]);
+        let u = undo_set(&rp, &caps, &touched, None, Some(&rescaled));
+        assert!(u.names.is_empty() && u.not_restorable == ["Comp"], "{u:?}");
+        // A scalar is never judged by scale.
+        let rp2 = snap_z5(&[("S", 1, json!(1))]);
+        let after2 = snap_z5(&[("S", 1, json!(9))]);
+        assert_eq!(undo_set(&rp2, &caps, &["S".to_string()].into(), None, Some(&after2)).names, ["S"]);
+    }
+
+    #[test]
+    fn a_stored_range_with_no_usable_position_is_not_written_and_is_an_error() {
+        // Stepped, 11 steps, index 11 is one past the end (or missing): its `value` is 0.0, so
+        // writing it as stored would put the property at the bottom of the scale.
+        let cam = FakeCamera::new().with(1, RW, stepped(100)).with(2, RW, stepped(100));
+        let mut snap = snapshot_of(&[]);
+        let mut past = stepped(612);
+        past["value_index"] = json!(1225);
+        let mut missing = stepped(612);
+        missing.as_object_mut().unwrap().remove("value_index");
+        snap.insert("A_Past", 1, past);
+        snap.insert("B_Missing", 2, missing);
+        let run = execute(&cam, &snap.properties, None, false);
+        assert!(cam.writes().is_empty(), "{:?}", cam.writes());
+        assert_eq!(run.counts().errors, 2);
+        assert!(matches!(&run.steps[0].outcome, StepOutcome::WriteFailed(m) if m.contains("no usable position")));
+    }
+
+    #[test]
+    fn an_empty_undo_set_stays_empty() {
+        let rp = snap_z5(&[("Setting", 1, json!(1))]);
+        let u = undo_set(&rp, &[cap(1, RW)], &BTreeSet::new(), None, None);
+        assert_eq!(u, UndoSet::default());
+    }
+
+    #[test]
+    fn a_read_back_with_no_baseline_is_judged_only_when_the_caller_waived_that() {
+        // Z 5 has no baseline: the read-back cannot be held to one. A transplant's read-back treats
+        // that as incomplete under Strict and complete under AllowPartial; a restore's must too.
+        let cam = FakeCamera::new().with(1, RW, json!(0));
+        let source = snap_z5(&[("A", 1, json!(10))]);
+        let run = execute(&cam, &source.properties, None, false);
+        let w = run.written_names();
+        let strict = verify_with(&cam, &lookup_for(&[("A", 1)]), &cam_id(), &source, &w, "t", GatePolicy::Strict);
+        assert_eq!(strict.verdict, Verdict::ReadbackIncomplete);
+        let partial = verify_with(&cam, &lookup_for(&[("A", 1)]), &cam_id(), &source, &w, "t", GatePolicy::AllowPartial);
+        assert_eq!(partial.verdict, Verdict::Verified);
+    }
+
+    #[test]
+    fn writing_only_properties_that_cannot_be_compared_is_not_verified() {
+        // `AngleLevel` is on the volatile list: written, but not compared. With nothing else compared
+        // the read-back checked nothing, however empty the residual looks.
+        let cam = FakeCamera::new().with(1, RW, json!(0));
+        let source = snap_z5(&[("kNkMAIDCapability_AngleLevel", 1, json!(10))]);
+        let run = execute(&cam, &source.properties, None, false);
+        let v = verify(&cam, &lookup_for(&[("kNkMAIDCapability_AngleLevel", 1)]), &cam_id(), &source, &run.written_names(), "t");
+        assert_eq!(v.verdict, Verdict::Unjudged);
+        assert_eq!(v.residual.as_ref().unwrap().unjudged, ["kNkMAIDCapability_AngleLevel"]);
+    }
+
+    #[test]
     fn a_failed_priming_read_does_not_stop_the_write() {
         let cam = FakeCamera::new().with(1, RW, stepped(100)).failing_read(1, Failure::Call(-106));
         let mut snap = snapshot_of(&[]);
@@ -877,29 +1189,70 @@ mod tests {
     }
 
     #[test]
-    fn a_dry_run_and_a_skipped_range_read_nothing() {
+    fn a_dry_run_writes_nothing_and_a_range_that_will_not_be_written_is_not_read() {
         let cam = FakeCamera::new().with(1, RW, stepped(100)).with(2, OP_GET, stepped(100));
         let mut snap = snapshot_of(&[]);
         snap.insert("A_Range", 1, stepped(612));
         snap.insert("B_ReadOnlyRange", 2, stepped(612));
         let dry = execute(&cam, &snap.properties, None, true);
-        assert!(cam.reads().is_empty() && cam.writes().is_empty(), "dry run touches nothing");
+        assert!(cam.writes().is_empty(), "a dry run writes nothing");
+        // The writable range is read (to compare its scale with the stored one); the read-only one
+        // is skipped before any read.
+        assert_eq!(cam.reads(), [1]);
         assert_eq!(dry.counts().written, 1);
         // A range not selected by --only is not read either.
+        let probe = FakeCamera::new().with(1, RW, stepped(100)).with(2, OP_GET, stepped(100));
         let only = BTreeSet::from(["B_ReadOnlyRange".to_string()]);
-        let _ = execute(&cam, &snap.properties, Some(&only), false);
-        assert!(cam.reads().is_empty(), "read-only: skipped, so neither read nor written");
+        let _ = execute(&probe, &snap.properties, Some(&only), false);
+        assert!(probe.reads().is_empty(), "read-only: skipped, so neither read nor written");
     }
 
     #[test]
-    fn a_continuous_range_is_written_without_a_priming_read() {
+    fn a_continuous_range_is_read_for_its_scale_and_then_written() {
         let cont = json!({"value": 3.5, "value_index": 0, "lower": 0.0, "upper": 10.0, "steps": 0});
         let cam = FakeCamera::new().with(1, RW, cont.clone());
         let mut snap = snapshot_of(&[]);
         snap.insert("A_Cont", 1, cont);
-        execute(&cam, &snap.properties, None, false);
-        assert!(cam.reads().is_empty());
+        let run = execute(&cam, &snap.properties, None, false);
+        assert_eq!(cam.reads(), [1]);
+        assert_eq!(run.counts().written, 1);
     }
+
+    #[test]
+    fn a_range_whose_scale_changed_since_the_snapshot_is_left_alone_not_written_onto_the_new_scale() {
+        // Stored on a 1225-step scale, now 751 steps (a firmware change, or a rescaling setting such
+        // as the EV step): index 612 would mean a different value, so the write is refused.
+        let now = json!({"value": 0.0, "default": 0.0, "value_index": 100, "default_index": 0, "lower": 2500.0, "upper": 10000.0, "steps": 751});
+        for dry_run in [true, false] {
+            let cam = FakeCamera::new().with(1, RW, now.clone());
+            let mut snap = snapshot_of(&[]);
+            snap.insert("A_Range", 1, stepped(612));
+            let run = execute(&cam, &snap.properties, None, dry_run);
+            assert_eq!(run.steps[0].outcome, StepOutcome::Skipped(RestoreSkip::RangeScaleDiffers), "dry_run={dry_run}");
+            assert!(cam.writes().is_empty(), "dry_run={dry_run}");
+            assert_eq!(run.counts().skipped_scale, 1);
+            assert_eq!(cam.value(1).unwrap()["value_index"], json!(100), "untouched");
+        }
+        // A targeted restore that names it cannot do what was named.
+        let cam = FakeCamera::new().with(1, RW, now);
+        let mut snap = snapshot_of(&[]);
+        snap.insert("A_Range", 1, stepped(612));
+        let only = BTreeSet::from(["A_Range".to_string()]);
+        let run = execute(&cam, &snap.properties, Some(&only), false);
+        assert_eq!(run.unrestored(), [("A_Range".to_string(), "range_scale_differs")]);
+    }
+
+    #[test]
+    fn the_same_scale_is_written_and_an_unreadable_scale_does_not_block_the_write() {
+        let cam = FakeCamera::new().with(1, RW, stepped(100));
+        let mut snap = snapshot_of(&[]);
+        snap.insert("A_Range", 1, stepped(612));
+        assert_eq!(execute(&cam, &snap.properties, None, false).counts().written, 1);
+        // The read failing leaves nothing to compare; the write and the read-back judge it.
+        let blind = FakeCamera::new().with(1, RW, stepped(100)).failing_read(1, Failure::Call(-106));
+        assert_eq!(execute(&blind, &snap.properties, None, false).counts().written, 1);
+    }
+
     // ── verify: read the body back after a restore ───────────────────────
 
     fn lookup_for(entries: &[(&str, u32)]) -> HashMap<u32, String> {
@@ -1036,9 +1389,9 @@ mod tests {
 
     #[test]
     fn verdict_tags_are_closed_and_distinct() {
-        let all = [Verdict::Verified, Verdict::ResidualFound, Verdict::ReadbackIncomplete, Verdict::NothingWritten];
+        let all = [Verdict::Verified, Verdict::ResidualFound, Verdict::ReadbackIncomplete, Verdict::NothingWritten, Verdict::Unjudged];
         let tags: BTreeSet<_> = all.iter().map(Verdict::tag).collect();
-        assert_eq!(tags.len(), 4);
+        assert_eq!(tags.len(), 5);
         for v in all {
             assert_eq!(serde_json::to_value(v).unwrap(), json!(v.tag()));
         }

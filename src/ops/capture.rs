@@ -38,6 +38,16 @@ pub struct CaptureStats {
     pub failed: Vec<FailedRead>,
 }
 
+/// The key a capability is stored under in a snapshot: the schema's name for the body's model, or
+/// `cap_0x...` when the schema does not know the code. Everything that looks a property up in a
+/// capture (the restore point, the read-back) must key it the same way.
+pub fn property_key(name_lookup: &HashMap<u32, String>, code: u32) -> String {
+    match name_lookup.get(&code) {
+        Some(n) => n.clone(),
+        None => format!("cap_{code:#x}"),
+    }
+}
+
 /// Read every get-capable capability of `port` into `snap`, naming each from
 /// `name_lookup` (`cap_{:#x}` on a schema miss).
 pub fn capture<P: CameraPort + ?Sized>(
@@ -51,10 +61,7 @@ pub fn capture<P: CameraPort + ?Sized>(
             stats.skipped_no_get += 1;
             continue;
         }
-        let name = match name_lookup.get(&cap.id) {
-            Some(n) => n.clone(),
-            None => format!("cap_{:#x}", cap.id),
-        };
+        let name = property_key(name_lookup, cap.id);
         match port.read_capability(cap.id) {
             Ok(value) => {
                 if !name_lookup.contains_key(&cap.id) {

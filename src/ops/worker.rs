@@ -73,6 +73,18 @@ impl Outcome {
     pub fn ok(data: Value) -> Self {
         Outcome::Ok { ok: OkMarker, data }
     }
+    /// `ok` carrying `report` as JSON. A report that cannot be serialised is an error, never an
+    /// empty success: for an apply it is the only record of what was written.
+    pub fn ok_report(report: &impl Serialize) -> Self {
+        match serde_json::to_value(report) {
+            Ok(data) => Outcome::ok(data),
+            Err(e) => Outcome::err(
+                "report_not_serialisable",
+                format!("the result could not be serialised ({e}); if this was an apply, the camera may have been written, so read it back before retrying"),
+                None,
+            ),
+        }
+    }
     pub fn err(tag: &str, message: impl Into<String>, detail: Option<Value>) -> Self {
         Outcome::Err { ok: ErrMarker, error: WorkerError { tag: tag.into(), message: message.into(), detail } }
     }
@@ -104,6 +116,15 @@ impl std::fmt::Display for EmitError {
 }
 
 impl std::error::Error for EmitError {}
+
+/// The progress phases an apply reports, in order. The MCP supervisor decides "were writes possible"
+/// from the last one it saw, so both sides use these constants and nothing else.
+pub const PHASE_PLAN_VERIFIED: &str = "plan_verified";
+pub const PHASE_RESTORE_POINT_WRITTEN: &str = "restore_point_written";
+/// Emitted (and flushed) before the first camera write: its absence proves none happened.
+pub const PHASE_WRITING: &str = "writing";
+/// Emitted after the writes, before the read-back.
+pub const PHASE_READ_BACK: &str = "read_back";
 
 /// Writes protocol lines, flushing after each.
 pub struct Emitter<W: Write> {
@@ -237,6 +258,21 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Cursor;
+
+    struct Unserialisable;
+    impl Serialize for Unserialisable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("no"))
+        }
+    }
+
+    #[test]
+    fn a_report_that_cannot_be_serialised_is_an_error_not_an_empty_success() {
+        assert_eq!(Outcome::ok_report(&json!({"a": 1})), Outcome::ok(json!({"a": 1})));
+        let Outcome::Err { error, .. } = Outcome::ok_report(&Unserialisable) else { panic!("must be an error") };
+        assert_eq!(error.tag, "report_not_serialisable");
+        assert!(error.message.contains("may have been written"));
+    }
 
     /// A writer that records bytes and the byte count at each flush.
     #[derive(Default)]
