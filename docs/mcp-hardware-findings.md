@@ -685,12 +685,49 @@ The Z6III (serial `0000003014527`, firmware 2.00) was plugged in next to the Z 9
   literal, a range whose steps or bounds differ between the bodies, a multi-property apply, or the same through the MCP.
 - **Still not run:** an opted-in raw-code enum, a literal, a range with different bounds, and any apply through the MCP.
 
+## F24. The teardown hang is an unserviced run loop (2026-10-28, Z 9)
+
+F3's hang in `DisconnectDevice` (the main thread parked inside the SDK's own `CFRunLoopRunSpecific`, every SDK thread
+on a condvar) was reproduced and isolated with 248 read-only CLI `snapshot`s of the Z 9, run in randomised order on a
+scratch build with env-var hooks (branch `f3-experiments`, not on master). A run counted as hung if it was still alive
+25 s after start; a healthy `DisconnectDevice` takes 1.52 to 1.58 s in every arm, so the two are unmistakable.
+
+| Arm (teardown condition) | Hung |
+|---|---|
+| control (as shipped before) | 14/40 (round 1: 8/24, round 2: 6/16) |
+| sleep 0.3 s before `DisconnectDevice` | 16/16 |
+| sleep 1 s | 16/16 |
+| sleep 2 s | 24/24 |
+| connect and disconnect, no reads | 0/24 |
+| no in-process `rusb` (libusb) | 3/24 |
+| pump the main run loop 0.2 s before disconnect | 0/16 |
+| pump 0.5 s | 1/16 |
+| pump 1.5 s | 1/40 |
+| pump after every read, nothing at the end | 4/16 |
+| pump after every read, plus 0.2 s at the end | 0/16 |
+
+- **Any idle gap before the disconnect hangs it, every time.** Sleeping 0.3 s was enough. The control's 35% is the
+  time spent between the last read and the disconnect (building and writing the snapshot).
+- **Servicing the main thread's default-mode run loop for 0.2 s immediately before `DisconnectDevice` removes it**
+  (2 hangs in 72 pump-before-disconnect runs, against 35%). Pumping during the reads alone does not (4/16). Working
+  explanation, not proven (the SDK is closed source): events queue on the main run loop while we are idle, and the
+  SDK's close then waits on a reply that depends on them. The in-process libusb thread may add a little (3/24 against
+  8/24 in round 1, weak) and is not the cause.
+- **The sleep arms do exactly the control's camera I/O and only add idle time**, and they hang 100%: so the trigger is
+  the idle gap, not anything done to the camera. The experiments were all reads.
+- **Fix:** `Device::drop` pumps the run loop for 300 ms (`PRE_DISCONNECT_PUMP`, above the shortest length tried) and
+  then calls `DisconnectDevice`. The ordering is pinned by a unit test; whether the pump is *enough* is only a hardware
+  question. **Verified on the Z 9:** 30 snapshots with the shipped binary, 30 exited cleanly in 3.6 to 5.0 s, none hung.
+- **Not yet verified:** the Z6III (not attached at the time), a write path (`transplant`/`restore`), and the worker
+  process. The supervisor's post-result grace and SIGKILL stay as a backstop regardless; the hang was never shown to
+  be impossible, only rare after the pump.
+- Camera state was healthy after every kill, as in F3 and F14.
+
 ## F13. Still unverified
 
 - Whether `available` / `connected_pid` can be obtained, and what they mean while another process
   holds a body.
-- The teardown hang's rate and trigger (F3). In particular: replug or power-cycle, then capture
-  several times, to test the "first open after attach" idea.
+- The teardown hang's remaining rate after the F24 pump: Z6III, write paths, and the worker.
 - Whether the SDK worker behaves as assumed inside a child process / dedicated thread (the CLI has
   only ever run it on its main thread).
 - A reset-initialised open while another process is mid-*write* (deliberately not tried; it could

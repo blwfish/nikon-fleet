@@ -133,7 +133,9 @@ that exists but cannot be read (`reference_read_failures`) instead of treating i
     lose it. Once the parent has read the `result` it is final: the worker gets a short grace to
     exit, then is sent SIGKILL and reaped, and a hang or non-zero exit after the result is not an
     error. (F3's hangs were ended with SIGTERM or an alarm and the camera was healthy afterwards;
-    SIGKILL of the worker has not been tried separately, §8.2.)
+    SIGKILL of the worker has not been tried separately, §8.2.) F24 found the cause of most hangs
+    (an unserviced main run loop before `DisconnectDevice`) and `Device::drop` now pumps it first;
+    this grace-then-kill stays as the backstop, since the hang is rare after the pump, not impossible.
   - No `result` by the deadline, or the worker died: typed `worker_no_result`, carrying the last
     `progress` phase. For an apply that is the `indeterminate` outcome (§5.5): writes may or may
     not have happened and the count is unknown. There is no automatic retry.
