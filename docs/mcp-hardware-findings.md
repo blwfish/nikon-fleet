@@ -775,6 +775,42 @@ scratch build with env-var hooks (branch `f3-experiments`, not on master). A run
   never shown to be impossible, only rare after the pump.
 - Camera state was healthy after every kill, as in F3 and F14.
 
+## F25. The MCP server's untested paths on the Z6III, including a write (2026-10-28)
+
+Z6III (serial `0000003014527`, fw 2.00), Z 9 also attached and untouched. The server was driven through its real binary
+over stdio by a small Python JSON-RPC client (not through Claude Code or Claude Desktop). Writes were approved for one
+property only: `ISOAutoShutterTimeAutoValue` (33584), the same property as F23, Z 9 `value_index` 3 onto Z6III 2.
+
+- **Worker read-only ops on the Z6III, 3 runs each:** `check` (gate passed), `transplant-plan` (7 properties would change
+  from a Z 9 source), `restore-plan` (0 would change from a fresh Z6III snapshot). All 9 exited 0 at the moment the result
+  arrived, 2.7 to 2.9 s, so the exit-after-result path (F24) works for these ops too.
+- **Read tools through the server, on real data:** `list_cameras`, `list_snapshots`, `capture_snapshot` (1.6 s, 200
+  properties, **`expected_unreadable: 12`, `unexpected_unreadable: 0`** live for the first time), `get_snapshot` (paged),
+  `diff_snapshots` (0 differences between two captures), `check_against_reference` (gate passed, 2.9 s),
+  `transplant_plan` with `limit: 3` (196 outcomes in total, a 3-entry page with `next: 3`, same summary), and
+  **`firmware_status` for the first time** (1.0 s; the Z 9 reported as `behind` at 5.31, the download `gated`).
+- **An apply and its undo through the server, with writes enabled (13 tools):** `transplant_plan` ("1 property would
+  change"), `transplant_apply` with the plan's digest and summary: **`applied_verified`**, 5.0 s, restore point stored
+  first, `undo_set` the one property. Then `restore_plan` on that restore point with `only` = `undo_set` ("1 property
+  would change"), `restore_apply`: **`applied_verified`**, 5.05 s, empty `residual`, verdict `verified`. An independent
+  `capture_snapshot` and `diff_snapshots` against the pre-write baseline: **no differences**.
+- **Teardown of the write path (still the ordinary disconnect, with the 300 ms pump): 24 more apply/undo cycles at the
+  worker level, then stopped.** Each cycle: `transplant-plan`, `transplant-apply`, `restore-plan`, `restore-apply`.
+  **All 48 worker applies were `applied_verified`, and none of the 96 worker runs hung** (applies 3.9 to 5.1 s wall; plans
+  2.5 to 2.7 s). With the two through the server that is 50 applies, 0 hangs. This is evidence the write path is not
+  worse than the read path was, not proof of a zero rate (0 of 50 would be unlikely at the 7% the pump alone left on
+  reads, about 3%, but the paths differ).
+- **The restore-point cap works on hardware.** The 25th `transplant-apply` was refused with `data_dir_full` ("50 MCP
+  restore points are stored for this camera (cap 50)") **before any write**, which ended the loop. The 50 restore points
+  were the 2 from the server run plus 2 per cycle. Nothing was deleted automatically.
+- **Final state:** an independent CLI `snapshot` of the Z6III diffed against the baseline taken before the first write:
+  **no differences** (`value_index` 2). Both bodies still enumerate. About 100 setting writes were made in all, all to
+  that one property, all undone.
+- Test-harness note: my first cycle script lost descriptor 3 whenever `os.pipe()` returned it as the read end, so every
+  worker exited 2 immediately; fixed before any of the numbers above. Not a product defect.
+- **Still not run:** Claude Desktop and other clients, an apply through Claude Code, and any strategy other than
+  `range_clamped` on a write.
+
 ## F13. Still unverified
 
 - Whether `available` / `connected_pid` can be obtained, and what they mean while another process

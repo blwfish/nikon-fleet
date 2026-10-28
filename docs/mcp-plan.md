@@ -3,9 +3,10 @@
 **Status: built (2026-10-27/28), in `mcp/` (crate `fleet-mcp`, install notes in `mcp/AGENT-INSTALL.md`).**
 All twelve tools exist; the camera ones go through the worker and have been run against a fake
 worker and, read-only, against a Z 9 (list, capture, restore plan), and through a real client (Claude Code
-2.1.308: list, capture, transplant plan; F20). The two `*_apply` tools have been tested only with a fake worker
-through the real server (the same ops ran on hardware directly, F18, F19). Not yet run: Claude Desktop, and
-an apply through the server on hardware. Written and revised 2026-10-27; the sections below are the design, kept as
+2.1.308: list, capture, transplant plan; F20). The two `*_apply` tools have been run with a fake worker
+through the real server, and on hardware (an apply and its undo on a Z6III, driven over stdio, plus 24 apply/undo
+cycles at the worker level: F25; the same ops also ran on hardware directly, F18, F19). Not yet run: Claude
+Desktop, and an apply through Claude Code. Written and revised 2026-10-27; the sections below are the design, kept as
 written, with the as-built notes in §11.
 
 - Hardware evidence behind every "measured" claim below is in
