@@ -569,6 +569,31 @@ itself a restore. Two writes in all, both on this one property. The residual pat
 still only tested on a fake body (nothing on this camera ignored a primed write). The worker again hit the
 post-result teardown hang on the apply (killed after the result line was read, F3).
 
+## F20. `fleet-mcp` through a real client (Claude Code 2.1.308, 2026-10-28)
+
+`fleet-mcp` was registered with Claude Code (`claude mcp add`, local scope, data dir = the repository, no
+`--enable-writes`) and driven by a headless `claude -p` run that was told to call `list_cameras`,
+`capture_snapshot` and `transplant_plan` and not to call any apply tool. The Z 9 was attached.
+
+- All three calls succeeded on the first attempt, through the worker for the last two. Claude Code
+  loaded the tools lazily (its tool search) and then called them with correct arguments, including the
+  USB serial it had just read from `list_cameras`. Only the three named tools were called; the server had
+  no apply tools to call. 5 turns, 28 s in all, nothing written to the camera.
+- `list_cameras`: one Z 9, `complete: true`. `capture_snapshot`: gate `passed`, 196 properties, a new file
+  in `snapshots/` (so a capture does add a file to the repository's gitignored data directory).
+  `transplant_plan` of the 2026-06-02 Z6III snapshot onto the Z 9: 33 copied, 6 of them would change, 4
+  `literal_unconfirmed`, 10 `never_copied`, 67 `malformed_source`, digest and summary returned.
+- The client's own report questioned two things, both explained by what is already known and neither a
+  defect in the plan: the 67 `malformed_source` come from that snapshot being from before the packed-string
+  fix (F8): all 98 of its enum properties have an empty `values` list; and the 11 failed reads in the capture
+  are the Z 9's healthy baseline (196 read, 11 not, F5).
+- **Usability gap this showed:** the capture result lists the 11 failed reads and `gate: passed` but does
+  not say that 11 is the expected number for this model, so a cold reader (here, the agent) cannot tell a
+  healthy capture from a degraded one without the findings file. Worth adding an `expected_unreadable`
+  count or list from the baseline to the capture result. Likewise `malformed_source` could say that old
+  snapshots need re-capturing.
+- Not covered: Claude Desktop, any apply through the server, a client cancellation of a live camera call.
+
 ## F13. Still unverified
 
 - Whether `available` / `connected_pid` can be obtained, and what they mean while another process

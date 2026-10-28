@@ -2,10 +2,10 @@
 
 **Status: built (2026-10-27/28), in `mcp/` (crate `fleet-mcp`, install notes in `mcp/AGENT-INSTALL.md`).**
 All twelve tools exist; the camera ones go through the worker and have been run against a fake
-worker and, read-only, against a Z 9 (list, capture, restore plan). The two `*_apply` tools have been
-tested only with a fake worker through the real server (the same ops ran on hardware directly, F18,
-F19). Not yet run: a real MCP client other than a scripted one, Claude Desktop, and an apply through
-the server on hardware. Written and revised 2026-10-27; the sections below are the design, kept as
+worker and, read-only, against a Z 9 (list, capture, restore plan), and through a real client (Claude Code
+2.1.308: list, capture, transplant plan; F20). The two `*_apply` tools have been tested only with a fake worker
+through the real server (the same ops ran on hardware directly, F18, F19). Not yet run: Claude Desktop, and
+an apply through the server on hardware. Written and revised 2026-10-27; the sections below are the design, kept as
 written, with "as built" notes in §3 and at the end of §6.
 
 - Hardware evidence behind every "measured" claim below is in
@@ -773,3 +773,6 @@ automating the firmware licence; FTP profile writes; firmware flashing.
 - **Live, read-only, on the Z 9:** `tools/list`, `list_cameras` (0.0 s), `capture_snapshot` (3.7 s, 196
   properties, gate passed, five progress notifications), `list_snapshots`, `restore_plan` (4.1 s). No
   teardown hang occurred in this run.
+- **Through a real client (F20):** registered in Claude Code (`claude mcp add nikon-fleet -- .../fleet-mcp
+  --data-dir <repo>`), a headless run called `list_cameras`, `capture_snapshot` and `transplant_plan` correctly.
+  Open usability item: the capture result should say how many unreadable properties are normal for the model.
