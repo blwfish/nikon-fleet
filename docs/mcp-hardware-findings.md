@@ -626,9 +626,23 @@ values the worker returns. Read-only, on the Z 9:
   itself, so every `--json` command that opened the SDK (including `discover --json`) printed that line before its
   JSON. `json_out::JsonOut` now moves stdout to stderr for the rest of the process and writes the JSON to a saved
   handle; stdout is pure JSON for all five commands (checked on the camera for `discover` and `transplant`).
-- **Not run on hardware:** a non-dry-run `transplant` or `restore` through the CLI. The ops it calls are the ones run
-  on the Z 9 in F18 and F19, and the CLI-side rendering is unit-tested, but the CLI apply path itself has not written
-  to a camera.
+- **Then, with permission, a real write through the CLI (Z 9, one property, `WBTuneAuto` 33049, a stepped range):**
+  1. `snapshot --json` baseline (gate `passed`, 196 properties; `value_index` 612).
+  2. `transplant --dry-run --json` of a one-property same-model source with `value_index` 613: 1 property would change,
+     digest `2e80d9af…25f5`.
+  3. `transplant --json` of that source: exit 0, `applied_verified`, restore point
+     `…mcp-restore-pre-transplant-20261028T004857.247951Z…json`, read-back gate `passed`, nothing not-taken or
+     unverifiable, no side effects. An independent `snapshot` afterwards, diffed against the baseline, differed in
+     that one property only (612 to 613).
+  4. `restore --json --only WBTuneAuto <that restore point>`: exit 0, `applied_verified`, verdict `verified` with an
+     empty residual, its own restore point, no side effects.
+  5. A final `snapshot` diffed against the baseline: no differences. Two writes in all, both on that property.
+  What this settles: the CLI apply path writes, reads back and undoes correctly for one stepped range, and its
+  JSON matches the worker's shape. What it does not: any other property type, a cross-model write, an opted-in
+  raw-code enum, a failing or ignored write, or `--allow-partial` against a real body. The CLI exited cleanly after
+  each of the three mutating or capturing runs except one read-only `snapshot` (the independent post-write
+  capture), which was still alive 150 s after printing its result and was killed (the post-result teardown hang, F3);
+  none of the writing runs hung.
 
 Behaviour changes for CLI users: a real `transplant` or `restore` writes a restore point (`mcp-restore-pre-...`) into
 `snapshots/`, refuses (`no_baseline`, `restore_point_incomplete`) unless `--allow-partial`, and exits non-zero on
