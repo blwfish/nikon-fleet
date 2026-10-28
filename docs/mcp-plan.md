@@ -818,11 +818,11 @@ automating the firmware licence; FTP profile writes; firmware flashing.
   (null when the gate did not judge the capture), which closes the usability item from F20. The three fields F21 left
   unexplained (`unknown_schema: 5`, `source_label: null`, `changes: null`) are explained in the `unreadable-is-normal`
   and new `reading-a-plan` notes: the five `cap_0x…` names are the same generic device facts on both bodies.
-- **Range defaults that differ between bodies: explained, no policy change (F25, 2026-10-28).** `ShootingLimit` (33086,
-  "Continuous Shooting Limit") is the one range of 39 whose `default_index` differs: Z 9 index 0, Z6III index 200. The
-  user read the cameras: it is Custom Setting d2, "maximum shots per burst", set to **infinity on the Z 9 and 200 on the
-  Z6III, which can also be set to infinity**. So index 0 is the "infinity" position on a scale both bodies share, and the
-  two bodies are simply set differently. Copying by number is then a faithful copy of the setting, not a hazard, and the
-  candidate policy of skipping a range whose defaults differ is **not adopted** (it would skip a real setting).
-  Still unverified: that the Z6III's "infinity" is index 0 (taken from the user's statement and the shared scale, not
-  read back), and why the reported defaults differ (the SDK table says 200 for both). Unwritten on hardware.
+- **Range defaults that differ between bodies: the first explanation was wrong (F25, 2026-10-28).** `ShootingLimit`
+  (33086, "Continuous Shooting Limit") is the one range of 39 whose `default_index` differs: Z 9 index 0, Z6III index 200.
+  The user read the menus: it is Custom Setting d2, "maximum shots per burst", **infinity on the Z 9, 200 on the Z6III**.
+  I first concluded that index 0 is "infinity" on a scale both bodies share. **Reading the Z6III after the user set it
+  to infinity refuted that:** `value_index` 1 (twice, `default_index` still 200), while the Z 9 at infinity reads 0. So
+  the same menu setting reads as different indexes on the two bodies (or the Z6III was not at infinity when read), and
+  copying by number would not be a faithful copy. The policy question is **open again**; do not write this property
+  until the mapping is known. Candidate policy: skip a range whose bodies' defaults differ.
