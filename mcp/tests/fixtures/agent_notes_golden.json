@@ -1,0 +1,474 @@
+{
+ "generated_from": "mcp-agent-notes 0.2.0 (dd83adf)",
+ "now": "2026-10-27",
+ "notes": [
+  {
+   "id": "crit-a",
+   "added": "2026-10-01",
+   "priority": "critical",
+   "kind": "strategy",
+   "summary": "Never do A without B.",
+   "detail": "Full A detail.\nSecond line.",
+   "tags": [
+    "apply"
+   ],
+   "addresses": [
+    "apply fails",
+    "stale plan"
+   ],
+   "location": null
+  },
+  {
+   "id": "crit-b",
+   "added": "2026-10-02",
+   "priority": "critical",
+   "kind": "tactic",
+   "summary": "Always pass the verbatim digest.",
+   "detail": "",
+   "tags": [
+    "apply"
+   ],
+   "addresses": [
+    "digest mismatch"
+   ],
+   "location": null
+  },
+  {
+   "id": "crit-c",
+   "added": "2026-10-03",
+   "priority": "critical",
+   "kind": "tactic",
+   "summary": "Serial means USB serial.",
+   "detail": "Use list_cameras.",
+   "tags": [
+    "serials"
+   ],
+   "addresses": [
+    "no usb serial",
+    "id-1"
+   ],
+   "location": "https://example.invalid/serials"
+  },
+  {
+   "id": "high-1",
+   "added": "2026-10-10",
+   "priority": "high",
+   "kind": "strategy",
+   "summary": "Undo is a targeted restore.",
+   "detail": "restore_plan then restore_apply.",
+   "tags": [
+    "restore"
+   ],
+   "addresses": [
+    "undo",
+    "put it back"
+   ],
+   "location": null
+  },
+  {
+   "id": "high-2",
+   "added": "2026-10-11",
+   "priority": "high",
+   "kind": "tactic",
+   "summary": "Eleven failed reads is normal.",
+   "detail": "Z 9 reads 196 and fails 11.",
+   "tags": [
+    "capture"
+   ],
+   "addresses": [
+    "failed reads",
+    "capture incomplete"
+   ],
+   "location": null
+  },
+  {
+   "id": "high-3",
+   "added": "2026-10-12",
+   "priority": "high",
+   "kind": "tactic",
+   "summary": "Old snapshots are malformed.",
+   "detail": "",
+   "tags": [
+    "capture",
+    "snapshots"
+   ],
+   "addresses": [
+    "malformed_source"
+   ],
+   "location": null
+  },
+  {
+   "id": "med-recent",
+   "added": "2026-10-25",
+   "priority": "medium",
+   "kind": "tactic",
+   "summary": "Recent medium note.",
+   "detail": "Medium detail.",
+   "tags": [
+    "capture"
+   ],
+   "addresses": [],
+   "location": null
+  },
+  {
+   "id": "med-old",
+   "added": "2026-08-01",
+   "priority": "medium",
+   "kind": "strategy",
+   "summary": "Old medium strategy.",
+   "detail": "Old detail.",
+   "tags": [
+    "snapshots"
+   ],
+   "addresses": [
+    "old strategy"
+   ],
+   "location": null
+  },
+  {
+   "id": "low-edge",
+   "added": "2026-10-20",
+   "priority": "low",
+   "kind": "tactic",
+   "summary": "Low note on the recent edge.",
+   "detail": "",
+   "tags": [],
+   "addresses": [
+    "edge"
+   ],
+   "location": null
+  },
+  {
+   "id": "low-before",
+   "added": "2026-10-19",
+   "priority": "low",
+   "kind": "tactic",
+   "summary": "Low note one day before the edge.",
+   "detail": "",
+   "tags": [],
+   "addresses": [],
+   "location": null
+  },
+  {
+   "id": "tier-addr",
+   "added": "2026-06-01",
+   "priority": "low",
+   "kind": "tactic",
+   "summary": "Quiet note.",
+   "detail": "",
+   "tags": [
+    "tiers"
+   ],
+   "addresses": [
+    "alpha"
+   ],
+   "location": null
+  },
+  {
+   "id": "tier-summary",
+   "added": "2026-06-02",
+   "priority": "low",
+   "kind": "tactic",
+   "summary": "beta gamma delta epsilon note",
+   "detail": "",
+   "tags": [
+    "tiers"
+   ],
+   "addresses": [],
+   "location": null
+  },
+  {
+   "id": "untagged",
+   "added": "2026-09-01",
+   "priority": "low",
+   "kind": "strategy",
+   "summary": "Untagged universal strategy.",
+   "detail": "Universal detail.",
+   "tags": [],
+   "addresses": [
+    "universal"
+   ],
+   "location": null
+  }
+ ],
+ "cases": [
+  {
+   "name": "render default",
+   "fn": "render",
+   "args": {
+    "capability_statement": "Capability.",
+    "query_tool_name": "q",
+    "recent_days": 30,
+    "max_notes": 8
+   },
+   "expected": "Capability.\n\nKey things to know:\n- Serial means USB serial.\n- Always pass the verbatim digest.\n- Never do A without B.\n- Old snapshots are malformed.\n- Eleven failed reads is normal.\n- Undo is a targeted restore.\n\nRecently added:\n- Recent medium note.\n- Low note on the recent edge.\n- Low note one day before the edge.\n\nFor more, call q(operation=\"strategy\") for a tiered overview, q(operation=\"strategy\"|\"tactics\", topic=\"...\") for one topic in full, or q(operation=\"find\", problem=\"...\") to search by symptom."
+  },
+  {
+   "name": "render recent 7 days exactly on the edge",
+   "fn": "render",
+   "args": {
+    "capability_statement": "Capability.",
+    "query_tool_name": "q",
+    "recent_days": 7,
+    "max_notes": 8
+   },
+   "expected": "Capability.\n\nKey things to know:\n- Serial means USB serial.\n- Always pass the verbatim digest.\n- Never do A without B.\n- Old snapshots are malformed.\n- Eleven failed reads is normal.\n- Undo is a targeted restore.\n\nRecently added:\n- Recent medium note.\n- Low note on the recent edge.\n\nFor more, call q(operation=\"strategy\") for a tiered overview, q(operation=\"strategy\"|\"tactics\", topic=\"...\") for one topic in full, or q(operation=\"find\", problem=\"...\") to search by symptom."
+  },
+  {
+   "name": "render recent 6 days: edge note out",
+   "fn": "render",
+   "args": {
+    "capability_statement": "Capability.",
+    "query_tool_name": "q",
+    "recent_days": 6,
+    "max_notes": 8
+   },
+   "expected": "Capability.\n\nKey things to know:\n- Serial means USB serial.\n- Always pass the verbatim digest.\n- Never do A without B.\n- Old snapshots are malformed.\n- Eleven failed reads is normal.\n- Undo is a targeted restore.\n\nRecently added:\n- Recent medium note.\n\nFor more, call q(operation=\"strategy\") for a tiered overview, q(operation=\"strategy\"|\"tactics\", topic=\"...\") for one topic in full, or q(operation=\"find\", problem=\"...\") to search by symptom."
+  },
+  {
+   "name": "render recent 0",
+   "fn": "render",
+   "args": {
+    "capability_statement": "Capability.",
+    "query_tool_name": "q",
+    "recent_days": 0,
+    "max_notes": 8
+   },
+   "expected": "Capability.\n\nKey things to know:\n- Serial means USB serial.\n- Always pass the verbatim digest.\n- Never do A without B.\n- Old snapshots are malformed.\n- Eleven failed reads is normal.\n- Undo is a targeted restore.\n\nFor more, call q(operation=\"strategy\") for a tiered overview, q(operation=\"strategy\"|\"tactics\", topic=\"...\") for one topic in full, or q(operation=\"find\", problem=\"...\") to search by symptom."
+  },
+  {
+   "name": "render max_notes 2 keeps every critical",
+   "fn": "render",
+   "args": {
+    "capability_statement": "Capability.",
+    "query_tool_name": "q",
+    "recent_days": 30,
+    "max_notes": 2
+   },
+   "expected": "Capability.\n\nKey things to know:\n- Serial means USB serial.\n- Always pass the verbatim digest.\n- Never do A without B.\n\nRecently added:\n- Old snapshots are malformed.\n- Eleven failed reads is normal.\n- Undo is a targeted restore.\n- Recent medium note.\n- Low note on the recent edge.\n- Low note one day before the edge.\n\nFor more, call q(operation=\"strategy\") for a tiered overview, q(operation=\"strategy\"|\"tactics\", topic=\"...\") for one topic in full, or q(operation=\"find\", problem=\"...\") to search by symptom."
+  },
+  {
+   "name": "render max_notes 0",
+   "fn": "render",
+   "args": {
+    "capability_statement": "Capability.",
+    "query_tool_name": "q",
+    "recent_days": 30,
+    "max_notes": 0
+   },
+   "expected": "Capability.\n\nKey things to know:\n- Serial means USB serial.\n- Always pass the verbatim digest.\n- Never do A without B.\n\nRecently added:\n- Old snapshots are malformed.\n- Eleven failed reads is normal.\n- Undo is a targeted restore.\n- Recent medium note.\n- Low note on the recent edge.\n- Low note one day before the edge.\n\nFor more, call q(operation=\"strategy\") for a tiered overview, q(operation=\"strategy\"|\"tactics\", topic=\"...\") for one topic in full, or q(operation=\"find\", problem=\"...\") to search by symptom."
+  },
+  {
+   "name": "render max_notes 4 one high",
+   "fn": "render",
+   "args": {
+    "capability_statement": "Capability.",
+    "query_tool_name": "q",
+    "recent_days": 30,
+    "max_notes": 4
+   },
+   "expected": "Capability.\n\nKey things to know:\n- Serial means USB serial.\n- Always pass the verbatim digest.\n- Never do A without B.\n- Old snapshots are malformed.\n\nRecently added:\n- Eleven failed reads is normal.\n- Undo is a targeted restore.\n- Recent medium note.\n- Low note on the recent edge.\n- Low note one day before the edge.\n\nFor more, call q(operation=\"strategy\") for a tiered overview, q(operation=\"strategy\"|\"tactics\", topic=\"...\") for one topic in full, or q(operation=\"find\", problem=\"...\") to search by symptom."
+  },
+  {
+   "name": "render empty capability",
+   "fn": "render",
+   "args": {
+    "capability_statement": "",
+    "query_tool_name": "q",
+    "recent_days": 30,
+    "max_notes": 8
+   },
+   "expected": "Key things to know:\n- Serial means USB serial.\n- Always pass the verbatim digest.\n- Never do A without B.\n- Old snapshots are malformed.\n- Eleven failed reads is normal.\n- Undo is a targeted restore.\n\nRecently added:\n- Recent medium note.\n- Low note on the recent edge.\n- Low note one day before the edge.\n\nFor more, call q(operation=\"strategy\") for a tiered overview, q(operation=\"strategy\"|\"tactics\", topic=\"...\") for one topic in full, or q(operation=\"find\", problem=\"...\") to search by symptom."
+  },
+  {
+   "name": "strategy overview none active",
+   "fn": "strategy",
+   "args": {
+    "topic": null,
+    "active_topics": []
+   },
+   "expected": "## Untagged universal strategy.\nUniversal detail.\n\nAlso available:\n- Never do A without B.\n- Undo is a targeted restore.\n- Old medium strategy."
+  },
+  {
+   "name": "strategy overview restore active",
+   "fn": "strategy",
+   "args": {
+    "topic": null,
+    "active_topics": [
+     "restore"
+    ]
+   },
+   "expected": "## Undo is a targeted restore.\nrestore_plan then restore_apply.\n\n## Untagged universal strategy.\nUniversal detail.\n\nAlso available:\n- Never do A without B.\n- Old medium strategy."
+  },
+  {
+   "name": "strategy overview apply+snapshots active",
+   "fn": "strategy",
+   "args": {
+    "topic": null,
+    "active_topics": [
+     "apply",
+     "snapshots"
+    ]
+   },
+   "expected": "## Never do A without B.\nFull A detail.\nSecond line.\n\n## Old medium strategy.\nOld detail.\n\n## Untagged universal strategy.\nUniversal detail.\n\nAlso available:\n- Undo is a targeted restore."
+  },
+  {
+   "name": "strategy topic restore",
+   "fn": "strategy",
+   "args": {
+    "topic": "restore",
+    "active_topics": []
+   },
+   "expected": "## Undo is a targeted restore.\nrestore_plan then restore_apply."
+  },
+  {
+   "name": "strategy topic missing",
+   "fn": "strategy",
+   "args": {
+    "topic": "nope",
+    "active_topics": []
+   },
+   "expected": "No strategy notes found for topic \"nope\"."
+  },
+  {
+   "name": "strategy topic is exact not prefix",
+   "fn": "strategy",
+   "args": {
+    "topic": "rest",
+    "active_topics": []
+   },
+   "expected": "No strategy notes found for topic \"rest\"."
+  },
+  {
+   "name": "tactics list",
+   "fn": "tactics",
+   "args": {
+    "topic": null
+   },
+   "expected": "Available tactical topics: apply, capture, serials, snapshots, tiers"
+  },
+  {
+   "name": "tactics capture",
+   "fn": "tactics",
+   "args": {
+    "topic": "capture"
+   },
+   "expected": "## Old snapshots are malformed.\nOld snapshots are malformed.\n\n## Eleven failed reads is normal.\nZ 9 reads 196 and fails 11.\n\n## Recent medium note.\nMedium detail."
+  },
+  {
+   "name": "tactics serials",
+   "fn": "tactics",
+   "args": {
+    "topic": "serials"
+   },
+   "expected": "## Serial means USB serial.\nUse list_cameras.\nSee: https://example.invalid/serials"
+  },
+  {
+   "name": "tactics missing",
+   "fn": "tactics",
+   "args": {
+    "topic": "zzz"
+   },
+   "expected": "No tactic notes found for topic \"zzz\"."
+  },
+  {
+   "name": "find addresses outrank summary",
+   "fn": "find",
+   "args": {
+    "problem": "stale plan on apply",
+    "top_n": 5
+   },
+   "expected": "[STRATEGY] Never do A without B.\nFull A detail.\nSecond line.\n\n[TACTIC] Low note on the recent edge."
+  },
+  {
+   "name": "find symptom",
+   "fn": "find",
+   "args": {
+    "problem": "my capture shows failed reads",
+    "top_n": 5
+   },
+   "expected": "[TACTIC] Eleven failed reads is normal.\nZ 9 reads 196 and fails 11."
+  },
+  {
+   "name": "find case and punctuation",
+   "fn": "find",
+   "args": {
+    "problem": "UNDO!!  put-it-back",
+    "top_n": 5
+   },
+   "expected": "[STRATEGY] Undo is a targeted restore.\nrestore_plan then restore_apply."
+  },
+  {
+   "name": "find summary fallback",
+   "fn": "find",
+   "args": {
+    "problem": "serial means",
+    "top_n": 5
+   },
+   "expected": "[TACTIC] Serial means USB serial.\nUse list_cameras.\nSee: https://example.invalid/serials"
+  },
+  {
+   "name": "find top_n 1",
+   "fn": "find",
+   "args": {
+    "problem": "capture",
+    "top_n": 1
+   },
+   "expected": "[TACTIC] Eleven failed reads is normal.\nZ 9 reads 196 and fails 11."
+  },
+  {
+   "name": "find top_n 0",
+   "fn": "find",
+   "args": {
+    "problem": "capture",
+    "top_n": 0
+   },
+   "expected": "No notes found matching \"capture\"."
+  },
+  {
+   "name": "find negative top_n",
+   "fn": "find",
+   "args": {
+    "problem": "capture",
+    "top_n": -3
+   },
+   "expected": "No notes found matching \"capture\"."
+  },
+  {
+   "name": "find one address token beats four summary tokens",
+   "fn": "find",
+   "args": {
+    "problem": "alpha beta gamma delta epsilon",
+    "top_n": 5
+   },
+   "expected": "[TACTIC] Quiet note.\n\n[TACTIC] beta gamma delta epsilon note"
+  },
+  {
+   "name": "find blank",
+   "fn": "find",
+   "args": {
+    "problem": "   ",
+    "top_n": 5
+   },
+   "expected": "No notes found matching \"   \"."
+  },
+  {
+   "name": "find nothing matches",
+   "fn": "find",
+   "args": {
+    "problem": "zebra",
+    "top_n": 5
+   },
+   "expected": "No notes found matching \"zebra\"."
+  },
+  {
+   "name": "find ties break by priority then recency then id",
+   "fn": "find",
+   "args": {
+    "problem": "capture",
+    "top_n": 5
+   },
+   "expected": "[TACTIC] Eleven failed reads is normal.\nZ 9 reads 196 and fails 11."
+  }
+ ]
+}
