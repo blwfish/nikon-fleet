@@ -142,3 +142,29 @@ All 26 High findings are `deferred`, since no fixes were requested for this pass
 - **#90** [Inventory] — `src/ptp_usb.rs:256-271` — Only 13 PTP response codes are named; others print as hex.
 - **#91** [Test] — `src/ptp_usb.rs:2299` — The Drop-close test replies with txid 0 against an expected 1, so the Enforce mismatch is swallowed by `let _`; mutating Enforce to Unchecked on close survives. Equivalent by design.
 - **#92** [Test] — `gui/fleet_lib.py:29,207` — `model_slug` replacing only the first space, `_plain_name_component` without the backslash/NUL rules, and the range branch without `upper` survive; exposure macOS-only and no two-space model.
+
+## Remediation
+
+Run `nikon-fleet-remediate-20261028-d1a7`, fix commit `9da8a99`, ledger commit `04bf6b2`. Nothing is pushed.
+
+Of the 92 findings above, **85 are fixed, 5 deferred, 2 wontfix**. Two cold reviews of the remediation itself found 19 more, recorded in the same ledger entry as `nikon-fleet-remediate-20261028-d1a7#R01..R19`: **16 fixed, 3 deferred**. All 26 High findings are fixed except #04; every Medium is fixed except #36.
+
+Verified: Rust 1419 tests and Python 652 tests pass (`make test` now runs both); the tautology sweep is clean; the clusters ran about 700 one-at-a-time mutations against the new tests and I re-ran nine of them myself (argv parity flag rename, zero-length packet, zip component check, baseline model check, Python port bound, exit-3 prompt, write_atomic symlink and temp name, the parse-only environment gate), all killed.
+
+**Not verified, needs a camera or a bench:**
+- The zero-length-packet rule follows PIMA 15740; no hardware has shown that a body needs it.
+- `PtpUsbSession::open` taking the CameraLock before the bus is tested with an injected lock; the real path was not run.
+- The egui GUI now runs discover and snapshot as CLI subprocesses. Its timeout, kill and partial-output salvage are tested with fake CLIs only, and the USB reset now happens in the CLI process.
+- Exit status 4 (indeterminate FTP write) is tested as a mapping; a real indeterminate write was not provoked.
+- No GUI window was driven; the egui UI wiring (button enablement, busy counting) has no automated test beyond the pure logic it calls. The Python GUI tests drive a real Tk root with a fake CLI and fail instead of skipping when `CI`, `REQUIRE_DISPLAY` or `REQUIRE_CLI` is set.
+- Two Python tests failed once each under heavy load and did not reproduce in about 25 reruns; the test helper's wait ceiling was raised to 60 s, which is not proven to be the cause.
+
+**Still deferred, and what it would take:**
+- #04 (High): the FTP-profile block still ships the capture rig's address as its default; what `[0,0]` means, the real field limits and the 331-byte variant need a bench session. No GitHub issue is filed (public posting).
+- #36: the baseline's known-good set is state-dependent; needs captures per model in the states a user reaches, and the second Z 9.
+- #74: the hard-coded USB configuration 1 and the two `pkill` spawns per open need a hardware experiment.
+- #86, #87: the 331-byte variant's extra field and the interrupt endpoint need a capture or a bench session and a design.
+- R17: `restore` targeting an `id-N` snapshot serial can land on the wrong body when two same-model bodies are attached (pre-existing; needs a design decision).
+- R18, R19: two Low items in the vendor path (bus touched before the lock; a failed descriptor read reported as "not found").
+
+**Behaviour changes worth a look:** `discover --json`'s `serial` is now the stored identity (`id-N` when there is no USB serial), not the bare SDK id; `vendor-write-ftp` rejects SSIDs over 32 bytes and control characters; `make test` needs pytest; the CLI's `--data-dir` default stays `.` on purpose (see `nikon-fleet settings show`).
