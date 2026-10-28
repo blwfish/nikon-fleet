@@ -113,6 +113,31 @@ pub enum CallKind {
     Apply,
 }
 
+/// Which list of a plan result to page, and the window to return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Paging {
+    pub key: &'static str,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+/// The default page for a plan's list: its warn-worthy entries come first, so the head matters most.
+pub const DEFAULT_PLAN_PAGE: usize = 50;
+
+impl Paging {
+    pub fn for_plan(key: &'static str, offset: Option<u32>, limit: Option<u32>) -> Paging {
+        Paging { key, offset: offset.unwrap_or(0) as usize, limit: limit.map_or(DEFAULT_PLAN_PAGE, |l| l as usize) }
+    }
+}
+
+/// Window the list in a successful worker result; anything else passes through untouched. Pure.
+pub fn page_finished(mut f: Finished, paging: &Paging) -> Finished {
+    if let Finished::Result { outcome: Outcome::Ok { data, .. }, .. } = &mut f {
+        *data = nikon_fleet::ops::views::page_list(std::mem::take(data), paging.key, paging.offset, paging.limit);
+    }
+    f
+}
+
 /// What a finished worker call means to the caller. Pure.
 pub fn to_result(kind: CallKind, f: Finished) -> CallToolResult {
     match f {
@@ -264,6 +289,15 @@ pub struct TransplantPlanArgs {
     #[serde(default)]
     #[schemars(schema_with = "strings_schema")]
     pub allow_raw_code: Option<Vec<String>>,
+    /// First entry of the plan's list to return (default 0). Each page re-reads the body, so a page
+    /// can differ from the last if the body changed: compare `digest` across pages.
+    #[serde(default)]
+    #[schemars(schema_with = "uint_schema")]
+    pub offset: Option<u32>,
+    /// How many entries of the plan's list to return (default 50; at most 500). `counts` always covers the whole plan.
+    #[serde(default)]
+    #[schemars(schema_with = "uint_schema")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -289,6 +323,15 @@ pub struct RestorePlanArgs {
     #[serde(default)]
     #[schemars(schema_with = "strings_schema")]
     pub only: Option<Vec<String>>,
+    /// First entry of the plan's list to return (default 0). Each page re-reads the body, so a page
+    /// can differ from the last if the body changed: compare `digest` across pages.
+    #[serde(default)]
+    #[schemars(schema_with = "uint_schema")]
+    pub offset: Option<u32>,
+    /// How many entries of the plan's list to return (default 50; at most 500). `counts` always covers the whole plan.
+    #[serde(default)]
+    #[schemars(schema_with = "uint_schema")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -498,6 +541,7 @@ impl FleetMcp {
         kind: CallKind,
         op_args: Vec<String>,
         deadline: Duration,
+        paging: Option<Paging>,
         meta: &RequestMetaObject,
         peer: &Peer<RoleServer>,
         ct: &CancellationToken,
@@ -539,7 +583,7 @@ impl FleetMcp {
             let _ = f.await;
         }
         match finished {
-            Ok(f) => to_result(kind, f),
+            Ok(f) => to_result(kind, match &paging { Some(p) => page_finished(f, p), None => f }),
             Err(e) => spawn_failure(&e),
         }
     }
@@ -655,7 +699,7 @@ impl FleetMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         Ok(self
-            .camera_call(CallKind::Read, ops_args::capture(&p.0), self.cfg.deadlines.capture, &meta, &peer, &ctx.ct)
+            .camera_call(CallKind::Read, ops_args::capture(&p.0), self.cfg.deadlines.capture, None, &meta, &peer, &ctx.ct)
             .await)
     }
 
@@ -672,7 +716,7 @@ impl FleetMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         Ok(self
-            .camera_call(CallKind::Read, ops_args::check(&p.0), self.cfg.deadlines.check, &meta, &peer, &ctx.ct)
+            .camera_call(CallKind::Read, ops_args::check(&p.0), self.cfg.deadlines.check, None, &meta, &peer, &ctx.ct)
             .await)
     }
 
@@ -680,7 +724,8 @@ impl FleetMcp {
         name = "transplant_plan",
         description = "Work out what copying a stored snapshot onto a body would do, and what could not be copied, by reading the body. \
                        Writes nothing. A plan is not a prediction: a write can still fail. Returns a `digest` and `summary` that transplant_apply must echo. \
-                       Picture Controls cannot be read through this SDK and are never copied.",
+                       Picture Controls cannot be read through this SDK and are never copied. \
+                       `outcomes` is paged (`offset`, `limit`, default 50; most important entries first): `counts` covers the whole plan and `page` says if more remain.",
         annotations(read_only_hint = true)
     )]
     async fn transplant_plan(
@@ -691,14 +736,15 @@ impl FleetMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         Ok(self
-            .camera_call(CallKind::Read, ops_args::transplant_plan(&p.0), self.cfg.deadlines.plan, &meta, &peer, &ctx.ct)
+            .camera_call(CallKind::Read, ops_args::transplant_plan(&p.0), self.cfg.deadlines.plan, Some(Paging::for_plan("outcomes", p.0.offset, p.0.limit)), &meta, &peer, &ctx.ct)
             .await)
     }
 
     #[tool(
         name = "restore_plan",
         description = "Work out what restoring a body from a stored snapshot of the same body would do, by reading the body. Writes nothing. \
-                       `only` limits it to named properties. Returns a `digest` and `summary` that restore_apply must echo.",
+                       `only` limits it to named properties. Returns a `digest` and `summary` that restore_apply must echo. \
+                       `steps` is paged (`offset`, `limit`, default 50): `counts` covers the whole plan and `page` says if more remain.",
         annotations(read_only_hint = true)
     )]
     async fn restore_plan(
@@ -709,7 +755,7 @@ impl FleetMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         Ok(self
-            .camera_call(CallKind::Read, ops_args::restore_plan(&p.0), self.cfg.deadlines.plan, &meta, &peer, &ctx.ct)
+            .camera_call(CallKind::Read, ops_args::restore_plan(&p.0), self.cfg.deadlines.plan, Some(Paging::for_plan("steps", p.0.offset, p.0.limit)), &meta, &peer, &ctx.ct)
             .await)
     }
 
@@ -729,7 +775,7 @@ impl FleetMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         Ok(self
-            .camera_call(CallKind::Apply, ops_args::transplant_apply(&p.0), self.cfg.deadlines.apply, &meta, &peer, &ctx.ct)
+            .camera_call(CallKind::Apply, ops_args::transplant_apply(&p.0), self.cfg.deadlines.apply, None, &meta, &peer, &ctx.ct)
             .await)
     }
 
@@ -748,7 +794,7 @@ impl FleetMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         Ok(self
-            .camera_call(CallKind::Apply, ops_args::restore_apply(&p.0), self.cfg.deadlines.apply, &meta, &peer, &ctx.ct)
+            .camera_call(CallKind::Apply, ops_args::restore_apply(&p.0), self.cfg.deadlines.apply, None, &meta, &peer, &ctx.ct)
             .await)
     }
 }
@@ -759,5 +805,54 @@ impl ServerHandler for FleetMcp {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fleet-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(self.instructions.as_str())
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    fn result_of(outcome: Outcome) -> Finished {
+        Finished::Result { outcome, last_phase: None, garbage_lines: 0 }
+    }
+
+    #[test]
+    fn plan_paging_defaults_to_fifty_from_the_start_and_takes_both_overrides() {
+        let d = Paging::for_plan("outcomes", None, None);
+        assert_eq!((d.key, d.offset, d.limit), ("outcomes", 0, DEFAULT_PLAN_PAGE));
+        assert_eq!(DEFAULT_PLAN_PAGE, 50);
+        let o = Paging::for_plan("steps", Some(7), Some(0));
+        assert_eq!((o.key, o.offset, o.limit), ("steps", 7, 0), "an explicit 0 is a summary, not the default");
+    }
+
+    #[test]
+    fn a_successful_plan_result_is_windowed_and_keeps_its_digest() {
+        let list: Vec<u32> = (0..120).collect();
+        let f = result_of(Outcome::ok(json!({"digest": "d", "outcomes": list})));
+        let paged = page_finished(f, &Paging::for_plan("outcomes", None, None));
+        let Finished::Result { outcome: Outcome::Ok { data, .. }, .. } = paged else { panic!("still a result") };
+        assert_eq!(data["outcomes"].as_array().map(Vec::len), Some(50));
+        assert_eq!((data["digest"].as_str(), data["page"]["total"].as_u64(), data["page"]["next"].as_u64()), (Some("d"), Some(120), Some(50)));
+    }
+
+    #[test]
+    fn a_plan_of_exactly_the_default_page_is_not_truncated() {
+        for (n, trunc) in [(49usize, false), (50, false), (51, true)] {
+            let f = result_of(Outcome::ok(json!({"outcomes": (0..n).collect::<Vec<_>>()})));
+            let Finished::Result { outcome: Outcome::Ok { data, .. }, .. } =
+                page_finished(f, &Paging::for_plan("outcomes", None, None))
+            else {
+                panic!("still a result")
+            };
+            assert_eq!(data["page"]["truncated"].as_bool(), Some(trunc), "n={n}");
+        }
+    }
+
+    #[test]
+    fn failures_and_missing_results_pass_through_unpaged() {
+        let p = Paging::for_plan("outcomes", None, None);
+        let err = result_of(Outcome::err("stale_plan", "x".to_string(), None));
+        assert!(matches!(page_finished(err, &p), Finished::Result { outcome: Outcome::Err { .. }, .. }));
+        assert!(matches!(page_finished(Finished::CancelledBeforeStart, &p), Finished::CancelledBeforeStart));
     }
 }

@@ -135,6 +135,31 @@ pub fn diff_view(d: &Diff, offset: usize, limit: usize) -> DiffView {
     }
 }
 
+/// Page the list at `report[key]` of an already-serialised plan, so a plan of
+/// hundreds of properties can be read a window at a time.
+///
+/// The list is replaced by its `[offset, offset + limit)` window and a `page`
+/// object is added (the fields of [`Page`] plus `list`, the key that was paged).
+/// Everything else in the report, the `digest` and `summary` included, is left
+/// alone: they describe the whole plan, not the window, so every page of one
+/// plan carries the same digest. Pages come from separate runs against the
+/// body, so a digest that differs between pages means the plan changed under
+/// the reader. The same window rules as the other views apply (see the module
+/// docs). A report with no array at `key` is returned unchanged and without a
+/// `page`, rather than guessed at.
+pub fn page_list(mut report: Value, key: &str, offset: usize, limit: usize) -> Value {
+    let Some(items) = report.get(key).and_then(Value::as_array) else {
+        return report;
+    };
+    let (start, end, page) = window(items.len(), offset, limit);
+    let window: Vec<Value> = items[start..end].to_vec();
+    let mut page_json = serde_json::to_value(page).expect("a Page always serialises");
+    page_json["list"] = Value::from(key);
+    report[key] = Value::Array(window);
+    report["page"] = page_json;
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +293,64 @@ mod tests {
         let kinds: Vec<&str> = v["entries"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["changed", "only_in_a", "only_in_b"]);
         assert_eq!(v["entries"][0]["value_b"], json!(1));
+    }
+    #[test]
+    fn page_list_windows_one_list_and_leaves_the_rest_alone() {
+        let report = json!({"digest": "d", "summary": "s", "outcomes": [0, 1, 2, 3, 4]});
+        let v = page_list(report, "outcomes", 1, 2);
+        assert_eq!(v["outcomes"], json!([1, 2]));
+        assert_eq!((v["digest"].as_str(), v["summary"].as_str()), (Some("d"), Some("s")));
+        assert_eq!(v["page"]["total"], 5);
+        assert_eq!(v["page"]["returned"], 2);
+        assert_eq!(v["page"]["truncated"], true);
+        assert_eq!(v["page"]["next"], 3);
+        assert_eq!(v["page"]["list"], "outcomes");
+    }
+
+    #[test]
+    fn page_list_at_below_and_above_the_total() {
+        let items = || json!({"steps": [0, 1, 2, 3, 4]});
+        let below = page_list(items(), "steps", 0, 4);
+        assert_eq!((below["page"]["truncated"].as_bool(), below["steps"].as_array().map(Vec::len)), (Some(true), Some(4)));
+        let at = page_list(items(), "steps", 0, 5);
+        assert_eq!((at["page"]["truncated"].as_bool(), at["page"]["next"].is_null()), (Some(false), true));
+        let above = page_list(items(), "steps", 0, 6);
+        assert_eq!((above["page"]["truncated"].as_bool(), above["steps"].as_array().map(Vec::len)), (Some(false), Some(5)));
+        let past = page_list(items(), "steps", 9, 3);
+        assert_eq!((past["page"]["returned"].as_u64(), past["page"]["truncated"].as_bool()), (Some(0), Some(false)));
+        assert_eq!(past["page"]["offset"], 9);
+    }
+
+    #[test]
+    fn page_list_limit_zero_is_a_summary_and_over_max_is_clamped() {
+        let zero = page_list(json!({"outcomes": [1, 2]}), "outcomes", 0, 0);
+        assert_eq!(zero["outcomes"], json!([]));
+        assert_eq!((zero["page"]["truncated"].as_bool(), zero["page"]["next"].as_u64()), (Some(true), Some(0)));
+        let big: Vec<usize> = (0..MAX_PAGE + 1).collect();
+        let clamped = page_list(json!({"outcomes": big}), "outcomes", 0, MAX_PAGE + 1);
+        assert_eq!(clamped["outcomes"].as_array().map(Vec::len), Some(MAX_PAGE));
+        assert_eq!((clamped["page"]["limit_clamped"].as_bool(), clamped["page"]["next"].as_u64()), (Some(true), Some(MAX_PAGE as u64)));
+    }
+
+    #[test]
+    fn page_list_with_no_array_at_the_key_changes_nothing() {
+        for report in [json!({"x": 1}), json!({"outcomes": "text"}), json!({"outcomes": null}), json!(null)] {
+            assert_eq!(page_list(report.clone(), "outcomes", 0, 10), report);
+        }
+    }
+
+    #[test]
+    fn page_list_walks_a_plan_once_in_order() {
+        let report = json!({"outcomes": (0..23).collect::<Vec<u32>>()});
+        let (mut offset, mut seen) = (0, Vec::new());
+        for _ in 0..10 {
+            let v = page_list(report.clone(), "outcomes", offset, 10);
+            seen.extend(v["outcomes"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap()));
+            match v["page"]["next"].as_u64() {
+                Some(n) => offset = n as usize,
+                None => break,
+            }
+        }
+        assert_eq!(seen, (0..23).collect::<Vec<u64>>());
     }
 }
