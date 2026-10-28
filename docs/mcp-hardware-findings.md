@@ -666,7 +666,24 @@ The Z6III (serial `0000003014527`, firmware 2.00) was plugged in next to the Z 9
   `literal_unconfirmed`, 4 `no_matching_option`, 2 unsupported value shape, 1 `target_read_failed`. No malformed
   sources, since the source is a current capture (compare the 67 against the June snapshot in F20). Nothing was written.
 - The read-only `snapshot` hung at teardown after printing its result (killed after 150 s; F3 again), the Z6III this time.
-- **Still not run:** any write to the Z6III, a cross-model apply, an opted-in raw-code enum, a literal.
+- **Then, with permission, a cross-model write (Z 9 to Z6III, one property).** From the plan above, the one `range_clamped`
+  property whose two bodies were a single step apart with identical bounds and step count:
+  `ISOAutoShutterTimeAutoValue` (33584, range -2 to +2 in 5 steps, the auto-ISO shutter-speed bias): Z 9 `value_index` 3,
+  Z6III 2. A one-property source was made from the Z 9 snapshot (its own model and serial).
+  1. Fresh Z6III baseline: gate `passed`, 200 read and 12 not, `value_index` 2.
+  2. `transplant --dry-run --json` onto the Z6III: "1 property would change", digest `6452279…98c0`.
+  3. `transplant --json`: exit 0, `applied_verified`, restore point
+     `Z6_3_…mcp-restore-pre-transplant-20261028T005722.883599Z…`, read-back gate `passed`, nothing not-taken or
+     unverifiable, no side effects. An independent `snapshot` diffed against the baseline: that property only, 2 to 3.
+  4. `restore --json --only ISOAutoShutterTimeAutoValue <that restore point>`: `applied_verified`, verdict `verified`,
+     empty residual, no side effects.
+  5. A final `snapshot` diffed against the baseline: no differences. Two writes in all, on one property.
+  The undo run printed its complete result and then hung at teardown (alive 150 s later, killed): F3 (4) again, after a
+  write this time; the result had been written and the final snapshot confirmed the state. The apply run exited cleanly.
+  What this settles: a cross-model write (`range_clamped`, different `Z 9` source and `Z6_3` target, no translation needed
+  beyond the clamp) lands, reads back and undoes through the CLI. What it does not: an enum by label or by raw code, a
+  literal, a range whose steps or bounds differ between the bodies, a multi-property apply, or the same through the MCP.
+- **Still not run:** an opted-in raw-code enum, a literal, a range with different bounds, and any apply through the MCP.
 
 ## F13. Still unverified
 
