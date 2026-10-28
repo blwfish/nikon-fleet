@@ -27,7 +27,10 @@ use nikon_fleet::ops::views::{diff_view, snapshot_view};
 use nikon_fleet::ops::worker::Outcome;
 use nikon_fleet::snapshot::Snapshot;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{CallToolResult, ErrorData, ProgressNotificationParam, RequestMetaObject};
+use rmcp::model::{
+    CallToolResult, ContentBlock, ErrorData, Implementation, InitializeResult, ProgressNotificationParam, RequestMetaObject,
+    ServerCapabilities,
+};
 use rmcp::service::RequestContext;
 use rmcp::{Peer, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -36,6 +39,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::guidance;
+use crate::notes::{self, Note, RenderOptions};
 use crate::supervisor::{CancelPolicy, Finished, Spec, SpawnError, Supervisor, writes_possible};
 
 /// Per-tool worker deadlines. They must stay under the client's own timeout
@@ -158,13 +163,33 @@ fn spawn_failure(e: &SpawnError) -> CallToolResult {
     failure("worker_spawn_failed", &e.to_string(), None)
 }
 
+// Plain JSON Schema for optional arguments. schemars would emit `"type": ["integer", "null"]` unions
+// and `"format": "uint32"`; plenty of tool-calling layers (and validators) handle neither, and an
+// optional argument is already expressed by not being listed in `required`.
+fn uint_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "integer", "minimum": 0})
+}
+fn string_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "string"})
+}
+fn bool_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "boolean"})
+}
+fn strings_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "array", "items": {"type": "string"}})
+}
+
 // ── arguments ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ListArgs {
     /// Only this camera, as "{model}_{serial}" (for example "Z 9_0000003023668").
+    #[serde(default)]
+    #[schemars(schema_with = "string_schema")]
     pub camera: Option<String>,
     /// Only snapshots whose label starts with this (for example "mcp-restore-" for restore points).
+    #[serde(default)]
+    #[schemars(schema_with = "string_schema")]
     pub label_prefix: Option<String>,
 }
 
@@ -173,10 +198,16 @@ pub struct GetSnapshotArgs {
     /// Snapshot file name inside the data directory's snapshots/ (a name, not a path).
     pub name: String,
     /// Only properties whose name contains this (case-sensitive substring, no patterns).
+    #[serde(default)]
+    #[schemars(schema_with = "string_schema")]
     pub name_contains: Option<String>,
     /// First property to return (default 0).
+    #[serde(default)]
+    #[schemars(schema_with = "uint_schema")]
     pub offset: Option<u32>,
     /// How many properties to return (default 0: a summary only; at most 500).
+    #[serde(default)]
+    #[schemars(schema_with = "uint_schema")]
     pub limit: Option<u32>,
 }
 
@@ -187,15 +218,23 @@ pub struct DiffArgs {
     /// Second snapshot file name in snapshots/.
     pub b: String,
     /// Also compare properties that change by themselves and enum default indexes (default false).
+    #[serde(default)]
+    #[schemars(schema_with = "bool_schema")]
     pub include_volatile: Option<bool>,
+    #[serde(default)]
+    #[schemars(schema_with = "uint_schema")]
     pub offset: Option<u32>,
     /// How many entries to return (default 100; at most 500).
+    #[serde(default)]
+    #[schemars(schema_with = "uint_schema")]
     pub limit: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct FirmwareArgs {
     /// Models to look up, for example "Z 9" or "Z6_3". Default: Z 9 and Z6_3.
+    #[serde(default)]
+    #[schemars(schema_with = "strings_schema")]
     pub models: Option<Vec<String>>,
 }
 
@@ -204,6 +243,8 @@ pub struct CaptureArgs {
     /// USB serial of the body (from list_cameras). `id-N` forms and SDK ids are refused.
     pub serial: String,
     /// Label for the snapshot; stored as "mcp-<label>".
+    #[serde(default)]
+    #[schemars(schema_with = "string_schema")]
     pub label: Option<String>,
 }
 
@@ -220,6 +261,8 @@ pub struct TransplantPlanArgs {
     /// USB serial of the body to copy onto.
     pub serial: String,
     /// Properties whose raw numeric value may be copied without being confirmed to mean the same thing on both bodies.
+    #[serde(default)]
+    #[schemars(schema_with = "strings_schema")]
     pub allow_raw_code: Option<Vec<String>>,
 }
 
@@ -227,6 +270,8 @@ pub struct TransplantPlanArgs {
 pub struct TransplantApplyArgs {
     pub source: String,
     pub serial: String,
+    #[serde(default)]
+    #[schemars(schema_with = "strings_schema")]
     pub allow_raw_code: Option<Vec<String>>,
     /// The plan's `digest`, copied from the transplant_plan result.
     pub plan_digest: String,
@@ -241,6 +286,8 @@ pub struct RestorePlanArgs {
     /// USB serial of the body. Must be the snapshot's own serial.
     pub serial: String,
     /// Restore only these properties (short or full names). Default: all.
+    #[serde(default)]
+    #[schemars(schema_with = "strings_schema")]
     pub only: Option<Vec<String>>,
 }
 
@@ -248,11 +295,27 @@ pub struct RestorePlanArgs {
 pub struct RestoreApplyArgs {
     pub source: String,
     pub serial: String,
+    #[serde(default)]
+    #[schemars(schema_with = "strings_schema")]
     pub only: Option<Vec<String>>,
     /// The plan's `digest`, copied from the restore_plan result.
     pub plan_digest: String,
     /// The plan's `summary`, copied from the restore_plan result.
     pub summary: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GuidanceArgs {
+    /// "strategy" (an overview, or one topic in full), "tactics" (the topics, or one in full) or "find" (search by problem).
+    pub operation: String,
+    /// A topic name, for "strategy" or "tactics".
+    #[serde(default)]
+    #[schemars(schema_with = "string_schema")]
+    pub topic: Option<String>,
+    /// A description of the problem or symptom, for "find".
+    #[serde(default)]
+    #[schemars(schema_with = "string_schema")]
+    pub problem: Option<String>,
 }
 
 fn flag_each(flag: &str, values: &Option<Vec<String>>) -> Vec<String> {
@@ -367,6 +430,8 @@ pub struct FleetMcp {
     /// mid-write does not abandon a half-applied camera. `main` waits for it.
     pub tasks: TaskTracker,
     tool_router: ToolRouter<Self>,
+    notes: Arc<Vec<Note>>,
+    instructions: Arc<String>,
 }
 
 impl FleetMcp {
@@ -376,7 +441,55 @@ impl FleetMcp {
             router.remove_route("transplant_apply");
             router.remove_route("restore_apply");
         }
-        FleetMcp { cfg: Arc::new(cfg), sup: Arc::new(sup), tasks: TaskTracker::new(), tool_router: router }
+        let notes = guidance::notes();
+        let instructions = notes::render_instructions(
+            &notes,
+            &RenderOptions {
+                capability_statement: &guidance::capability_statement(cfg.enable_writes),
+                query_tool_name: guidance::TOOL_NAME,
+                now: time::OffsetDateTime::now_utc().date(),
+                recent_days: 7,
+                max_notes: 8,
+            },
+        );
+        FleetMcp {
+            cfg: Arc::new(cfg),
+            sup: Arc::new(sup),
+            tasks: TaskTracker::new(),
+            tool_router: router,
+            notes: Arc::new(notes),
+            instructions: Arc::new(instructions),
+        }
+    }
+
+    /// Topics whose notes are shown in full in the strategy overview: every topic except the
+    /// write-only ones when writes are off.
+    fn active_topics(&self) -> std::collections::BTreeSet<String> {
+        self.notes
+            .iter()
+            .flat_map(|n| n.tags.iter().cloned())
+            .filter(|t| self.cfg.enable_writes || !guidance::WRITE_TOPICS.contains(&t.as_str()))
+            .collect()
+    }
+
+    /// The text of one `get_usage_guidance` call. Pure over the notes.
+    pub fn guidance(&self, a: &GuidanceArgs) -> CallToolResult {
+        let text = match a.operation.as_str() {
+            "strategy" => notes::strategy(&self.notes, a.topic.as_deref(), &self.active_topics()),
+            "tactics" => notes::tactics(&self.notes, a.topic.as_deref()),
+            "find" => match a.problem.as_deref() {
+                Some(p) if !p.trim().is_empty() => notes::find(&self.notes, p, 5),
+                _ => return failure("missing_problem", "operation \"find\" needs a non-empty `problem`", None),
+            },
+            other => {
+                return failure(
+                    "unknown_operation",
+                    &format!("unknown operation {other:?}"),
+                    Some(json!({"operations": ["strategy", "tactics", "find"]})),
+                );
+            }
+        };
+        CallToolResult::success(vec![ContentBlock::text(text)])
     }
 
     /// Run one worker call, forwarding progress when the client supplied a token.
@@ -434,6 +547,17 @@ impl FleetMcp {
 
 #[tool_router(router = tool_router)]
 impl FleetMcp {
+    #[tool(
+        name = "get_usage_guidance",
+        description = "How to use this server well: lessons that are not obvious from the tool list (how plan and apply fit together, what each status means, \
+                       which failures are normal). operation \"strategy\" gives an overview or, with `topic`, one topic in full; \"tactics\" lists the topics or gives one; \
+                       \"find\" searches by a description of the problem. Read-only.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_usage_guidance(&self, p: Parameters<GuidanceArgs>) -> Result<CallToolResult, ErrorData> {
+        Ok(self.guidance(&p.0))
+    }
+
     #[tool(
         name = "list_cameras",
         description = "List attached Nikon bodies from their USB descriptors (model, serial, firmware). Opens no camera session. \
@@ -630,4 +754,10 @@ impl FleetMcp {
 }
 
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for FleetMcp {}
+impl ServerHandler for FleetMcp {
+    fn get_info(&self) -> InitializeResult {
+        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("fleet-mcp", env!("CARGO_PKG_VERSION")))
+            .with_instructions(self.instructions.as_str())
+    }
+}

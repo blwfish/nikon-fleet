@@ -61,6 +61,8 @@ struct Server {
     pub notifications: Vec<Value>,
     /// Responses that arrived while waiting for a different request.
     pending: Vec<Value>,
+    /// The `initialize` result.
+    init: Value,
 }
 
 fn write_worker(dir: &Path) -> PathBuf {
@@ -99,12 +101,13 @@ impl Server {
                 }
             }
         });
-        let mut s = Server { child, stdin, rx, next_id: 1, dir, notifications: Vec::new(), pending: Vec::new() };
+        let mut s = Server { child, stdin, rx, next_id: 1, dir, notifications: Vec::new(), pending: Vec::new(), init: Value::Null };
         let init = s.request(
             "initialize",
             json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
         );
         assert!(init["result"]["serverInfo"].is_object(), "{init}");
+        s.init = init["result"].clone();
         s.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         s
     }
@@ -213,12 +216,13 @@ fn seed_snapshot(dir: &Path, file: &str, model: &str, serial: &str, label: &str,
     s.save_to_file(snaps.join(file)).unwrap();
 }
 
-const READ_ONLY_TOOLS: [&str; 10] = [
+const READ_ONLY_TOOLS: [&str; 11] = [
     "capture_snapshot",
     "check_against_reference",
     "diff_snapshots",
     "firmware_status",
     "get_snapshot",
+    "get_usage_guidance",
     "list_cameras",
     "list_references",
     "list_snapshots",
@@ -244,7 +248,7 @@ fn without_enable_writes_the_apply_tools_are_absent_and_a_direct_call_is_refused
 fn with_enable_writes_both_apply_tools_are_registered_and_marked_destructive() {
     let mut s = Server::start(&["--enable-writes"]);
     let names = s.tool_names();
-    assert_eq!(names.len(), 12);
+    assert_eq!(names.len(), 13);
     assert!(names.contains(&"transplant_apply".to_string()) && names.contains(&"restore_apply".to_string()));
     let list = s.request("tools/list", json!({}));
     for t in list["result"]["tools"].as_array().unwrap() {
@@ -438,4 +442,97 @@ fn a_client_that_disconnects_mid_apply_does_not_abandon_the_worker() {
     };
     assert!(status.success(), "{status:?}");
     assert!(s.dir.path().join("apply-finished").exists(), "the server exited before the apply worker finished");
+}
+
+// ── what the server tells every client about itself ─────────────────────
+
+#[test]
+fn the_handshake_names_the_server_and_carries_the_instructions() {
+    let s = Server::start(&[]);
+    assert_eq!(s.init["serverInfo"]["name"], json!("fleet-mcp"));
+    let ins = s.init["instructions"].as_str().expect("instructions in the initialize result");
+    assert!(ins.contains("Camera writes are DISABLED"), "{ins}");
+    assert!(ins.contains("Key things to know:") && ins.contains("get_usage_guidance(operation=\"strategy\")"), "{ins}");
+    assert!(ins.len() < 4500, "{} bytes", ins.len());
+    let w = Server::start(&["--enable-writes"]);
+    let ins = w.init["instructions"].as_str().unwrap();
+    assert!(ins.contains("Camera writes are ENABLED") && !ins.contains("DISABLED"), "{ins}");
+}
+
+#[test]
+fn input_schemas_are_plain_json_schema() {
+    // Some tool-calling layers reject `format` keywords, `["x","null"]` type unions and combinators.
+    fn walk(v: &Value, path: &str, bad: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => {
+                for (k, x) in m {
+                    if ["format", "anyOf", "oneOf", "allOf", "$ref", "$defs"].contains(&k.as_str()) {
+                        bad.push(format!("{path}/{k}"));
+                    }
+                    if k == "type" && x.is_array() {
+                        bad.push(format!("{path}/type is a union"));
+                    }
+                    walk(x, &format!("{path}/{k}"), bad);
+                }
+            }
+            Value::Array(a) => a.iter().enumerate().for_each(|(i, x)| walk(x, &format!("{path}/{i}"), bad)),
+            _ => {}
+        }
+    }
+    let mut s = Server::start(&["--enable-writes"]);
+    let list = s.request("tools/list", json!({}));
+    let mut bad = Vec::new();
+    for t in list["result"]["tools"].as_array().unwrap() {
+        walk(&t["inputSchema"], t["name"].as_str().unwrap(), &mut bad);
+    }
+    assert!(bad.is_empty(), "{bad:?}");
+    let req = |name: &str| -> Vec<String> {
+        let t = list["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == json!(name)).unwrap();
+        let mut r: Vec<String> = t["inputSchema"]["required"].as_array().map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect()).unwrap_or_default();
+        r.sort();
+        r
+    };
+    assert_eq!(req("get_snapshot"), ["name"]);
+    assert_eq!(req("capture_snapshot"), ["serial"]);
+    assert_eq!(req("diff_snapshots"), ["a", "b"]);
+    assert_eq!(req("restore_apply"), ["plan_digest", "serial", "source", "summary"]);
+    assert_eq!(req("transplant_apply"), ["plan_digest", "serial", "source", "summary"]);
+    assert_eq!(req("get_usage_guidance"), ["operation"]);
+    assert_eq!(req("list_snapshots"), Vec::<String>::new(), "every argument of list_snapshots is optional");
+    let gs = list["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == json!("get_snapshot")).unwrap();
+    assert_eq!(gs["inputSchema"]["properties"]["limit"]["type"], json!("integer"));
+    assert_eq!(gs["inputSchema"]["properties"]["limit"]["minimum"], json!(0));
+}
+
+fn text_of(r: &Value) -> String {
+    r["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string()
+}
+
+#[test]
+fn the_guidance_tool_serves_the_notes_and_refuses_what_it_does_not_know() {
+    let mut s = Server::start(&[]);
+    let r = s.call("get_usage_guidance", json!({"operation": "strategy"}));
+    assert!(!is_error(&r), "{r}");
+    let overview = text_of(&r);
+    assert!(overview.contains("Also available:"), "with writes off the apply strategy is a one-liner here: {overview}");
+    let r = s.call("get_usage_guidance", json!({"operation": "strategy", "topic": "apply"}));
+    assert!(text_of(&r).contains("Never compose either one yourself"), "{r}");
+    let r = s.call("get_usage_guidance", json!({"operation": "tactics"}));
+    assert!(text_of(&r).starts_with("Available tactical topics:"), "{r}");
+    let r = s.call("get_usage_guidance", json!({"operation": "find", "problem": "capture had 11 failed reads"}));
+    assert!(text_of(&r).contains("Eleven failed reads") || text_of(&r).contains("11 read") || text_of(&r).contains("196"), "{r}");
+    let r = s.call("get_usage_guidance", json!({"operation": "find"}));
+    assert!(is_error(&r) && structured(&r)["error"]["tag"] == json!("missing_problem"), "{r}");
+    let r = s.call("get_usage_guidance", json!({"operation": "find", "problem": "   "}));
+    assert_eq!(structured(&r)["error"]["tag"], json!("missing_problem"));
+    let r = s.call("get_usage_guidance", json!({"operation": "Strategy"}));
+    assert_eq!(structured(&r)["error"]["tag"], json!("unknown_operation"), "no case folding");
+    assert!(s.log("args.log").is_empty(), "guidance never starts a worker");
+}
+
+#[test]
+fn with_writes_the_apply_strategy_is_in_the_overview() {
+    let mut s = Server::start(&["--enable-writes"]);
+    let r = s.call("get_usage_guidance", json!({"operation": "strategy"}));
+    assert!(text_of(&r).contains("Never compose either one yourself"), "{r}");
 }
