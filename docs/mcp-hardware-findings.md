@@ -847,6 +847,15 @@ property only: `ISOAutoShutterTimeAutoValue` (33584), the same property as F23, 
     something else or invalid); the Z6III was at 1 shot, not infinity, when read (the camera display was not checked); or
     the two bodies order the options differently. Mapping it needs the user to set known values on the Z6III (for example
     2, 199, infinity) with a read after each. Unwritten on hardware.
+  - **The series (user set d2 on the Z6III, each read read-only, 2026-10-28).** Z6III: **1 reads index 1, 17 reads 17,
+    200 reads 200, infinity reads 1.** The user confirmed at the display that it was infinity when it read 1. So on the
+    Z6III the index follows the number, and **infinity is indistinguishable from 1 through the SDK range**. The Z 9 at
+    infinity reads index 0 (its other settings were not measured). Consequences, each reasoned from these readings and
+    **not tested**: (1) a transplant Z 9 to Z6III copies index 0, a position the Z6III has not been seen to report, so the
+    result is unknown (rejected, clamped to 1 shot per burst, or infinity); (2) a **restore** of a Z6III snapshot taken at
+    infinity writes back index 1, which would likely leave it at 1 shot per burst instead of infinity; (3) the field the
+    camera honours on a range write is itself unknown (F18), so (2) may also be ignored. `ShootingLimit` is therefore
+    not safely copyable or restorable on the Z6III as built. The Z6III was left at 17 by the series.
 - **Waiting on the user's naming (the opt-in rule):** the plan holds five `literal_unconfirmed` skips
   (`ElectronicVR`, `MovieRecMicrophone`, `MovieWBAutoType`, `MovieWindNoiseReduction`, `WBAutoType`) and seven
   `raw_code_unconfirmed` skips (`AEBracketingStep`, `AEBracketingType`, `AFSubjectDetection`, `ImageColorSpace`,

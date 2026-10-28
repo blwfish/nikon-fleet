@@ -826,3 +826,9 @@ automating the firmware licence; FTP profile writes; firmware flashing.
   the same menu setting reads as different indexes on the two bodies (or the Z6III was not at infinity when read), and
   copying by number would not be a faithful copy. The policy question is **open again**; do not write this property
   until the mapping is known. Candidate policy: skip a range whose bodies' defaults differ.
+  **The series then showed (Z6III set by the user, read-only reads):** 1 reads 1, 17 reads 17, 200 reads 200, and
+  infinity also reads 1, so on the Z6III infinity cannot be told from 1; the Z 9 at infinity reads 0. A Z6III snapshot
+  taken at infinity would, on restore, write index 1 (likely 1 shot per burst), and a Z 9 to Z6III transplant writes
+  index 0, whose effect is unknown. Neither tested. Decision needed (§9): exclude `ShootingLimit` from transplant and
+  restore with a named skip reason, or find out how the SDK represents infinity. A general "defaults differ" rule
+  would not have caught the restore case, since a same-body restore has equal defaults.
