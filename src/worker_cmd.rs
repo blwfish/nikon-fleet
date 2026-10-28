@@ -66,6 +66,10 @@ pub enum WorkerOp {
         /// Exit with this status after the result.
         #[arg(long, default_value_t = 0)]
         exit_code: i32,
+        /// After the result, leave through `process_exit::exit_now` (the read-only teardown),
+        /// before any `--hang-after-result` takes effect.
+        #[arg(long)]
+        exit_now: bool,
     },
     /// List the attached bodies from the USB descriptors. No SDK, no lock, no
     /// camera session: works with no SDK bundle installed.
@@ -140,6 +144,33 @@ pub enum WorkerOp {
     },
 }
 
+/// What the worker does with the camera session once the result is out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Teardown {
+    /// Drop the `Device` and `Sdk` as usual: `DisconnectDevice`, after the run-loop pump.
+    Disconnect,
+    /// Leave the session open and end the process with `_exit` (F24): the SDK's disconnect hangs on
+    /// both bodies, and an operation that wrote nothing has nothing to close cleanly.
+    ExitAfterResult,
+}
+
+impl Teardown {
+    /// The one place that says which operations may skip the disconnect. Exhaustive on purpose: a
+    /// new operation has to be classified here, and anything that can write to the camera keeps
+    /// the ordinary disconnect.
+    fn for_op(op: &WorkerOp) -> Teardown {
+        match op {
+            WorkerOp::Capture { .. }
+            | WorkerOp::Check { .. }
+            | WorkerOp::TransplantPlan { .. }
+            | WorkerOp::RestorePlan { .. } => Teardown::ExitAfterResult,
+            WorkerOp::TransplantApply { .. } | WorkerOp::RestoreApply { .. } => Teardown::Disconnect,
+            // No camera session at all.
+            WorkerOp::Selftest { .. } | WorkerOp::ListCameras => Teardown::Disconnect,
+        }
+    }
+}
+
 /// Run the worker; returns the process exit status.
 pub fn run(data_dir: &Path, bundle: &Path, schema: &Path, args: &WorkerArgs) -> i32 {
     let file = match open_result_fd(args.result_fd) {
@@ -150,22 +181,24 @@ pub fn run(data_dir: &Path, bundle: &Path, schema: &Path, args: &WorkerArgs) -> 
         }
     };
     let mut em = Emitter::new(file);
+    let teardown = Teardown::for_op(&args.op);
     match &args.op {
-        WorkerOp::Selftest { fail, hang_after_result, exit_code } => {
-            selftest(&mut em, *fail, *hang_after_result, *exit_code)
+        WorkerOp::Selftest { fail, hang_after_result, exit_code, exit_now } => {
+            selftest(&mut em, *fail, *hang_after_result, *exit_code, *exit_now)
         }
         WorkerOp::ListCameras => {
             progress(&mut em, "starting");
             let list = nikon_fleet::ops::cameras::list_cameras();
             finish(&mut em, Outcome::ok(serde_json::to_value(&list).unwrap_or(json!(null))))
         }
-        WorkerOp::Capture { serial, label } => capture(&mut em, data_dir, bundle, schema, serial, label.as_deref()),
-        WorkerOp::Check { serial } => op_check(&mut em, data_dir, bundle, schema, serial),
+        WorkerOp::Capture { serial, label } => capture(&mut em, teardown, data_dir, bundle, schema, serial, label.as_deref()),
+        WorkerOp::Check { serial } => op_check(&mut em, teardown, data_dir, bundle, schema, serial),
         WorkerOp::TransplantPlan { serial, source, allow_raw_code } => {
-            op_transplant(&mut em, data_dir, bundle, schema, serial, source, allow_raw_code, None)
+            op_transplant(&mut em, teardown, data_dir, bundle, schema, serial, source, allow_raw_code, None)
         }
         WorkerOp::TransplantApply { serial, source, allow_raw_code, digest, summary } => op_transplant(
             &mut em,
+            teardown,
             data_dir,
             bundle,
             schema,
@@ -175,10 +208,11 @@ pub fn run(data_dir: &Path, bundle: &Path, schema: &Path, args: &WorkerArgs) -> 
             Some((digest.as_str(), summary.as_str())),
         ),
         WorkerOp::RestorePlan { serial, source, only } => {
-            op_restore(&mut em, data_dir, bundle, schema, serial, source, only, None)
+            op_restore(&mut em, teardown, data_dir, bundle, schema, serial, source, only, None)
         }
         WorkerOp::RestoreApply { serial, source, only, digest, summary } => op_restore(
             &mut em,
+            teardown,
             data_dir,
             bundle,
             schema,
@@ -209,7 +243,7 @@ fn progress(em: &mut Emitter<File>, phase: &str) {
     }
 }
 
-fn selftest(em: &mut Emitter<File>, fail: bool, hang_after_result: bool, exit_code: i32) -> i32 {
+fn selftest(em: &mut Emitter<File>, fail: bool, hang_after_result: bool, exit_code: i32, exit_now: bool) -> i32 {
     progress(em, "starting");
     progress(em, "working");
     let outcome = if fail {
@@ -218,6 +252,9 @@ fn selftest(em: &mut Emitter<File>, fail: bool, hang_after_result: bool, exit_co
         Outcome::ok(json!({"selftest": true}))
     };
     let code = finish(em, outcome);
+    if exit_now {
+        nikon_fleet::process_exit::exit_now(if exit_code != 0 { exit_code } else { code });
+    }
     if hang_after_result {
         // Stands in for a hang in DisconnectDevice after the work is done.
         loop {
@@ -241,6 +278,7 @@ struct Body<'a, 'sdk> {
 /// **while the session is alive** so its result is written before teardown.
 fn with_body(
     em: &mut Emitter<File>,
+    teardown: Teardown,
     bundle: &Path,
     schema_path: &Path,
     serial: &str,
@@ -300,8 +338,13 @@ fn with_body(
         schema: &schema,
     };
     let outcome = f(em, &body);
-    finish(em, outcome)
-    // `device` and `sdk` drop here, after the result line was written and flushed.
+    let code = finish(em, outcome);
+    if teardown == Teardown::ExitAfterResult {
+        // The result line is out and flushed; nothing was written to the camera.
+        nikon_fleet::process_exit::exit_now(code);
+    }
+    code
+    // Otherwise `device` and `sdk` drop here, after the result line was written and flushed.
 }
 
 fn now() -> Result<String, Outcome> {
@@ -310,6 +353,7 @@ fn now() -> Result<String, Outcome> {
 
 fn capture(
     em: &mut Emitter<File>,
+    teardown: Teardown,
     data_dir: &Path,
     bundle: &Path,
     schema_path: &Path,
@@ -317,7 +361,7 @@ fn capture(
     label: Option<&str>,
 ) -> i32 {
     progress(em, "starting");
-    with_body(em, bundle, schema_path, serial, |em, body| {
+    with_body(em, teardown, bundle, schema_path, serial, |em, body| {
         let name_lookup = body.schema.name_map_for_model(&body.camera.model);
         let captured_at = match now() {
             Ok(t) => t,
@@ -351,9 +395,9 @@ fn capture(
     })
 }
 
-fn op_check(em: &mut Emitter<File>, data_dir: &Path, bundle: &Path, schema_path: &Path, serial: &str) -> i32 {
+fn op_check(em: &mut Emitter<File>, teardown: Teardown, data_dir: &Path, bundle: &Path, schema_path: &Path, serial: &str) -> i32 {
     progress(em, "starting");
-    with_body(em, bundle, schema_path, serial, |em, body| {
+    with_body(em, teardown, bundle, schema_path, serial, |em, body| {
         let ref_path = references_dir(data_dir).join(reference_filename(&body.camera.model, &body.camera.serial));
         let reference = match Snapshot::load_from_file(&ref_path) {
             Ok(r) => r,
@@ -398,6 +442,7 @@ fn op_check(em: &mut Emitter<File>, data_dir: &Path, bundle: &Path, schema_path:
 #[allow(clippy::too_many_arguments)]
 fn op_transplant(
     em: &mut Emitter<File>,
+    teardown: Teardown,
     data_dir: &Path,
     bundle: &Path,
     schema_path: &Path,
@@ -435,7 +480,7 @@ fn op_transplant(
     };
     let options = TransplantOptions { allow_raw_code: allow };
 
-    with_body(em, bundle, schema_path, serial, |em, body| {
+    with_body(em, teardown, bundle, schema_path, serial, |em, body| {
         let guard = match CodeNameGuard::new(body.schema, &source.camera.model, &body.camera.model) {
             Ok(g) => g,
             Err(e) => return Outcome::err("unsupported_model", e.to_string(), None),
@@ -487,6 +532,7 @@ fn op_transplant(
 #[allow(clippy::too_many_arguments)]
 fn op_restore(
     em: &mut Emitter<File>,
+    teardown: Teardown,
     data_dir: &Path,
     bundle: &Path,
     schema_path: &Path,
@@ -527,7 +573,7 @@ fn op_restore(
         }
     };
 
-    with_body(em, bundle, schema_path, serial, |em, body| {
+    with_body(em, teardown, bundle, schema_path, serial, |em, body| {
         let input = RestorePlanInput {
             source: &source,
             source_name: &source_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -575,4 +621,52 @@ fn op_restore(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn only_operations_that_cannot_write_may_skip_the_disconnect() {
+        let (serial, source) = (s("123"), s("a.json"));
+        let table: Vec<(WorkerOp, Teardown)> = vec![
+            (WorkerOp::Capture { serial: serial.clone(), label: None }, Teardown::ExitAfterResult),
+            (WorkerOp::Check { serial: serial.clone() }, Teardown::ExitAfterResult),
+            (
+                WorkerOp::TransplantPlan { serial: serial.clone(), source: source.clone(), allow_raw_code: vec![] },
+                Teardown::ExitAfterResult,
+            ),
+            (
+                WorkerOp::RestorePlan { serial: serial.clone(), source: source.clone(), only: vec![] },
+                Teardown::ExitAfterResult,
+            ),
+            (
+                WorkerOp::TransplantApply {
+                    serial: serial.clone(),
+                    source: source.clone(),
+                    allow_raw_code: vec![],
+                    digest: s("d"),
+                    summary: s("s"),
+                },
+                Teardown::Disconnect,
+            ),
+            (
+                WorkerOp::RestoreApply { serial, source, only: vec![], digest: s("d"), summary: s("s") },
+                Teardown::Disconnect,
+            ),
+            (WorkerOp::ListCameras, Teardown::Disconnect),
+            (
+                WorkerOp::Selftest { fail: false, hang_after_result: false, exit_code: 0, exit_now: false },
+                Teardown::Disconnect,
+            ),
+        ];
+        for (op, want) in table {
+            assert_eq!(Teardown::for_op(&op), want, "{op:?}");
+        }
+    }
 }

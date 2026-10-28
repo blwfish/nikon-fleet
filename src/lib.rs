@@ -14,6 +14,7 @@ pub mod firmware_webview;
 pub mod json_out;
 pub mod maid_layer;
 pub mod ops;
+pub mod process_exit;
 pub mod ptp_usb;
 pub mod range_value;
 pub mod sdk;

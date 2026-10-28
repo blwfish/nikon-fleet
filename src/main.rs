@@ -1066,7 +1066,8 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
         // a total failure, not a normal capture.
         bail!("no capability could be read ({} read error(s), see above); wrote an empty snapshot to {}", stats.read_err, path.display());
     }
-    Ok(())
+    // Read-only and finished: leave without closing the session (F24).
+    nikon_fleet::process_exit::exit_now(0)
 }
 
 /// Read one vendor-only property via raw USB PTP (`0x943B`), bypassing the
@@ -1215,7 +1216,8 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     } else {
         print_diff_human(&reference, &live, &d);
     }
-    Ok(())
+    // Read-only and finished: leave without closing the session (F24).
+    nikon_fleet::process_exit::exit_now(0)
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -118,6 +118,36 @@ fn the_result_is_readable_while_the_process_is_still_hanging_after_it() {
 }
 
 #[test]
+fn exit_now_leaves_with_the_result_delivered_and_beats_a_hang_that_follows_it() {
+    // The read-only teardown (F24): result out, then `_exit` — the hang flag after it never gets a chance.
+    let mut w = spawn(&[], &["selftest", "--exit-now", "--hang-after-result"], &[]);
+    let r = w.read();
+    assert_eq!(r.end, ReadEnd::Result(Outcome::ok(json!({"selftest": true}))));
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = w.child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(0));
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "exit_now did not end the process");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn exit_now_keeps_the_exit_status_rules_and_an_error_result_is_status_one() {
+    for (args, want) in [
+        (vec!["selftest", "--exit-now"], Some(0)),
+        (vec!["selftest", "--exit-now", "--fail"], Some(1)),
+        (vec!["selftest", "--exit-now", "--exit-code", "7"], Some(7)),
+    ] {
+        let mut w = spawn(&[], &args, &[]);
+        let _ = w.read();
+        assert_eq!(w.finish().0, want, "{args:?}");
+    }
+}
+
+#[test]
 fn the_exit_status_is_not_the_answer() {
     let mut w = spawn(&[], &["selftest", "--exit-code", "7"], &[]);
     let r = w.read();
