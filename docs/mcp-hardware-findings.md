@@ -808,8 +808,36 @@ property only: `ISOAutoShutterTimeAutoValue` (33584), the same property as F23, 
   that one property, all undone.
 - Test-harness note: my first cycle script lost descriptor 3 whenever `os.pipe()` returned it as the read end, so every
   worker exited 2 immediately; fixed before any of the numbers above. Not a product defect.
-- **Still not run:** Claude Desktop and other clients, an apply through Claude Code, and any strategy other than
-  `range_clamped` on a write.
+- **`enum_by_label` on a write, Z 9 source onto the Z6III (later the same day).** Two single-property cycles with the
+  worker ops, each: fresh Z6III snapshot, plan ("1 property would change", strategy `enum_by_label`), apply, independent
+  snapshot and diff, undo from the restore point, snapshot and diff.
+  - `MovieISOAutoHiLimit` (33874): **51200 (index 24) to 25600 (index 21)**. The Z6III's option list is longer than the
+    Z 9's (150 against 132 packed bytes: it ends in `Hi 0.3` to `Hi 2.0`), and the label matched in the shared prefix.
+    `applied_verified`, 5.1 s; the independent diff showed that one property, index 24 to 21; the undo was
+    `applied_verified` with an empty residual and the diff against the "before" snapshot showed no differences.
+  - `BracketingVary` (33063): **"AE & Flash" (index 0) to "AE Only" (index 1)**, lists identical. Same result: apply
+    `applied_verified` 5.0 s, diff exactly that property, undo `applied_verified`, no differences afterwards.
+  - A diff of the final Z6III state against the first baseline of the session: **no differences**. These two examples
+    are labels that sit at the *same* index on both bodies; a label that sits at *different* indexes on the two bodies has
+    not been written yet.
+- **Not written, and why: `ShootingLimit` (33086).** The plan wants to change it (`range_clamped`), but the two bodies'
+  *defaults differ*: Z 9 `default_index` 0, Z6III `default_index` 200 (range 0 to 200, 201 steps on both), and each body is
+  currently at its own default. `translate_range` maps by the number (`lower + index * (upper - lower) / (steps - 1)`),
+  so it would move the Z6III from its default to the other end. Whether the two bodies mean the same thing by that range
+  is unknown, and the write could not be judged afterwards because a stepped range reports `value: 0.0`. This is a
+  candidate defect in the range strategy, not a result: **a range whose defaults differ between source and target may not
+  be safe to copy by number.** Unwritten and untested.
+- **Waiting on the user's naming (the opt-in rule):** the plan holds five `literal_unconfirmed` skips
+  (`ElectronicVR`, `MovieRecMicrophone`, `MovieWBAutoType`, `MovieWindNoiseReduction`, `WBAutoType`) and seven
+  `raw_code_unconfirmed` skips (`AEBracketingStep`, `AEBracketingType`, `AFSubjectDetection`, `ImageColorSpace`,
+  `MeteringMode`, `MovieFileType`, `MovieScreenSize`). An opted-in write of one of each is still the untested part of
+  the strategy list.
+- Harness notes: the restore-point cap (50) also stopped my second round before any write until I moved the scratch
+  restore points aside by hand, and my script first read the wrong key (`verification`; an apply reports `readback`,
+  a restore reports `verification`) and stopped after a write that had landed, which I undid at once from the restore
+  point. No product defect in either; the second is one reason the scripts now stop at anything unexpected.
+- **Still not run:** Claude Desktop and other clients, an apply through Claude Code, a label that moves index between
+  bodies, and an opted-in raw-code or literal write.
 
 ## F13. Still unverified
 
