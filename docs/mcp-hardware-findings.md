@@ -718,9 +718,15 @@ scratch build with env-var hooks (branch `f3-experiments`, not on master). A run
 - **Fix:** `Device::drop` pumps the run loop for 300 ms (`PRE_DISCONNECT_PUMP`, above the shortest length tried) and
   then calls `DisconnectDevice`. The ordering is pinned by a unit test; whether the pump is *enough* is only a hardware
   question. **Verified on the Z 9:** 30 snapshots with the shipped binary, 30 exited cleanly in 3.6 to 5.0 s, none hung.
-- **Not yet verified:** the Z6III (not attached at the time), a write path (`transplant`/`restore`), and the worker
-  process. The supervisor's post-result grace and SIGKILL stay as a backstop regardless; the hang was never shown to
-  be impossible, only rare after the pump.
+- **Z6III: 28 of 30 clean, 2 hung.** The same 30 snapshots with the shipped binary, `Z6_3` (id 2), a few minutes after
+  it was plugged back in: runs 1 and 3 hung (killed at 25 s), runs 2 and 4 to 30 exited cleanly in 4.7 to 4.9 s. Both
+  hangs were at the start, so this may be the "first opens after attach" effect F3 suspected rather than the idle-gap
+  hang; 2 of 30 is also not distinguishable from a rate of a few percent. Neither reading is established. The control
+  rate was only ever measured on the Z 9, so there is no Z6III baseline to compare against. Camera healthy afterwards
+  (`discover` listed both bodies). **So the pump is not shown to remove the hang on the Z6III.**
+- **Not yet verified:** a settled-Z6III repeat (the 2 hangs vs. attach timing), a write path (`transplant`/`restore`),
+  and the worker process. The supervisor's post-result grace and SIGKILL stay as a backstop regardless; the hang was
+  never shown to be impossible, only rare after the pump.
 - Camera state was healthy after every kill, as in F3 and F14.
 
 ## F13. Still unverified
