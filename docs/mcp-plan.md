@@ -268,7 +268,7 @@ compile until mapped.
 | `literal` | scalar copied as-is |
 | `enum_by_label` | packed-string enum matched on the whole label |
 | `enum_by_raw_value` | enum matched by raw numeric code (weaker; see `raw_code_unconfirmed`) |
-| `range_clamped` | range value clamped/snapped into the target's bounds |
+| `range_clamped` | range position carried to the same position on the same scale (the name is from when it also clamped into a differing scale; that is now `range_scale_differs`, §5.3a) |
 
 | `SkipReason` tag | Routine? | Meaning |
 |---|---|---|
@@ -287,6 +287,8 @@ compile until mapped.
 | `never_copied` | routine (policy) | on the never-copy table (§5.2); no override |
 | `raw_code_unconfirmed` | policy | matched only by raw numeric code, would change the target, and was not opted in (§5.3) |
 | `literal_unconfirmed` | policy | a numeric literal scalar would change the target and was not opted in (§5.3); in the code since `6d412c7` |
+| `range_unverified` | policy | a range between two different models that are not both on the verified list (§5.3a); no override |
+| `range_scale_differs` | **warn** | the target's live range has different `lower`, `upper` or `steps` from the source's (§5.3a) |
 
 Report shape: counts per tag first, then the per-property list grouped by tag with the warn-worthy
 tags first; each written or would-write enum carries its `ResolvedChoice` (option label or `code
@@ -316,6 +318,24 @@ state-like or reset by the body, and omitting one property from a copy costs lit
 reads the same menu setting as a different index on each body (infinity is index 0 on a Z 9, index 1 on a Z6III where it is
 indistinguishable from 1 shot, and the Z5 has no infinity; F25), so neither a copy nor a restore can be trusted, and the table
 is the one place both read. Consequence: a restore, including a firmware rollback, does not bring this one setting back.
+
+### 5.3a Ranges: default-deny between models (2026-10-28)
+
+A range is a position on a scale, and the same position need not mean the same thing on another body (F25: `ShootingLimit`,
+max shots per burst, has 0 to 200 on a Z 9 and a Z6III and reads infinity as index 0 on one and index 1 on the other, and
+the Z5 has 1 to 100 and no infinity). So copying a range between two **different** models is allowed only when the
+property is on `range_policy::VERIFIED_RANGES` for both models; a copy within one model is always allowed (the scale is the
+same by identity). A model nobody has captured, such as a Z8, is refused until someone reads it and adds it:
+`range_unverified`, a policy skip with no override. Separately, whatever the models, a target whose live `lower`,
+`upper` or `steps` differ from the source's is `range_scale_differs` (exact comparison: these are SDK constants), so the
+earlier clamping into a narrower target scale no longer happens.
+
+"Verified" means exactly this and no more: `lower`, `upper`, `steps` and `default_index` were read identical in a capture from
+each listed model (32 ranges on the Z 5, Z 9 and Z6_3, six movie WB presets on the Z 9 and Z6_3; `PixelShiftShootingInterval`
+was seen on one model only). It does **not** show that each position means the same thing, which only someone at the camera can
+show, and `ShootingLimit` is the proof that identical bounds are not enough (it is on the never-copy table, §5.2). To add a
+model: capture it, compare every range against the listed models, and add the model to each range that matches. The check
+runs after the read-only test, so a range the target cannot write is reported `read_only`, not as a policy skip.
 
 ### 5.3 Raw-code opt-in
 
@@ -734,6 +754,10 @@ To write for the MCP:
 
 ### Decided 2026-10-28 (the user, after the build)
 
+- **Ranges are copied between models only when verified (F25).** After `ShootingLimit` read as a different position on each
+  body, the user chose default-deny over "copy unless known bad": see §5.3a. The user will have other models read later
+  (ZR, Z8, Z6II, Z30) and they are added to the table then.
+
 - **Baseline key: model, with firmware recorded.** As built: `no_baseline` fires when a capture's firmware differs
   from the baseline's *and* its readable set differs (`ops::baseline::check_against`, tested). A firmware update that
   changes the readable set gets `no_baseline` until someone reseeds; that is accepted.
@@ -839,3 +863,8 @@ automating the firmware licence; FTP profile writes; firmware flashing.
   as a 1 to 100 range (index 99 = 100 shots, confirmed at its display), so a Z 9 at infinity copied onto it would be
   clamped to 1 shot per burst with nothing in the plan to warn of it. This strengthens the case for excluding
   `ShootingLimit` by name rather than by a general rule.
+- **Ranges are default-deny between models (F25, 2026-10-28).** Two commits: `ShootingLimit` joined `NEVER_TRANSPLANT`, and
+  `range_policy::VERIFIED_RANGES` plus the live scale check made every other range between two different models
+  verified-only (§5.3a). The new skips are `range_unverified` (policy) and `range_scale_differs` (warn), counted in the CLI
+  summary and described in the guidance note `range-copy-is-default-deny`. A read-only plan of a Z 9 snapshot onto the Z5
+  planned 21 range copies (2 would change, the two settings that genuinely differ) and no new skip; nothing was written.

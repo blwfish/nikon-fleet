@@ -490,16 +490,40 @@ mod tests {
         assert_ne!(with.digest, without.digest);
     }
 
+    /// A plan between two bodies of one model, so only the range's scale decides (not the model pair).
+    fn same_model_plan(camera: &FakeCamera, entries: &[(&str, u32, Value)]) -> PlanReport {
+        let (src, bytes) = source_of("Z 9", entries);
+        let target = cam("Z 9", "T");
+        let caps: Vec<(&str, u32)> = entries.iter().map(|(n, c, _)| (*n, *c)).collect();
+        let g = CodeNameGuard::new(&parse_config(&[("Z 9", &caps)]), "Z 9", "Z 9").unwrap();
+        let options = opts(&[]);
+        build_plan(camera, &g, &PlanInput { source: &src, source_bytes: &bytes, target: &target, options: &options })
+    }
+
     #[test]
-    fn the_value_to_be_written_is_covered_when_only_the_target_bounds_change_it() {
+    fn a_target_whose_range_has_a_different_scale_is_skipped_and_never_clamped() {
+        // Source 8 of 0..10 used to clamp to a target's 0..5 or 0..6 and write 5 or 6. Now the scale
+        // not matching is the skip, whatever the target's bounds are.
         let range = |upper: f64, v: f64| json!({"value": v, "default": 0.0, "value_index": 0, "default_index": 0, "lower": 0.0, "upper": upper, "steps": 0});
         let entries = vec![("R", 9, range(10.0, 8.0))];
-        // Source 8 clamps to the target's upper bound: 5 or 6. Both change the target; same tags.
-        let a = plan_with(&FakeCamera::new().with(9, RW, range(5.0, 1.0)), &entries, "T", &[]);
-        let b = plan_with(&FakeCamera::new().with(9, RW, range(6.0, 1.0)), &entries, "T", &[]);
-        assert_eq!(a.counts.by_tag, b.counts.by_tag);
-        assert_eq!((a.counts.would_change, b.counts.would_change), (1, 1));
-        assert_ne!(a.digest, b.digest);
+        for target_upper in [5.0, 6.0, 11.0] {
+            let p = same_model_plan(&FakeCamera::new().with(9, RW, range(target_upper, 1.0)), &entries);
+            assert_eq!(p.counts.by_tag.get("range_scale_differs"), Some(&1), "target 0..{target_upper}");
+            assert_eq!((p.counts.copied, p.counts.would_change), (0, 0), "target 0..{target_upper}");
+        }
+        // The same scale on both sides is copied.
+        let same = same_model_plan(&FakeCamera::new().with(9, RW, range(10.0, 1.0)), &entries);
+        assert_eq!((same.counts.copied, same.counts.would_change), (1, 1));
+    }
+
+    #[test]
+    fn a_range_between_two_models_that_are_not_both_on_the_verified_list_is_skipped() {
+        let range = json!({"value": 8.0, "default": 0.0, "value_index": 0, "default_index": 0, "lower": 0.0, "upper": 10.0, "steps": 0});
+        let entries = vec![("R", 9, range.clone())];
+        // plan_with is Z 9 to Z 8, and code 9 is on no list.
+        let p = plan_with(&FakeCamera::new().with(9, RW, range), &entries, "T", &[]);
+        assert_eq!(p.counts.by_tag.get("range_unverified"), Some(&1));
+        assert_eq!((p.counts.copied, p.counts.would_change), (0, 0));
     }
 
     #[test]

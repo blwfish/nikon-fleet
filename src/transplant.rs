@@ -278,6 +278,15 @@ pub enum SkipReason {
     /// would change the target, and the user did not opt this property in.
     /// `proposed` is `5, was 3`, or `5 (target's current value unknown)`.
     LiteralUnconfirmed { proposed: String },
+    /// A numeric range between two different models, where the property is not
+    /// on [`crate::range_policy::VERIFIED_RANGES`] for both. The same position
+    /// on a scale need not mean the same thing on another body (F25), so the
+    /// range is skipped until both models have been read and added.
+    RangeUnverified { source_model: String, target_model: String },
+    /// The source's range and the target's live range differ in `lower`,
+    /// `upper` or `steps`, so a position cannot be carried across. Each side
+    /// reads like `0..200 in 201 steps`.
+    RangeScaleDiffers { source: String, target: String },
 }
 
 /// How a skip should be read. Routine skips are expected and numerous; policy
@@ -314,6 +323,8 @@ impl SkipReason {
             SkipReason::NeverCopied { .. } => "never_copied",
             SkipReason::RawCodeUnconfirmed { .. } => "raw_code_unconfirmed",
             SkipReason::LiteralUnconfirmed { .. } => "literal_unconfirmed",
+            SkipReason::RangeUnverified { .. } => "range_unverified",
+            SkipReason::RangeScaleDiffers { .. } => "range_scale_differs",
         }
     }
 
@@ -326,8 +337,10 @@ impl SkipReason {
             }
             SkipReason::NeverCopied { .. }
             | SkipReason::RawCodeUnconfirmed { .. }
-            | SkipReason::LiteralUnconfirmed { .. } => Severity::Policy,
-            SkipReason::NoMatchingOption
+            | SkipReason::LiteralUnconfirmed { .. }
+            | SkipReason::RangeUnverified { .. } => Severity::Policy,
+            SkipReason::RangeScaleDiffers { .. }
+            | SkipReason::NoMatchingOption
             | SkipReason::UnsupportedValueShape
             | SkipReason::TargetReadFailed(_)
             | SkipReason::MalformedSource
@@ -369,6 +382,10 @@ impl SkipReason {
             SkipReason::RawCodeUnconfirmed { proposed } | SkipReason::LiteralUnconfirmed { proposed } => {
                 Some(json!({ "proposed": proposed }))
             }
+            SkipReason::RangeUnverified { source_model, target_model } => {
+                Some(json!({ "source_model": source_model, "target_model": target_model }))
+            }
+            SkipReason::RangeScaleDiffers { source, target } => Some(json!({ "source": source, "target": target })),
         }
     }
 }
@@ -416,6 +433,17 @@ impl std::fmt::Display for SkipReason {
                 f,
                 "numeric value copied as-is, which is not known to mean the same on both bodies; \
                  would set {proposed}. Not written unless you opt this property in (--allow-raw-code)"
+            ),
+            SkipReason::RangeUnverified { source_model, target_model } => write!(
+                f,
+                "this range has not been checked between a {source_model} and a {target_model}, and the same \
+                 position on a scale need not mean the same thing on both. Not written until both models are \
+                 on the verified list"
+            ),
+            SkipReason::RangeScaleDiffers { source, target } => write!(
+                f,
+                "the range has a different scale on the two bodies (source: {source}; target: {target}), so a \
+                 position cannot be carried across"
             ),
             SkipReason::AmbiguousLabel { label, source_count, target_count } => write!(
                 f,
@@ -697,6 +725,8 @@ pub fn is_z_series_model(config: &MaidLayerConfig, model: &str) -> bool {
 pub struct CodeNameGuard {
     source: HashMap<u32, BTreeSet<String>>,
     target: HashMap<u32, BTreeSet<String>>,
+    source_model: String,
+    target_model: String,
 }
 
 impl CodeNameGuard {
@@ -712,6 +742,22 @@ impl CodeNameGuard {
         Ok(CodeNameGuard {
             source: config.name_sets_for_model(source_model),
             target: config.name_sets_for_model(target_model),
+            source_model: source_model.to_string(),
+            target_model: target_model.to_string(),
+        })
+    }
+
+    /// `Ok` if a range at `code` may be copied between the two models:
+    /// they are the same model, or both are listed for the code in
+    /// [`crate::range_policy::VERIFIED_RANGES`]. Default-deny: a code not on
+    /// the table, or a model not captured yet, is `RangeUnverified`.
+    pub fn check_range(&self, code: u32) -> Result<(), SkipReason> {
+        if crate::range_policy::range_copy_verified(code, &self.source_model, &self.target_model) {
+            return Ok(());
+        }
+        Err(SkipReason::RangeUnverified {
+            source_model: self.source_model.clone(),
+            target_model: self.target_model.clone(),
         })
     }
 
@@ -1107,7 +1153,37 @@ fn precheck<'a>(
     if cap.operations & OP_SET == 0 {
         return Err(SkipReason::ReadOnly);
     }
+    // Last, so a property the target cannot write is reported as read-only, not as a policy skip.
+    if is_range_shape(&prop.value) {
+        guard.check_range(prop.code)?;
+    }
     Ok(cap)
+}
+
+/// `lower`, `upper` and `steps` of a range-shaped value, or `None` if any is
+/// missing or the wrong type.
+fn range_scale(value: &Value) -> Option<(f64, f64, u64)> {
+    Some((value.get("lower")?.as_f64()?, value.get("upper")?.as_f64()?, value.get("steps")?.as_u64()?))
+}
+
+fn describe_scale((lower, upper, steps): (f64, f64, u64)) -> String {
+    format!("{lower}..{upper} in {steps} steps")
+}
+
+/// The scale a position is read against must be the same on both sides. A
+/// target whose live range differs from the source's (in `lower`, `upper` or
+/// `steps`, compared exactly: these are fixed SDK constants, not measurements)
+/// is not the scale anything was verified on, so it is skipped rather than
+/// clamped. A value that is not range-shaped on either side is left for
+/// `translate_value` to report.
+fn check_range_scale(source_value: &Value, target_live: Option<&Value>) -> Result<(), SkipReason> {
+    let (Some(src), Some(tgt)) = (range_scale(source_value), target_live.and_then(range_scale)) else {
+        return Ok(());
+    };
+    if src == tgt {
+        return Ok(());
+    }
+    Err(SkipReason::RangeScaleDiffers { source: describe_scale(src), target: describe_scale(tgt) })
 }
 
 /// Everything `transplant_one` decides between reading the target and writing
@@ -1120,6 +1196,7 @@ fn plan_property(
     target_live: Option<&Value>,
     opted_in: bool,
 ) -> Result<(Value, Strategy, Option<ResolvedChoice>), SkipReason> {
+    check_range_scale(source_value, target_live)?;
     let (translated, strategy) = translate_value(source_value, target_live)?;
     let choice = target_live.and_then(|l| resolve_choice(&translated, l, strategy));
     raw_code_gate(strategy, choice.as_ref(), opted_in)?;
@@ -1635,6 +1712,129 @@ mod tests {
         }
     }
 
+    // ── range policy: default-deny between models, one scale on both sides ─
+
+    fn scale(lower: f64, upper: f64, steps: u64) -> Value {
+        json!({"value": 0.0, "default": 0.0, "value_index": 1, "default_index": 0, "lower": lower, "upper": upper, "steps": steps})
+    }
+
+    #[test]
+    fn real_config_verified_range_names_match_their_codes() {
+        // Each (code, name) must exist as written in a Z-series section, so a mistyped code cannot
+        // leave the intended range refused (or a different one allowed).
+        let Some(c) = real_config() else { return };
+        let z: Vec<String> = c.known_models().into_iter().filter(|m| is_z_series_model(&c, m)).collect();
+        for (code, name, _) in crate::range_policy::VERIFIED_RANGES {
+            let found = z.iter().any(|m| c.name_sets_for_model(m).get(code).is_some_and(|names| names.contains(*name)));
+            assert!(found, "{name} is not named at code {code} in any Z-series section");
+        }
+    }
+
+    #[test]
+    fn a_range_scale_must_match_exactly_on_lower_upper_and_steps() {
+        let src = scale(0.0, 200.0, 201);
+        assert_eq!(check_range_scale(&src, Some(&scale(0.0, 200.0, 201))), Ok(()));
+        // At the boundary of each field: one step, one unit, or the smallest float apart is a different scale.
+        for (what, tgt) in [
+            ("steps below", scale(0.0, 200.0, 200)),
+            ("steps above", scale(0.0, 200.0, 202)),
+            ("upper below", scale(0.0, 199.0, 201)),
+            ("upper above", scale(0.0, 201.0, 201)),
+            ("lower below", scale(-1.0, 200.0, 201)),
+            ("lower above", scale(1.0, 200.0, 201)),
+            ("lower by one ulp", scale(f64::EPSILON, 200.0, 201)),
+            ("the Z5's ShootingLimit", scale(1.0, 100.0, 100)),
+        ] {
+            assert!(
+                matches!(check_range_scale(&src, Some(&tgt)), Err(SkipReason::RangeScaleDiffers { .. })),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scale_mismatch_names_both_scales() {
+        let err = check_range_scale(&scale(0.0, 200.0, 201), Some(&scale(1.0, 100.0, 100))).unwrap_err();
+        assert_eq!(
+            err,
+            SkipReason::RangeScaleDiffers { source: "0..200 in 201 steps".into(), target: "1..100 in 100 steps".into() }
+        );
+    }
+
+    #[test]
+    fn the_scale_check_leaves_non_range_values_to_the_translation() {
+        let r = scale(0.0, 10.0, 11);
+        assert_eq!(check_range_scale(&json!(5), Some(&r)), Ok(()), "a number source");
+        assert_eq!(check_range_scale(&r, None), Ok(()), "no live value");
+        assert_eq!(check_range_scale(&r, Some(&json!("text"))), Ok(()), "a non-range target");
+        // Missing fields are not a scale mismatch; translation reports the malformed shape.
+        let no_steps = json!({"lower": 0.0, "upper": 10.0});
+        assert_eq!(check_range_scale(&r, Some(&no_steps)), Ok(()));
+        assert_eq!(check_range_scale(&no_steps, Some(&r)), Ok(()));
+    }
+
+    #[test]
+    fn a_range_between_models_is_copied_only_when_both_are_on_the_verified_list() {
+        // 33049 (WBTuneAuto) is verified on the Z 5, Z 9 and Z6_3, not on a Z 8.
+        let r = |idx: u64| json!({"value": 0.0, "default": 0.0, "value_index": idx, "default_index": 612, "lower": 0.0, "upper": 1224.0, "steps": 1225});
+        let entries = [("WBTuneAuto", 33049, r(700))];
+        for (src, tgt, copied) in [
+            ("Z 9", "Z6_3", true),
+            ("Z6_3", "Z 5", true),
+            ("Z 9", "Z 9", true),
+            ("Z 9", "Z 8", false),
+            ("Z 8", "Z 9", false),
+            ("Z 8", "Z 8", true), // same model needs no list
+        ] {
+            let cam = FakeCamera::new().with(33049, RW, r(612));
+            let out = run_between(src, tgt, &cam, &entries, &[], true);
+            let want = if copied { "copied" } else { "range_unverified" };
+            assert_eq!(tag(&out[0]), want, "{src} -> {tgt}");
+        }
+    }
+
+    #[test]
+    fn a_range_not_on_the_list_is_refused_between_models_and_allowed_within_one() {
+        let r = scale(0.0, 10.0, 11);
+        let entries = [("Mystery", 40000, r.clone())];
+        let cam = FakeCamera::new().with(40000, RW, r);
+        assert_eq!(tag(&run_between("Z 9", "Z6_3", &cam, &entries, &[], true)[0]), "range_unverified");
+        assert_eq!(tag(&run_between("Z 9", "Z 9", &cam, &entries, &[], true)[0]), "copied");
+    }
+
+    #[test]
+    fn the_unverified_skip_names_the_two_models() {
+        let r = scale(0.0, 10.0, 11);
+        let cam = FakeCamera::new().with(40000, RW, r.clone());
+        let out = run_between("Z 9", "Z6_3", &cam, &[("Mystery", 40000, r)], &[], true);
+        assert_eq!(
+            out[0].result,
+            Err(SkipReason::RangeUnverified { source_model: "Z 9".into(), target_model: "Z6_3".into() })
+        );
+    }
+
+    #[test]
+    fn the_range_policy_never_touches_enums_or_scalars() {
+        // Only range-shaped values are gated: a number or a string between unlisted models still copies.
+        let cam = FakeCamera::new().with(1, RW, json!("a")).with(2, RW, json!(3));
+        let out = run_between("Z 9", "Z 8", &cam, &[("S", 1, json!("x")), ("N", 2, json!(3))], &[], true);
+        assert_eq!(out.iter().map(tag).collect::<Vec<_>>(), ["copied", "copied"]);
+    }
+
+    #[test]
+    fn precheck_reports_read_only_before_the_range_policy() {
+        // A range the target cannot write is a routine read-only skip, not a policy skip about models.
+        let c = parse_config(&[("Z 9", &[("Mystery", 40000)]), ("Z 8", &[("Mystery", 40000)])]);
+        let g = CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap();
+        let ro = cap_info(40000, OP_GET);
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(40000, &ro)]);
+        let prop = PropertyEntry { code: 40000, value: scale(0.0, 10.0, 11) };
+        assert_eq!(precheck(&caps, &g, &prop).unwrap_err(), SkipReason::ReadOnly);
+        let rw = cap_info(40000, OP_SET);
+        let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(40000, &rw)]);
+        assert!(matches!(precheck(&caps, &g, &prop), Err(SkipReason::RangeUnverified { .. })));
+    }
+
     #[test]
     fn precheck_refuses_shoot_no_card_even_when_present_and_writable() {
         let c = parse_config(&[("Z 9", &[("ShootNoCard", 33108)]), ("Z 8", &[("ShootNoCard", 33108)])]);
@@ -1764,6 +1964,8 @@ mod tests {
             SkipReason::NeverCopied { reason: "lock state" },
             SkipReason::RawCodeUnconfirmed { proposed: "code 5 (#2)".into() },
             SkipReason::LiteralUnconfirmed { proposed: "5, was 3".into() },
+            SkipReason::RangeUnverified { source_model: "Z 9".into(), target_model: "Z 8".into() },
+            SkipReason::RangeScaleDiffers { source: "0..200 in 201 steps".into(), target: "1..100 in 100 steps".into() },
         ]
     }
 
@@ -1779,6 +1981,7 @@ mod tests {
                 "unsupported_value_shape", "target_read_failed", "malformed_source", "write_failed",
                 "enum_undecoded_by_sdk", "enum_type_mismatch", "capability_name_mismatch",
                 "ambiguous_label", "never_copied", "raw_code_unconfirmed", "literal_unconfirmed",
+                "range_unverified", "range_scale_differs",
             ]
         );
         let distinct: BTreeSet<&str> = tags.iter().copied().collect();
@@ -1810,6 +2013,7 @@ mod tests {
                 ("malformed_source", Warn), ("write_failed", Error), ("enum_undecoded_by_sdk", Warn),
                 ("enum_type_mismatch", Warn), ("capability_name_mismatch", Warn), ("ambiguous_label", Warn),
                 ("never_copied", Policy), ("raw_code_unconfirmed", Policy), ("literal_unconfirmed", Policy),
+                ("range_unverified", Policy), ("range_scale_differs", Warn),
             ]
         );
     }
@@ -1836,6 +2040,16 @@ mod tests {
         assert_eq!(
             j(SkipReason::LiteralUnconfirmed { proposed: "5, was 3".into() }),
             json!({"tag": "literal_unconfirmed", "severity": "policy", "detail": {"proposed": "5, was 3"}})
+        );
+        assert_eq!(
+            j(SkipReason::RangeUnverified { source_model: "Z 9".into(), target_model: "Z 8".into() }),
+            json!({"tag": "range_unverified", "severity": "policy",
+                   "detail": {"source_model": "Z 9", "target_model": "Z 8"}})
+        );
+        assert_eq!(
+            j(SkipReason::RangeScaleDiffers { source: "0..200 in 201 steps".into(), target: "1..100 in 100 steps".into() }),
+            json!({"tag": "range_scale_differs", "severity": "warn",
+                   "detail": {"source": "0..200 in 201 steps", "target": "1..100 in 100 steps"}})
         );
     }
 
@@ -2764,8 +2978,16 @@ mod tests {
 
     /// Source and target share names at the codes used below, so the name guard passes.
     fn guard_for(codes: &[(&str, u32)]) -> CodeNameGuard {
-        let c = parse_config(&[("Z 9", codes), ("Z 8", codes)]);
-        CodeNameGuard::new(&c, "Z 9", "Z 8").unwrap()
+        guard_between("Z 9", "Z 8", codes)
+    }
+
+    fn guard_between(source: &str, target: &str, codes: &[(&str, u32)]) -> CodeNameGuard {
+        let c = if source == target {
+            parse_config(&[(source, codes)])
+        } else {
+            parse_config(&[(source, codes), (target, codes)])
+        };
+        CodeNameGuard::new(&c, source, target).unwrap()
     }
 
     fn props_of(entries: &[(&str, u32, Value)]) -> BTreeMap<String, PropertyEntry> {
@@ -2776,11 +2998,28 @@ mod tests {
     }
 
     fn run(cam: &FakeCamera, entries: &[(&str, u32, Value)], opt_in: &[&str], dry: bool) -> Vec<TransplantOutcome> {
+        run_between("Z 9", "Z 8", cam, entries, opt_in, dry)
+    }
+
+    /// A transplant between two bodies of the same model, where a range's scale is the same by
+    /// identity: for the tests of how a range is written and read back, not of which pairs may copy one.
+    fn run_same_model(cam: &FakeCamera, entries: &[(&str, u32, Value)], opt_in: &[&str], dry: bool) -> Vec<TransplantOutcome> {
+        run_between("Z 9", "Z 9", cam, entries, opt_in, dry)
+    }
+
+    fn run_between(
+        source: &str,
+        target: &str,
+        cam: &FakeCamera,
+        entries: &[(&str, u32, Value)],
+        opt_in: &[&str],
+        dry: bool,
+    ) -> Vec<TransplantOutcome> {
         let codes: Vec<(&str, u32)> = entries.iter().map(|(n, c, _)| (*n, *c)).collect();
         let options = TransplantOptions {
             allow_raw_code: opt_in.iter().map(|n| format!("kNkMAIDCapability_{n}")).collect(),
         };
-        transplant(cam, &props_of(entries), &guard_for(&codes), &options, dry)
+        transplant(cam, &props_of(entries), &guard_between(source, target, &codes), &options, dry)
     }
 
     fn tag(o: &TransplantOutcome) -> &'static str {
@@ -2892,12 +3131,12 @@ mod tests {
         let range = |v: f64, idx: u64| json!({"value": v, "default": 0.0, "value_index": idx, "default_index": 0, "lower": 0.0, "upper": 2.0, "steps": 3});
         // Honest body: the written value reads back.
         let good = FakeCamera::new().with(10, RW, range(0.0, 0));
-        let out = run(&good, &[("R", 10, range(2.0, 2))], &[], false);
+        let out = run_same_model(&good, &[("R", 10, range(2.0, 2))], &[], false);
         assert_eq!(out[0].result, Ok(Strategy::RangeClamped));
         assert_eq!(good.reads(), [10, 10], "one read for translation, one to verify the write");
         // A body that lands somewhere else after the write (a dependent override of the same code).
         let bad = FakeCamera::new().with(10, RW, range(0.0, 0)).with_dependent(10, 10, range(0.0, 0));
-        let out = run(&bad, &[("R", 10, range(2.0, 2))], &[], false);
+        let out = run_same_model(&bad, &[("R", 10, range(2.0, 2))], &[], false);
         assert!(matches!(&out[0].result, Err(SkipReason::WriteFailed(m)) if m.contains("reports")), "{:?}", out[0].result);
     }
 
@@ -2958,7 +3197,7 @@ mod tests {
     fn a_range_reports_change_by_value_with_a_tolerance_below_which_it_is_the_same() {
         let range = |v: f64| json!({"value": v, "default": 0.0, "value_index": 0, "default_index": 0, "lower": 0.0, "upper": 10.0, "steps": 0});
         let cam = FakeCamera::new().with(10, RW, range(2.0)).with(11, RW, range(2.0)).with(12, RW, range(2.0));
-        let out = run(&cam, &[("Same", 10, range(2.0)), ("Tiny", 11, range(2.0000001)), ("Moved", 12, range(2.5))], &[], true);
+        let out = run_same_model(&cam, &[("Same", 10, range(2.0)), ("Tiny", 11, range(2.0000001)), ("Moved", 12, range(2.5))], &[], true);
         // Outcomes are in name order: Moved, Same, Tiny.
         let by_name: Vec<(&str, Option<bool>)> = out.iter().map(|o| (o.name.as_str(), planned(o).changes)).collect();
         assert_eq!(
@@ -3055,7 +3294,7 @@ mod tests {
     fn copying_a_stepped_range_onto_itself_is_unchanged_and_the_write_verifies() {
         let live = stepped(612, 0.0, 1224.0, 1225);
         let cam = FakeCamera::new().with(10, RW, live.clone());
-        let out = run(&cam, &[("WBTuneAuto", 10, live)], &[], false);
+        let out = run_same_model(&cam, &[("WBTuneAuto", 10, live)], &[], false);
         assert_eq!(out[0].result, Ok(Strategy::RangeClamped), "the read-back check must not mistake the zero value field for a failure");
         let p = planned(&out[0]);
         assert_eq!(p.changes, Some(false));
@@ -3065,7 +3304,7 @@ mod tests {
     #[test]
     fn a_stepped_range_at_a_different_position_is_a_change_to_the_sources_position() {
         let cam = FakeCamera::new().with(10, RW, stepped(100, 0.0, 1224.0, 1225));
-        let out = run(&cam, &[("WBTuneAuto", 10, stepped(612, 0.0, 1224.0, 1225))], &[], true);
+        let out = run_same_model(&cam, &[("WBTuneAuto", 10, stepped(612, 0.0, 1224.0, 1225))], &[], true);
         let p = planned(&out[0]);
         assert_eq!((p.changes, p.value["value_index"].clone()), (Some(true), json!(612)));
     }
@@ -3086,13 +3325,13 @@ mod tests {
         let cam = FakeCamera::new()
             .with(10, RW, stepped(100, 0.0, 1224.0, 1225))
             .with_dependent(10, 10, stepped(612, 0.0, 1224.0, 1225));
-        let out = run(&cam, &[("WBTuneAuto", 10, stepped(612, 0.0, 1224.0, 1225))], &[], false);
+        let out = run_same_model(&cam, &[("WBTuneAuto", 10, stepped(612, 0.0, 1224.0, 1225))], &[], false);
         assert_eq!(out[0].result, Ok(Strategy::RangeClamped), "{:?}", out[0].result);
         // And a body that lands on the wrong position is still caught.
         let bad = FakeCamera::new()
             .with(10, RW, stepped(100, 0.0, 1224.0, 1225))
             .with_dependent(10, 10, stepped(0, 0.0, 1224.0, 1225));
-        let out = run(&bad, &[("WBTuneAuto", 10, stepped(612, 0.0, 1224.0, 1225))], &[], false);
+        let out = run_same_model(&bad, &[("WBTuneAuto", 10, stepped(612, 0.0, 1224.0, 1225))], &[], false);
         assert!(matches!(&out[0].result, Err(SkipReason::WriteFailed(m)) if m.contains("reports")), "{:?}", out[0].result);
     }
 }

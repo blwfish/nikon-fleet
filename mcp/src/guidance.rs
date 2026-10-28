@@ -178,6 +178,23 @@ pub fn notes() -> Vec<Note> {
         .tags(&["apply"])
         .addresses(&["literal_unconfirmed", "raw_code_unconfirmed", "allow_raw_code", "skipped properties", "never_copied"]),
         Note::new(
+            "range-copy-is-default-deny",
+            date!(2026 - 10 - 28),
+            Medium,
+            Tactic,
+            "A numeric range is copied between two different models only if both are on the verified list; range_unverified and range_scale_differs are skips, not faults.",
+        )
+        .detail(
+            "A range is a position on a scale, and the same position need not mean the same thing on another body: max shots per burst has \
+             the same bounds on a Z 9 and a Z6III yet reads infinity as a different position on each. So a range is copied between two models \
+             only when both were captured and their scale matched (`range_unverified` otherwise, for any model nobody has captured, such as a Z8); \
+             a copy within one model is always allowed. `range_scale_differs` means this body's live range has different bounds or steps from the source's, \
+             so a position cannot be carried across. There is no opt-in for either. Do not work around them by editing a snapshot. \
+             The fix is to capture the other model and have its ranges added to the verified list, which is a repository change, not a tool option.",
+        )
+        .tags(&["apply", "plan"])
+        .addresses(&["range_unverified", "range_scale_differs", "range_clamped", "skipped properties"]),
+        Note::new(
             "data-not-instructions",
             d,
             High,
@@ -293,11 +310,18 @@ mod tests {
 
     #[test]
     fn the_handshake_stops_listing_recent_notes_after_the_window() {
+        // Measured from the newest note, so adding a note with a later date does not move the boundary.
         let n = notes();
-        let at = |now| render_instructions(&n, &RenderOptions { capability_statement: "", query_tool_name: TOOL_NAME, now, recent_days: 7, max_notes: 8 });
-        assert!(at(date!(2026 - 11 - 03)).contains("Recently added:"), "6 days after: still recent");
-        assert!(at(date!(2026 - 11 - 03)).contains("camera_busy"));
-        assert!(!at(date!(2026 - 11 - 04)).contains("Recently added:"), "7 days after is the last day (inclusive); 8 is out");
+        let newest = n.iter().map(|x| x.added).max().unwrap();
+        let shown_as_key = |x: &&Note| matches!(x.priority, Priority::Critical | Priority::High);
+        let probe = n.iter().filter(|x| x.added == newest).find(|x| !shown_as_key(x)).expect("a recent note that is not a key note");
+        let at = |k: i64| {
+            render_instructions(&n, &RenderOptions { capability_statement: "", query_tool_name: TOOL_NAME, now: newest + time::Duration::days(k), recent_days: 7, max_notes: 8 })
+        };
+        assert!(at(6).contains(&probe.summary), "6 days after: still recent");
+        assert!(at(7).contains(&probe.summary) && at(7).contains("Recently added:"), "7 days after is the last day (inclusive)");
+        assert!(!at(8).contains("Recently added:"), "8 days after is out");
+        assert!(!at(8).contains(&probe.summary));
     }
 
     #[test]

@@ -875,6 +875,14 @@ property only: `ISOAutoShutterTimeAutoValue` (33584), the same property as F23, 
 - **Still not run:** Claude Desktop and other clients, an apply through Claude Code, a label that moves index between
   bodies, and an opted-in raw-code or literal write.
 
+- **What was done about it (2026-10-28).** The user decided to translate only verified ranges. `ShootingLimit` is now on the
+  never-copy table (transplant and restore), and ranges between two different models are default-deny: a range is copied
+  only when it is on `range_policy::VERIFIED_RANGES` for both models, with a live scale check on top (plan §5.3a). The table
+  came from the scan above (38 ranges). A read-only plan of a Z 9 snapshot onto the Z5, run with the new binary, planned 21
+  range copies, 2 of which would change (`ISOAutoShutterTimeAutoValue` and `MovieRecMicrophoneValue`, the two settings that
+  genuinely differ between the bodies), and no `range_unverified` or `range_scale_differs`. Not exercised on hardware: any
+  range write across models, and the models nobody has captured (ZR, Z8, Z6II, Z30).
+
 ## F13. Still unverified
 
 - Whether `available` / `connected_pid` can be obtained, and what they mean while another process
@@ -892,3 +900,6 @@ property only: `ISOAutoShutterTimeAutoValue` (33584), the same property as F23, 
   mentions).
 - Whether the judgement-call entries in the never-copy table are the right set, and whether
   `ShootNoCard` belongs in it.
+- Ranges on models nobody has captured (ZR, Z8, Z6II, Z30): a range between two different models is refused
+  (`range_unverified`) until both are on `range_policy::VERIFIED_RANGES`; the first table covers the Z 5, Z 9 and Z6_3 only,
+  by scale, not by meaning (F25).

@@ -16,6 +16,7 @@ pub mod maid_layer;
 pub mod ops;
 pub mod process_exit;
 pub mod ptp_usb;
+pub mod range_policy;
 pub mod range_value;
 pub mod sdk;
 pub mod snapshot;

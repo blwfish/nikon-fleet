@@ -25,6 +25,7 @@ pub fn render_transplant(outcomes: &[TransplantOutcome], dry_run: bool) -> Trans
     let (mut absent, mut read_only, mut unsupported_type, mut no_match) = (0usize, 0usize, 0usize, 0usize);
     let (mut type_mismatch, mut sdk_decode, mut name_mismatch, mut ambiguous) = (0usize, 0usize, 0usize, 0usize);
     let (mut never, mut other) = (0usize, 0usize);
+    let (mut range_unverified, mut range_scale) = (0usize, 0usize);
     let mut raw_unconfirmed: Vec<(String, String)> = Vec::new();
     let mut literal_unconfirmed: Vec<(String, String)> = Vec::new();
 
@@ -59,6 +60,8 @@ pub fn render_transplant(outcomes: &[TransplantOutcome], dry_run: bool) -> Trans
                     SkipReason::NeverCopied { .. } => never += 1,
                     SkipReason::RawCodeUnconfirmed { proposed } => raw_unconfirmed.push((o.name.clone(), proposed.clone())),
                     SkipReason::LiteralUnconfirmed { proposed } => literal_unconfirmed.push((o.name.clone(), proposed.clone())),
+                    SkipReason::RangeUnverified { .. } => range_unverified += 1,
+                    SkipReason::RangeScaleDiffers { .. } => range_scale += 1,
                     SkipReason::UnsupportedValueShape | SkipReason::TargetReadFailed(_) | SkipReason::MalformedSource => other += 1,
                 }
                 // Whether to warn is the reason's own severity, not a second table here.
@@ -79,6 +82,7 @@ pub fn render_transplant(outcomes: &[TransplantOutcome], dry_run: bool) -> Trans
          skipped(name-mismatch)={name_mismatch} skipped(ambiguous-label)={ambiguous} \
          skipped(never-copied)={never} skipped(raw-code-unconfirmed)={} \
          skipped(literal-unconfirmed)={} \
+         skipped(range-unverified)={range_unverified} skipped(range-scale-differs)={range_scale} \
          skipped(other)={other}  errors={}\n",
         if dry_run { "Dry run:" } else { "Transplant complete:" },
         out.written,

@@ -395,6 +395,8 @@ mod tests {
 
     const RW: u32 = OP_GET | OP_SET;
     const AT: &str = "2026-10-27T17:26:00.688812Z";
+    /// A range that is on the verified-range table for both models the fixture uses (Z6_3 and Z 9).
+    const WB_TUNE_AUTO: (&str, u32) = ("kNkMAIDCapability_WBTuneAuto", 33049);
 
     /// A fake Z 9 that reads and writes exactly the baseline's capabilities (value 1 each).
     struct World {
@@ -951,18 +953,19 @@ mod tests {
     fn a_stepped_range_is_applied_and_verified_against_a_body_that_reads_its_value_back_as_zero() {
         // The real SDK shape (F18): the position is right, the `value` field reads 0.0.
         let st = |i: u64| json!({"value": 0.0, "default": 0.0, "value_index": i, "default_index": 612, "lower": 0.0, "upper": 1224.0, "steps": 1225});
-        let w = world_with(|c, codes| c.with(codes[0].1, RW, st(612)).with_sdk_range_quirk(), 0);
+        // WBTuneAuto: on the verified-range table for the Z6_3 to Z 9 pair the fixture uses.
+        let (name, code) = (WB_TUNE_AUTO.0.to_string(), WB_TUNE_AUTO.1);
+        let w = world_with(|c, _| c.with(code, RW, st(612)).with_sdk_range_quirk(), 0);
         let mut f = fixture(&w, true);
-        let (name, code) = w.codes[0].clone();
         f.source.insert(name.clone(), code, st(613));
         f.bytes = f.source.to_pretty_json().unwrap().into_bytes();
         let r = apply_planned(&w, &f).unwrap();
         assert_eq!(r.status, ApplyStatus::AppliedVerified, "{:?}", r.readback.as_ref().map(|rb| (&rb.not_taken, &rb.unverifiable)));
         assert_eq!(w.cam.value(code).unwrap()["value_index"], json!(613));
         // A body that ignores the write is caught even though the call said success.
-        let w2 = world_with(|c, codes| c.with(codes[0].1, RW, st(612)).with_sdk_range_quirk().ignoring_writes(codes[0].1), 0);
+        let w2 = world_with(|c, _| c.with(code, RW, st(612)).with_sdk_range_quirk().ignoring_writes(code), 0);
         let mut f2 = fixture(&w2, true);
-        let (n2, c2) = w2.codes[0].clone();
+        let (n2, c2) = (name.clone(), code);
         f2.source.insert(n2.clone(), c2, st(613));
         f2.bytes = f2.source.to_pretty_json().unwrap().into_bytes();
         let r2 = apply_planned(&w2, &f2).unwrap();
