@@ -22,10 +22,10 @@ pub const CAPTURE_PREFIX: &str = "mcp-";
 /// Marks a restore point made through the MCP. Checked before [`CAPTURE_PREFIX`].
 pub const RESTORE_PREFIX: &str = "mcp-restore-";
 
-/// Placeholder cap on MCP captures per camera, chosen at build time
-/// (docs/mcp-plan.md §9, still open).
+/// Cap on MCP captures per camera (docs/mcp-plan.md §9, decided 2026-10-28:
+/// a snapshot is about 83 KB, so 200 is about 16 MB).
 pub const MAX_CAPTURES_PER_CAMERA: usize = 200;
-/// Placeholder cap on MCP restore points per camera.
+/// Cap on MCP restore points per camera (about 4 MB at 50; decided 2026-10-28).
 pub const MAX_RESTORE_POINTS_PER_CAMERA: usize = 50;
 
 /// Longest label an agent may supply (before the prefix).

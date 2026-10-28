@@ -107,7 +107,7 @@ that exists but cannot be read (`reference_read_failures`) instead of treating i
 - **Retention.** There is no `rm` tool, so captures and restore points only accumulate. Files the
   MCP creates are marked by label prefix, added server-side so an agent-supplied label cannot
   dodge it: `mcp-<label>` for captures, `mcp-restore-<op>-<timestamp>` for restore points. Each
-  kind has its own per-camera cap (placeholders, chosen at build time). `capture_snapshot` refuses
+  kind has its own per-camera cap (200 and 50, decided in §9). `capture_snapshot` refuses
   with `data_dir_full` past the capture cap; `*_apply` refuses with `data_dir_full`, before any
   write, past the restore-point cap. Nothing is auto-deleted.
 - **The SDK runs in a killable worker process with a watchdog.** The SDK is documented as not
@@ -471,7 +471,7 @@ snapshot" as meaningful, or filter them from the default lists.
 | A small camera-port trait (`capabilities`/`read_capability`/`write_capability`) so plan/apply and the restore-point logic are testable without a `Device` (`plan_property` covers translate+gate only) | **done** (`72ed3a8`, `ops::port::{CameraPort, FakeCamera}`); `transplant()`, `capture()` and `restore::execute()` run on it |
 | Lift `firmware latest --json`'s types out of `main.rs` | **done** (`a08312a`, `ops::firmware_latest`) |
 | Strict USB-serial matcher in `ops` (refuses `id-N` and bare SDK ids, `no_usb_serial`); the CLI keeps `serial_matches` (§3) | matcher **done** (`638c23c`, `ops::target`); no caller yet, the MCP tools will be the first |
-| `mcp-` / `mcp-restore-` label prefixes and the two per-camera caps (§3) | **done** (`51ac523`, `f1b2705`, `ops::retention`): labels, per-camera counting by file content, cap checks (200 captures / 50 restore points, placeholders). Nothing calls it yet; the capture and apply tools will |
+| `mcp-` / `mcp-restore-` label prefixes and the two per-camera caps (§3) | **done** (`51ac523`, `f1b2705`, `ops::retention`): labels, per-camera counting by file content, cap checks (200 captures / 50 restore points, decided in §9). Nothing calls it yet; the capture and apply tools will |
 | Read-back in `ops`: transplant returns `side_effects`, restore returns `residual` (§5.5-5.6) | **done** (`1c83fcb`, `ops::readback::{side_effects, residual}`), and the whole apply/undo sequence is tested on a fake body (`48c9b90`) |
 | Capture gate evaluated in memory before the file is written (a failed gate leaves no file) | **done** in the CLI and GUI (`d786333`); `ops::capture` returns the stats and the failed reads |
 
@@ -725,16 +725,25 @@ To write for the MCP:
     typed errors as `Err(Json<E>)`; handlers `select!` on `ctx.ct`; `rmcp-macros` pinned with
     `rmcp`; no `u64` in tool schemas.
 
+### Decided 2026-10-28 (the user, after the build)
+
+- **Baseline key: model, with firmware recorded.** As built: `no_baseline` fires when a capture's firmware differs
+  from the baseline's *and* its readable set differs (`ops::baseline::check_against`, tested). A firmware update that
+  changes the readable set gets `no_baseline` until someone reseeds; that is accepted.
+- **Retention caps: 200 captures and 50 restore points per camera.** A snapshot is about 83 KB, so about 16 MB and 4 MB.
+  Nothing is auto-deleted and there is no delete tool; past a cap the call refuses with `data_dir_full` and the user
+  tidies by hand. A human prune command is not built; add it if the caps start to bite.
+- **Per-tool deadlines unchanged: capture 90 s, check 120 s, plan 150 s, apply 300 s** (`--deadline-secs` overrides).
+  Healthy calls take about 3 to 20 s and a hang after the result is handled by the 3 s grace, so the deadlines bind
+  rarely. A too-long read deadline only makes a stuck call slow; a too-short apply deadline would make a good write
+  look `indeterminate`, so the apply one stays generous. Clients' own request timeouts are still unverified (§8.2).
+- **Same-model pairing: keep refusing `ambiguous_pairing`.** No verified pairing method exists, and a wrong pairing
+  stamps a capture with the wrong serial or writes to the wrong body. A read-only search for a body-unique capability
+  with two Z 9s attached was offered and declined for now.
+
 ### Still open
 
-- Whether the baseline key must include firmware (F5 suggests it may). Cheapest path: key by
-  model, record the firmware in the file, and make `no_baseline` fire when a capture's firmware
-  differs from the baseline's *and* the readable set differs.
-- The two retention caps' numbers (§3; captures and restore points separately), and whether
-  restore points should ever be pruned by a human command.
-- The per-tool worker deadlines, the apply one especially, and their relation to the clients'
-  request timeouts (§3, §8.2).
-- A verified way to pair same-model bodies, which would lift `ambiguous_pairing` (§3).
+Nothing from the earlier list. New questions go here.
 
 ## 10. Out of scope
 
@@ -796,3 +805,13 @@ automating the firmware licence; FTP profile writes; firmware flashing.
   and the diff; what stays MCP-only is policy: the `mcp-` label prefix, the per-camera caps and the strict gate.
   The §7 parity test is by construction (one constructor per reported value) plus the live check that the CLI's dry-run
   digest equals the MCP's plan digest.
+- **Plan lists are paged; the capture result says what is normal (later on 2026-10-28).** `transplant_plan` and
+  `restore_plan` take `offset` and `limit` (default 50, at most 500) and return that window of `outcomes` / `steps`
+  with a `page` object (`total`, `returned`, `truncated`, `next`, `list`). `digest`, `summary` and `counts` always
+  describe the whole plan, so every page of one plan carries the same digest; each page is a fresh run against the body,
+  so a digest that differs between pages means the plan changed. The paging is `ops::views::page_list` applied to the
+  worker's result in the server (the worker, the CLI `--json` and the digest are unchanged), and the most important
+  entries are already first in the list. The capture result gains `expected_unreadable` and `unexpected_unreadable`
+  (null when the gate did not judge the capture), which closes the usability item from F20. The three fields F21 left
+  unexplained (`unknown_schema: 5`, `source_label: null`, `changes: null`) are explained in the `unreadable-is-normal`
+  and new `reading-a-plan` notes: the five `cap_0x…` names are the same generic device facts on both bodies.

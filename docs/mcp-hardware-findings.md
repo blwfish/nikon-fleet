@@ -729,7 +729,17 @@ scratch build with env-var hooks (branch `f3-experiments`, not on master). A run
   6 of 60 (10%) Z6III runs hung, against 0 of 30 on the Z 9.** The pump removes the Z 9's hang and only reduces or
   does not touch the Z6III's; whether that is a lower rate or the same rate as before the fix is unknown, since no
   Z6III control was run. The Z6III's hang may have a different or additional cause.
-- **Not yet verified:** a Z6III control and pump-length/placement arms (as for the Z 9), a write path (`transplant`/`restore`),
+- **Z6III experiment arms (80 runs, the scratch build, randomised):** control 3/16, sleep 0.3 s **16/16**, pump 0.2 s
+  0/16, pump 1.5 s 1/16, pump after every read plus 0.2 s 0/16; healthy disconnects 1.52 to 1.58 s as on the Z 9. So the
+  Z6III has the same mechanism: any idle gap before `DisconnectDevice` hangs it every time, and servicing the run loop
+  prevents most hangs. What does not line up is the shipped fix: 300 ms of pump before the disconnect and nothing else
+  hung 6/60 on the Z6III, while the 0.2 s and 1.5 s arms of the experiment hung 1/32 together. With these counts
+  (1/32 against 6/60) that is not distinguishable from chance, and the experiment build also printed trace lines around
+  the disconnect, so the arms are not byte-for-byte the shipped code. Pooled over both bodies the best arm is the
+  one that pumps after every read *and* before the disconnect: 0/16 on the Z 9 and 0/16 on the Z6III, against 4/16 for
+  per-read pumping alone on the Z 9. **That arm is not what shipped.** Candidate next step: pump the run loop (zero
+  duration) after each capability read as well, then repeat the 60 Z6III snapshots; the cost is one cheap call per read.
+- **Not yet verified:** the shipped-code-versus-arm discrepancy above, a write path (`transplant`/`restore`),
   and the worker process. The supervisor's post-result grace and SIGKILL stay as a backstop regardless; the hang was
   never shown to be impossible, only rare after the pump.
 - Camera state was healthy after every kill, as in F3 and F14.
