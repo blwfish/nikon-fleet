@@ -831,4 +831,7 @@ automating the firmware licence; FTP profile writes; firmware flashing.
   taken at infinity would, on restore, write index 1 (likely 1 shot per burst), and a Z 9 to Z6III transplant writes
   index 0, whose effect is unknown. Neither tested. Decision needed (§9): exclude `ShootingLimit` from transplant and
   restore with a named skip reason, or find out how the SDK represents infinity. A general "defaults differ" rule
-  would not have caught the restore case, since a same-body restore has equal defaults.
+  would not have caught the restore case, since a same-body restore has equal defaults. **The Z5** reads this property
+  as a 1 to 100 range (index 99 = 100 shots, confirmed at its display), so a Z 9 at infinity copied onto it would be
+  clamped to 1 shot per burst with nothing in the plan to warn of it. This strengthens the case for excluding
+  `ShootingLimit` by name rather than by a general rule.

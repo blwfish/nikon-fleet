@@ -856,6 +856,13 @@ property only: `ISOAutoShutterTimeAutoValue` (33584), the same property as F23, 
     infinity writes back index 1, which would likely leave it at 1 shot per burst instead of infinity; (3) the field the
     camera honours on a range write is itself unknown (F18), so (2) may also be ignored. `ShootingLimit` is therefore
     not safely copyable or restorable on the Z6III as built. The Z6III was left at 17 by the series.
+  - **The Z5 (read-only capture, serial 0000003021501, firmware 1.43; the capture gate was `no_baseline` /
+    `unknown_model`, 165 properties).** `ShootingLimit` is a **1 to 100 range in 100 steps, `value_index` 99,
+    `default_index` 99**; the user confirmed the Z5's d2 shows **100**, so index 99 is 100 shots (index = number minus 1
+    on this body) and the default is the top of the scale. The Z5 has no 0 position and no infinity. Three bodies, three
+    scales (Z5 1 to 100; Z6III 0 to 200 with index = number; Z 9 0 to 200 with infinity at 0). Consequence, reasoned and
+    **not tested**: a Z 9 at infinity (index 0, number 0) transplanted onto the Z5 is clamped to 1 and would leave the
+    Z5 at 1 shot per burst with no skip or warning in the plan.
 - **Waiting on the user's naming (the opt-in rule):** the plan holds five `literal_unconfirmed` skips
   (`ElectronicVR`, `MovieRecMicrophone`, `MovieWBAutoType`, `MovieWindNoiseReduction`, `WBAutoType`) and seven
   `raw_code_unconfirmed` skips (`AEBracketingStep`, `AEBracketingType`, `AFSubjectDetection`, `ImageColorSpace`,
