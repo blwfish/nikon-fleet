@@ -1,0 +1,272 @@
+{
+ "model": "Z 5",
+ "firmware": "1.43",
+ "captured_at": "2026-10-28T10:26:03.553511Z",
+ "range_count": 33,
+ "ranges": {
+  "FlexibleProgram": {
+   "code": 33044,
+   "lower": -5.0,
+   "upper": 5.0,
+   "steps": 31,
+   "default_index": 15,
+   "value_index": 15
+  },
+  "ExposureComp": {
+   "code": 33045,
+   "lower": -5.0,
+   "upper": 5.0,
+   "steps": 31,
+   "default_index": 15,
+   "value_index": 15
+  },
+  "WBTuneAuto": {
+   "code": 33049,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "WBTuneFluorescent": {
+   "code": 33051,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "WBTuneSunny": {
+   "code": 33052,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "WBTuneFlash": {
+   "code": 33053,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "WBTuneShade": {
+   "code": 33054,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "WBTuneCloudy": {
+   "code": 33055,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "FocalLength": {
+   "code": 33059,
+   "lower": 0.0,
+   "upper": 0.0,
+   "steps": 0,
+   "default_index": 0,
+   "value_index": 0
+  },
+  "ShootingLimit": {
+   "code": 33086,
+   "lower": 1.0,
+   "upper": 100.0,
+   "steps": 100,
+   "default_index": 99,
+   "value_index": 99
+  },
+  "InternalFlashComp": {
+   "code": 33214,
+   "lower": -3.0,
+   "upper": 1.0,
+   "steps": 13,
+   "default_index": 9,
+   "value_index": 9
+  },
+  "ExternalFlashComp": {
+   "code": 33215,
+   "lower": -3.0,
+   "upper": 3.0,
+   "steps": 19,
+   "default_index": 9,
+   "value_index": 9
+  },
+  "MFDriveStep": {
+   "code": 33352,
+   "lower": 1.0,
+   "upper": 32767.0,
+   "steps": 32767,
+   "default_index": 0,
+   "value_index": 0
+  },
+  "WBTuneColorAdjust": {
+   "code": 33358,
+   "lower": 0.0,
+   "upper": 48.0,
+   "steps": 49,
+   "default_index": 24,
+   "value_index": 24
+  },
+  "WBTunePreset1": {
+   "code": 33359,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "WBTunePreset2": {
+   "code": 33360,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "WBTunePreset3": {
+   "code": 33361,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "WBTunePreset4": {
+   "code": 33362,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "WBTunePreset5": {
+   "code": 33363,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "WBTuneColorTempEx": {
+   "code": 33573,
+   "lower": 2500.0,
+   "upper": 10000.0,
+   "steps": 751,
+   "default_index": 250,
+   "value_index": 250
+  },
+  "ISOAutoShutterTimeAutoValue": {
+   "code": 33584,
+   "lower": -2.0,
+   "upper": 2.0,
+   "steps": 5,
+   "default_index": 2,
+   "value_index": 2
+  },
+  "MovieRecMicrophoneValue": {
+   "code": 33586,
+   "lower": 1.0,
+   "upper": 20.0,
+   "steps": 20,
+   "default_index": 14,
+   "value_index": 9
+  },
+  "MovieExposureComp": {
+   "code": 33593,
+   "lower": -3.0,
+   "upper": 3.0,
+   "steps": 19,
+   "default_index": 9,
+   "value_index": 9
+  },
+  "WBTunePreset6": {
+   "code": 33621,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "MovieWBTuneAuto": {
+   "code": 33889,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "MovieWBTuneFluorescent": {
+   "code": 33893,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "MovieWBTuneSunny": {
+   "code": 33894,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "MovieWBTuneShade": {
+   "code": 33896,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "MovieWBTuneCloudy": {
+   "code": 33897,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "MovieWBTuneColorTempEx": {
+   "code": 33898,
+   "lower": 2500.0,
+   "upper": 10000.0,
+   "steps": 751,
+   "default_index": 250,
+   "value_index": 250
+  },
+  "MovieWBTuneColorAdjust": {
+   "code": 33899,
+   "lower": 0.0,
+   "upper": 48.0,
+   "steps": 49,
+   "default_index": 24,
+   "value_index": 24
+  },
+  "WBTuneNatural": {
+   "code": 34044,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  },
+  "MovieWBTuneNatural": {
+   "code": 34046,
+   "lower": 0.0,
+   "upper": 1224.0,
+   "steps": 1225,
+   "default_index": 612,
+   "value_index": 612
+  }
+ }
+}

@@ -87,7 +87,7 @@ pub fn range_copy_verified(code: u32, source_model: &str, target_model: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const WB_TUNE_AUTO: u32 = 33049; // on all three models
     const SHOOTING_LIMIT: u32 = 33086;
@@ -185,6 +185,98 @@ mod tests {
         assert!(!range_copy_verified(c, "Z 9 ", "Z6_3"), "trailing space");
         assert!(!range_copy_verified(c, "Z 9", "Z6"), "prefix of Z6_3");
         assert!(!range_copy_verified(c, "Z6_3x", "Z 9"), "extension of Z6_3");
+    }
+
+    // ── the table against its evidence: docs/range-scales/*.json ──────────
+
+    /// One report per model, made by `scripts/range_scales.py dump` from a real capture.
+    const REPORTS: [&str; 3] = [
+        include_str!("../docs/range-scales/Z_5.json"),
+        include_str!("../docs/range-scales/Z_9.json"),
+        include_str!("../docs/range-scales/Z6_3.json"),
+    ];
+
+    /// `(lower, upper, steps, default_index)`, compared exactly as the script and the live check do.
+    type Scale = (String, String, u64, u64);
+
+    /// model -> code -> scale. Bounds are kept as their JSON text so no float comparison is involved.
+    fn reports() -> BTreeMap<String, BTreeMap<u32, Scale>> {
+        REPORTS
+            .iter()
+            .map(|text| {
+                let v: serde_json::Value = serde_json::from_str(text).unwrap();
+                let model = v["model"].as_str().unwrap().to_string();
+                let ranges = v["ranges"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(|r| {
+                        let scale = (
+                            r["lower"].to_string(),
+                            r["upper"].to_string(),
+                            r["steps"].as_u64().unwrap(),
+                            r["default_index"].as_u64().unwrap(),
+                        );
+                        (r["code"].as_u64().unwrap() as u32, scale)
+                    })
+                    .collect();
+                (model, ranges)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_table_entry_is_backed_by_an_identical_scale_in_each_listed_models_report() {
+        let reports = reports();
+        for (code, name, models) in VERIFIED_RANGES {
+            let scales: Vec<&Scale> = models
+                .iter()
+                .map(|m| {
+                    reports
+                        .get(*m)
+                        .unwrap_or_else(|| panic!("{name}: no report for model {m:?}"))
+                        .get(code)
+                        .unwrap_or_else(|| panic!("{name} ({code}) is not in {m}'s report"))
+                })
+                .collect();
+            assert!(scales.windows(2).all(|w| w[0] == w[1]), "{name}: scales differ across {models:?}: {scales:?}");
+        }
+    }
+
+    #[test]
+    fn every_scale_shared_by_two_models_in_the_reports_is_on_the_table() {
+        // The other direction: nothing the evidence supports is left off by accident.
+        let reports = reports();
+        let codes: BTreeSet<u32> = reports.values().flat_map(|r| r.keys().copied()).collect();
+        for code in codes {
+            let mut groups: BTreeMap<&Scale, Vec<&str>> = BTreeMap::new();
+            for (model, ranges) in &reports {
+                if let Some(scale) = ranges.get(&code) {
+                    groups.entry(scale).or_default().push(model);
+                }
+            }
+            let shared: Vec<Vec<&str>> = groups.into_values().filter(|g| g.len() >= 2).collect();
+            let listed = VERIFIED_RANGES.iter().find(|(c, _, _)| *c == code).map(|(_, _, m)| *m);
+            match (shared.as_slice(), listed) {
+                ([], None) => {}
+                ([group], Some(models)) => {
+                    let mut want = group.clone();
+                    let mut got = models.to_vec();
+                    want.sort_unstable();
+                    got.sort_unstable();
+                    assert_eq!(got, want, "code {code}");
+                }
+                (other, listed) => panic!("code {code}: shared groups {other:?}, table {listed:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_models_in_the_table_are_exactly_the_models_with_a_report() {
+        let reported: BTreeSet<String> = reports().keys().cloned().collect();
+        let listed: BTreeSet<String> =
+            VERIFIED_RANGES.iter().flat_map(|(_, _, m)| m.iter().map(|x| x.to_string())).collect();
+        assert_eq!(listed, reported);
     }
 
     #[test]
