@@ -543,9 +543,18 @@ impl FleetApp {
             if !self.cli_log.trim().is_empty() {
                 let lines = self.cli_log.lines().count();
                 egui::CollapsingHeader::new(format!("CLI messages ({lines} line(s))")).show(ui, |ui| {
-                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                        ui.add(egui::Label::new(egui::RichText::new(self.cli_log.trim_end()).monospace()));
-                    });
+                    // Drag the corner handle to make the log taller or shorter; the size is kept.
+                    egui::Resize::default()
+                        .id_salt("cli_log_resize")
+                        .resizable([false, true])
+                        .default_size(egui::vec2(ui.available_width(), 120.0))
+                        .min_size(egui::vec2(0.0, 40.0))
+                        .max_size(egui::vec2(f32::INFINITY, 700.0))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                ui.add(egui::Label::new(egui::RichText::new(self.cli_log.trim_end()).monospace()));
+                            });
+                        });
                 });
             }
         });

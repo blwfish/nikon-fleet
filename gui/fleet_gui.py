@@ -121,17 +121,22 @@ class FleetApp:
 
         # What the CLI said besides its answer (warnings on a successful run)
         # and what went wrong: kept, not just flashed in the status line.
-        notes_f = ttk.LabelFrame(self.root, text="Messages", padding=2)
-        notes_f.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(0, 4))
+        # The main area and the Messages box share a vertical PanedWindow, so the divider between
+        # them can be dragged to give the messages more (or less) room.
+        vpw = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
+        vpw.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        pw = ttk.PanedWindow(vpw, orient=tk.HORIZONTAL)
+        vpw.add(pw, weight=4)
+
+        notes_f = ttk.LabelFrame(vpw, text="Messages", padding=2)
         self._notes = tk.Text(notes_f, height=4, wrap=tk.WORD, state=tk.DISABLED,
                               background="#f5f5f5", font=("Menlo", 10))
         notes_sb = ttk.Scrollbar(notes_f, orient=tk.VERTICAL, command=self._notes.yview)
         self._notes.configure(yscrollcommand=notes_sb.set)
         notes_sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._notes.pack(fill=tk.X)
-
-        pw = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        pw.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._notes.pack(fill=tk.BOTH, expand=True)
+        vpw.add(notes_f, weight=1)
 
         # Camera list
         cam_f = ttk.LabelFrame(pw, text="Cameras", padding=4)

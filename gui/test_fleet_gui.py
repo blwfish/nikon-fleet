@@ -1276,3 +1276,29 @@ class TestSmallGuards:
         app.discover()
         settle(tk_root, app)
         assert app._status_var.get() == "Error: no Nikon cameras detected"
+
+
+class TestMessagesBoxIsResizable:
+    def test_the_messages_box_and_the_main_area_share_a_vertical_paned_window(self, tk_root, fake_cli):
+        app = make_app(tk_root, fake_cli)
+        app.root.update_idletasks()
+        notes_frame = app._notes.master
+        paned = notes_frame.master
+        assert str(paned.cget("orient")) == "vertical", "the divider above Messages must be draggable"
+        panes = [str(p) for p in paned.panes()]
+        assert str(notes_frame) in panes and len(panes) == 2, panes
+        # The main area is the other pane, and it holds the camera list.
+        main = paned.nametowidget(next(p for p in panes if p != str(notes_frame)))
+        assert str(app._cam_lb).startswith(str(main) + "."), (str(app._cam_lb), str(main))
+
+    def test_dragging_the_divider_gives_the_messages_more_room(self, tk_root, fake_cli):
+        app = make_app(tk_root, fake_cli)
+        app.root.geometry("900x600")
+        app.root.update()
+        paned = app._notes.master.master
+        before = app._notes.master.winfo_height()
+        sash_y = paned.sashpos(0)
+        paned.sashpos(0, sash_y - 80)
+        app.root.update()
+        after = app._notes.master.winfo_height()
+        assert after >= before + 60, (before, after)
