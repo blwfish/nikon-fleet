@@ -293,6 +293,29 @@ That catches anything in MAID's scope. Catching anything WiFi-only-vendor-side w
 adjunct client (above) doing the same before/after snapshot+diff, but over the full known `0xD0xx`/`0x5xxx`
 vendor-property space instead of just what MAID exposes.
 
+## Standard `GetDeviceInfo` (0x1001) — `nikon-fleet device-info` (2026-10-28)
+
+Read-only. Parsed per ISO 15740 DeviceInfo (every field kept; strings are a u8 unit count including the
+NUL, then UTF-16LE). Purpose: whether a body reports its serial in `DeviceInfo.SerialNumber`, which would
+identify a body whose USB `iSerialNumber` descriptor is empty. The command prints
+`serial: PTP "<x>" | USB "<y>" | match|differ|ptp_empty|usb_empty|both_empty`; `usb_empty` is the case that
+answers the question (descriptor empty, DeviceInfo has a serial). Record the first real results here.
+
+### First real result (2026-10-28, Z 9, firmware V5.31, over USB)
+
+`nikon-fleet device-info --serial 0000003023668`: standard version 100, vendor extension id
+`0xffffffff` version 110 desc `"Microsoft.com/DeviceServices: 1.0"`, functional mode 0, 146 operations,
+27 events, 21 device properties, 2 capture and 9 playback formats, manufacturer `"Nikon Corporation"`,
+model `"Z 9"`, device version `"V5.31"`, no trailing bytes.
+
+**The PTP serial is filled in, but zero-padded to 32 characters:** PTP `"00000000000000000000000003023668"`
+against USB `"0000003023668"` (13 characters). They are the same number: the USB serial is the last 13
+characters of the PTP one. The command's `differ` verdict is therefore literal (the strings differ), not a
+disagreement. Anything that wants to use the PTP serial as an identity must normalise it first (the USB
+form is the trailing 13 digits here), and that rule is unverified on other bodies. Still to check: the
+Z 5, Z6III and the second Z 9; and a body whose USB descriptor is empty (a Z 30?), which is the case that
+matters.
+
 ## Open items for next session
 
 - [ ] Still↔video switch side-effect check (both via `fleet check` for MAID-scope, and via a raw PTP/IP

@@ -72,6 +72,10 @@ const HEADER_LEN: usize = 12;
 /// PTP commands carry at most five 32-bit parameters.
 const MAX_COMMAND_PARAMS: usize = 5;
 
+/// `0x1001` — GetDeviceInfo (ISO 15740): no params, the DeviceInfo dataset
+/// as the data phase. Standard and read-only; it needs no open session, but
+/// this module sends it inside one like every other op.
+const OP_GET_DEVICE_INFO: u16 = 0x1001;
 const OP_OPEN_SESSION: u16 = 0x1002;
 const OP_CLOSE_SESSION: u16 = 0x1003;
 
@@ -309,6 +313,8 @@ pub enum PtpUsbError {
     UnexpectedDataOp { op: u16, got: u16 },
     #[error("PTP operation 0x{op:04x} answered OK but sent no data container at all")]
     NoDataPhase { op: u16 },
+    #[error("PTP DeviceInfo dataset is malformed at its {field} (byte offset {offset}): {fault}")]
+    DeviceInfoMalformed { field: &'static str, offset: usize, fault: DeviceInfoFault },
     #[error("FTP profile field {field} is {len} {unit}, exceeds the {max}-{unit} limit")]
     FtpFieldTooLong { field: &'static str, len: usize, max: usize, unit: &'static str },
     #[error("FTP profile field {field} contains non-ASCII characters, which this encoding does not support")]
@@ -470,6 +476,9 @@ struct Candidate {
     device: rusb::Device<GlobalContext>,
     handle: rusb::DeviceHandle<GlobalContext>,
     serial: String,
+    /// The `iSerialNumber` descriptor as read; empty when the body has none or the read failed
+    /// (`warnings` says which), unlike `serial`, which then holds the topology fallback.
+    usb_serial: String,
     model: String,
     /// Descriptor reads that failed while identifying this body (its serial
     /// or model then fell back to the topology serial / `""`).
@@ -558,7 +567,8 @@ fn candidate_devices() -> Enumeration {
         let (real_serial, product, warnings) = read_identity(&handle, &desc);
         let serial = candidate_serial(&device, &real_serial);
         let model = model_from_product_string(&product);
-        candidates.push(Candidate { device, handle, serial, model, warnings, serial_from_topology: real_serial.is_empty() });
+        let serial_from_topology = real_serial.is_empty();
+        candidates.push(Candidate { device, handle, serial, usb_serial: real_serial, model, warnings, serial_from_topology });
     }
     Enumeration { candidates, skipped }
 }
@@ -1268,6 +1278,251 @@ pub struct VendorRead {
     pub warnings: Vec<String>,
 }
 
+/// Why a DeviceInfo dataset could not be parsed (the `fault` of
+/// [`PtpUsbError::DeviceInfoMalformed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum DeviceInfoFault {
+    #[error("needs {needed} more byte(s) but only {available} remain")]
+    Truncated { needed: usize, available: usize },
+    #[error("declares {count} element(s) ({needed} byte(s)) but only {available} byte(s) remain")]
+    CountExceedsData { count: u32, needed: u64, available: usize },
+}
+
+/// Something odd about a decoded [`PtpString`]. A closed set: the text is still
+/// returned, and these say how far to trust it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringAnomaly {
+    /// An unpaired UTF-16 surrogate, decoded as U+FFFD.
+    UnpairedSurrogate,
+    /// The string's last code unit is not the NUL the format requires.
+    MissingTerminator,
+    /// A NUL before the last code unit; the text keeps it.
+    EmbeddedNul,
+}
+
+impl StringAnomaly {
+    pub fn tag(self) -> &'static str {
+        match self {
+            StringAnomaly::UnpairedSurrogate => "unpaired_surrogate",
+            StringAnomaly::MissingTerminator => "missing_terminator",
+            StringAnomaly::EmbeddedNul => "embedded_nul",
+        }
+    }
+}
+
+/// A PTP string (ISO 15740 §3.2.2): a character count `N` (terminating NUL
+/// included; 0 means an empty string with no further bytes), then `N`
+/// UTF-16LE code units.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtpString {
+    /// Decoded without the terminating NUL; lossy where `anomalies` says so.
+    pub text: String,
+    pub anomalies: Vec<StringAnomaly>,
+}
+
+/// The ISO 15740 DeviceInfo dataset (response data of operation `0x1001`),
+/// every field of it: none is dropped. Bytes after the last field are kept in
+/// `trailing` rather than ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfoDataset {
+    pub standard_version: u16,
+    pub vendor_extension_id: u32,
+    pub vendor_extension_version: u16,
+    pub vendor_extension_desc: PtpString,
+    pub functional_mode: u16,
+    pub operations_supported: Vec<u16>,
+    pub events_supported: Vec<u16>,
+    pub device_properties_supported: Vec<u16>,
+    pub capture_formats: Vec<u16>,
+    pub playback_formats: Vec<u16>,
+    pub manufacturer: PtpString,
+    pub model: PtpString,
+    pub device_version: PtpString,
+    pub serial_number: PtpString,
+    pub trailing: Vec<u8>,
+}
+
+/// A bounds-checked cursor over a DeviceInfo dataset. Every read names the
+/// field it is for, so a failure says where the dataset went wrong.
+struct DeviceInfoReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> DeviceInfoReader<'a> {
+    fn malformed(&self, field: &'static str, fault: DeviceInfoFault) -> PtpUsbError {
+        PtpUsbError::DeviceInfoMalformed { field, offset: self.pos, fault }
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    fn take(&mut self, field: &'static str, n: usize) -> Result<&'a [u8], PtpUsbError> {
+        if n > self.remaining() {
+            return Err(self.malformed(field, DeviceInfoFault::Truncated { needed: n, available: self.remaining() }));
+        }
+        let bytes = &self.data[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(bytes)
+    }
+
+    fn u8(&mut self, field: &'static str) -> Result<u8, PtpUsbError> {
+        Ok(self.take(field, 1)?[0])
+    }
+
+    fn u16(&mut self, field: &'static str) -> Result<u16, PtpUsbError> {
+        Ok(u16::from_le_bytes(self.take(field, 2)?.try_into().expect("take(2) returns 2 bytes")))
+    }
+
+    fn u32(&mut self, field: &'static str) -> Result<u32, PtpUsbError> {
+        Ok(u32::from_le_bytes(self.take(field, 4)?.try_into().expect("take(4) returns 4 bytes")))
+    }
+
+    /// A u32 count and that many u16 codes. The count is checked against the
+    /// bytes left before anything is allocated for it.
+    fn u16_array(&mut self, field: &'static str) -> Result<Vec<u16>, PtpUsbError> {
+        let count = self.u32(field)?;
+        let needed = u64::from(count) * 2;
+        if needed > self.remaining() as u64 {
+            return Err(self.malformed(field, DeviceInfoFault::CountExceedsData { count, needed, available: self.remaining() }));
+        }
+        let bytes = self.take(field, needed as usize)?;
+        Ok(bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+    }
+
+    fn string(&mut self, field: &'static str) -> Result<PtpString, PtpUsbError> {
+        let chars = usize::from(self.u8(field)?);
+        let bytes = self.take(field, chars * 2)?;
+        let mut units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let mut anomalies = Vec::new();
+        if !units.is_empty() {
+            if units.last() == Some(&0) {
+                units.pop();
+            } else {
+                anomalies.push(StringAnomaly::MissingTerminator);
+            }
+        }
+        if units.contains(&0) {
+            anomalies.push(StringAnomaly::EmbeddedNul);
+        }
+        let mut text = String::with_capacity(units.len());
+        let mut lossy = false;
+        for decoded in char::decode_utf16(units) {
+            match decoded {
+                Ok(c) => text.push(c),
+                Err(_) => {
+                    lossy = true;
+                    text.push(char::REPLACEMENT_CHARACTER);
+                }
+            }
+        }
+        if lossy {
+            anomalies.push(StringAnomaly::UnpairedSurrogate);
+        }
+        Ok(PtpString { text, anomalies })
+    }
+}
+
+/// Parse a DeviceInfo dataset (ISO 15740 §5.5.1.1). Total: a truncated
+/// dataset, or an array count larger than the bytes left, is a typed error;
+/// bytes after the SerialNumber are returned in `trailing`.
+pub fn parse_device_info(data: &[u8]) -> Result<DeviceInfoDataset, PtpUsbError> {
+    let mut r = DeviceInfoReader { data, pos: 0 };
+    let standard_version = r.u16("StandardVersion")?;
+    let vendor_extension_id = r.u32("VendorExtensionID")?;
+    let vendor_extension_version = r.u16("VendorExtensionVersion")?;
+    let vendor_extension_desc = r.string("VendorExtensionDesc")?;
+    let functional_mode = r.u16("FunctionalMode")?;
+    let operations_supported = r.u16_array("OperationsSupported")?;
+    let events_supported = r.u16_array("EventsSupported")?;
+    let device_properties_supported = r.u16_array("DevicePropertiesSupported")?;
+    let capture_formats = r.u16_array("CaptureFormats")?;
+    let playback_formats = r.u16_array("PlaybackFormats")?;
+    let manufacturer = r.string("Manufacturer")?;
+    let model = r.string("Model")?;
+    let device_version = r.string("DeviceVersion")?;
+    let serial_number = r.string("SerialNumber")?;
+    let trailing = r.data[r.pos..].to_vec();
+    Ok(DeviceInfoDataset {
+        standard_version,
+        vendor_extension_id,
+        vendor_extension_version,
+        vendor_extension_desc,
+        functional_mode,
+        operations_supported,
+        events_supported,
+        device_properties_supported,
+        capture_formats,
+        playback_formats,
+        manufacturer,
+        model,
+        device_version,
+        serial_number,
+        trailing,
+    })
+}
+
+/// How the PTP DeviceInfo SerialNumber compares with the USB `iSerialNumber`
+/// of the same body. A closed set; [`Self::tag`] is its wire form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialVerdict {
+    /// Both non-empty and byte-for-byte equal.
+    Match,
+    /// Both non-empty and different.
+    Differ,
+    /// The PTP serial is empty, the USB one is not.
+    PtpEmpty,
+    /// The USB serial is empty, the PTP one is not: the case DeviceInfo could identify a body the
+    /// descriptor cannot.
+    UsbEmpty,
+    BothEmpty,
+}
+
+impl SerialVerdict {
+    /// Exact comparison, no trimming or case folding: a near-miss is `Differ`, and both values are
+    /// printed beside the verdict.
+    pub fn compare(ptp: &str, usb: &str) -> Self {
+        match (ptp.is_empty(), usb.is_empty()) {
+            (true, true) => SerialVerdict::BothEmpty,
+            (true, false) => SerialVerdict::PtpEmpty,
+            (false, true) => SerialVerdict::UsbEmpty,
+            (false, false) if ptp == usb => SerialVerdict::Match,
+            (false, false) => SerialVerdict::Differ,
+        }
+    }
+
+    pub fn tag(self) -> &'static str {
+        match self {
+            SerialVerdict::Match => "match",
+            SerialVerdict::Differ => "differ",
+            SerialVerdict::PtpEmpty => "ptp_empty",
+            SerialVerdict::UsbEmpty => "usb_empty",
+            SerialVerdict::BothEmpty => "both_empty",
+        }
+    }
+}
+
+/// What a DeviceInfo read returned, with the identity the USB lookup had already read for the
+/// same body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfoReport {
+    pub dataset: DeviceInfoDataset,
+    /// The USB product string's model (`"Z 9"`); empty when it could not be read.
+    pub usb_model: String,
+    /// The USB `iSerialNumber` descriptor; empty when the body has none or the read failed
+    /// (`usb_warnings` says which).
+    pub usb_serial: String,
+    /// Descriptor reads that failed while identifying the body.
+    pub usb_warnings: Vec<String>,
+}
+
+impl DeviceInfoReport {
+    pub fn serial_verdict(&self) -> SerialVerdict {
+        SerialVerdict::compare(&self.dataset.serial_number.text, &self.usb_serial)
+    }
+}
+
 /// An open raw-PTP-over-USB session. Closes the PTP session and releases the
 /// USB interface on drop (best-effort — errors are ignored, matching
 /// `sdk.rs`'s `Device::drop` policy of not panicking on teardown), unless a
@@ -1295,6 +1550,11 @@ pub struct PtpUsbSession<T: BulkTransport = rusb::DeviceHandle<GlobalContext>> {
     /// Why the session is unusable, once a failure left the pipes in an
     /// unknown state.
     poisoned: Option<String>,
+    /// The body's USB `iSerialNumber` descriptor as the device lookup read it (empty: none, or the
+    /// read failed — see `usb_warnings`); the test constructor leaves it empty.
+    usb_serial: String,
+    /// Descriptor reads that failed while the lookup identified this body.
+    usb_warnings: Vec<String>,
     /// Whether the most recent transaction got as far as handing its
     /// data-out container to the pipe (so the camera may have acted on it).
     data_phase_started: bool,
@@ -1338,7 +1598,7 @@ impl PtpUsbSession {
         find: impl FnOnce(Option<&str>) -> Result<Candidate, PtpUsbError>,
         serial: Option<&str>,
     ) -> Result<Self, PtpUsbError> {
-        let Candidate { device, handle, model, .. } = find(serial)?;
+        let Candidate { device, handle, model, usb_serial, warnings, .. } = find(serial)?;
         let endpoints = find_ptp_endpoints(&device)?;
         claim_with_retry(&handle, endpoints.interface)?;
 
@@ -1351,6 +1611,8 @@ impl PtpUsbSession {
             model,
             Some(lock),
         );
+        session.usb_serial = usb_serial;
+        session.usb_warnings = warnings;
         session.open_ptp_session()?;
         Ok(session)
     }
@@ -1379,6 +1641,8 @@ impl<T: BulkTransport> PtpUsbSession<T> {
             rx: Vec::new(),
             transaction_timeout: TRANSACTION_TIMEOUT,
             poisoned: None,
+            usb_serial: String::new(),
+            usb_warnings: Vec::new(),
             data_phase_started: false,
             unrecognized_containers: 0,
             _camera_lock: camera_lock,
@@ -1719,6 +1983,30 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         Ok(VendorRead { data: reply.data, warnings })
     }
 
+    /// Read the DeviceInfo dataset (`0x1001`, standard and read-only). Same
+    /// checks as a vendor read: a non-OK answer is [`PtpUsbError::OperationFailed`], an OK
+    /// answer with no data container at all is [`PtpUsbError::NoDataPhase`], and the dataset is
+    /// parsed strictly ([`parse_device_info`]).
+    pub fn get_device_info(&mut self) -> Result<DeviceInfoDataset, PtpUsbError> {
+        let reply = self.transact(OP_GET_DEVICE_INFO, &[], None, TxidCheck::Enforce)?;
+        Self::require_ok(OP_GET_DEVICE_INFO, reply.code)?;
+        if reply.data_containers == 0 {
+            return Err(PtpUsbError::NoDataPhase { op: OP_GET_DEVICE_INFO });
+        }
+        parse_device_info(&reply.data)
+    }
+
+    /// [`Self::get_device_info`] with the identity the USB lookup read for this body.
+    pub fn read_device_info_report(&mut self) -> Result<DeviceInfoReport, PtpUsbError> {
+        let dataset = self.get_device_info()?;
+        Ok(DeviceInfoReport {
+            dataset,
+            usb_model: self.model.clone(),
+            usb_serial: self.usb_serial.clone(),
+            usb_warnings: self.usb_warnings.clone(),
+        })
+    }
+
     /// Write an FTP profile via `0x90EE`, with the captured
     /// [`FtpCameraNetwork`]. See [`Self::write_ftp_profile_with`].
     pub fn write_ftp_profile(
@@ -1807,6 +2095,20 @@ pub fn read_vendor_property_report_locked(
 ) -> Result<VendorRead, PtpUsbError> {
     let mut session = PtpUsbSession::open_locked(lock, serial)?;
     session.read_vendor_property_report(propcode)
+}
+
+/// Open a session, read the DeviceInfo dataset (`0x1001`), close it. Takes the [`CameraLock`]
+/// first, like every session. Read-only.
+pub fn read_device_info(serial: Option<&str>) -> Result<DeviceInfoReport, PtpUsbError> {
+    let mut session = PtpUsbSession::open(serial)?;
+    session.read_device_info_report()
+}
+
+/// [`read_device_info`] for a caller already holding the [`CameraLock`]; see
+/// [`PtpUsbSession::open_locked`].
+pub fn read_device_info_locked(lock: CameraLock, serial: Option<&str>) -> Result<DeviceInfoReport, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.read_device_info_report()
 }
 
 /// Open a session, write an FTP profile via `0x90EE`, close it. Convenience
@@ -4086,6 +4388,184 @@ mod tests {
             let (mut s, _t) = session(vec![data_c(OP_VENDOR_PROP_READ, &[1]), resp(RESP_OK)], m);
             assert_eq!(s.read_vendor_property_report(0xD053).unwrap().warnings.len(), 1, "{m:?}");
         }
+    }
+
+    // ── GetDeviceInfo (0x1001) ───────────────────────────────────────────
+    //
+    // The parser itself is pinned by tests/followup_device_info_parse.rs; these are the session's
+    // half: what is sent, what is checked, and what a failure does to the session.
+
+    fn pstr(s: &str) -> Vec<u8> {
+        if s.is_empty() {
+            return vec![0];
+        }
+        let units: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut out = vec![units.len() as u8];
+        out.extend(units.iter().flat_map(|u| u.to_le_bytes()));
+        out
+    }
+
+    fn u16_arr(codes: &[u16]) -> Vec<u8> {
+        let mut out = (codes.len() as u32).to_le_bytes().to_vec();
+        out.extend(codes.iter().flat_map(|c| c.to_le_bytes()));
+        out
+    }
+
+    /// A DeviceInfo dataset laid out from ISO 15740: a Nikon-looking Z 9 with the given serial.
+    fn device_info_bytes(serial: &str) -> Vec<u8> {
+        [
+            100u16.to_le_bytes().to_vec(),
+            0x0au32.to_le_bytes().to_vec(),
+            100u16.to_le_bytes().to_vec(),
+            pstr("Nikon"),
+            0u16.to_le_bytes().to_vec(),
+            u16_arr(&[0x1001, 0x1002, 0x1003, 0x943B]),
+            u16_arr(&[0x4006]),
+            u16_arr(&[0x5001, 0xD053]),
+            u16_arr(&[0x3801]),
+            u16_arr(&[0x3000, 0x3801]),
+            pstr("Nikon Corporation"),
+            pstr("Z 9"),
+            pstr("5.31"),
+            pstr(serial),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn get_device_info_sends_a_parameterless_1001_and_parses_the_data_phase() {
+        let (mut s, t) = session(vec![data_c(OP_GET_DEVICE_INFO, &device_info_bytes("0000003023668")), resp(RESP_OK)], "Z 9");
+        let d = s.get_device_info().unwrap();
+        assert_eq!(t.sent(), vec![(CONTAINER_COMMAND, 0x1001, 0, vec![])]);
+        assert_eq!(OP_GET_DEVICE_INFO, 0x1001);
+        assert_eq!(d.serial_number.text, "0000003023668");
+        assert_eq!(d.model.text, "Z 9");
+        assert_eq!(d.operations_supported, [0x1001, 0x1002, 0x1003, 0x943B]);
+        assert_eq!(t.unread(), 0);
+    }
+
+    #[test]
+    fn get_device_info_reassembles_a_dataset_split_over_data_containers() {
+        let raw = device_info_bytes("0000003023668");
+        let (a, b) = raw.split_at(raw.len() / 2);
+        let (mut s, _t) = session(vec![data_c(OP_GET_DEVICE_INFO, a), data_c(OP_GET_DEVICE_INFO, b), resp(RESP_OK)], "Z 9");
+        assert_eq!(s.get_device_info().unwrap().serial_number.text, "0000003023668");
+    }
+
+    #[test]
+    fn get_device_info_runs_after_open_session_with_the_next_transaction_id() {
+        let (mut s, t) = session(vec![resp(RESP_OK), data_c(OP_GET_DEVICE_INFO, &device_info_bytes("")), resp(RESP_OK)], "Z 9");
+        s.open_ptp_session().unwrap();
+        assert_eq!(s.get_device_info().unwrap().serial_number.text, "");
+        assert_eq!(
+            t.sent(),
+            vec![(CONTAINER_COMMAND, OP_OPEN_SESSION, 0, le(SESSION_ID)), (CONTAINER_COMMAND, 0x1001, 1, vec![])]
+        );
+    }
+
+    #[test]
+    fn get_device_info_non_ok_response_is_operation_failed_and_the_data_is_not_parsed() {
+        // A garbage data phase followed by an error response: the response code wins, the
+        // dataset is not looked at.
+        let (mut s, _t) = session(vec![data_c(OP_GET_DEVICE_INFO, &[1, 2, 3]), resp(0x2005)], "Z 9");
+        let err = s.get_device_info().unwrap_err();
+        assert!(
+            matches!(err, PtpUsbError::OperationFailed { op: OP_GET_DEVICE_INFO, code: PtpResponseCode(0x2005) }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn get_device_info_ok_without_any_data_container_is_an_error() {
+        let (mut s, _t) = session(vec![resp(RESP_OK)], "Z 9");
+        let err = s.get_device_info().unwrap_err();
+        assert!(matches!(err, PtpUsbError::NoDataPhase { op: OP_GET_DEVICE_INFO }), "{err:?}");
+    }
+
+    #[test]
+    fn get_device_info_with_an_empty_data_container_is_malformed_not_an_empty_dataset() {
+        let (mut s, _t) = session(vec![data_c(OP_GET_DEVICE_INFO, &[]), resp(RESP_OK)], "Z 9");
+        let err = s.get_device_info().unwrap_err();
+        assert!(
+            matches!(err, PtpUsbError::DeviceInfoMalformed { field: "StandardVersion", offset: 0, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_dataset_leaves_the_session_usable() {
+        // The response was fully read, so the pipes are in sync: the next read works.
+        let raw = device_info_bytes("0000003023668");
+        let (mut s, t) = session(
+            vec![
+                data_c(OP_GET_DEVICE_INFO, &raw[..raw.len() - 1]),
+                resp(RESP_OK),
+                data_c(OP_GET_DEVICE_INFO, &raw),
+                resp(RESP_OK),
+            ],
+            "Z 9",
+        );
+        let err = s.get_device_info().unwrap_err();
+        assert!(matches!(err, PtpUsbError::DeviceInfoMalformed { field: "SerialNumber", .. }), "{err:?}");
+        assert!(s.poisoned.is_none());
+        assert_eq!(s.get_device_info().unwrap().serial_number.text, "0000003023668");
+        assert_eq!(t.sent().iter().map(|c| c.2).collect::<Vec<_>>(), [0, 1], "each attempt consumed its own transaction id");
+    }
+
+    #[test]
+    fn get_device_info_enforces_the_transaction_id_of_the_data_and_response() {
+        let data = |id| Step::Bytes(encode_data(OP_GET_DEVICE_INFO, id, &device_info_bytes("X")).unwrap());
+        let (mut s, _t) = session(vec![data(9), resp(RESP_OK)], "Z 9");
+        let err = s.get_device_info().unwrap_err();
+        assert!(matches!(err, PtpUsbError::TransactionIdMismatch { op: OP_GET_DEVICE_INFO, expected: 0, got: 9 }), "{err:?}");
+        assert!(s.poisoned.is_some(), "a stale reply may still be queued: the session must not be reused");
+
+        let (mut s, _t) = session(vec![data_c(OP_GET_DEVICE_INFO, &device_info_bytes("X")), resp_id(RESP_OK, 4)], "Z 9");
+        let err = s.get_device_info().unwrap_err();
+        assert!(matches!(err, PtpUsbError::TransactionIdMismatch { op: OP_GET_DEVICE_INFO, expected: 0, got: 4 }), "{err:?}");
+    }
+
+    #[test]
+    fn get_device_info_refuses_a_data_container_for_another_operation() {
+        let (mut s, _t) = session(vec![data_c(OP_VENDOR_PROP_READ, &device_info_bytes("X")), resp(RESP_OK)], "Z 9");
+        let err = s.get_device_info().unwrap_err();
+        assert!(matches!(err, PtpUsbError::UnexpectedDataOp { op: OP_GET_DEVICE_INFO, got: OP_VENDOR_PROP_READ }), "{err:?}");
+    }
+
+    #[test]
+    fn a_failed_device_info_read_poisons_the_session_so_the_next_call_sends_nothing() {
+        let (mut s, t) = session(vec![Step::Err(rusb::Error::Timeout)], "Z 9");
+        assert!(matches!(s.get_device_info().unwrap_err(), PtpUsbError::Usb(rusb::Error::Timeout)));
+        let sent = t.sent().len();
+        assert!(matches!(s.get_device_info().unwrap_err(), PtpUsbError::SessionPoisoned { .. }));
+        assert_eq!(t.sent().len(), sent, "a poisoned session writes nothing");
+    }
+
+    #[test]
+    fn the_report_carries_the_usb_identity_beside_the_ptp_serial_and_its_verdict() {
+        for (usb_serial, ptp_serial, verdict) in [
+            ("0000003023668", "0000003023668", "match"),
+            ("0000003023669", "0000003023668", "differ"),
+            ("", "0000003023668", "usb_empty"),
+            ("0000003023668", "", "ptp_empty"),
+            ("", "", "both_empty"),
+        ] {
+            let (mut s, _t) = session(vec![data_c(OP_GET_DEVICE_INFO, &device_info_bytes(ptp_serial)), resp(RESP_OK)], "Z 9");
+            s.usb_serial = usb_serial.to_string();
+            s.usb_warnings = vec!["reading the USB serial string failed: timeout".to_string()];
+            let report = s.read_device_info_report().unwrap();
+            assert_eq!(report.usb_serial, usb_serial);
+            assert_eq!(report.usb_model, "Z 9");
+            assert_eq!(report.usb_warnings, ["reading the USB serial string failed: timeout"]);
+            assert_eq!(report.dataset.serial_number.text, ptp_serial);
+            assert_eq!(report.serial_verdict().tag(), verdict, "USB {usb_serial:?} PTP {ptp_serial:?}");
+        }
+    }
+
+    #[test]
+    fn a_device_info_read_failure_yields_no_report() {
+        let (mut s, _t) = session(vec![resp(0x2002)], "Z 9");
+        assert!(matches!(s.read_device_info_report().unwrap_err(), PtpUsbError::OperationFailed { .. }));
     }
 
     #[test]

@@ -156,6 +156,13 @@ enum Cmd {
     /// confirmed to also work over plain USB.
     VendorRead(VendorReadArgs),
 
+    /// Read the standard PTP DeviceInfo dataset (operation 0x1001) over raw USB
+    /// PTP and compare its SerialNumber with the USB iSerialNumber of the same
+    /// body. Read-only: it changes nothing on the camera. Uses the raw PTP path
+    /// like vendor-read (no --sdk-bundle/MAID SDK needed).
+    #[command(after_help = DEVICE_INFO_HELP)]
+    DeviceInfo(DeviceInfoArgs),
+
     /// Write an FTP profile (0x90EE) over raw USB PTP, bypassing the MAID
     /// SDK. Reverse-engineered the same way as VendorRead — see
     /// docs/nx-field-session-2026-07-09.md for the field map and the parts
@@ -347,6 +354,14 @@ Exit status:
 /// camera first.
 const EXIT_WRITE_INDETERMINATE: i32 = 4;
 
+const DEVICE_INFO_HELP: &str = "\
+Read-only: sends only the standard GetDeviceInfo (0x1001) inside a PTP session and changes nothing
+on the camera. The last line compares the PTP SerialNumber with the USB iSerialNumber:
+  serial: PTP \"<x>\" | USB \"<y>\" | match|differ|ptp_empty|usb_empty|both_empty
+  usb_empty means the descriptor has no serial but DeviceInfo does (the body could be identified by it).
+With --json the same comparison is the serial_comparison object.
+Exit status: 0 read and printed; 1 any error (camera busy, no such camera, malformed dataset); 2 usage error.";
+
 const VENDOR_WRITE_HELP: &str = "\
 Exit status:
   0  the camera accepted the profile (see the note printed after it, if any)
@@ -471,6 +486,19 @@ struct VendorReadArgs {
     /// real serial or "usb-<bus>:<addr>".
     #[arg(long)]
     serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct DeviceInfoArgs {
+    /// Camera serial to target; same rules as vendor-read's --serial (required when more than
+    /// one Nikon camera is on USB; "id-N" only when that is the sole camera attached and it has
+    /// no readable USB serial).
+    #[arg(long)]
+    serial: Option<String>,
+    /// Print everything as JSON on stdout, including the full operation, event, property and
+    /// format lists as hex codes; warnings go to stderr.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1290,6 +1318,112 @@ fn cmd_vendor_read(args: &VendorReadArgs) -> Result<()> {
     }
     println!("{stdout}");
     Ok(())
+}
+
+/// Read the PTP DeviceInfo dataset via raw USB PTP (`0x1001`) and print it with the serial
+/// comparison. Read-only. See `nikon_fleet::ptp_usb`.
+fn cmd_device_info(args: &DeviceInfoArgs) -> Result<()> {
+    let report = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
+        .and_then(|(lock, serial)| {
+            nikon_fleet::ptp_usb::read_device_info_locked(lock, serial.as_deref()).map_err(anyhow::Error::new)
+        })
+        .context("reading the PTP DeviceInfo dataset over USB")?;
+    for w in &report.usb_warnings {
+        eprintln!("warning: USB descriptor: {w}");
+    }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&device_info_json(&report))?);
+    } else {
+        println!("{}", device_info_text(&report));
+    }
+    Ok(())
+}
+
+/// `0x1001`-style code list as hex strings, for `device-info --json`.
+fn hex_codes(codes: &[u16]) -> Vec<String> {
+    codes.iter().map(|c| format!("0x{c:04x}")).collect()
+}
+
+/// A decoded PTP string for the text output: quoted, with its anomalies (if any) after it.
+fn ptp_string_text(s: &nikon_fleet::ptp_usb::PtpString) -> String {
+    if s.anomalies.is_empty() {
+        format!("{:?}", s.text)
+    } else {
+        let tags: Vec<&str> = s.anomalies.iter().map(|a| a.tag()).collect();
+        format!("{:?}  [anomaly: {}]", s.text, tags.join(", "))
+    }
+}
+
+/// The serial line of `device-info`, the question the command exists to answer.
+fn device_info_serial_line(report: &nikon_fleet::ptp_usb::DeviceInfoReport) -> String {
+    format!(
+        "serial: PTP {:?} | USB {:?} | {}",
+        report.dataset.serial_number.text,
+        report.usb_serial,
+        report.serial_verdict().tag()
+    )
+}
+
+/// What `device-info` prints without `--json`: every string and number of the dataset, the
+/// size of each list (the lists themselves are in `--json`), the count of trailing bytes, then the
+/// serial comparison.
+fn device_info_text(report: &nikon_fleet::ptp_usb::DeviceInfoReport) -> String {
+    let d = &report.dataset;
+    [
+        format!("USB model:                 {:?}", report.usb_model),
+        format!("standard version:          {} (0x{:04x})", d.standard_version, d.standard_version),
+        format!("vendor extension id:       0x{:08x}", d.vendor_extension_id),
+        format!("vendor extension version:  {} (0x{:04x})", d.vendor_extension_version, d.vendor_extension_version),
+        format!("vendor extension desc:     {}", ptp_string_text(&d.vendor_extension_desc)),
+        format!("functional mode:           0x{:04x}", d.functional_mode),
+        format!("operations supported:      {}", d.operations_supported.len()),
+        format!("events supported:          {}", d.events_supported.len()),
+        format!("device properties:         {}", d.device_properties_supported.len()),
+        format!("capture formats:           {}", d.capture_formats.len()),
+        format!("playback formats:          {}", d.playback_formats.len()),
+        format!("manufacturer:              {}", ptp_string_text(&d.manufacturer)),
+        format!("model:                     {}", ptp_string_text(&d.model)),
+        format!("device version:            {}", ptp_string_text(&d.device_version)),
+        format!("serial number:             {}", ptp_string_text(&d.serial_number)),
+        format!("trailing bytes:            {}", d.trailing.len()),
+        device_info_serial_line(report),
+    ]
+    .join("\n")
+}
+
+/// What `device-info --json` prints: the whole dataset (lists as hex codes), the USB identity of
+/// the same body, and the serial comparison.
+fn device_info_json(report: &nikon_fleet::ptp_usb::DeviceInfoReport) -> serde_json::Value {
+    let d = &report.dataset;
+    let string = |s: &nikon_fleet::ptp_usb::PtpString| {
+        serde_json::json!({ "text": s.text, "anomalies": s.anomalies.iter().map(|a| a.tag()).collect::<Vec<_>>() })
+    };
+    serde_json::json!({
+        "usb": { "model": report.usb_model, "serial": report.usb_serial, "warnings": report.usb_warnings },
+        "device_info": {
+            "standard_version": d.standard_version,
+            "vendor_extension_id": d.vendor_extension_id,
+            "vendor_extension_version": d.vendor_extension_version,
+            "vendor_extension_desc": string(&d.vendor_extension_desc),
+            "functional_mode": d.functional_mode,
+            "operations_supported": hex_codes(&d.operations_supported),
+            "events_supported": hex_codes(&d.events_supported),
+            "device_properties_supported": hex_codes(&d.device_properties_supported),
+            "capture_formats": hex_codes(&d.capture_formats),
+            "playback_formats": hex_codes(&d.playback_formats),
+            "manufacturer": string(&d.manufacturer),
+            "model": string(&d.model),
+            "device_version": string(&d.device_version),
+            "serial_number": string(&d.serial_number),
+            "trailing_bytes": d.trailing.len(),
+            "trailing_hex": nikon_fleet::ptp_usb::hex_bytes(&d.trailing),
+        },
+        "serial_comparison": {
+            "ptp": d.serial_number.text,
+            "usb": report.usb_serial,
+            "verdict": report.serial_verdict().tag(),
+        },
+    })
 }
 
 /// What `vendor-read` prints: the data line for stdout, and one stderr line per warning the read
@@ -2562,6 +2696,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
         Cmd::Transplant(args) => cmd_transplant(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
         Cmd::VendorRead(args) => cmd_vendor_read(args),
+        Cmd::DeviceInfo(args) => cmd_device_info(args),
         Cmd::VendorWriteFtp(args) => cmd_vendor_write_ftp(args),
         Cmd::Firmware(sub) => match sub {
             FirmwareCmd::Add(args) => cmd_firmware_add(&cli.data_dir, args),
@@ -3707,6 +3842,129 @@ mod tests {
         );
         assert_eq!(warned.0, "0x5001: 0 byte(s): ");
         assert_eq!(warned.1, ["warning: model \"Z 8\" is not surveyed", "warning: second"], "one line per warning, none dropped");
+    }
+
+    // ── device-info output ───────────────────────────────────────────────
+
+    fn ptp_str(text: &str) -> nikon_fleet::ptp_usb::PtpString {
+        nikon_fleet::ptp_usb::PtpString { text: text.to_string(), anomalies: vec![] }
+    }
+
+    fn device_info_report(ptp_serial: &str, usb_serial: &str) -> nikon_fleet::ptp_usb::DeviceInfoReport {
+        nikon_fleet::ptp_usb::DeviceInfoReport {
+            dataset: nikon_fleet::ptp_usb::DeviceInfoDataset {
+                standard_version: 100,
+                vendor_extension_id: 0x0a,
+                vendor_extension_version: 0x64,
+                vendor_extension_desc: ptp_str("Nikon"),
+                functional_mode: 0,
+                operations_supported: vec![0x1001, 0x943b],
+                events_supported: vec![0x4006],
+                device_properties_supported: vec![0x5001, 0xd053, 0xd0b4],
+                capture_formats: vec![0x3801],
+                playback_formats: vec![0x3000, 0x3801],
+                manufacturer: ptp_str("Nikon Corporation"),
+                model: ptp_str("Z 9"),
+                device_version: ptp_str("5.31"),
+                serial_number: ptp_str(ptp_serial),
+                trailing: vec![0xaa, 0xbb, 0xcc],
+            },
+            usb_model: "Z 9".into(),
+            usb_serial: usb_serial.into(),
+            usb_warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn device_info_text_ends_with_the_serial_verdict_line_for_each_verdict() {
+        for (ptp, usb, line) in [
+            ("0000003023668", "0000003023668", "serial: PTP \"0000003023668\" | USB \"0000003023668\" | match"),
+            ("0000003023668", "0000003023669", "serial: PTP \"0000003023668\" | USB \"0000003023669\" | differ"),
+            ("", "0000003023668", "serial: PTP \"\" | USB \"0000003023668\" | ptp_empty"),
+            ("0000003023668", "", "serial: PTP \"0000003023668\" | USB \"\" | usb_empty"),
+            ("", "", "serial: PTP \"\" | USB \"\" | both_empty"),
+        ] {
+            let text = device_info_text(&device_info_report(ptp, usb));
+            assert_eq!(text.lines().last(), Some(line), "{text}");
+        }
+    }
+
+    #[test]
+    fn device_info_text_prints_every_scalar_string_and_count_of_the_dataset() {
+        let text = device_info_text(&device_info_report("0000003023668", "0000003023668"));
+        for line in [
+            "USB model:                 \"Z 9\"",
+            "standard version:          100 (0x0064)",
+            "vendor extension id:       0x0000000a",
+            "vendor extension version:  100 (0x0064)",
+            "vendor extension desc:     \"Nikon\"",
+            "functional mode:           0x0000",
+            "operations supported:      2",
+            "events supported:          1",
+            "device properties:         3",
+            "capture formats:           1",
+            "playback formats:          2",
+            "manufacturer:              \"Nikon Corporation\"",
+            "model:                     \"Z 9\"",
+            "device version:            \"5.31\"",
+            "serial number:             \"0000003023668\"",
+            "trailing bytes:            3",
+        ] {
+            assert!(text.lines().any(|l| l == line), "{line:?} missing from:\n{text}");
+        }
+    }
+
+    #[test]
+    fn device_info_text_shows_a_string_anomaly_next_to_the_string() {
+        use nikon_fleet::ptp_usb::StringAnomaly;
+        let mut report = device_info_report("x", "x");
+        report.dataset.model.anomalies = vec![StringAnomaly::UnpairedSurrogate, StringAnomaly::EmbeddedNul];
+        let text = device_info_text(&report);
+        assert!(
+            text.lines().any(|l| l == "model:                     \"Z 9\"  [anomaly: unpaired_surrogate, embedded_nul]"),
+            "{text}"
+        );
+        // A clean string carries no marker.
+        assert!(!device_info_text(&device_info_report("x", "x")).contains("anomaly"));
+    }
+
+    #[test]
+    fn device_info_json_carries_every_dataset_field_with_the_lists_in_full_as_hex() {
+        let v = device_info_json(&device_info_report("0000003023668", ""));
+        let info = v["device_info"].as_object().expect("device_info object");
+        let mut keys: Vec<&str> = info.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        // The 14 DeviceInfo fields of ISO 15740, plus what the command adds about the tail.
+        let mut expected = vec![
+            "standard_version", "vendor_extension_id", "vendor_extension_version", "vendor_extension_desc",
+            "functional_mode", "operations_supported", "events_supported", "device_properties_supported",
+            "capture_formats", "playback_formats", "manufacturer", "model", "device_version", "serial_number",
+            "trailing_bytes", "trailing_hex",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected, "a dataset field was dropped from (or invented in) the JSON");
+        assert_eq!(info["operations_supported"], json!(["0x1001", "0x943b"]));
+        assert_eq!(info["events_supported"], json!(["0x4006"]));
+        assert_eq!(info["device_properties_supported"], json!(["0x5001", "0xd053", "0xd0b4"]));
+        assert_eq!(info["capture_formats"], json!(["0x3801"]));
+        assert_eq!(info["playback_formats"], json!(["0x3000", "0x3801"]));
+        assert_eq!(info["standard_version"], json!(100));
+        assert_eq!(info["vendor_extension_id"], json!(10));
+        assert_eq!(info["serial_number"], json!({"text": "0000003023668", "anomalies": []}));
+        assert_eq!(info["trailing_bytes"], json!(3));
+        assert_eq!(info["trailing_hex"], json!("aa bb cc"));
+    }
+
+    #[test]
+    fn device_info_json_carries_the_verdict_and_the_usb_identity() {
+        let mut report = device_info_report("0000003023668", "");
+        report.usb_warnings = vec!["reading the USB serial string failed: timeout".into()];
+        let v = device_info_json(&report);
+        assert_eq!(v["serial_comparison"], json!({"ptp": "0000003023668", "usb": "", "verdict": "usb_empty"}));
+        assert_eq!(
+            v["usb"],
+            json!({"model": "Z 9", "serial": "", "warnings": ["reading the USB serial string failed: timeout"]})
+        );
     }
 
     // ── raw-USB commands: what `--serial id-N` means ─────────────────────
