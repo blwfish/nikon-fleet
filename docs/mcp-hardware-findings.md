@@ -724,7 +724,12 @@ scratch build with env-var hooks (branch `f3-experiments`, not on master). A run
   hang; 2 of 30 is also not distinguishable from a rate of a few percent. Neither reading is established. The control
   rate was only ever measured on the Z 9, so there is no Z6III baseline to compare against. Camera healthy afterwards
   (`discover` listed both bodies). **So the pump is not shown to remove the hang on the Z6III.**
-- **Not yet verified:** a settled-Z6III repeat (the 2 hangs vs. attach timing), a write path (`transplant`/`restore`),
+- **Z6III repeat, settled: 26 of 30 clean, 4 hung** (runs 7, 17, 22 and 28), spread through the batch, clean runs
+  3.4 to 4.9 s. So the first batch's early hangs were not an attach effect. **Across both batches the shipped fix leaves
+  6 of 60 (10%) Z6III runs hung, against 0 of 30 on the Z 9.** The pump removes the Z 9's hang and only reduces or
+  does not touch the Z6III's; whether that is a lower rate or the same rate as before the fix is unknown, since no
+  Z6III control was run. The Z6III's hang may have a different or additional cause.
+- **Not yet verified:** a Z6III control and pump-length/placement arms (as for the Z 9), a write path (`transplant`/`restore`),
   and the worker process. The supervisor's post-result grace and SIGKILL stay as a backstop regardless; the hang was
   never shown to be impossible, only rare after the pump.
 - Camera state was healthy after every kill, as in F3 and F14.
