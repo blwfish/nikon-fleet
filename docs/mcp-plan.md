@@ -312,6 +312,10 @@ either, which is right for an undo but a change for a backup/firmware-rollback r
 (§9): keep one table, since a second one is a second source of truth. `ShootNoCard` joins it
 (Phase 0): it flipped across a power cycle with nothing writing to the camera (F10), so it is
 state-like or reset by the body, and omitting one property from a copy costs little. `CCDDataMode` was deliberately left out (its meaning is unclear). Tests and notes that quote `never-copied=9` become 10.
+`ShootingLimit` (33086, "maximum shots per burst", Custom Setting d2) joins it too, though it is a setting, not state: the SDK
+reads the same menu setting as a different index on each body (infinity is index 0 on a Z 9, index 1 on a Z6III where it is
+indistinguishable from 1 shot, and the Z5 has no infinity; F25), so neither a copy nor a restore can be trusted, and the table
+is the one place both read. Consequence: a restore, including a firmware rollback, does not bring this one setting back.
 
 ### 5.3 Raw-code opt-in
 

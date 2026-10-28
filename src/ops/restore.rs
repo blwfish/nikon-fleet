@@ -442,6 +442,22 @@ mod tests {
     }
 
     #[test]
+    fn precheck_skips_shooting_limit_and_not_its_neighbours() {
+        // A Z6III snapshot taken at infinity stores index 1; restoring it would write 1 shot
+        // per burst (F25). At, below and above the code.
+        for (code, restored) in [(33085, true), (33086, false), (33087, true)] {
+            let c = cap(code, OP_GET | OP_SET);
+            let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(code, &c)]);
+            let got = restore_precheck(&caps, code);
+            if restored {
+                assert_eq!(got.unwrap().id, code, "{code}");
+            } else {
+                assert_eq!(got.err(), Some(RestoreSkip::NeverCopied), "{code}");
+            }
+        }
+    }
+
+    #[test]
     fn precheck_policy_skip_wins_over_absent_and_read_only() {
         let code = transplant::NEVER_TRANSPLANT[0].0;
         let empty: HashMap<u32, &CapabilityInfo> = HashMap::new();

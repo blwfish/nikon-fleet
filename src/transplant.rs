@@ -756,7 +756,10 @@ fn names_compatible(code: u32, src: &BTreeSet<String>, tgt: &BTreeSet<String>) -
 
 /// Capabilities `transplant` and `restore` never write, by code: they report what the
 /// body or its session is doing right now (or lock it), not a setting a person
-/// chose, so "make body B like body A" must not carry them across. A single
+/// chose, so "make body B like body A" must not carry them across. The one
+/// exception in kind is `ShootingLimit`, a real setting whose value this SDK
+/// reads back differently on different bodies (F25), so no write of it can be
+/// trusted to mean what was read. A single
 /// table is the source of truth; [`never_copied`] and the real-config test
 /// both read it, so a code and its name cannot drift apart unnoticed.
 ///
@@ -777,6 +780,7 @@ pub const NEVER_TRANSPLANT: &[(u32, &str, &str)] = &[
     (33165, "kNkMAIDCapability_ShootingMode", "exposure mode, set by the body's mode dial (judgement call)"),
     (34147, "kNkMAIDCapability_Viewmode", "which display the body is showing (judgement call)"),
     (33108, "kNkMAIDCapability_ShootNoCard", "flipped on its own across a power cycle with nothing writing to the camera, so state-like or reset by the body (judgement call, hardware observation F10)"),
+    (33086, "kNkMAIDCapability_ShootingLimit", "max shots per burst (Custom Setting d2): the same setting reads as different positions on different bodies, so a copy or a restore can leave 1 shot per burst instead of infinity (infinity is index 0 on a Z 9, index 1 on a Z6III where it cannot be told from 1, and a Z5 has no infinity; hardware observation F25)"),
 ];
 
 /// Why `code` is never transplanted, if it is on [`NEVER_TRANSPLANT`].
@@ -1603,6 +1607,32 @@ mod tests {
         assert_eq!(never_copied(33107), None);
         assert_eq!(never_copied(33109), None);
         assert!(NEVER_TRANSPLANT.iter().any(|(c, n, _)| *c == 33108 && *n == "kNkMAIDCapability_ShootNoCard"));
+    }
+
+    #[test]
+    fn shooting_limit_is_never_copied_and_its_neighbours_are_not() {
+        // 33086 reads as a different index for the same menu setting on the Z 9,
+        // Z6III and Z5 (F25). Pin the code and both sides of it, and the reason
+        // a user will read, which names the failure rather than just the policy.
+        assert!(never_copied(33086).is_some_and(|why| why.contains("burst") && why.contains("infinity")));
+        assert_eq!(never_copied(33085), None);
+        assert_eq!(never_copied(33087), None);
+        assert!(NEVER_TRANSPLANT.iter().any(|(c, n, _)| *c == 33086 && *n == "kNkMAIDCapability_ShootingLimit"));
+    }
+
+    #[test]
+    fn precheck_refuses_shooting_limit_for_a_range_between_any_two_models() {
+        // Same model on both sides is refused too: a Z6III at infinity reads 1, so copying
+        // it to a second Z6III writes 1 shot per burst.
+        let range = json!({"value": 0.0, "default": 0.0, "value_index": 1, "default_index": 200, "lower": 0.0, "upper": 200.0, "steps": 201});
+        for (src, tgt) in [("Z 9", "Z6_3"), ("Z6_3", "Z6_3"), ("Z 9", "Z 5")] {
+            let c = parse_config(&[(src, &[("ShootingLimit", 33086)]), (tgt, &[("ShootingLimit", 33086)])]);
+            let g = CodeNameGuard::new(&c, src, tgt).unwrap();
+            let ok = cap_info(33086, OP_SET);
+            let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(33086, &ok)]);
+            let prop = PropertyEntry { code: 33086, value: range.clone() };
+            assert!(matches!(precheck(&caps, &g, &prop), Err(SkipReason::NeverCopied { .. })), "{src} -> {tgt}");
+        }
     }
 
     #[test]
