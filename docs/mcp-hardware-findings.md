@@ -739,7 +739,19 @@ scratch build with env-var hooks (branch `f3-experiments`, not on master). A run
   one that pumps after every read *and* before the disconnect: 0/16 on the Z 9 and 0/16 on the Z6III, against 4/16 for
   per-read pumping alone on the Z 9. **That arm is not what shipped.** Candidate next step: pump the run loop (zero
   duration) after each capability read as well, then repeat the 60 Z6III snapshots; the cost is one cheap call per read.
-- **Not yet verified:** the shipped-code-versus-arm discrepancy above, a write path (`transplant`/`restore`),
+- **Per-read pump added and measured (not kept).** `read_capability` was made to pump the run loop (zero duration) after
+  every read, on top of the 300 ms pump before the disconnect (the best experimental arm), and 60 Z6III and 30 Z 9
+  snapshots were run with that binary: **Z6III 2/60 hung** (runs 30 and 52), **Z 9 3/30 hung** (runs 1, 13 and 29), clean
+  runs 3.5 to 5.0 s. Against the end-pump-only fix that is Z6III 6/60 to 2/60 and Z 9 0/30 to 3/30, so across both
+  bodies 6/90 to 5/90: no measurable gain, and neither difference is distinguishable from chance. The change was not
+  committed (the patch is not in the repo). So the per-read pump is not the missing piece, and the arm that looked best
+  (0/16 on each body) was probably a lucky sample.
+- **What the 330-odd runs support, and what they do not.** Established: an idle gap before `DisconnectDevice` hangs
+  both bodies every time (sleep arms: 16/16 and 16/16 and 24/24). Established: pumping the run loop first removes that
+  *deterministic* hang. Not established: that anything we tried takes the residual rate to zero. The shipped code
+  sits at about 7% over 90 snapshots (6 hung), where the pre-fix control was 17 of 56 (30%). The residual hangs may be
+  a second cause, or load on this machine at the time (the Z 9 hung on run 1 of its batch, straight after a Z6III batch).
+- **Not yet verified:** the residual-hang cause, a write path (`transplant`/`restore`),
   and the worker process. The supervisor's post-result grace and SIGKILL stay as a backstop regardless; the hang was
   never shown to be impossible, only rare after the pump.
 - Camera state was healthy after every kill, as in F3 and F14.
