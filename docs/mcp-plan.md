@@ -199,12 +199,13 @@ that exists but cannot be read (`reference_read_failures`) instead of treating i
 - **A target camera is always named, by USB serial.** Capture, check, plan and apply require a
   `serial` even when only one body is attached: the CLI's `snapshot` silently picks the first
   available body when none is given (F12), and an agent would not notice which one it got. The MCP
-  matches `serial` against the **USB** serial only. The CLI's `serial_matches` also accepts the
+  matches `serial` against the **USB** serial only. The CLI's rule (`ops::target::select_by_cli_serial`) also accepts the
   bare SDK id and the `id-N` fallback; SDK ids are assigned per session, so `id-1` can be a
   different body on the next call, and a digest or restore point keyed to one would silently
   retarget. A body with no readable USB serial, or a snapshot stamped `id-N`, cannot be a target
   for any camera-touching tool (`no_usb_serial`); `list_cameras` still shows it. Phase 0 gives
-  `ops` a strict matcher; the CLI keeps `serial_matches`.
+  `ops` a strict matcher; the CLI keeps its looser one, now also in `ops::target`, which refuses a value that
+  names two different bodies (a USB serial that is another body's SDK id) instead of taking the first.
 - **Refuse when two bodies of one model are attached.** For same-model bodies, `pair_devices`
   attaches serial and firmware to SDK devices by enumeration order (`main.rs`,
   `warn_if_ambiguous_pairing`); nothing in the SDK's device info can confirm it. With two Z 9s
@@ -509,7 +510,7 @@ snapshot" as meaningful, or filter them from the default lists.
 | Cross-process `flock` on an open fd at a fixed per-user local path (not `--data-dir`), taken by CLI, GUI and MCP worker (§3) | **done** (`a8b5c95`): `nikon_fleet::camera_lock`, taken in the CLI's `open_sdk` and the Rust GUI's discover and snapshot; the MCP worker takes it the same way once it exists. `vendor-read`/`vendor-write-ftp` are raw USB PTP and do not take it |
 | A small camera-port trait (`capabilities`/`read_capability`/`write_capability`) so plan/apply and the restore-point logic are testable without a `Device` (`plan_property` covers translate+gate only) | **done** (`72ed3a8`, `ops::port::{CameraPort, FakeCamera}`); `transplant()`, `capture()` and `restore::execute()` run on it |
 | Lift `firmware latest --json`'s types out of `main.rs` | **done** (`a08312a`, `ops::firmware_latest`) |
-| Strict USB-serial matcher in `ops` (refuses `id-N` and bare SDK ids, `no_usb_serial`); the CLI keeps `serial_matches` (§3) | matcher **done** (`638c23c`, `ops::target`); no caller yet, the MCP tools will be the first |
+| Strict USB-serial matcher in `ops` (refuses `id-N` and bare SDK ids, `no_usb_serial`); the CLI keeps its looser `select_by_cli_serial` (§3) | matcher **done** (`638c23c`, `ops::target`); no caller yet, the MCP tools will be the first |
 | `mcp-` / `mcp-restore-` label prefixes and the two per-camera caps (§3) | **done** (`51ac523`, `f1b2705`, `ops::retention`): labels, per-camera counting by file content, cap checks (200 captures / 50 restore points, decided in §9). Nothing calls it yet; the capture and apply tools will |
 | Read-back in `ops`: transplant returns `side_effects`, restore returns `residual` (§5.5-5.6) | **done** (`1c83fcb`, `ops::readback::{side_effects, residual}`), and the whole apply/undo sequence is tested on a fake body (`48c9b90`) |
 | Capture gate evaluated in memory before the file is written (a failed gate leaves no file) | **done** in the CLI and GUI (`d786333`); `ops::capture` returns the stats and the failed reads |
@@ -773,7 +774,11 @@ To write for the MCP:
 
 - **Baseline key: model, with firmware recorded.** As built: `no_baseline` fires when a capture's firmware differs
   from the baseline's *and* its readable set differs (`ops::baseline::check_against`, tested). A firmware update that
-  changes the readable set gets `no_baseline` until someone reseeds; that is accepted.
+  changes the readable set gets `no_baseline` until someone reseeds; that is accepted. A capture on a known
+  different firmware that lacks baseline capabilities is not saved at all: `capture_snapshot` and `check_against_reference`
+  return `firmware_shortfall` (`detail.missing`, `detail.baseline_firmware`, `detail.capture_firmware`), the same
+  refusal the CLI's `snapshot` and `check` give without `--allow-partial` (the MCP has no override). A firmware the
+  SDK reports as empty is not evidence of a change; that capture is `capture_incomplete` if it is short.
 - **Retention caps: 200 captures and 50 restore points per camera.** A snapshot is about 83 KB, so about 16 MB and 4 MB.
   Nothing is auto-deleted and there is no delete tool; past a cap the call refuses with `data_dir_full` and the user
   tidies by hand. A human prune command is not built; add it if the caps start to bite.
@@ -781,6 +786,9 @@ To write for the MCP:
   Healthy calls take about 3 to 20 s and a hang after the result is handled by the 3 s grace, so the deadlines bind
   rarely. A too-long read deadline only makes a stuck call slow; a too-short apply deadline would make a good write
   look `indeterminate`, so the apply one stays generous. Clients' own request timeouts are still unverified (§8.2).
+  The offline tools (list, get, diff, `list_cameras`) have their own deadline (30 s; `firmware_status`, which uses the
+  network, 180 s) and fail with `tool_deadline`; the blocked thread cannot be cancelled and is abandoned, which is
+  harmless for reads. After a kill the supervisor waits at most 5 s to reap the worker before it releases the queue.
 - **Same-model pairing: keep refusing `ambiguous_pairing`.** No verified pairing method exists, and a wrong pairing
   stamps a capture with the wrong serial or writes to the wrong body. A read-only search for a body-unique capability
   with two Z 9s attached was offered and declined for now.

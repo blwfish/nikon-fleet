@@ -1,0 +1,7 @@
+{
+  "cameras": [
+    {"model": "Z 9", "firmware": "5.31", "serial": "0000003023668", "sdk_id": 1, "usb_serial": "0000003023668", "known_model": true, "baseline": true},
+    {"model": "Z6_3", "firmware": "2.00", "serial": "id-2", "sdk_id": 2, "usb_serial": null, "known_model": true, "baseline": true},
+    {"model": "Z 5", "firmware": "1.10", "serial": "6000001", "sdk_id": 3, "usb_serial": "6000001", "known_model": true, "baseline": false}
+  ]
+}

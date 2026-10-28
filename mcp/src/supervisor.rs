@@ -12,12 +12,17 @@
 //! - on a deadline, or a cancellation the policy allows, the worker is sent
 //!   SIGKILL and reaped, and the pipe is drained afterwards: a `result` or a
 //!   progress line already written is honoured, because killing does not unwrite it;
+//! - the kill is bounded too ([`Supervisor::reap`]): a worker stuck in uninterruptible I/O is
+//!   reported and abandoned, so it cannot hold the queue (and the next call) forever;
+//! - a line that is not UTF-8 is a garbage line, like any other line that is not protocol: it is
+//!   counted and does not end the read (and so never kills a worker that is mid-apply);
 //! - dropping the future kills the child (`kill_on_drop`); a caller that must
 //!   not abandon a half-applied camera runs the future detached instead;
 //! - calls are served one at a time in arrival order, so `camera_busy` from a
 //!   worker means a holder outside this server.
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -25,7 +30,7 @@ use std::time::Duration;
 
 use nikon_fleet::ops::worker::{Line, Outcome};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::net::unix::pipe;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -121,6 +126,9 @@ pub struct Supervisor {
     pub grace: Duration,
     /// How long to keep reading after a kill (the pipe ends as soon as the child is gone).
     drain: Duration,
+    /// How long a killed worker may take to be reaped. SIGKILL cannot be caught, but a process
+    /// in uninterruptible I/O (a wedged USB transfer) does not die until the I/O returns.
+    pub reap: Duration,
 }
 
 fn pipe_pair() -> std::io::Result<(OwnedFd, OwnedFd)> {
@@ -147,6 +155,7 @@ impl Supervisor {
             queue: Mutex::new(()),
             grace: Duration::from_secs(3),
             drain: Duration::from_secs(2),
+            reap: Duration::from_secs(5),
         }
     }
 
@@ -195,7 +204,7 @@ impl Supervisor {
             _ = ct.cancelled() => return Ok(Finished::CancelledBeforeStart),
         };
         let (mut child, rx) = self.spawn(&spec.op_args)?;
-        let mut lines = BufReader::new(rx).lines();
+        let mut lines = ChannelLines::new(BufReader::new(rx));
         let deadline = tokio::time::sleep(spec.deadline);
         tokio::pin!(deadline);
 
@@ -238,17 +247,17 @@ impl Supervisor {
         if let Some(outcome) = answer {
             // Final. Give the worker a moment to leave, then end it whatever state it is in.
             if tokio::time::timeout(self.grace, child.wait()).await.is_err() {
-                kill_and_reap(&mut child).await;
+                self.kill_and_reap(&mut child).await;
             }
             return Ok(Finished::Result { outcome, last_phase, garbage_lines: garbage });
         }
 
         let cause = stop.unwrap_or(NoResultCause::WorkerDied);
         if cause != NoResultCause::WorkerDied {
-            kill_and_reap(&mut child).await;
+            self.kill_and_reap(&mut child).await;
         } else {
             let _ = tokio::time::timeout(self.grace, child.wait()).await;
-            kill_and_reap(&mut child).await;
+            self.kill_and_reap(&mut child).await;
         }
         // Whatever the worker managed to write before it died is still in the pipe.
         let drained = tokio::time::timeout(self.drain, async {
@@ -268,11 +277,84 @@ impl Supervisor {
             None => Finished::NoResult { cause, last_phase, garbage_lines: garbage },
         })
     }
+
+    /// Kill the worker and wait for it, for at most [`Supervisor::reap`]. A failure is logged and
+    /// the call goes on: the queue lock is released when `run` returns, and `kill_on_drop` kills
+    /// the child again when it is dropped.
+    async fn kill_and_reap(&self, child: &mut Child) {
+        if let Err(e) = bounded_reap(child.kill(), self.reap).await {
+            eprintln!("fleet-mcp: {e}");
+        }
+    }
+}
+
+/// Why a killed worker was not reaped.
+#[derive(Debug)]
+enum ReapError {
+    /// Still not gone after the limit: stuck in a call the kernel will not interrupt.
+    TimedOut(Duration),
+    Kill(std::io::Error),
+}
+
+impl std::fmt::Display for ReapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReapError::TimedOut(limit) => write!(
+                f,
+                "the worker was killed but was still not reaped after {limit:?} (stuck in uninterruptible I/O?); \
+                 abandoning it so the queue is not held"
+            ),
+            ReapError::Kill(e) => write!(f, "killing the worker: {e}"),
+        }
+    }
+}
+
+/// Run `reap` (the kill and wait of a worker) for at most `limit`. A worker that is already gone
+/// (`InvalidInput`) is fine; any other error is returned.
+async fn bounded_reap(reap: impl Future<Output = std::io::Result<()>>, limit: Duration) -> Result<(), ReapError> {
+    match tokio::time::timeout(limit, reap).await {
+        Err(_) => Err(ReapError::TimedOut(limit)),
+        Ok(Err(e)) if e.kind() != std::io::ErrorKind::InvalidInput => Err(ReapError::Kill(e)),
+        Ok(_) => Ok(()),
+    }
+}
+
+/// Newline-delimited lines off the result channel as raw bytes. `tokio::io::Lines` fails on the
+/// first byte that is not UTF-8, and the caller treated that failure as a dead channel and killed
+/// the worker, even mid-apply; here a line is just bytes and [`absorb`] decides what it is.
+///
+/// Cancellation-safe like `Lines`: bytes read so far stay in `buf` until the line is complete.
+struct ChannelLines<R> {
+    reader: R,
+    buf: Vec<u8>,
+}
+
+impl<R: AsyncBufRead + Unpin> ChannelLines<R> {
+    fn new(reader: R) -> Self {
+        ChannelLines { reader, buf: Vec::new() }
+    }
+
+    /// The next line without its terminator (`\n` or `\r\n`), `None` at end of input. A final
+    /// line with no terminator is still returned.
+    async fn next_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        self.reader.read_until(b'\n', &mut self.buf).await?;
+        if self.buf.is_empty() {
+            return Ok(None);
+        }
+        let mut line = std::mem::take(&mut self.buf);
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+        }
+        Ok(Some(line))
+    }
 }
 
 /// Absorb the lines that are available right now, without waiting for more.
-async fn drain_ready<R: tokio::io::AsyncBufRead + Unpin>(
-    lines: &mut tokio::io::Lines<R>,
+async fn drain_ready<R: AsyncBufRead + Unpin>(
+    lines: &mut ChannelLines<R>,
     last_phase: &mut Option<String>,
     garbage: &mut usize,
     writing_seen: &mut bool,
@@ -288,13 +370,17 @@ async fn drain_ready<R: tokio::io::AsyncBufRead + Unpin>(
 }
 
 fn absorb(
-    line: &str,
+    line: &[u8],
     last_phase: &mut Option<String>,
     garbage: &mut usize,
     writing_seen: &mut bool,
     answer: &mut Option<Outcome>,
     on_progress: &mut (dyn FnMut(&str) + Send),
 ) {
+    let Ok(line) = std::str::from_utf8(line) else {
+        *garbage += 1;
+        return;
+    };
     if line.trim().is_empty() {
         return;
     }
@@ -308,15 +394,6 @@ fn absorb(
         }
         Ok(Line::Result(o)) => *answer = Some(o),
         Err(_) => *garbage += 1,
-    }
-}
-
-async fn kill_and_reap(child: &mut Child) {
-    if let Err(e) = child.kill().await {
-        // Already gone is fine; anything else is worth knowing.
-        if e.kind() != std::io::ErrorKind::InvalidInput {
-            eprintln!("fleet-mcp: killing the worker: {e}");
-        }
     }
 }
 
@@ -500,6 +577,93 @@ mod tests {
         let (f, _) = run(&s, &spec(5000, CancelPolicy::Always), &CancellationToken::new()).await;
         let Finished::Result { garbage_lines, .. } = f else { panic!("{f:?}") };
         assert_eq!(garbage_lines, 2);
+    }
+
+    #[tokio::test]
+    async fn a_line_that_is_not_utf8_is_garbage_not_a_dead_channel() {
+        // `tokio::io::Lines` failed on the first such byte, which ended the read, killed the worker
+        // and reported `channel_error`, even for a worker that was mid-apply.
+        let d = TempDir::new().unwrap();
+        let progress = r#"{"type":"progress","phase":"a"}"#;
+        let s = fake(
+            &d,
+            "w",
+            &format!("printf '\\377\\376\\n' >&3\necho '{progress}' >&3\nprintf '{OK_LINE}\\200\\n' >&3\necho '{OK_LINE}' >&3"),
+        );
+        let (f, phases) = run(&s, &spec(5000, CancelPolicy::Always), &CancellationToken::new()).await;
+        // The progress line after the bad one is still read; a result line with a stray byte in it
+        // is not a result (it is not UTF-8), so only the clean one answers.
+        assert_eq!(phases, ["a"]);
+        let Finished::Result { outcome, last_phase, garbage_lines } = f else { panic!("{f:?}") };
+        assert_eq!(ok_data(&outcome), Some(&serde_json::json!({"n": 1})));
+        assert_eq!((last_phase.as_deref(), garbage_lines), (Some("a"), 2));
+    }
+
+    async fn lines_of(input: &[u8]) -> Vec<Vec<u8>> {
+        let mut l = ChannelLines::new(BufReader::new(input));
+        let mut out = Vec::new();
+        while let Some(line) = l.next_line().await.unwrap() {
+            out.push(line);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn channel_lines_split_on_newline_and_keep_every_byte_of_the_line() {
+        assert_eq!(lines_of(b"").await, Vec::<Vec<u8>>::new(), "empty input: no lines, not one empty line");
+        assert_eq!(lines_of(b"a\nb\n").await, [b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(lines_of(b"a\n\nb\n").await, [b"a".to_vec(), b"".to_vec(), b"b".to_vec()], "an empty line is a line");
+        assert_eq!(lines_of(b"a\r\nb\n").await, [b"a".to_vec(), b"b".to_vec()], "CRLF is one terminator");
+        assert_eq!(lines_of(b"a\nb").await, [b"a".to_vec(), b"b".to_vec()], "an unterminated last line is still delivered");
+        assert_eq!(lines_of(b"\xff\xfe\nok\n").await, [vec![0xff, 0xfe], b"ok".to_vec()], "invalid UTF-8 passes through as bytes");
+    }
+
+    #[tokio::test]
+    async fn a_partly_read_line_survives_a_cancelled_read() {
+        // The run loop reads inside a `select!`, so a read is dropped whenever another branch wins.
+        use tokio::io::AsyncWriteExt;
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let mut l = ChannelLines::new(BufReader::new(rx));
+        tx.write_all(b"hel").await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), l.next_line()).await.is_err(), "no newline yet");
+        tx.write_all(b"lo\n").await.unwrap();
+        assert_eq!(l.next_line().await.unwrap(), Some(b"hello".to_vec()), "the bytes read before the cancel are not lost");
+        drop(tx);
+        assert_eq!(l.next_line().await.unwrap(), None);
+    }
+
+    fn io_err(kind: std::io::ErrorKind) -> std::io::Result<()> {
+        Err(std::io::Error::new(kind, "x"))
+    }
+
+    #[tokio::test]
+    async fn a_reap_that_never_completes_is_abandoned_at_the_limit() {
+        // A child that ignores SIGKILL (uninterruptible I/O) cannot be made in a test, so the
+        // kill-and-wait is injected as a future that never finishes.
+        let limit = Duration::from_millis(150);
+        let t = Instant::now();
+        let r = bounded_reap(std::future::pending::<std::io::Result<()>>(), limit).await;
+        assert!(matches!(r, Err(ReapError::TimedOut(l)) if l == limit), "{r:?}");
+        assert!(t.elapsed() >= limit, "not given up early: {:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(5), "released: {:?}", t.elapsed());
+        assert!(r.unwrap_err().to_string().contains("not reaped"));
+    }
+
+    #[tokio::test]
+    async fn a_reap_just_inside_the_limit_succeeds_and_just_outside_does_not() {
+        let slow = |ms: u64| async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok(())
+        };
+        assert!(bounded_reap(slow(10), Duration::from_millis(1000)).await.is_ok(), "below the limit");
+        assert!(matches!(bounded_reap(slow(1000), Duration::from_millis(50)).await, Err(ReapError::TimedOut(_))), "above the limit");
+    }
+
+    #[tokio::test]
+    async fn an_already_gone_worker_is_not_an_error_but_a_failed_kill_is() {
+        let limit = Duration::from_secs(1);
+        assert!(bounded_reap(async { io_err(std::io::ErrorKind::InvalidInput) }, limit).await.is_ok(), "already gone");
+        assert!(matches!(bounded_reap(async { io_err(std::io::ErrorKind::PermissionDenied) }, limit).await, Err(ReapError::Kill(_))));
     }
 
     #[tokio::test]

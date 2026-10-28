@@ -19,6 +19,7 @@ pub mod ptp_usb;
 pub mod range_policy;
 pub mod range_value;
 pub mod sdk;
+pub mod settings;
 pub mod snapshot;
 pub mod transplant;
 pub(crate) mod value_shape;

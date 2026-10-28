@@ -25,6 +25,8 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::ops::baseline::baseline_for;
+use crate::ops::target::{body_firmware, storable_serial};
 use crate::sdk::{DeviceInfo, UsbCameraInfo, UsbScan, UsbUnreadable, usb_camera_scan};
 
 /// Model names whose USB spelling is verified to equal the SDK/schema spelling.
@@ -45,6 +47,10 @@ pub struct UsbCamera {
     pub firmware: String,
     /// The model is in [`KNOWN_MODELS`]; if not, it cannot be a target.
     pub known_model: bool,
+    /// The build ships a capture baseline for this model. A known model with no
+    /// baseline (the Z 5) can be read and captured, but every apply refuses it
+    /// (`no_baseline`): there is nothing to judge a restore point or read-back by.
+    pub baseline: bool,
     /// The USB serial descriptor could be read (a body without one cannot be
     /// named, see `ops::target`).
     pub serial_readable: bool,
@@ -71,6 +77,7 @@ pub fn describe(usb: &[UsbCameraInfo]) -> Vec<UsbCamera> {
             serial: u.serial.clone(),
             firmware: u.firmware.clone(),
             known_model: sdk_model_name(&u.model).is_some(),
+            baseline: baseline_for(&u.model).is_some(),
             serial_readable: !u.serial.is_empty(),
             pairing_ambiguous: dups.contains_key(&u.model),
         })
@@ -80,6 +87,39 @@ pub fn describe(usb: &[UsbCameraInfo]) -> Vec<UsbCamera> {
 /// The attached cameras, from USB alone.
 pub fn list_usb() -> Vec<UsbCamera> {
     describe(&usb_camera_scan().cameras)
+}
+
+/// One body as `nikon-fleet discover --json` reports it: the SDK's device paired with its USB
+/// record. `serial` is the identity every stored snapshot and reference uses
+/// ([`storable_serial`]); `sdk_id` and `usb_serial` are the two things it is made from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiscoveredCamera {
+    pub model: String,
+    /// The USB serial, or `id-{sdk_id}` when none could be read. Never the bare SDK id.
+    pub serial: String,
+    /// USB `bcdDevice` firmware, else the SDK's own (empty on every surveyed body).
+    pub firmware: String,
+    /// This session's SDK device id; not stable across sessions.
+    pub sdk_id: u32,
+    /// The USB `iSerialNumber`; `null` when there is no USB record or it was empty.
+    pub usb_serial: Option<String>,
+    /// The model is in [`KNOWN_MODELS`].
+    pub known_model: bool,
+    /// The build ships a capture baseline for this model (see [`UsbCamera::baseline`]).
+    pub baseline: bool,
+}
+
+/// Describe one paired SDK device. Pure.
+pub fn describe_device(dev: &DeviceInfo, usb: &Option<UsbCameraInfo>) -> DiscoveredCamera {
+    DiscoveredCamera {
+        model: dev.name.clone(),
+        serial: storable_serial(usb, dev.id),
+        firmware: body_firmware(dev, usb),
+        sdk_id: dev.id,
+        usb_serial: usb.as_ref().map(|u| u.serial.clone()).filter(|s| !s.is_empty()),
+        known_model: sdk_model_name(&dev.name).is_some(),
+        baseline: baseline_for(&dev.name).is_some(),
+    }
 }
 
 /// `list_cameras`: the bodies read, the ones that could not be, and whether the
@@ -210,7 +250,8 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&d).unwrap(),
             json!([{"model": "Z 9", "serial": "0000003023668", "firmware": "5.31",
-                    "known_model": true, "serial_readable": true, "pairing_ambiguous": false}])
+                    "known_model": true, "baseline": true, "serial_readable": true,
+                    "pairing_ambiguous": false}])
         );
     }
 
@@ -233,6 +274,41 @@ mod tests {
         assert_eq!((d[0].known_model, d[0].serial_readable), (false, true));
         assert_eq!((d[1].known_model, d[1].serial_readable), (true, false));
         assert_eq!(d[1].serial, "", "reported as read, not replaced by an id-N");
+    }
+
+    #[test]
+    fn a_known_model_without_a_baseline_is_visible_as_such() {
+        // The Z 5 is a known model (it can be named and captured) with no baseline: every apply
+        // refuses it, and the listing is where that must show.
+        let d = describe(&[usb("Z 5", "S5"), usb("Z 9", "S9"), usb("Z6_3", "S6"), usb("Z 8", "S8")]);
+        let got: Vec<(&str, bool, bool)> = d.iter().map(|c| (c.model.as_str(), c.known_model, c.baseline)).collect();
+        assert_eq!(
+            got,
+            [("Z 5", true, false), ("Z 9", true, true), ("Z6_3", true, true), ("Z 8", false, false)]
+        );
+    }
+
+    #[test]
+    fn discover_rows_carry_the_storable_serial_and_both_its_parts() {
+        let row = |dev: DeviceInfo, usb: Option<UsbCameraInfo>| serde_json::to_value(describe_device(&dev, &usb)).unwrap();
+        // A body with a USB serial: serial is it, usb_serial repeats it, sdk_id is separate.
+        assert_eq!(
+            row(dev(3, "Z 9").0, Some(usb("Z 9", "0000003023668"))),
+            json!({"model": "Z 9", "serial": "0000003023668", "firmware": "5.31", "sdk_id": 3,
+                   "usb_serial": "0000003023668", "known_model": true, "baseline": true})
+        );
+        // No USB record at all: the id-N fallback (NOT the bare SDK id), no usb_serial, unknown firmware.
+        assert_eq!(
+            row(dev(2, "Z 5").0, None),
+            json!({"model": "Z 5", "serial": "id-2", "firmware": "", "sdk_id": 2,
+                   "usb_serial": null, "known_model": true, "baseline": false})
+        );
+        // An unreadable descriptor (Some("")) is no serial either; the firmware it did read is kept.
+        let v = row(dev(4, "Z6_3").0, Some(usb("Z6_3", "")));
+        assert_eq!((v["serial"].as_str(), v["usb_serial"].clone(), v["firmware"].as_str()), (Some("id-4"), json!(null), Some("5.31")));
+        // An unsurveyed model: reported, flagged, and without a baseline.
+        let v = row(dev(1, "Z 8").0, Some(usb("Z 8", "S")));
+        assert_eq!((v["known_model"].clone(), v["baseline"].clone()), (json!(false), json!(false)));
     }
 
     #[test]

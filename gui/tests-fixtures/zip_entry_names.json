@@ -1,0 +1,235 @@
+{
+  "_about": "Zip entry names the archive layout accepts (gui/src/main.rs classify_zip_entry; the Python GUI's accept_zip_entry must agree). Rule: split the RAW name on '/'; every component must be non-empty, not '.', not '..', and contain no backslash or NUL; then the parts must be exactly [snapshots|references, <x>.json] or [firmware, <slug>, <version>, firmware.bin|source-page.html|metadata.json]. Case-sensitive.",
+  "cases": [
+    {
+      "name": "snapshots/foo.json",
+      "accept": true,
+      "why": "a snapshot"
+    },
+    {
+      "name": "references/bar.json",
+      "accept": true,
+      "why": "a reference"
+    },
+    {
+      "name": "firmware/Z_9/5.31/firmware.bin",
+      "accept": true,
+      "why": "firmware binary"
+    },
+    {
+      "name": "firmware/Z_9/5.31/metadata.json",
+      "accept": true,
+      "why": "firmware metadata"
+    },
+    {
+      "name": "firmware/Z_9/5.31/source-page.html",
+      "accept": true,
+      "why": "the archived source page (part of an archive entry)"
+    },
+    {
+      "name": "firmware/Z6_3/2.00/firmware.bin",
+      "accept": true,
+      "why": "Z6III spelling"
+    },
+    {
+      "name": "snapshots/Z_9_30012345_a b_20260101T000000Z.json",
+      "accept": true,
+      "why": "spaces in a file name are plain"
+    },
+    {
+      "name": "snapshots/.json",
+      "accept": true,
+      "why": "a file literally named .json ends with .json"
+    },
+    {
+      "name": "snapshots/foo.bin",
+      "accept": false,
+      "why": "not .json"
+    },
+    {
+      "name": "snapshots/foo.JSON",
+      "accept": false,
+      "why": "the suffix is case-sensitive"
+    },
+    {
+      "name": "Snapshots/foo.json",
+      "accept": false,
+      "why": "the folder is case-sensitive"
+    },
+    {
+      "name": "references/bar.bin",
+      "accept": false,
+      "why": "not .json"
+    },
+    {
+      "name": "other/foo.json",
+      "accept": false,
+      "why": "unknown folder"
+    },
+    {
+      "name": "foo.json",
+      "accept": false,
+      "why": "no folder"
+    },
+    {
+      "name": "",
+      "accept": false,
+      "why": "empty name"
+    },
+    {
+      "name": "snapshots",
+      "accept": false,
+      "why": "folder alone"
+    },
+    {
+      "name": "firmware/Z_9/5.31/other.json",
+      "accept": false,
+      "why": "firmware entry files are exactly three names"
+    },
+    {
+      "name": "firmware/Z_9/5.31/firmware.bin.part",
+      "accept": false,
+      "why": "temp file of an interrupted archive"
+    },
+    {
+      "name": "firmware/Z_9_0531.bin",
+      "accept": false,
+      "why": "legacy flat firmware layout"
+    },
+    {
+      "name": "snapshots/sub.json/foo.json",
+      "accept": false,
+      "why": "too deep (3 parts); sub.json passes the .json check"
+    },
+    {
+      "name": "references/sub.json/foo.json",
+      "accept": false,
+      "why": "too deep (3 parts)"
+    },
+    {
+      "name": "firmware/Z_9/firmware.bin",
+      "accept": false,
+      "why": "too shallow (3 parts)"
+    },
+    {
+      "name": "firmware/Z_9/5.31/firmware.bin/firmware.bin",
+      "accept": false,
+      "why": "too deep (5 parts); parts[3] is a valid file name"
+    },
+    {
+      "name": "firmware/Z_9/5.31/extra/firmware.bin",
+      "accept": false,
+      "why": "too deep (5 parts)"
+    },
+    {
+      "name": "firmware/../snapshots/metadata.json",
+      "accept": false,
+      "why": ".. component"
+    },
+    {
+      "name": "snapshots/../etc/passwd",
+      "accept": false,
+      "why": ".. component"
+    },
+    {
+      "name": "firmware/../Z_9/5.31/firmware.bin",
+      "accept": false,
+      "why": ".. as the slug"
+    },
+    {
+      "name": "../etc/passwd",
+      "accept": false,
+      "why": "traversal"
+    },
+    {
+      "name": "../snapshots/foo.json",
+      "accept": false,
+      "why": "traversal then a valid-looking name"
+    },
+    {
+      "name": "/snapshots/foo.json",
+      "accept": false,
+      "why": "absolute path (empty first component)"
+    },
+    {
+      "name": "./snapshots/foo.json",
+      "accept": false,
+      "why": ". component"
+    },
+    {
+      "name": "snapshots/./foo.json",
+      "accept": false,
+      "why": ". component"
+    },
+    {
+      "name": "snapshots//foo.json",
+      "accept": false,
+      "why": "empty component"
+    },
+    {
+      "name": "firmware/Z_9//5.31/firmware.bin",
+      "accept": false,
+      "why": "empty component"
+    },
+    {
+      "name": "firmware//Z_9/5.31/firmware.bin",
+      "accept": false,
+      "why": "empty component"
+    },
+    {
+      "name": "firmware/Z_9/5.31//firmware.bin",
+      "accept": false,
+      "why": "empty component"
+    },
+    {
+      "name": "snapshots/",
+      "accept": false,
+      "why": "trailing slash: a directory entry"
+    },
+    {
+      "name": "snapshots/foo.json/",
+      "accept": false,
+      "why": "trailing slash"
+    },
+    {
+      "name": "snapshots/a\\b.json",
+      "accept": false,
+      "why": "backslash inside a component"
+    },
+    {
+      "name": "snapshots\\foo.json",
+      "accept": false,
+      "why": "backslash as a separator"
+    },
+    {
+      "name": "snapshots/a\u0000b.json",
+      "accept": false,
+      "why": "NUL"
+    },
+    {
+      "name": "firmware/../5.31/firmware.bin",
+      "accept": false,
+      "why": ".. as the slug in an otherwise valid 4-part name"
+    },
+    {
+      "name": "firmware/Z_9/../firmware.bin",
+      "accept": false,
+      "why": ".. as the version in an otherwise valid 4-part name"
+    },
+    {
+      "name": "firmware/./5.31/firmware.bin",
+      "accept": false,
+      "why": ". as the slug in an otherwise valid 4-part name"
+    },
+    {
+      "name": "firmware/Z_9/./metadata.json",
+      "accept": false,
+      "why": ". as the version in an otherwise valid 4-part name"
+    },
+    {
+      "name": "firmware//5.31/firmware.bin",
+      "accept": false,
+      "why": "empty slug in an otherwise valid 4-part name"
+    }
+  ]
+}

@@ -1,0 +1,146 @@
+{
+  "dir": "../tests/fixtures/reference_parity/snapshots",
+  "dir_exists": true,
+  "entries": [
+    {
+      "file": "abc_no_newline.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "ABC123",
+      "firmware": "5.31",
+      "label": "baseline",
+      "captured_at": "2026-01-01T00:00:00.100Z",
+      "property_count": 1,
+      "is_reference": false
+    },
+    {
+      "file": "abc_older.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "ABC123",
+      "firmware": "5.31",
+      "label": "older",
+      "captured_at": "2025-12-01T00:00:00Z",
+      "property_count": 1,
+      "is_reference": false
+    },
+    {
+      "file": "abc_ref_source.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "ABC123",
+      "firmware": "5.31",
+      "label": "baseline",
+      "captured_at": "2026-01-01T00:00:00.100Z",
+      "property_count": 1,
+      "is_reference": true
+    },
+    {
+      "file": "abc_ref_twin.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "ABC123",
+      "firmware": "5.31",
+      "label": "baseline",
+      "captured_at": "2026-01-01T00:00:00.100Z",
+      "property_count": 1,
+      "is_reference": true
+    },
+    {
+      "file": "abc_reordered.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "ABC123",
+      "firmware": "5.31",
+      "label": "baseline",
+      "captured_at": "2026-01-01T00:00:00.100Z",
+      "property_count": 1,
+      "is_reference": false
+    },
+    {
+      "file": "abc_same_second.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "ABC123",
+      "firmware": "5.31",
+      "label": "other label",
+      "captured_at": "2026-01-01T00:00:00.100Z",
+      "property_count": 1,
+      "is_reference": false
+    },
+    {
+      "file": "broken.json",
+      "status": "unreadable",
+      "error_kind": "json",
+      "error": "JSON error: key must be a string at line 1 column 3"
+    },
+    {
+      "file": "hostile_subdir.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "x/y",
+      "firmware": "5.31",
+      "label": "hostile subdir serial",
+      "captured_at": "2026-05-02T00:00:00Z",
+      "property_count": 1,
+      "is_reference": false
+    },
+    {
+      "file": "id1_z6.json",
+      "status": "ok",
+      "model": "Z6_3",
+      "serial": "id-1",
+      "firmware": "5.31",
+      "label": "z6 fallback serial",
+      "captured_at": "2026-03-02T00:00:00Z",
+      "property_count": 1,
+      "is_reference": true
+    },
+    {
+      "file": "id1_z9.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "id-1",
+      "firmware": "5.31",
+      "label": "z9 fallback serial",
+      "captured_at": "2026-03-01T00:00:00Z",
+      "property_count": 1,
+      "is_reference": false
+    },
+    {
+      "file": "trav.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "../snapshots/abc_ref_source",
+      "firmware": "5.31",
+      "label": "hostile serial",
+      "captured_at": "2026-05-01T00:00:00Z",
+      "property_count": 1,
+      "is_reference": false
+    },
+    {
+      "file": "uni.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "UNI1",
+      "firmware": "5.31",
+      "label": "Café – ☃ 日本",
+      "captured_at": "2026-04-01T00:00:00Z",
+      "property_count": 1,
+      "is_reference": true
+    },
+    {
+      "file": "xyz_no_reference.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "XYZ789",
+      "firmware": "5.31",
+      "label": "no reference",
+      "captured_at": "2026-02-01T00:00:00Z",
+      "property_count": 1,
+      "is_reference": false
+    }
+  ],
+  "skipped_dir_entries": 0,
+  "reference_read_failures": 0
+}

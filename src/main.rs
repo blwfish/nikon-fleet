@@ -20,24 +20,27 @@ use time::format_description::well_known::Rfc3339;
 use nikon_fleet::camera_lock::CameraLock;
 use nikon_fleet::diff::{Diff, DiffOptions, diff_with_schema, is_volatile};
 use nikon_fleet::firmware::{
-    FirmwareError, FirmwareMeta, FIRMWARE_META_FORMAT_VERSION,
-    archive_dir, archive_exists, format_size, ingest_bundle, list_archives, load_meta,
-    model_slug, save_meta, sha256_file, IngestOutcome, Provenance, RetrievalMethod,
+    ArchiveListing, FirmwareError, FirmwareMeta, FIRMWARE_META_FORMAT_VERSION,
+    archive_dir, archive_exists, format_size, ingest_bundle, load_meta,
+    model_slug, save_meta, scan_archives, sha256_file, IngestOutcome, Provenance, RetrievalMethod,
 };
 use nikon_fleet::firmware_browse::{
-    BrowserWindow, VersionEvidence, browse_firmware, nikon_is_release_page,
+    BrowseError, BrowserWindow, VersionEvidence, browse_firmware, nikon_is_release_page,
 };
 use nikon_fleet::firmware_source::{
-    CameraRelation, DownloadAccess, FirmwareSource, FwVersion, ModelStatus, NikonDownloadCenter,
-    Release, UreqHttp, camera_relation, fetch_direct,
+    CameraRelation, DownloadAccess, FetchError, FirmwareSource, FwVersion, ModelStatus,
+    NikonDownloadCenter, Release, UreqHttp, camera_relation, fetch_direct,
 };
 use nikon_fleet::maid_layer::MaidLayerConfig;
-use nikon_fleet::ops::cameras::duplicate_models;
+use nikon_fleet::ops::cameras::{describe_device, duplicate_models};
 use nikon_fleet::ops::capture::{self as ops_capture, CaptureStats};
 use nikon_fleet::ops::firmware_latest::{LatestReport, ModelSurvey, survey_json, survey_models, watch_models};
-use nikon_fleet::ops::paths::is_safe_path_component;
-use nikon_fleet::ops::list::{EntryState, Listing, list_dir, reference_filename};
+use nikon_fleet::ops::paths::{checked_reference_filename, is_safe_path_component, write_atomic};
+use nikon_fleet::ops::list::{EntryState, Listing, list_dir};
 use nikon_fleet::ops::restore;
+use nikon_fleet::ops::target::{
+    TargetError, body_firmware, raw_usb_serial_arg, select_by_cli_serial, storable_serial,
+};
 use nikon_fleet::sdk::{Device, DeviceInfo, Sdk, UsbCameraInfo, pair_devices, usb_camera_list};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use nikon_fleet::transplant;
@@ -67,7 +70,12 @@ const DEFAULT_SCHEMA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/sdk-runtime/M
 #[derive(Parser, Debug)]
 #[command(name = "fleet", about = "Manage settings across a fleet of Nikon Z cameras", version)]
 struct Cli {
-    /// Base directory for snapshots/ and references/ subdirs.
+    /// Base directory for the snapshots/, references/ and firmware/ subdirs.
+    /// Defaults to the CURRENT DIRECTORY (`.`), not to the directory the GUIs use: they
+    /// read `data_dir` from settings.json, and the CLI does not, so a plain `nikon-fleet
+    /// snapshot` writes ./snapshots, which the GUIs never see. To work in the GUIs'
+    /// directory pass `--data-dir "$(nikon-fleet settings data-dir)"` (see `nikon-fleet
+    /// settings show`).
     #[arg(long, default_value = ".", global = true)]
     data_dir: PathBuf,
 
@@ -112,6 +120,11 @@ enum Cmd {
     #[command(subcommand)]
     Baseline(BaselineCmd),
 
+    /// Show or change settings.json, which the GUIs read for the data directory (the CLI
+    /// does not use it unless you pass it as --data-dir).
+    #[command(subcommand)]
+    Settings(SettingsCmd),
+
     /// Diff two snapshot files.
     Diff(DiffArgs),
 
@@ -147,12 +160,16 @@ enum Cmd {
     /// SDK. Reverse-engineered the same way as VendorRead — see
     /// docs/nx-field-session-2026-07-09.md for the field map and the parts
     /// of the wire format that are still opaque-but-fixed.
+    #[command(after_help = VENDOR_WRITE_HELP)]
     VendorWriteFtp(VendorWriteFtpArgs),
 }
 
 #[derive(Args, Debug)]
 struct DiscoverArgs {
-    /// Output camera list as JSON (for GUI / scripting).
+    /// Output camera list as JSON (for GUI / scripting): `{"cameras": [...]}`, each with
+    /// `model`, `serial` (the identity snapshots are stored under: the USB serial, or `id-N`
+    /// when none could be read), `firmware`, `sdk_id`, `usb_serial` (null when none),
+    /// `known_model` and `baseline` (a capture baseline ships for the model).
     #[arg(long)]
     json: bool,
 }
@@ -162,8 +179,8 @@ struct SnapshotArgs {
     /// Camera serial to target. (Used to disambiguate when multiple bodies are attached.)
     #[arg(long)]
     serial: Option<String>,
-    /// Optional label, e.g. "wedding-baseline".
-    #[arg(long)]
+    /// Optional label, e.g. "wedding-baseline". May start with `-` (`--label -guest`).
+    #[arg(long, allow_hyphen_values = true)]
     label: Option<String>,
     /// Save the capture even if it is missing capabilities the model's
     /// baseline reads (a body in an unusual state, e.g. no card). Without
@@ -188,15 +205,46 @@ enum BaselineCmd {
         #[arg(long, default_value = "baselines")]
         out_dir: PathBuf,
         /// Replace an existing baseline for this model (needed after a
-        /// firmware update).
+        /// firmware update). Refuses a replacement that stops requiring a capability the
+        /// existing baseline reads (see --allow-shrink).
         #[arg(long)]
         force: bool,
+        /// With --force: replace the existing baseline even though the new one lists fewer
+        /// capabilities, or the existing file cannot be read to compare. A smaller baseline
+        /// passes captures the old one would fail, so say so deliberately.
+        #[arg(long, requires = "force")]
+        allow_shrink: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SettingsCmd {
+    /// Print where settings.json is, what it says and the directory in use.
+    Show {
+        /// One JSON object: settings_path, settings_exist, data_dir (null when unset),
+        /// effective_data_dir, keys (every key in the file).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the directory the GUIs use (settings.json's data_dir, else the default), and
+    /// nothing else: `nikon-fleet --data-dir "$(nikon-fleet settings data-dir)" ls`.
+    DataDir,
+    /// Set the data directory the GUIs use (an absolute path), keeping every other key in
+    /// settings.json. A settings.json that cannot be parsed is left alone and reported.
+    SetDataDir {
+        /// The directory (absolute). Omit with --unset.
+        dir: Option<PathBuf>,
+        /// Clear the setting so the default is used.
+        #[arg(long, conflicts_with = "dir")]
+        unset: bool,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum RefCmd {
-    /// Promote a stored snapshot to be the reference for its camera.
+    /// Promote a stored snapshot to be the reference for its camera. Replaces the camera's
+    /// current reference (and says so); refuses a snapshot whose model or serial is not a
+    /// plain file-name component.
     Set { snapshot_path: PathBuf },
     /// Show the reference snapshot for a (model, serial).
     Show { model: String, serial: String },
@@ -254,6 +302,7 @@ struct RmArgs {
 #[derive(Subcommand, Debug)]
 enum FirmwareCmd {
     /// Archive a firmware binary file.
+    #[command(after_help = ALREADY_ARCHIVED_HELP)]
     Add(FirmwareAddArgs),
     /// List archived firmware versions.
     Ls(FirmwareLsArgs),
@@ -268,13 +317,43 @@ enum FirmwareCmd {
     Latest(FirmwareLatestArgs),
     /// Archive newly published firmware (or ingest a bundle you downloaded
     /// yourself with --from-file) with provenance.
+    #[command(after_help = ALREADY_ARCHIVED_HELP)]
     Fetch(FirmwareFetchArgs),
     /// Open the release's download page in an embedded browser so YOU accept
     /// Nikon's licence and click Download; the file is captured, checked
     /// against the page's version and archived with provenance. Needs a build
     /// with `--features webview`; otherwise prints the manual steps.
+    #[command(after_help = ALREADY_ARCHIVED_HELP)]
     Browse(FirmwareBrowseArgs),
 }
+
+/// Process exit status for "this model and version is already in the archive and nothing was
+/// changed": `firmware add` without `--force`, or a fetch/browse whose bytes differ from the
+/// archived ones. A script or GUI tests for it instead of reading the message.
+const EXIT_ALREADY_ARCHIVED: i32 = 3;
+
+const ALREADY_ARCHIVED_HELP: &str = "\
+Exit status:
+  0  done (identical bytes that are already archived count as done)
+  1  any other error
+  2  command-line usage error
+  3  refused: that model and version is already in the archive, nothing was changed
+     (`add` without --force; `fetch`/`browse` when the bytes differ from the archived ones;
+     with several models, 3 only when every failure was this)";
+
+/// Process exit status for a `vendor-write-ftp` that failed after the profile data had been sent
+/// to the camera: it may or may not have changed (`PtpUsbError::FtpWriteIndeterminate`). Distinct
+/// from the plain failure (1) a script is allowed to retry blindly: this one needs a look at the
+/// camera first.
+const EXIT_WRITE_INDETERMINATE: i32 = 4;
+
+const VENDOR_WRITE_HELP: &str = "\
+Exit status:
+  0  the camera accepted the profile (see the note printed after it, if any)
+  1  any other error; nothing was sent to the camera unless the message says so
+  2  command-line usage error
+  4  the profile data was sent but the write then failed: the camera MAY have changed.
+     The profile cannot be read back over USB; check it in the camera's menu before retrying";
 
 #[derive(Args, Debug)]
 struct FirmwareBrowseArgs {
@@ -322,8 +401,8 @@ struct FirmwareAddArgs {
     /// Firmware version string, e.g. "5.31".
     #[arg(long)]
     version: String,
-    /// Optional free-form notes.
-    #[arg(long)]
+    /// Optional free-form notes. May start with `-`.
+    #[arg(long, allow_hyphen_values = true)]
     notes: Option<String>,
     /// Overwrite an existing archive entry.
     #[arg(long)]
@@ -335,6 +414,12 @@ struct FirmwareLsArgs {
     /// Limit to a specific model, e.g. "Z 9".
     #[arg(long)]
     model: Option<String>,
+    /// Output as JSON (one object: dir, dir_exists, entries, skipped_dir_entries). Each valid
+    /// entry has status "ok", model, version, directory, bin_present, bin_sha256,
+    /// bin_size_bytes, archived_at, archived_by, canonical_snapshot_path, notes and provenance;
+    /// an entry that could not be listed has status "unreadable", directory, error_kind and error.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -379,11 +464,11 @@ struct VendorReadArgs {
     #[arg(value_parser = nikon_fleet::ptp_usb::parse_propcode)]
     propcode: u16,
     /// Camera serial to target. Required when more than one Nikon camera is
-    /// on USB; this command does not use --sdk-bundle/the MAID SDK at all,
-    /// so it does NOT understand the "id-N" fallback serial `fleet
-    /// discover`/`snapshot` print for a camera with no readable USB serial —
-    /// use the real serial, or the "usb-<bus>:<addr>" fallback this
-    /// command's own error/warning output uses instead for that case.
+    /// on USB; this command does not use --sdk-bundle/the MAID SDK at all.
+    /// The "id-N" serial `fleet discover` prints for a camera with no readable
+    /// USB serial is accepted only when that is the one Nikon camera attached
+    /// (this command cannot tell SDK ids apart); with several cameras use the
+    /// real serial or "usb-<bus>:<addr>".
     #[arg(long)]
     serial: Option<String>,
 }
@@ -417,11 +502,11 @@ struct VendorWriteFtpArgs {
     #[arg(long, conflicts_with = "password")]
     password_stdin: bool,
     /// Camera serial to target. Required when more than one Nikon camera is
-    /// on USB; this command does not use --sdk-bundle/the MAID SDK at all,
-    /// so it does NOT understand the "id-N" fallback serial `fleet
-    /// discover`/`snapshot` print for a camera with no readable USB serial —
-    /// use the real serial, or the "usb-<bus>:<addr>" fallback this
-    /// command's own error/warning output uses instead for that case.
+    /// on USB; this command does not use --sdk-bundle/the MAID SDK at all.
+    /// The "id-N" serial `fleet discover` prints for a camera with no readable
+    /// USB serial is accepted only when that is the one Nikon camera attached
+    /// (this command cannot tell SDK ids apart); with several cameras use the
+    /// real serial or "usb-<bus>:<addr>".
     #[arg(long)]
     serial: Option<String>,
     /// Print the encoded blob without sending it to the camera.
@@ -551,17 +636,6 @@ fn warn_if_ambiguous_pairing(enriched: &[(DeviceInfo, Option<UsbCameraInfo>)]) {
     }
 }
 
-/// Whether `s` identifies this device, as recorded by `cmd_snapshot`'s
-/// serial field: the real USB serial, the bare numeric SDK id, or the
-/// `"id-{id}"` fallback form written when no USB serial was readable.
-/// Without the last form, a camera snapshotted under that fallback could
-/// never be found again by --serial in any later command.
-fn serial_matches(dev: &DeviceInfo, usb: &Option<UsbCameraInfo>, s: &str) -> bool {
-    usb.as_ref().map(|u| u.serial.as_str()) == Some(s)
-        || dev.id.to_string() == s
-        || format!("id-{}", dev.id) == s
-}
-
 /// Who the body being written to is, for a restore point and for deciding whether a snapshot is
 /// of this very body. Built from the body itself, never from the snapshot being applied: taking
 /// the snapshot's serial when no USB descriptor was read made every other body look like the
@@ -569,24 +643,9 @@ fn serial_matches(dev: &DeviceInfo, usb: &Option<UsbCameraInfo>, s: &str) -> boo
 fn target_identity(target: &DeviceInfo, usb_info: &Option<UsbCameraInfo>) -> Camera {
     Camera {
         model: target.name.clone(),
-        serial: snapshot_serial(usb_info, target.id),
-        firmware: usb_info
-            .as_ref()
-            .map(|u| u.firmware.clone())
-            .filter(|f| !f.is_empty())
-            .unwrap_or_else(|| target.version.clone()),
+        serial: storable_serial(usb_info, target.id),
+        firmware: body_firmware(target, usb_info),
     }
-}
-
-/// The serial to record for a captured snapshot: the real USB serial if one
-/// was read (and non-empty — the SDK/USB layer can return `Some("")` for an
-/// unreadable descriptor, which must NOT be treated as a valid serial), else
-/// the `"id-{id}"` fallback.
-fn snapshot_serial(usb_info: &Option<UsbCameraInfo>, dev_id: u32) -> String {
-    usb_info
-        .as_ref()
-        .and_then(|u| (!u.serial.is_empty()).then(|| u.serial.clone()))
-        .unwrap_or_else(|| format!("id-{dev_id}"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -720,23 +779,68 @@ fn cmd_rm(_data_dir: &Path, args: &RmArgs) -> Result<()> {
     Ok(())
 }
 
+/// What `ref set` did, for its message.
+#[derive(Debug)]
+struct ReferenceSet {
+    camera: Camera,
+    target: PathBuf,
+    /// The reference that was there before, when there was one: its capture time and label.
+    replaced: Option<(String, Option<String>)>,
+    /// The snapshot was already byte-for-byte the reference; nothing changed.
+    unchanged: bool,
+}
+
+/// Promote `snapshot_path` to be the reference for its camera: a byte copy of the file under
+/// `refs/{model_slug}_{serial}.json`. The name is built from the snapshot's own model and serial
+/// through `checked_reference_filename`, so a `/` or `..` in a snapshot (data, not code) cannot
+/// write outside `refs`; the bytes parsed are the bytes written (one read), and the write is
+/// atomic, so a failure keeps the old reference. An existing reference is replaced: that is what
+/// promoting means, and the result says what was replaced.
+fn set_reference(refs: &Path, snapshot_path: &Path) -> Result<ReferenceSet> {
+    let bytes = fs::read(snapshot_path).with_context(|| format!("loading {}", snapshot_path.display()))?;
+    let snap = Snapshot::from_json(
+        std::str::from_utf8(&bytes).with_context(|| format!("loading {}", snapshot_path.display()))?,
+    )
+    .with_context(|| format!("loading {}", snapshot_path.display()))?;
+    let name = checked_reference_filename(&snap.camera.model, &snap.camera.serial).map_err(|e| {
+        anyhow::anyhow!(
+            "{} cannot be a reference: {e}; the reference file name is built from its camera model and serial",
+            snapshot_path.display()
+        )
+    })?;
+    ensure_dir(refs)?;
+    let target = refs.join(name);
+    let previous = fs::read(&target).ok();
+    let replaced = previous
+        .as_deref()
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|t| Snapshot::from_json(t).ok())
+        .map(|s| (s.captured_at, s.label));
+    let unchanged = previous.as_deref() == Some(bytes.as_slice());
+    write_atomic(&target, &bytes).with_context(|| format!("writing {}", target.display()))?;
+    Ok(ReferenceSet { camera: snap.camera, target, replaced, unchanged })
+}
+
 fn cmd_ref(data_dir: &Path, sub: &RefCmd) -> Result<()> {
     let refs = references_dir(data_dir);
     match sub {
         RefCmd::Set { snapshot_path } => {
-            let snap = Snapshot::load_from_file(snapshot_path)
-                .with_context(|| format!("loading {}", snapshot_path.display()))?;
-            ensure_dir(&refs)?;
-            let target = refs.join(reference_filename(&snap.camera.model, &snap.camera.serial));
-            fs::copy(snapshot_path, &target)
-                .with_context(|| format!("copying to {}", target.display()))?;
+            let done = set_reference(&refs, snapshot_path)?;
             println!(
                 "Set reference for {} {} → {}",
-                snap.camera.model, snap.camera.serial, target.display()
+                done.camera.model, done.camera.serial, done.target.display()
             );
+            match (&done.replaced, done.unchanged) {
+                (_, true) => println!("  (this snapshot was already the reference; nothing changed)"),
+                (Some((captured_at, label)), false) => println!(
+                    "  replaced the previous reference (captured {captured_at}, label {})",
+                    label.as_deref().unwrap_or("-")
+                ),
+                (None, false) => {}
+            }
         }
         RefCmd::Show { model, serial } => {
-            let target = refs.join(reference_filename(model, serial));
+            let target = refs.join(checked_reference_filename(model, serial)?);
             if !target.exists() {
                 bail!("no reference for {} {} (looked for {})", model, serial, target.display());
             }
@@ -825,58 +929,64 @@ fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs, no_usb_reset: bool) -> 
     let mut json_out = nikon_fleet::json_out::JsonOut::redirect(args.json)?;
     let sdk = open_sdk(bundle_path, no_usb_reset)?;
     let enriched = enrich_devices(sdk.devices()?);
-    if enriched.is_empty() {
-        if args.json {
-            // Built via serde like the populated-list branch below, rather
-            // than a hand-typed literal — the two used to be two different
-            // code paths producing the same logical shape with no compiler
-            // tie between them if the schema ever gains a field.
-            json_out.emit(&serde_json::json!({ "cameras": Vec::<serde_json::Value>::new() }).to_string())?;
-        } else {
-            println!("(no Nikon cameras detected)");
-        }
-        return Ok(());
-    }
+    let report = discover_report(&enriched, args.json)?;
     if args.json {
-        let cameras: Vec<serde_json::Value> = enriched.iter().map(|(dev, usb)| {
-            let id_str   = dev.id.to_string();
-            let serial   = usb.as_ref().and_then(|u| (!u.serial.is_empty()).then_some(u.serial.as_str())).unwrap_or(id_str.as_str()).to_string();
-            let firmware = usb.as_ref().map(|u| u.firmware.as_str()).unwrap_or(dev.version.as_str()).to_string();
-            serde_json::json!({ "model": dev.name, "serial": serial, "firmware": firmware })
-        }).collect();
-        json_out.emit(&serde_json::json!({ "cameras": cameras }).to_string())?;
+        json_out.emit(&report)?;
     } else {
-        println!("{} device(s):", enriched.len());
-        for (dev, usb) in &enriched {
-            // Same empty-but-present-serial fallback as the --json branch
-            // above — previously this branch only fell back to "?" when
-            // there was no USB pairing at all, so an empty (not absent)
-            // serial printed as a blank field instead of falling back.
-            let id_str   = dev.id.to_string();
-            let serial   = usb.as_ref().and_then(|u| (!u.serial.is_empty()).then_some(u.serial.as_str())).unwrap_or(id_str.as_str());
-            let firmware = usb.as_ref().map(|u| u.firmware.as_str()).unwrap_or(dev.version.as_str());
-            println!("  {}  serial={}  fw={}  id={}", dev.name, serial, firmware, dev.id);
-        }
+        println!("{report}");
     }
-    Ok(())
+    // Read-only and finished: the output is out and flushed, so leave without closing the session
+    // (F24: the SDK's DisconnectDevice can hang, and nothing here needs it).
+    nikon_fleet::process_exit::exit_now(0)
 }
 
-/// Select the target device: by --serial if given (matched against USB
-/// iSerialNumber, bare SDK id, or the "id-{id}" fallback form — see
-/// `serial_matches`), else the first available one. Shared by cmd_snapshot
-/// and cmd_check, which used to each carry an identical copy of this match.
+/// What `discover` prints: the `{"cameras": [...]}` document under `--json`, else the text listing.
+/// One value built through serde in every case, so the empty and populated JSON cannot drift apart.
+/// The rows are the ones the egui GUI can build (`ops::cameras::describe_device`): `serial` is the
+/// identity snapshots are stored under, so a snapshot just taken shows in its own list, and the
+/// text row prints the same fields so a serial shown there is one `--serial` accepts.
+fn discover_report(enriched: &[(DeviceInfo, Option<UsbCameraInfo>)], json: bool) -> Result<String> {
+    let cameras: Vec<_> = enriched.iter().map(|(dev, usb)| describe_device(dev, usb)).collect();
+    if json {
+        return Ok(serde_json::json!({ "cameras": cameras }).to_string());
+    }
+    if cameras.is_empty() {
+        return Ok("(no Nikon cameras detected)".to_string());
+    }
+    let mut lines = vec![format!("{} device(s):", cameras.len())];
+    for cam in &cameras {
+        lines.push(format!(
+            "  {}  serial={}  fw={}  id={}  baseline={}",
+            cam.model, cam.serial, cam.firmware, cam.sdk_id, if cam.baseline { "yes" } else { "no" }
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Select the target device: by --serial if given (the one rule for every caller,
+/// `ops::target::select_by_cli_serial`: a USB serial, or the `id-N` / SDK id `discover` printed
+/// for a body with no readable one; ambiguity is refused, never first-match), else the first
+/// available one. Shared by cmd_snapshot, cmd_check and cmd_transplant.
 fn select_device(
     enriched: Vec<(DeviceInfo, Option<UsbCameraInfo>)>,
     serial: Option<&str>,
 ) -> Result<(DeviceInfo, Option<UsbCameraInfo>)> {
     match serial {
-        Some(s) => enriched.into_iter()
-            .find(|(dev, usb)| serial_matches(dev, usb, s))
-            .ok_or_else(|| anyhow::anyhow!("no device with serial {s}")),
+        Some(s) => select_by_cli_serial(enriched, s).map_err(|e| target_error(s, e)),
         None => {
             let idx = enriched.iter().position(|(d, _)| d.available).unwrap_or(0);
             Ok(enriched.into_iter().nth(idx).unwrap())
         }
+    }
+}
+
+/// A `TargetError` with the CLI's own hint for the one case that is a mistake of naming.
+fn target_error(requested: &str, e: TargetError) -> anyhow::Error {
+    match e {
+        TargetError::NotFound { .. } => {
+            anyhow::anyhow!("no device with serial {requested} (see `nikon-fleet discover` for the serials in use)")
+        }
+        other => anyhow::anyhow!("{other}"),
     }
 }
 
@@ -908,12 +1018,13 @@ fn capture_capabilities(
 
 /// `unknown_schema` warning shared by cmd_snapshot and cmd_check.
 fn warn_if_unknown_schema(unknown_schema: usize, schema_path: &Path) {
+    use nikon_fleet::ops::baseline::capabilities_phrase;
     if unknown_schema > 0 {
         eprintln!(
-            "warning: {unknown_schema} capabilit{plural} not found in the loaded schema \
+            "warning: {} not found in the loaded schema \
              ({schema_path}) — recorded by numeric code (cap_0x...) instead of a symbolic \
              name. The schema may be stale relative to this camera's firmware.",
-            plural = if unknown_schema == 1 { "y is" } else { "ies are" },
+            capabilities_phrase(unknown_schema),
             schema_path = schema_path.display(),
         );
     }
@@ -922,9 +1033,19 @@ fn warn_if_unknown_schema(unknown_schema: usize, schema_path: &Path) {
 /// Judge a freshly captured snapshot against its model's baseline, in memory,
 /// before anything is written. An incomplete capture is an error unless
 /// `allow_partial`; a capture the gate cannot judge is noted on stderr and
-/// allowed (a new model has to be capturable to be baselined).
+/// allowed (a new model has to be capturable to be baselined), with one exception: a capture
+/// of a *different firmware* that lacks capabilities the baseline reads. A firmware update can
+/// drop capabilities, but an interrupted capture or a USB reset looks exactly the same, so that
+/// is refused too unless `allow_partial` says the shortfall is expected.
 fn apply_capture_gate(snap: &Snapshot, allow_partial: bool) -> Result<nikon_fleet::ops::baseline::GateOutcome> {
     use nikon_fleet::ops::baseline::{GateOutcome, NoBaselineReason, describe_failure, gate};
+    use nikon_fleet::ops::capture_snapshot::firmware_shortfall;
+    if snap.camera.firmware.is_empty() {
+        eprintln!(
+            "warning: this body's firmware could not be read (no USB record paired with it), so the \
+             capture records it as empty; the baseline gate treats unknown firmware as unchanged."
+        );
+    }
     let verdict = gate(snap);
     match &verdict {
         GateOutcome::Passed => {}
@@ -944,11 +1065,20 @@ fn apply_capture_gate(snap: &Snapshot, allow_partial: bool) -> Result<nikon_flee
             );
         }
         GateOutcome::NoBaseline(NoBaselineReason::FirmwareChanged { baseline, capture }) => {
-            eprintln!(
-                "note: firmware {capture} differs from the {:?} baseline's {baseline} and the readable set differs \
-                 too; this capture was not checked for completeness (re-seed the baseline for the new firmware).",
-                snap.camera.model
-            );
+            match firmware_shortfall(snap, &verdict) {
+                None => eprintln!(
+                    "note: firmware {capture} differs from the {:?} baseline's {baseline} and the readable set differs \
+                     too; this capture was not checked for completeness (re-seed the baseline for the new firmware).",
+                    snap.camera.model
+                ),
+                Some(shortfall) if allow_partial => {
+                    eprintln!("warning: {shortfall} Continuing because --allow-partial was given; re-seed the baseline for the new firmware.");
+                }
+                Some(shortfall) => bail!(
+                    "{shortfall}\nNothing was written. Re-run the capture; if the firmware really dropped them, pass \
+                     --allow-partial and re-seed the baseline for the new firmware."
+                ),
+            }
         }
     }
     Ok(verdict)
@@ -963,10 +1093,21 @@ fn say(json: bool, text: &str) {
     }
 }
 
+/// What `seed_baseline` wrote.
+#[derive(Debug)]
+struct Seeded {
+    path: PathBuf,
+    /// The exact text written, for `registration_of`.
+    json: String,
+}
+
 /// Write the baseline seeded from `snapshot_path` to `out_dir/{model_slug}.json`.
-/// Refuses to replace an existing file unless `force`.
-fn seed_baseline(snapshot_path: &Path, out_dir: &Path, force: bool) -> Result<PathBuf> {
-    use nikon_fleet::ops::baseline::Baseline;
+/// Refuses to replace an existing file unless `force`; with `force` it still refuses a
+/// replacement that stops requiring a capability the existing baseline reads (or one it cannot
+/// read to compare), unless `allow_shrink`: a snapshot of a partial capture or a restore point
+/// carries no marker saying so, and a shrunken baseline passes captures the old one failed.
+fn seed_baseline(snapshot_path: &Path, out_dir: &Path, force: bool, allow_shrink: bool) -> Result<Seeded> {
+    use nikon_fleet::ops::baseline::{Baseline, capabilities_phrase, describe_missing_list, lost_capabilities};
     let snap = Snapshot::load_from_file(snapshot_path)
         .with_context(|| format!("loading {}", snapshot_path.display()))?;
     let from = snapshot_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -979,7 +1120,41 @@ fn seed_baseline(snapshot_path: &Path, out_dir: &Path, force: bool) -> Result<Pa
     let path = out_dir.join(format!("{slug}.json"));
     let json = baseline.to_pretty_json()?;
     if force {
-        fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+        match fs::read_to_string(&path) {
+            Ok(existing_text) => match Baseline::from_json(&existing_text) {
+                Ok(existing) => {
+                    if existing.model != baseline.model && !allow_shrink {
+                        bail!(
+                            "{} holds the baseline for {:?}, not {:?} (their names make the same file); \
+                             pass --allow-shrink to replace it anyway",
+                            path.display(), existing.model, baseline.model
+                        );
+                    }
+                    let lost = lost_capabilities(&existing, &baseline);
+                    if !lost.is_empty() && !allow_shrink {
+                        bail!(
+                            "refusing to replace {}: the new baseline (from {from}, firmware {}) no longer lists {} the \
+                             existing one (firmware {}) reads: {}. A smaller baseline passes captures the old one would fail. \
+                             If those capabilities really went away (a firmware update, a body state), pass --allow-shrink.",
+                            path.display(), baseline.firmware, capabilities_phrase(lost.len()),
+                            existing.firmware, describe_missing_list(&lost)
+                        );
+                    }
+                }
+                Err(e) if !allow_shrink => bail!(
+                    "the existing {} cannot be read as a baseline ({e}), so the new one cannot be compared with it; \
+                     pass --allow-shrink to replace it anyway",
+                    path.display()
+                ),
+                Err(_) => {}
+            },
+            // Nothing there yet: --force on a fresh model is just a write.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("reading the existing {}", path.display())),
+        }
+        // Atomic: the shrink guard above protects this file, so a full disk or a kill mid-write
+        // must leave the old baseline, not a truncated one.
+        nikon_fleet::ops::paths::write_atomic(&path, json.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
     } else {
         use std::io::Write;
         let mut f = fs::OpenOptions::new()
@@ -989,14 +1164,33 @@ fn seed_baseline(snapshot_path: &Path, out_dir: &Path, force: bool) -> Result<Pa
             .with_context(|| format!("{} (already exists? pass --force to replace it)", path.display()))?;
         f.write_all(json.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
     }
-    Ok(path)
+    Ok(Seeded { path, json })
+}
+
+/// What the user must do next for a written baseline to be used by this program: nothing, a
+/// rebuild, or a rebuild after registering the file (the registry is a hand-kept list).
+fn seed_next_step(path: &Path, json: &str) -> String {
+    use nikon_fleet::ops::baseline::{Registration, registration_of};
+    let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    match registration_of(&file, json) {
+        Registration::Embedded => "This build already embeds exactly this baseline.".to_string(),
+        Registration::RebuildNeeded => {
+            "Baselines are embedded at build time: rebuild to use it (this build still has the old one).".to_string()
+        }
+        Registration::NotRegistered => format!(
+            "NOT ACTIVE: no baseline file is read from disk, and {file} is not in the built-in registry. \
+             Add {file:?} to BUILTIN_SOURCES in src/ops/baseline.rs (the test `every_file_in_baselines_is_registered` \
+             fails until you do, if the file is in the repo's baselines/), then rebuild. Until then captures of this \
+             model are reported as having no baseline."
+        ),
+    }
 }
 
 fn cmd_baseline(sub: &BaselineCmd) -> Result<()> {
     match sub {
-        BaselineCmd::Seed { snapshot_path, out_dir, force } => {
-            let path = seed_baseline(snapshot_path, out_dir, *force)?;
-            println!("Wrote {}\nBaselines are embedded at build time: rebuild to use it.", path.display());
+        BaselineCmd::Seed { snapshot_path, out_dir, force, allow_shrink } => {
+            let seeded = seed_baseline(snapshot_path, out_dir, *force, *allow_shrink)?;
+            println!("Wrote {}\n{}", seeded.path.display(), seed_next_step(&seeded.path, &seeded.json));
             Ok(())
         }
     }
@@ -1028,9 +1222,8 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     say(args.json, &format!("Reading {} capabilities…\n", device.capabilities.len()));
 
     let captured_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
-    let serial = snapshot_serial(&usb_info, target.id);
-    let firmware = usb_info.as_ref().map(|u| u.firmware.clone())
-        .unwrap_or_else(|| target.version.clone());
+    let serial = storable_serial(&usb_info, target.id);
+    let firmware = body_firmware(&target, &usb_info);
     let mut snap = Snapshot::new(
         Camera {
             model: target.name.clone(),
@@ -1052,8 +1245,10 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     );
     warn_if_unknown_schema(stats.unknown_schema, schema_path);
 
-    // Judge completeness in memory, before anything is written.
-    let verdict = apply_capture_gate(&snap, args.allow_partial)?;
+    // Judge completeness in memory, before anything is written. A capture that read nothing is
+    // refused first, whatever `--allow-partial` says: there is nothing worth keeping.
+    let verdict = judge_capture(&snap, &stats, args.allow_partial)
+        .map_err(|e| anyhow::anyhow!("{e}; nothing was written"))?;
 
     // Save under snapshots/.
     let dir = snapshots_dir(data_dir);
@@ -1076,12 +1271,6 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
         );
         json_out.emit(&serde_json::to_string_pretty(&outcome)?)?;
     }
-    if snapshot_capture_failed(stats.read_ok) {
-        // The file is still written (matches prior behavior), but a
-        // script/CI checking exit status must be able to tell this run was
-        // a total failure, not a normal capture.
-        bail!("no capability could be read ({} read error(s), see above); wrote an empty snapshot to {}", stats.read_err, path.display());
-    }
     // Read-only and finished: leave without closing the session (F24).
     nikon_fleet::process_exit::exit_now(0)
 }
@@ -1089,10 +1278,40 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
 /// Read one vendor-only property via raw USB PTP (`0x943B`), bypassing the
 /// MAID SDK entirely — no --sdk-bundle needed. See `nikon_fleet::ptp_usb`.
 fn cmd_vendor_read(args: &VendorReadArgs) -> Result<()> {
-    let data = nikon_fleet::ptp_usb::read_vendor_property(args.serial.as_deref(), args.propcode)
+    let serial = vendor_target_serial(args.serial.as_deref(), usb_camera_list)?;
+    let read = nikon_fleet::ptp_usb::read_vendor_property_report(serial.as_deref(), args.propcode)
         .with_context(|| format!("reading vendor property 0x{:04x} over USB PTP", args.propcode))?;
-    println!("0x{:04x}: {} byte(s): {}", args.propcode, data.len(), nikon_fleet::ptp_usb::hex_bytes(&data));
+    let (stdout, warnings) = vendor_read_output(args.propcode, &read);
+    for w in warnings {
+        eprintln!("{w}");
+    }
+    println!("{stdout}");
     Ok(())
+}
+
+/// What `vendor-read` prints: the data line for stdout, and one stderr line per warning the read
+/// returned (an unsurveyed model, say). The command has no `--json` mode, so warnings are text.
+fn vendor_read_output(propcode: u16, read: &nikon_fleet::ptp_usb::VendorRead) -> (String, Vec<String>) {
+    (
+        format!("0x{propcode:04x}: {} byte(s): {}", read.data.len(), nikon_fleet::ptp_usb::hex_bytes(&read.data)),
+        read.warnings.iter().map(|w| format!("warning: {w}")).collect(),
+    )
+}
+
+/// The serial to hand the raw-USB vendor commands. They see only the USB bus, so the `id-N`
+/// that `discover` and the GUIs give for a body with no readable USB serial means nothing to
+/// them: it resolves only when that body is the sole Nikon camera attached (`ops::target`), and
+/// otherwise stops here, before any camera is opened. The bus is scanned (`attached`) only for an
+/// `id-N`; a real serial or `usb-<bus>:<addr>` is passed through untouched.
+fn vendor_target_serial(
+    serial: Option<&str>,
+    attached: impl FnOnce() -> Vec<UsbCameraInfo>,
+) -> Result<Option<String>> {
+    let on_bus = match serial {
+        Some(s) if nikon_fleet::ops::target::is_id_fallback(s) => attached(),
+        _ => Vec::new(),
+    };
+    raw_usb_serial_arg(serial, &on_bus).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Strip exactly one trailing `\n` (as `echo`/a shell heredoc would add),
@@ -1114,6 +1333,15 @@ fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
         // password_stdin is false.
         args.password.clone().expect("clap guarantees --password is set when --password-stdin is not")
     };
+    // Before anything is encoded, previewed or sent: the same required-field rule the GUIs apply
+    // (one list, `ptp_usb::ftp_profile_missing_fields`). An all-empty profile used to encode to
+    // a blank-field blob and, without --dry-run, be written to the camera.
+    let missing = nikon_fleet::ptp_usb::ftp_profile_missing_fields(
+        &args.profile_name, &args.ssid_24ghz, &args.ssid_5ghz, &args.host, &args.username, &password,
+    );
+    if !missing.is_empty() {
+        bail!("refusing to write an FTP profile with missing field(s): {}", missing.join(", "));
+    }
     let profile = nikon_fleet::ptp_usb::FtpProfile {
         profile_name: args.profile_name.clone(),
         ssid_24ghz: args.ssid_24ghz.clone(),
@@ -1140,10 +1368,51 @@ fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
         return Ok(());
     }
 
-    nikon_fleet::ptp_usb::write_ftp_profile(args.serial.as_deref(), &profile, args.force_unconfirmed_model)
-        .context("writing FTP profile over USB PTP")?;
+    let serial = vendor_target_serial(args.serial.as_deref(), usb_camera_list)?;
+    let receipt = nikon_fleet::ptp_usb::write_ftp_profile(serial.as_deref(), &profile, args.force_unconfirmed_model)
+        .map_err(vendor_write_error)?;
     println!("Wrote FTP profile {:?} ({}@{}:{})", args.profile_name, args.username, args.host, args.port);
+    if let Some(note) = ftp_receipt_note(&receipt) {
+        eprintln!("{note}");
+    }
     Ok(())
+}
+
+/// A failed `vendor-write-ftp`, worded for the person at the terminal. Most failures are plain
+/// ("camera busy", "no such camera", ...): their own text says what to do. An indeterminate write
+/// (the data was sent, then something failed) is the one that must not read like the others:
+/// `exit_code_for` gives it [`EXIT_WRITE_INDETERMINATE`].
+fn vendor_write_error(e: nikon_fleet::ptp_usb::PtpUsbError) -> anyhow::Error {
+    use nikon_fleet::ptp_usb::PtpUsbError;
+    match e {
+        e @ PtpUsbError::FtpWriteIndeterminate { .. } => anyhow::Error::new(e).context(
+            "the camera may have changed: the profile data was sent before this failed; check the FTP profile \
+             in the camera's menu before deciding whether to repeat the write",
+        ),
+        other => anyhow::Error::new(other).context("writing FTP profile over USB PTP"),
+    }
+}
+
+/// What a successful FTP-profile write cannot promise: the camera answered OK, which is all there is
+/// to go on (nothing reads the profile back). A reply that did not match the command, or that carried
+/// parameters (none seen in any capture), is worth saying so the OK is not over-trusted.
+fn ftp_receipt_note(r: &nikon_fleet::ptp_usb::FtpWriteReceipt) -> Option<String> {
+    let mut notes = Vec::new();
+    if !r.reply_matched_command {
+        notes.push(
+            "a reply to the setup or the write carried a different transaction id or operation code than the command"
+                .to_string(),
+        );
+    }
+    if !r.response_params.is_empty() {
+        notes.push(format!("the write's response carried parameters {:?} (none were seen in any capture)", r.response_params));
+    }
+    (!notes.is_empty()).then(|| {
+        format!(
+            "note: the camera answered OK, but {}. The profile cannot be read back, so check it in the camera's menu.",
+            notes.join(", and ")
+        )
+    })
 }
 
 /// Whether a capture should be treated as a hard failure: zero capabilities
@@ -1159,6 +1428,21 @@ fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
 /// failure whatever the error count.
 fn snapshot_capture_failed(read_ok: usize) -> bool {
     read_ok == 0
+}
+
+/// The whole in-memory verdict on a fresh capture, in the order that matters: a capture that read
+/// nothing is an error before the baseline gate looks at it (`--allow-partial` would otherwise let
+/// an empty capture through the gate as merely "incomplete"), then [`apply_capture_gate`].
+/// The same order as `ops::capture_snapshot`'s `NothingReadable`, then `Incomplete`.
+fn judge_capture(
+    snap: &Snapshot,
+    stats: &nikon_fleet::ops::capture::CaptureStats,
+    allow_partial: bool,
+) -> Result<nikon_fleet::ops::baseline::GateOutcome> {
+    if snapshot_capture_failed(stats.read_ok) {
+        bail!("no capability could be read ({} read error(s), see above)", stats.read_err);
+    }
+    apply_capture_gate(snap, allow_partial)
 }
 
 /// A connected camera that reports zero capabilities cannot be read from or
@@ -1195,9 +1479,8 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     let name_lookup = schema.name_map_for_model(&target.name);
     let device = sdk.connect(target.id)?;
     ensure_capabilities_present(device.capabilities.len())?;
-    let serial = snapshot_serial(&usb_info, target.id);
-    let firmware = usb_info.as_ref().map(|u| u.firmware.clone())
-        .unwrap_or_else(|| target.version.clone());
+    let serial = storable_serial(&usb_info, target.id);
+    let firmware = body_firmware(&target, &usb_info);
 
     let mut live = Snapshot::new(
         Camera {
@@ -1211,10 +1494,10 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     live.label = Some("live".into());
     let stats = capture_capabilities(&device, &name_lookup, &mut live);
     warn_if_unknown_schema(stats.unknown_schema, schema_path);
-    let verdict = apply_capture_gate(&live, args.allow_partial)?;
+    let verdict = judge_capture(&live, &stats, args.allow_partial)?;
 
     // Reference for this body.
-    let ref_path = references_dir(data_dir).join(reference_filename(&target.name, &serial));
+    let ref_path = references_dir(data_dir).join(checked_reference_filename(&target.name, &serial)?);
     if !ref_path.exists() {
         bail!(
             "no reference for {} {} at {}.\n\
@@ -1333,7 +1616,14 @@ fn cmd_firmware_add(data_dir: &Path, args: &FirmwareAddArgs) -> Result<()> {
 }
 
 fn cmd_firmware_ls(data_dir: &Path, args: &FirmwareLsArgs) -> Result<()> {
-    let entries = list_archives(data_dir, args.model.as_deref());
+    // One walk and one validation rule (`firmware::scan_archives`) for the text and the JSON.
+    let scan = scan_archives(data_dir, args.model.as_deref());
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&ArchiveListing::from_scan(&scan))?);
+        return Ok(());
+    }
+    scan.warn_skipped();
+    let entries = scan.entries;
     if entries.is_empty() {
         if let Some(m) = &args.model {
             println!("(no firmware archived for {m})");
@@ -1576,14 +1866,13 @@ fn cmd_firmware_check(data_dir: &Path, args: &FirmwareCheckArgs) -> Result<()> {
     let refs_dir = references_dir(data_dir);
     for cam in filtered {
         let ref_fw = if refs_dir.exists() {
-            let ref_path = refs_dir.join(reference_filename(&cam.model, &cam.serial));
-            if ref_path.exists() {
-                Snapshot::load_from_file(&ref_path)
+            // A model or serial that is not a plain name has no reference to find.
+            match checked_reference_filename(&cam.model, &cam.serial) {
+                Ok(name) if refs_dir.join(&name).exists() => Snapshot::load_from_file(refs_dir.join(name))
                     .ok()
                     .map(|s| s.camera.firmware)
-                    .unwrap_or_default()
-            } else {
-                String::new()
+                    .unwrap_or_default(),
+                _ => String::new(),
             }
         } else {
             String::new()
@@ -1689,6 +1978,7 @@ fn cmd_firmware_fetch(data_dir: &Path, args: &FirmwareFetchArgs) -> Result<()> {
     let models = watch_models(&args.models);
     let surveys = survey_models(data_dir, &models, &source, &http);
     let mut failures = 0usize;
+    let mut already_archived = 0usize;
     let mut manual_pending = 0usize;
 
     for s in &surveys {
@@ -1727,6 +2017,7 @@ fn cmd_firmware_fetch(data_dir: &Path, args: &FirmwareFetchArgs) -> Result<()> {
         })();
         if let Err(e) = result {
             failures += 1;
+            already_archived += usize::from(is_already_archived(&e));
             eprintln!("error: {}: {e:#}", s.model);
         }
     }
@@ -1734,9 +2025,21 @@ fn cmd_firmware_fetch(data_dir: &Path, args: &FirmwareFetchArgs) -> Result<()> {
         println!("\n{manual_pending} model(s) need a manual, licence-gated download (see ACTION REQUIRED above).");
     }
     if failures > 0 {
-        bail!("{failures} of {} model(s) failed (see above)", surveys.len());
+        return Err(fetch_failure(failures, already_archived, surveys.len()));
     }
     Ok(())
+}
+
+/// The end of a `fetch` run in which `failures` of `total` models failed, `already_archived` of
+/// them because that version is already archived with different bytes. When that is every
+/// failure the run exits `EXIT_ALREADY_ARCHIVED`; any other mix is the ordinary exit 1.
+fn fetch_failure(failures: usize, already_archived: usize, total: usize) -> anyhow::Error {
+    let message = format!("{failures} of {total} model(s) failed (see above)");
+    if failures > 0 && already_archived == failures {
+        ExitCodeError { code: EXIT_ALREADY_ARCHIVED, message }.into()
+    } else {
+        anyhow::anyhow!(message)
+    }
 }
 
 /// Manual route, shown when the embedded browser is unavailable.
@@ -1878,13 +2181,13 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Restor
 
     // Match by --serial override, or by the serial embedded in the snapshot.
     let target_serial = args.serial.as_deref().unwrap_or(&snap.camera.serial);
-    let (target, usb_info) = enriched
-        .into_iter()
-        .find(|(dev, usb)| serial_matches(dev, usb, target_serial))
-        .ok_or_else(|| anyhow::anyhow!(
+    let (target, usb_info) = select_by_cli_serial(enriched, target_serial).map_err(|e| match e {
+        TargetError::NotFound { .. } => anyhow::anyhow!(
             "no connected camera with serial {}  (snapshot is for {} {})",
             target_serial, snap.camera.model, snap.camera.serial
-        ))?;
+        ),
+        other => anyhow::anyhow!("{other}"),
+    })?;
 
     say(json, &format!("Connecting to {:?} (id={})…\n", target.name, target.id));
     let device = sdk.connect(target.id)?;
@@ -2127,8 +2430,97 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+/// An error that carries the process exit status it should end the run with.
+#[derive(Debug)]
+struct ExitCodeError {
+    code: i32,
+    message: String,
+}
+
+impl std::fmt::Display for ExitCodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExitCodeError {}
+
+/// The archive error inside `e`, however it was wrapped: raised directly, inside a fetch
+/// (`FetchError::Archive`), or inside a browse (`BrowseError::Ingest`).
+fn firmware_error_in(e: &anyhow::Error) -> Option<&FirmwareError> {
+    if let Some(f) = e.downcast_ref::<FirmwareError>() {
+        return Some(f);
+    }
+    match (e.downcast_ref::<FetchError>(), e.downcast_ref::<BrowseError>()) {
+        (Some(FetchError::Archive(f)), _) => Some(f),
+        (_, Some(BrowseError::Ingest { error, .. })) => Some(error),
+        _ => None,
+    }
+}
+
+/// This model and version is already archived and the command refused to change it: the typed
+/// `FirmwareError`s for "already there" (`AlreadyArchived`: `add` without `--force`;
+/// `ContentMismatch`: same version, different bytes).
+fn is_already_archived(e: &anyhow::Error) -> bool {
+    matches!(
+        firmware_error_in(e),
+        Some(FirmwareError::AlreadyArchived { .. } | FirmwareError::ContentMismatch { .. })
+    )
+}
+
+/// The process exit status for a failed run: 3 for "already archived" (`EXIT_ALREADY_ARCHIVED`),
+/// 4 for an indeterminate FTP-profile write (`EXIT_WRITE_INDETERMINATE`), a status an error
+/// carries itself, else 1.
+fn exit_code_for(e: &anyhow::Error) -> i32 {
+    if let Some(x) = e.downcast_ref::<ExitCodeError>() {
+        x.code
+    } else if is_already_archived(e) {
+        EXIT_ALREADY_ARCHIVED
+    } else if matches!(
+        e.downcast_ref::<nikon_fleet::ptp_usb::PtpUsbError>(),
+        Some(nikon_fleet::ptp_usb::PtpUsbError::FtpWriteIndeterminate { .. })
+    ) {
+        EXIT_WRITE_INDETERMINATE
+    } else {
+        1
+    }
+}
+
+fn cmd_settings(sub: &SettingsCmd) -> Result<()> {
+    use nikon_fleet::settings::{resolve, settings_path, update_in};
+    let path = settings_path();
+    match sub {
+        SettingsCmd::Show { json } => {
+            let r = resolve(&path)?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("settings file:  {}{}", r.settings_path, if r.settings_exist { "" } else { "  (does not exist)" });
+                println!("data_dir:       {}", r.data_dir.as_deref().unwrap_or("(unset)"));
+                println!("in use by GUIs: {}", r.effective_data_dir);
+                println!("the CLI uses --data-dir, default `.`; pass --data-dir with the line above to share it");
+            }
+        }
+        SettingsCmd::DataDir => println!("{}", resolve(&path)?.effective_data_dir),
+        SettingsCmd::SetDataDir { dir, unset } => {
+            let new = match (dir, unset) {
+                (Some(d), false) => {
+                    if !d.is_absolute() {
+                        bail!("{} is not an absolute path; a relative data_dir would mean a different place to each program", d.display());
+                    }
+                    Some(d.to_str().with_context(|| format!("{} is not valid UTF-8", d.display()))?.to_string())
+                }
+                (None, true) => None,
+                _ => bail!("give a directory, or --unset to clear the setting"),
+            };
+            let s = update_in(&path, |s| s.set_data_dir(new.as_deref()))?;
+            println!("data_dir: {}  ({})", s.data_dir().unwrap_or("(unset)"), path.display());
+        }
+    }
+    Ok(())
+}
+
+fn run(cli: Cli) -> Result<()> {
     let no_reset = cli.no_usb_reset;
     match &cli.cmd {
         Cmd::Discover(a) => cmd_discover(&cli.sdk_bundle, a, no_reset),
@@ -2139,6 +2531,7 @@ fn main() -> Result<()> {
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
         Cmd::Baseline(sub) => cmd_baseline(sub),
+        Cmd::Settings(sub) => cmd_settings(sub),
         Cmd::Worker(args) => {
             let code = worker_cmd::run(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args);
             std::process::exit(code)
@@ -2160,6 +2553,23 @@ fn main() -> Result<()> {
     }
 }
 
+fn main() {
+    let cli = Cli::parse();
+    // Test hook, not an option: with this variable set the command line is parsed and nothing runs.
+    // tests/gui_cli_argv_parity.rs feeds it every argv the Python GUI builds. An environment
+    // variable rather than a flag, so no wrapper script can turn a real command into a silent
+    // exit 0 by adding an argument.
+    if std::env::var_os("NIKON_FLEET_PARSE_ONLY").is_some_and(|v| v == "1") {
+        return;
+    }
+    if let Err(e) = run(cli) {
+        // Exactly what returning the error from `main` printed, with the exit status chosen
+        // by `exit_code_for` instead of always 1.
+        eprintln!("Error: {e:?}");
+        std::process::exit(exit_code_for(&e));
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────
@@ -2167,6 +2577,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nikon_fleet::ops::list::reference_filename;
     use std::sync::Mutex;
     use tempfile::TempDir;
     use serde_json::json;
@@ -2268,7 +2679,7 @@ mod tests {
         assert_eq!(resolved, PathBuf::from("here.json"));
     }
 
-    // ── serial_matches / snapshot_serial ───────────────────────────────────
+    // ── select_device (the serial rule itself is ops::target's) ──────────
 
     fn dev(id: u32) -> DeviceInfo {
         DeviceInfo { id, name: "Z 9".into(), available: true, connected_pid: 0, version: "5.31".into() }
@@ -2295,6 +2706,25 @@ mod tests {
     fn select_device_by_serial_no_match_errors() {
         let enriched = vec![(dev(1), Some(usb("AAA")))];
         assert!(select_device(enriched, Some("NOPE")).is_err());
+    }
+
+    #[test]
+    fn select_device_refuses_a_serial_that_names_two_bodies_instead_of_taking_the_first() {
+        // Body A (SDK id 1, serial AAA) and B (SDK id 2, USB serial "1"): `--serial 1` is B's USB
+        // serial and A's SDK id. The CLI's inline copy used to take A (first match).
+        let enriched = vec![(dev(1), Some(usb("AAA"))), (dev(2), Some(usb("1")))];
+        let err = select_device(enriched.clone(), Some("1")).unwrap_err().to_string();
+        assert!(err.contains("USB serial of one attached camera") && err.contains("SDK id of another"), "{err}");
+        // The same call through the one rule every front end uses, so they cannot differ.
+        assert_eq!(
+            select_by_cli_serial(enriched.clone(), "1"),
+            Err(TargetError::AmbiguousSerial { requested: "1".into() })
+        );
+        // A name that is unambiguous works in every form.
+        assert_eq!(select_device(enriched.clone(), Some("AAA")).unwrap().0.id, 1);
+        assert_eq!(select_device(enriched.clone(), Some("id-2")).unwrap().0.id, 2);
+        let missing = select_device(enriched, Some("NOPE")).unwrap_err().to_string();
+        assert!(missing.contains("no device with serial NOPE") && missing.contains("discover"), "{missing}");
     }
 
     #[test]
@@ -2382,49 +2812,6 @@ mod tests {
     #[test]
     fn strip_single_trailing_newline_empty_string() {
         assert_eq!(strip_single_trailing_newline(String::new()), "");
-    }
-
-    #[test]
-    fn serial_matches_real_usb_serial() {
-        assert!(serial_matches(&dev(7), &Some(usb("ABC123")), "ABC123"));
-    }
-
-    #[test]
-    fn serial_matches_bare_sdk_id() {
-        assert!(serial_matches(&dev(7), &None, "7"));
-    }
-
-    #[test]
-    fn serial_matches_id_fallback_form() {
-        // Regression: a snapshot recorded under the "id-{id}" fallback
-        // (written when USB serial was unreadable) must be re-findable by
-        // that exact string — previously only the real serial or bare id
-        // were checked, so such a snapshot could never be matched again.
-        assert!(serial_matches(&dev(7), &None, "id-7"));
-    }
-
-    #[test]
-    fn serial_matches_no_match() {
-        assert!(!serial_matches(&dev(7), &Some(usb("ABC123")), "OTHER"));
-        assert!(!serial_matches(&dev(7), &None, "8"));
-    }
-
-    #[test]
-    fn snapshot_serial_uses_real_serial_when_present() {
-        assert_eq!(snapshot_serial(&Some(usb("ABC123")), 7), "ABC123");
-    }
-
-    #[test]
-    fn snapshot_serial_falls_back_to_id_when_usb_none() {
-        assert_eq!(snapshot_serial(&None, 7), "id-7");
-    }
-
-    #[test]
-    fn snapshot_serial_falls_back_to_id_when_serial_present_but_empty() {
-        // Regression: Some(UsbCameraInfo { serial: "", .. }) (a real,
-        // observed case — read_usb_string returns "" for an unreadable
-        // descriptor) must NOT be treated as a valid serial.
-        assert_eq!(snapshot_serial(&Some(usb("")), 7), "id-7");
     }
 
     // ── snapshot_capture_failed ─────────────────
@@ -2657,17 +3044,60 @@ mod tests {
     }
 
     #[test]
-    fn capture_gate_does_not_judge_an_unknown_model_or_a_changed_firmware() {
+    fn capture_gate_does_not_judge_an_unknown_model() {
         let mut unknown = capture_from_builtin("Z 9", 0);
         unknown.camera.model = "Z 5".into();
         unknown.properties.clear();
         assert!(apply_capture_gate(&unknown, false).is_ok(), "no baseline: allowed, with a note");
+    }
+
+    #[test]
+    fn a_capture_of_new_firmware_that_reads_everything_is_allowed_with_a_note() {
+        // The baseline is out of date (extras appeared), but nothing it requires is missing.
+        let mut newer = capture_from_builtin("Z 9", 0);
+        newer.camera.firmware = "9.99".into();
+        newer.insert("kNkMAIDCapability_NewInNineNineNine", 999_999, serde_json::json!(1));
+        assert!(apply_capture_gate(&newer, false).is_ok());
+    }
+
+    #[test]
+    fn a_capture_of_new_firmware_that_lacks_baseline_capabilities_is_not_kept_silently() {
+        // Cannot tell a firmware that dropped capabilities from an interrupted capture or a USB
+        // reset (the ok=18 err=194 shape): it used to be written with only a stderr note.
         let mut newer = capture_from_builtin("Z 9", 5);
         newer.camera.firmware = "9.99".into();
-        assert!(apply_capture_gate(&newer, false).is_ok(), "other firmware and a different set: not blamed");
+        let err = apply_capture_gate(&newer, false).unwrap_err().to_string();
+        assert!(err.contains("firmware 9.99") && err.contains("5.31") && err.contains("5 capabilities"), "{err}");
+        assert!(err.contains("Nothing was written") && err.contains("--allow-partial") && err.contains("re-seed"), "{err}");
+        // One missing is enough (threshold: at one, not only at many).
+        let mut one = capture_from_builtin("Z 9", 1);
+        one.camera.firmware = "9.99".into();
+        assert!(apply_capture_gate(&one, false).unwrap_err().to_string().contains("1 capability "));
+        // The deliberate way through, which still names the shortfall on stderr.
+        assert!(apply_capture_gate(&newer, true).is_ok());
+    }
+
+    #[test]
+    fn an_incomplete_capture_with_unknown_firmware_fails_like_any_incomplete_capture() {
+        // `DeviceInfo.version` is always "", so a body with no USB record is captured with
+        // firmware "": that is no evidence the firmware changed, and it used to land in
+        // NoBaseline(FirmwareChanged) and be saved.
+        let mut unknown_fw = capture_from_builtin("Z 9", 3);
+        unknown_fw.camera.firmware = String::new();
+        let err = apply_capture_gate(&unknown_fw, false).unwrap_err().to_string();
+        assert!(err.contains("incomplete") && err.contains("3 capabilities") && err.contains("firmware unknown"), "{err}");
+        assert!(apply_capture_gate(&unknown_fw, true).is_ok());
+        // Complete with unknown firmware is fine.
+        let mut complete = capture_from_builtin("Z 9", 0);
+        complete.camera.firmware = String::new();
+        assert!(apply_capture_gate(&complete, false).is_ok());
     }
 
     fn write_seed_source(dir: &Path, model: &str, firmware: &str, codes: &[u32]) -> PathBuf {
+        write_named_seed_source(dir, "src_snapshot.json", model, firmware, codes)
+    }
+
+    fn write_named_seed_source(dir: &Path, name: &str, model: &str, firmware: &str, codes: &[u32]) -> PathBuf {
         let mut s = Snapshot::new(
             Camera { model: model.into(), serial: "1".into(), firmware: firmware.into() },
             Transport::Usb,
@@ -2676,7 +3106,7 @@ mod tests {
         for c in codes {
             s.insert(format!("kNkMAIDCapability_C{c}"), *c, serde_json::json!(1));
         }
-        let p = dir.join("src_snapshot.json");
+        let p = dir.join(name);
         s.save_to_file(&p).unwrap();
         p
     }
@@ -2686,9 +3116,10 @@ mod tests {
         let d = TempDir::new().unwrap();
         let src = write_seed_source(d.path(), "Z 9", "5.31", &[3, 1, 2]);
         let out = d.path().join("baselines");
-        let path = seed_baseline(&src, &out, false).unwrap();
-        assert_eq!(path, out.join("Z_9.json"));
-        let b = nikon_fleet::ops::baseline::Baseline::from_json(&fs::read_to_string(&path).unwrap()).unwrap();
+        let seeded = seed_baseline(&src, &out, false, false).unwrap();
+        assert_eq!(seeded.path, out.join("Z_9.json"));
+        assert_eq!(fs::read_to_string(&seeded.path).unwrap(), seeded.json);
+        let b = nikon_fleet::ops::baseline::Baseline::from_json(&seeded.json).unwrap();
         assert_eq!((b.model.as_str(), b.firmware.as_str(), b.readable.len()), ("Z 9", "5.31", 3));
         assert_eq!(b.seeded_from, "src_snapshot.json");
     }
@@ -2698,13 +3129,13 @@ mod tests {
         let d = TempDir::new().unwrap();
         let out = d.path().join("baselines");
         let first = write_seed_source(d.path(), "Z 9", "5.31", &[1, 2]);
-        let path = seed_baseline(&first, &out, false).unwrap();
+        let path = seed_baseline(&first, &out, false, false).unwrap().path;
         let before = fs::read_to_string(&path).unwrap();
         let second = write_seed_source(d.path(), "Z 9", "5.40", &[1, 2, 3]);
-        let err = seed_baseline(&second, &out, false).unwrap_err();
+        let err = seed_baseline(&second, &out, false, false).unwrap_err();
         assert!(format!("{err:#}").contains("--force"), "{err:#}");
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
-        seed_baseline(&second, &out, true).unwrap();
+        seed_baseline(&second, &out, true, false).unwrap();
         let replaced = fs::read_to_string(&path).unwrap();
         assert!(replaced.contains("5.40") && replaced != before);
     }
@@ -2714,12 +3145,103 @@ mod tests {
         let d = TempDir::new().unwrap();
         let out = d.path().join("baselines");
         let empty = write_seed_source(d.path(), "Z 9", "5.31", &[]);
-        assert!(seed_baseline(&empty, &out, false).is_err(), "no readable capabilities");
+        assert!(seed_baseline(&empty, &out, false, false).is_err(), "no readable capabilities");
         let no_fw = write_seed_source(d.path(), "Z 9", "", &[1]);
-        assert!(seed_baseline(&no_fw, &out, false).is_err(), "no firmware");
+        assert!(seed_baseline(&no_fw, &out, false, false).is_err(), "no firmware");
         let hostile = write_seed_source(d.path(), "../evil", "1.00", &[1]);
-        assert!(seed_baseline(&hostile, &out, false).is_err(), "model that is not a file name");
+        assert!(seed_baseline(&hostile, &out, false, false).is_err(), "model that is not a file name");
         assert!(!d.path().join("evil.json").exists() && !out.join("evil.json").exists());
+    }
+
+    // ── --force must not shrink a baseline unless told to ────────────────
+
+    fn seeded_file(d: &Path) -> (PathBuf, PathBuf, String) {
+        let out = d.join("baselines");
+        let first = write_named_seed_source(d, "first.json", "Z 9", "5.31", &[1, 2, 3]);
+        let path = seed_baseline(&first, &out, false, false).unwrap().path;
+        let before = fs::read_to_string(&path).unwrap();
+        (out, path, before)
+    }
+
+    #[test]
+    fn force_refuses_a_replacement_that_drops_a_capability_and_leaves_the_file_alone() {
+        let d = TempDir::new().unwrap();
+        let (out, path, before) = seeded_file(d.path());
+        // A partial capture (or a restore point) of the same model: 3 is gone.
+        let partial = write_named_seed_source(d.path(), "partial.json", "Z 9", "5.31", &[1, 2]);
+        let err = format!("{:#}", seed_baseline(&partial, &out, true, false).unwrap_err());
+        assert!(err.contains("no longer lists 1 capability") && err.contains("C3 (0x3)") && err.contains("--allow-shrink"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "the existing baseline is untouched");
+        // Same size, different set: still loses one.
+        let swapped = write_named_seed_source(d.path(), "swapped.json", "Z 9", "5.31", &[1, 2, 9]);
+        assert!(seed_baseline(&swapped, &out, true, false).is_err());
+        // The second flag is the deliberate way through.
+        seed_baseline(&partial, &out, true, true).unwrap();
+        assert_ne!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn force_allows_a_replacement_that_keeps_or_grows_the_set() {
+        let d = TempDir::new().unwrap();
+        let (out, path, before) = seeded_file(d.path());
+        let same = write_named_seed_source(d.path(), "same.json", "Z 9", "5.40", &[1, 2, 3]);
+        seed_baseline(&same, &out, true, false).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("5.40"));
+        let grown = write_named_seed_source(d.path(), "grown.json", "Z 9", "5.50", &[1, 2, 3, 4]);
+        seed_baseline(&grown, &out, true, false).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("5.50") && text != before);
+    }
+
+    #[test]
+    fn force_on_a_model_with_no_file_yet_is_just_a_write() {
+        let d = TempDir::new().unwrap();
+        let src = write_seed_source(d.path(), "Z 9", "5.31", &[1]);
+        let seeded = seed_baseline(&src, &d.path().join("b"), true, false).unwrap();
+        assert!(seeded.path.exists());
+    }
+
+    #[test]
+    fn force_refuses_to_compare_against_an_existing_file_it_cannot_read() {
+        let d = TempDir::new().unwrap();
+        let out = d.path().join("baselines");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("Z_9.json"), "{ not a baseline").unwrap();
+        let src = write_seed_source(d.path(), "Z 9", "5.31", &[1]);
+        let err = format!("{:#}", seed_baseline(&src, &out, true, false).unwrap_err());
+        assert!(err.contains("cannot be read as a baseline") && err.contains("--allow-shrink"), "{err}");
+        assert_eq!(fs::read_to_string(out.join("Z_9.json")).unwrap(), "{ not a baseline");
+        seed_baseline(&src, &out, true, true).unwrap();
+        assert!(fs::read_to_string(out.join("Z_9.json")).unwrap().contains("5.31"));
+    }
+
+    #[test]
+    fn force_refuses_to_replace_another_models_baseline_that_slugs_to_the_same_file() {
+        let d = TempDir::new().unwrap();
+        let out = d.path().join("baselines");
+        let first = write_named_seed_source(d.path(), "a.json", "Z 9", "5.31", &[1]);
+        let path = seed_baseline(&first, &out, false, false).unwrap().path;
+        let before = fs::read_to_string(&path).unwrap();
+        // "Z_9" slugs to the same Z_9.json as "Z 9" (firmware::slug_collision_pinned).
+        let other = write_named_seed_source(d.path(), "b.json", "Z_9", "5.31", &[1, 2]);
+        let err = format!("{:#}", seed_baseline(&other, &out, true, false).unwrap_err());
+        assert!(err.contains("not \"Z_9\"") && err.contains("--allow-shrink"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    // ── what the user is told after seeding ──────────────────────────────
+
+    #[test]
+    fn seed_next_step_says_whether_the_file_is_embedded_stale_or_never_read() {
+        let (file, text) = ("Z_9.json", "stale text");
+        let p = Path::new("somewhere").join(file);
+        assert!(seed_next_step(&p, text).contains("rebuild to use it"), "registered, different bytes");
+        let unregistered = Path::new("baselines/Z_5.json");
+        let t = seed_next_step(unregistered, "{}");
+        assert!(t.starts_with("NOT ACTIVE") && t.contains("BUILTIN_SOURCES") && t.contains("Z_5.json"), "{t}");
+        // The shipped file's own text is "already embedded".
+        let shipped = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("baselines/Z_9.json")).unwrap();
+        assert!(seed_next_step(&p, &shipped).contains("already embeds"), "registered, identical bytes");
     }
 
     // ── looks_like_bcd_version ───────────────────────────────────────────
@@ -2974,4 +3496,299 @@ mod tests {
 
         assert!(out_dir.join("canonical_settings.json").exists());
     }
+    // ── exit status for "already archived" ───────────────────────────────
+
+    fn already(model: &str) -> FirmwareError {
+        FirmwareError::AlreadyArchived { model: model.into(), version: "5.31".into(), path: "p".into() }
+    }
+
+    fn mismatch() -> FirmwareError {
+        FirmwareError::ContentMismatch { model: "Z 9".into(), version: "5.31".into(), existing: "a".into(), new: "b".into() }
+    }
+
+    #[test]
+    fn exit_code_is_three_for_already_archived_however_the_error_is_wrapped() {
+        let archived: [anyhow::Error; 6] = [
+            already("Z 9").into(),
+            mismatch().into(),
+            // `fetch` raises it through FetchError::Archive (transparent), `browse` inside BrowseError::Ingest.
+            FetchError::Archive(already("Z 9")).into(),
+            FetchError::Archive(mismatch()).into(),
+            BrowseError::Ingest { kept: PathBuf::from("k"), error: mismatch() }.into(),
+            anyhow::Error::from(already("Z 9")).context("while adding"),
+        ];
+        for e in &archived {
+            assert_eq!(exit_code_for(e), EXIT_ALREADY_ARCHIVED, "{e:?}");
+        }
+        assert_eq!(EXIT_ALREADY_ARCHIVED, 3, "documented in --help; scripts test for it");
+    }
+
+    #[test]
+    fn every_other_error_is_exit_one_including_other_archive_errors() {
+        let others: [anyhow::Error; 7] = [
+            anyhow::anyhow!("no cameras"),
+            FirmwareError::NotFound { model: "Z 9".into(), version: "5.31".into() }.into(),
+            FirmwareError::ChecksumMismatch { stored: "a".into(), computed: "b".into() }.into(),
+            FirmwareError::IncompleteArchive { path: "p".into() }.into(),
+            FetchError::Gated("Z 9".into()).into(),
+            BrowseError::NotCompiledIn.into(),
+            BrowseError::Ingest { kept: PathBuf::from("k"), error: FirmwareError::Io(std::io::Error::other("x")) }.into(),
+        ];
+        for e in &others {
+            assert_eq!(exit_code_for(e), 1, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn a_fetch_exits_three_only_when_every_failure_was_already_archived() {
+        let code = |failures, already, total| exit_code_for(&fetch_failure(failures, already, total));
+        assert_eq!(code(1, 1, 1), EXIT_ALREADY_ARCHIVED);
+        assert_eq!(code(2, 2, 2), EXIT_ALREADY_ARCHIVED);
+        assert_eq!(code(2, 1, 2), 1, "one refusal and one real failure is a real failure");
+        assert_eq!(code(1, 0, 2), 1);
+        assert_eq!(code(2, 2, 3), EXIT_ALREADY_ARCHIVED, "models that succeeded do not matter");
+        let msg = fetch_failure(2, 2, 3).to_string();
+        assert!(msg.contains("2 of 3 model(s) failed"), "{msg}");
+    }
+
+    // ── discover's output, and snapshot's order of refusals ──────────────
+
+    fn named_device(id: u32, name: &str) -> DeviceInfo {
+        DeviceInfo { id, name: name.into(), available: true, connected_pid: 0, version: String::new() }
+    }
+
+    fn usb_record(serial: &str, model: &str, firmware: &str) -> UsbCameraInfo {
+        UsbCameraInfo { product_id: 1, serial: serial.into(), firmware: firmware.into(), model: model.into() }
+    }
+
+    #[test]
+    fn discover_prints_one_json_document_even_for_no_cameras() {
+        let empty: serde_json::Value = serde_json::from_str(&discover_report(&[], true).unwrap()).unwrap();
+        assert_eq!(empty, serde_json::json!({"cameras": []}));
+        assert_eq!(discover_report(&[], false).unwrap(), "(no Nikon cameras detected)");
+        let rows = [(named_device(3, "Z 9"), Some(usb_record("S9", "Z 9", "5.31"))), (named_device(4, "Z 5"), None)];
+        let v: serde_json::Value = serde_json::from_str(&discover_report(&rows, true).unwrap()).unwrap();
+        let cams = v["cameras"].as_array().unwrap();
+        assert_eq!(cams.len(), 2);
+        assert_eq!((cams[0]["serial"].as_str(), cams[0]["firmware"].as_str(), cams[0]["baseline"].as_bool()), (Some("S9"), Some("5.31"), Some(true)));
+        assert_eq!((cams[1]["serial"].as_str(), cams[1]["usb_serial"].is_null(), cams[1]["baseline"].as_bool()), (Some("id-4"), true, Some(false)));
+    }
+
+    #[test]
+    fn discover_text_lists_the_storable_serial_and_the_baseline() {
+        let rows = [(named_device(3, "Z 9"), Some(usb_record("S9", "Z 9", "5.31"))), (named_device(4, "Z 5"), None)];
+        let text = discover_report(&rows, false).unwrap();
+        assert_eq!(
+            text,
+            "2 device(s):\n  Z 9  serial=S9  fw=5.31  id=3  baseline=yes\n  Z 5  serial=id-4  fw=  id=4  baseline=no"
+        );
+    }
+
+    #[test]
+    fn a_capture_that_read_nothing_is_refused_before_the_gate_even_with_allow_partial() {
+        use nikon_fleet::ops::capture::CaptureStats;
+        let empty = Snapshot::new(Camera { model: "Z 9".into(), serial: "S".into(), firmware: "5.31".into() }, nikon_fleet::snapshot::Transport::Usb, "t".into());
+        let stats = |read_ok, read_err| CaptureStats { read_ok, read_err, ..Default::default() };
+        // at the threshold: 0 reads is refused under both settings, and says how many reads failed
+        for allow_partial in [false, true] {
+            let err = judge_capture(&empty, &stats(0, 7), allow_partial).unwrap_err().to_string();
+            assert!(err.contains("no capability could be read (7 read error(s)"), "{err}");
+        }
+        assert!(judge_capture(&empty, &stats(0, 0), true).is_err(), "no errors and no reads is still nothing");
+        // just above: 1 read gets past this check and is the gate's to judge (a Z 9 shortfall: allowed only by --allow-partial)
+        let one_read = Snapshot { ..empty.clone() };
+        assert!(judge_capture(&one_read, &stats(1, 0), false).is_err(), "the gate refuses the shortfall");
+        assert!(judge_capture(&one_read, &stats(1, 0), true).is_ok(), "and --allow-partial is the way past it");
+        // a model with no baseline is not judged, so one read is enough
+        let z5 = Snapshot::new(Camera { model: "Z 5".into(), serial: "S".into(), firmware: "1.43".into() }, nikon_fleet::snapshot::Transport::Usb, "t".into());
+        assert!(judge_capture(&z5, &stats(1, 0), false).is_ok());
+        assert!(judge_capture(&z5, &stats(0, 0), false).is_err());
+    }
+
+    // ── exit status for an indeterminate FTP-profile write ───────────────
+
+    fn indeterminate() -> nikon_fleet::ptp_usb::PtpUsbError {
+        nikon_fleet::ptp_usb::PtpUsbError::FtpWriteIndeterminate {
+            cause: Box::new(nikon_fleet::ptp_usb::PtpUsbError::ShortWrite { written: 40, expected: 82 }),
+        }
+    }
+
+    #[test]
+    fn exit_code_is_four_for_an_indeterminate_write_however_the_error_is_wrapped() {
+        use anyhow::Context as _;
+        let wrapped: [anyhow::Error; 4] = [
+            indeterminate().into(),
+            anyhow::Error::from(indeterminate()).context("while writing"),
+            vendor_write_error(indeterminate()),
+            Err::<(), _>(indeterminate()).context("a").context("b").unwrap_err(),
+        ];
+        for e in &wrapped {
+            assert_eq!(exit_code_for(e), EXIT_WRITE_INDETERMINATE, "{e:?}");
+        }
+        assert_eq!(EXIT_WRITE_INDETERMINATE, 4, "documented in --help; scripts test for it");
+        assert!(![1, 2, EXIT_ALREADY_ARCHIVED].contains(&EXIT_WRITE_INDETERMINATE), "distinct from every other documented status");
+    }
+
+    #[test]
+    fn a_failure_before_the_data_was_sent_is_exit_one_not_four() {
+        use nikon_fleet::ptp_usb::PtpUsbError as E;
+        // Including a ShortWrite that is the *cause* of an indeterminate one: bare, it is an ordinary failure.
+        let plain = [
+            E::NoDevice,
+            E::BodiesSkipped { skipped: vec!["a".into()] },
+            E::ShortWrite { written: 1, expected: 2 },
+            E::SessionPoisoned { cause: "x".into() },
+            E::UnconfirmedModel("Z 5".into()),
+        ];
+        for e in plain {
+            let e = vendor_write_error(e);
+            assert_eq!(exit_code_for(&e), 1, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn the_failures_print_their_own_actionable_text() {
+        use nikon_fleet::ptp_usb::PtpUsbError as E;
+        let printed = |e: E| format!("{:?}", vendor_write_error(e));
+        let skipped = printed(E::BodiesSkipped { skipped: vec!["bus 1 addr 4".into()] });
+        assert!(skipped.contains("could not be opened to read their serial") && skipped.contains("bus 1 addr 4"), "{skipped}");
+        let busy = printed(E::CameraLock(nikon_fleet::camera_lock::LockError::Busy { path: PathBuf::from("/tmp/lock") }));
+        assert!(busy.contains("camera busy: another nikon-fleet session"), "{busy}");
+        let indeterminate = printed(indeterminate());
+        assert!(indeterminate.contains("the camera may have changed"), "{indeterminate}");
+        assert!(indeterminate.contains("may or may not have taken effect"), "the cause's own text is kept: {indeterminate}");
+    }
+
+    #[test]
+    fn a_reply_that_did_not_match_the_command_is_noted_and_a_clean_one_is_not() {
+        use nikon_fleet::ptp_usb::FtpWriteReceipt as R;
+        let note = |matched, params: &[u32]| ftp_receipt_note(&R { response_params: params.to_vec(), reply_matched_command: matched });
+        assert_eq!(note(true, &[]), None, "the ordinary receipt says nothing");
+        let unmatched = note(false, &[]).expect("a reply that did not match is noted");
+        assert!(unmatched.contains("different transaction id") && unmatched.contains("check it in the camera's menu"), "{unmatched}");
+        assert!(!unmatched.contains("parameters"), "{unmatched}");
+        let params = note(true, &[7, 9]).expect("response parameters are noted");
+        assert!(params.contains("[7, 9]") && !params.contains("transaction id"), "{params}");
+        let both = note(false, &[1]).unwrap();
+        assert!(both.contains("transaction id") && both.contains("[1]"), "{both}");
+    }
+
+    #[test]
+    fn vendor_read_prints_the_data_on_stdout_and_each_warning_on_stderr() {
+        use nikon_fleet::ptp_usb::VendorRead;
+        let clean = vendor_read_output(0xd053, &VendorRead { data: vec![0xde, 0xad], warnings: vec![] });
+        assert_eq!(clean, ("0xd053: 2 byte(s): de ad".to_string(), vec![]));
+        let warned = vendor_read_output(
+            0x5001,
+            &VendorRead { data: vec![], warnings: vec!["model \"Z 8\" is not surveyed".into(), "second".into()] },
+        );
+        assert_eq!(warned.0, "0x5001: 0 byte(s): ");
+        assert_eq!(warned.1, ["warning: model \"Z 8\" is not surveyed", "warning: second"], "one line per warning, none dropped");
+    }
+
+    // ── raw-USB commands: what `--serial id-N` means ─────────────────────
+
+    #[test]
+    fn the_bus_is_scanned_only_for_an_id_n_and_that_is_where_it_can_be_refused() {
+        use std::cell::Cell;
+        let scans = Cell::new(0);
+        let scan = |cams: Vec<UsbCameraInfo>| {
+            let scans = &scans;
+            move || {
+                scans.set(scans.get() + 1);
+                cams
+            }
+        };
+        // Real serials and usb-<bus>:<addr> pass through with no scan at all.
+        assert_eq!(vendor_target_serial(Some("0000003023668"), scan(vec![])).unwrap(), Some("0000003023668".into()));
+        assert_eq!(vendor_target_serial(Some("usb-20:5"), scan(vec![])).unwrap(), Some("usb-20:5".into()));
+        assert_eq!(vendor_target_serial(None, scan(vec![])).unwrap(), None);
+        assert_eq!(scans.get(), 0);
+        // id-N resolves for the sole serial-less body: the vendor command then takes the sole camera.
+        assert_eq!(vendor_target_serial(Some("id-1"), scan(vec![usb("")])).unwrap(), None);
+        assert_eq!(scans.get(), 1);
+        // ... and is refused, before any camera is opened, in every other case.
+        for attached in [vec![], vec![usb("AAA")], vec![usb(""), usb("")], vec![usb(""), usb("AAA")]] {
+            let n = attached.len();
+            let err = vendor_target_serial(Some("id-1"), scan(attached)).unwrap_err().to_string();
+            assert!(err.contains("SDK id") && err.contains(&format!("{n} attached")), "{err}");
+        }
+    }
+
+    // ── ref set: the name comes from data, so it is checked ──────────────
+
+    fn snapshot_with(dir: &Path, file: &str, model: &str, serial: &str, label: Option<&str>, at: &str) -> PathBuf {
+        let mut s = Snapshot::new(
+            Camera { model: model.into(), serial: serial.into(), firmware: "5.00".into() },
+            Transport::File,
+            at.into(),
+        );
+        s.label = label.map(String::from);
+        let p = dir.join(file);
+        s.save_to_file(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn ref_set_refuses_a_serial_or_model_that_would_leave_references() {
+        let d = TempDir::new().unwrap();
+        let refs = d.path().join("references");
+        for (model, serial) in [("Z 9", "../../escape"), ("Z 9", "x/y"), ("Z 9", ".."), ("Z 9", ""), ("Z 9", "a\\b"), ("../Z", "1"), ("", "1")] {
+            let src = snapshot_with(d.path(), "s.json", model, serial, None, "2026-01-01T00:00:00Z");
+            let err = set_reference(&refs, &src).unwrap_err().to_string();
+            assert!(err.contains("cannot be a reference"), "{model:?} {serial:?}: {err}");
+        }
+        // Nothing was created, in references/ or above it.
+        assert!(!refs.exists());
+        let created: Vec<String> = fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(created, ["s.json"]);
+        // A serial with a space or a dot in it is a plain name and works.
+        let ok = snapshot_with(d.path(), "ok.json", "Z 9", "a b.c", None, "2026-01-01T00:00:00Z");
+        assert_eq!(set_reference(&refs, &ok).unwrap().target, refs.join("Z_9_a b.c.json"));
+    }
+
+    #[test]
+    fn ref_set_copies_the_bytes_it_checked_and_reports_what_it_replaced() {
+        let d = TempDir::new().unwrap();
+        let refs = d.path().join("references");
+        let first = snapshot_with(d.path(), "first.json", "Z 9", "ABC", Some("old"), "2026-01-01T00:00:00Z");
+        let done = set_reference(&refs, &first).unwrap();
+        assert!(done.replaced.is_none() && !done.unchanged);
+        assert_eq!(fs::read(&done.target).unwrap(), fs::read(&first).unwrap(), "a byte copy, not a re-serialisation");
+        // Promoting another snapshot of the same camera replaces it, and says what went.
+        let second = snapshot_with(d.path(), "second.json", "Z 9", "ABC", Some("new"), "2026-02-02T00:00:00Z");
+        let done = set_reference(&refs, &second).unwrap();
+        assert_eq!(done.replaced, Some(("2026-01-01T00:00:00Z".to_string(), Some("old".to_string()))));
+        assert!(!done.unchanged);
+        assert_eq!(fs::read(&done.target).unwrap(), fs::read(&second).unwrap());
+        // Promoting the same file again changes nothing, and says so.
+        let again = set_reference(&refs, &second).unwrap();
+        assert!(again.unchanged);
+        // Other cameras' references are untouched, and no temp file lingers.
+        let names: Vec<String> = fs::read_dir(&refs).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["Z_9_ABC.json"]);
+    }
+
+    #[test]
+    fn ref_set_leaves_the_old_reference_when_the_new_snapshot_is_unreadable() {
+        let d = TempDir::new().unwrap();
+        let refs = d.path().join("references");
+        let good = snapshot_with(d.path(), "good.json", "Z 9", "ABC", None, "2026-01-01T00:00:00Z");
+        let target = set_reference(&refs, &good).unwrap().target;
+        let bad = d.path().join("bad.json");
+        fs::write(&bad, "{ not json").unwrap();
+        assert!(set_reference(&refs, &bad).is_err());
+        let wrong_version = d.path().join("v.json");
+        fs::write(&wrong_version, fs::read_to_string(&good).unwrap().replace("\"format_version\": 1", "\"format_version\": 9")).unwrap();
+        assert!(set_reference(&refs, &wrong_version).is_err());
+        assert_eq!(fs::read(&target).unwrap(), fs::read(&good).unwrap());
+    }
+
+    #[test]
+    fn ref_show_refuses_an_unsafe_name_instead_of_looking_it_up() {
+        let d = TempDir::new().unwrap();
+        let err = cmd_ref(d.path(), &RefCmd::Show { model: "Z 9".into(), serial: "../x".into() }).unwrap_err();
+        assert!(err.to_string().contains("not a plain file name"), "{err}");
+    }
+
 }

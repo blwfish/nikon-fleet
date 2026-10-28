@@ -52,9 +52,14 @@ and use it as `--data-dir` below.
 target/release/nikon-fleet discover --json
 ```
 
-Record, for the report: the model string exactly as printed, the firmware, and `known_model`. Do not
-record the serial. `known_model: false` is expected for these models (the MCP server's table only
-knows three); the command line still works.
+Each camera in the JSON has `model`, `serial`, `firmware`, `sdk_id`, `usb_serial`, `known_model` and
+`baseline`. Record, for the report: the model string exactly as printed, the firmware, `known_model`
+and `baseline`. Do not record the serial (`serial`, `usb_serial`). `known_model: false` is expected
+for these models (the MCP server's table only knows three); the command line still works.
+`baseline: false` is expected too: there is no capture baseline for a new model, so step 2 prints a
+"no baseline" note and the camera cannot be written to by the apply tools until one is seeded. (The
+Z 5 is `known_model: true` and `baseline: false` today.) Use the `serial` value as `--serial` below;
+it is the USB serial, or `id-N` when the body has no readable one.
 
 Then read the raw USB descriptors from the operating system, because the maintainer needs them to add
 the model to the registry (`docs/firmware-archive-spec.md` §2) and to the MCP server's known models,

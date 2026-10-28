@@ -139,3 +139,57 @@ fn ls_json_marks_the_snapshot_promoted_by_ref_set_and_only_that_one() {
     let r = json_of(&run(d.path(), &["ref", "list", "--json"]));
     assert!(r["entries"][0].get("is_reference").is_none());
 }
+
+#[test]
+fn ls_json_applies_the_shared_validity_rules_to_every_file() {
+    // The same directory the library test and (in time) both GUIs read: `format_version`,
+    // `properties` and `transport` are all required; a future version is its own kind.
+    let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/snapshot_validity");
+    let expected: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&std::fs::read_to_string(fx.join("expected.json")).unwrap()).unwrap();
+    let v = json_of(&run(&fx, &["ls", "--json"]));
+    let got: std::collections::BTreeMap<String, String> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let verdict = match e["status"].as_str().unwrap() {
+                "ok" => "ok".to_string(),
+                _ => e["error_kind"].as_str().unwrap().to_string(),
+            };
+            (e["file"].as_str().unwrap().to_string(), verdict)
+        })
+        .collect();
+    assert_eq!(got, expected);
+
+    // What a GUI lists for a valid file: identity, label, time, property count, reference mark.
+    let ok = v["entries"].as_array().unwrap().iter().find(|e| e["file"] == json!("ok.json")).unwrap();
+    assert_eq!(
+        ok,
+        &json!({"file": "ok.json", "status": "ok", "model": "Z 9", "serial": "0000003023668", "firmware": "5.31",
+                "label": "fixture", "captured_at": "2026-10-27T12:00:00Z", "property_count": 2, "is_reference": false})
+    );
+}
+
+#[test]
+fn ref_set_refuses_a_serial_that_would_write_outside_references_and_reports_a_replacement() {
+    let d = tempfile::tempdir().unwrap();
+    let snaps = d.path().join("snapshots");
+    std::fs::create_dir_all(&snaps).unwrap();
+    snap("Z 9", "../../escape", None).save_to_file(snaps.join("hostile.json")).unwrap();
+    let o = run(d.path(), &["ref", "set", snaps.join("hostile.json").to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("cannot be a reference"), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!d.path().join("references").exists(), "nothing created for a refused name");
+    assert!(!d.path().join("escape_.json").exists() && !d.path().parent().unwrap().join("escape.json").exists());
+
+    // Promoting twice replaces, and says what was replaced.
+    snap("Z 9", "1", Some("first")).save_to_file(snaps.join("a.json")).unwrap();
+    snap("Z 9", "1", Some("second")).save_to_file(snaps.join("b.json")).unwrap();
+    let first = run(d.path(), &["ref", "set", snaps.join("a.json").to_str().unwrap()]);
+    assert!(first.status.success() && !stdout(&first).contains("replaced"), "{}", stdout(&first));
+    let second = run(d.path(), &["ref", "set", snaps.join("b.json").to_str().unwrap()]);
+    assert!(stdout(&second).contains("replaced the previous reference (captured 2026-10-27T12:00:00Z, label first)"), "{}", stdout(&second));
+    let again = run(d.path(), &["ref", "set", snaps.join("b.json").to_str().unwrap()]);
+    assert!(stdout(&again).contains("already the reference"), "{}", stdout(&again));
+}

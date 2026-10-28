@@ -6,8 +6,10 @@
 //! - `total` counts everything that matched the filter, before paging.
 //! - `limit` is clamped to [`MAX_PAGE`]; `limit_clamped` says when it was.
 //! - `truncated` is true exactly when matching entries remain after this page,
-//!   and `next` is then the offset to ask for. A `limit` of 0 returns no
-//!   entries (a summary) and is truncated whenever anything matched.
+//!   and `next` is then the offset to ask for, **if asking for it would advance**.
+//!   A `limit` of 0 returns no entries (a summary), is truncated whenever
+//!   anything matched, and has no `next`: the cursor would be the offset just
+//!   asked for, and a client that follows `next` would loop forever.
 //! - An `offset` past the end returns an empty page that is not truncated.
 
 use serde::Serialize;
@@ -43,7 +45,7 @@ fn window(total: usize, offset: usize, limit: usize) -> (usize, usize, Page) {
         returned: end - start,
         limit_clamped: clamped,
         truncated,
-        next: truncated.then_some(end),
+        next: (truncated && end > start).then_some(end),
     };
     (start, end, page)
 }
@@ -200,10 +202,31 @@ mod tests {
     fn limit_zero_is_a_summary_that_says_more_exists() {
         let v = snapshot_view(&snap(3), None, 0, 0);
         assert!(v.properties.is_empty());
-        assert_eq!((v.page.total, v.page.returned, v.page.truncated, v.page.next), (3, 0, true, Some(0)));
+        assert_eq!((v.page.total, v.page.returned, v.page.truncated, v.page.next), (3, 0, true, None));
         assert_eq!(v.property_count, 3);
         let empty = snapshot_view(&snap(0), None, 0, 0);
         assert!(!empty.page.truncated && empty.page.next.is_none(), "nothing matched, nothing remains");
+    }
+
+    #[test]
+    fn a_page_gets_a_next_cursor_only_when_asking_for_it_advances() {
+        // limit 0 / 1 / 2 at the same offset: only a page that returns something moves the cursor.
+        let s = snap(3);
+        for (offset, limit, next) in [(0usize, 0usize, None), (0, 1, Some(1)), (2, 0, None), (2, 1, None), (1, 1, Some(2)), (3, 0, None)] {
+            let v = snapshot_view(&s, None, offset, limit);
+            assert_eq!(v.page.next, next, "offset={offset} limit={limit}");
+            if let Some(n) = v.page.next {
+                assert!(n > offset, "following `next` must move forward: offset={offset} limit={limit}");
+            }
+        }
+        // A limit-0 client that follows `next` to the end terminates immediately instead of looping.
+        let v = snapshot_view(&s, None, 1, 0);
+        assert_eq!((v.page.truncated, v.page.next), (true, None), "still says more exists, without a loopable cursor");
+        // The same on a diff and on a plan list, which share `window`.
+        let d = diff_view(&diff_of(1, 1, 1), 1, 0);
+        assert_eq!((d.page.truncated, d.page.next), (true, None));
+        let p = page_list(json!({"steps": [0, 1, 2]}), "steps", 1, 0);
+        assert_eq!((p["page"]["truncated"].as_bool(), p["page"]["next"].is_null()), (Some(true), true));
     }
 
     #[test]
@@ -325,7 +348,7 @@ mod tests {
     fn page_list_limit_zero_is_a_summary_and_over_max_is_clamped() {
         let zero = page_list(json!({"outcomes": [1, 2]}), "outcomes", 0, 0);
         assert_eq!(zero["outcomes"], json!([]));
-        assert_eq!((zero["page"]["truncated"].as_bool(), zero["page"]["next"].as_u64()), (Some(true), Some(0)));
+        assert_eq!((zero["page"]["truncated"].as_bool(), zero["page"]["next"].as_u64()), (Some(true), None));
         let big: Vec<usize> = (0..MAX_PAGE + 1).collect();
         let clamped = page_list(json!({"outcomes": big}), "outcomes", 0, MAX_PAGE + 1);
         assert_eq!(clamped["outcomes"].as_array().map(Vec::len), Some(MAX_PAGE));

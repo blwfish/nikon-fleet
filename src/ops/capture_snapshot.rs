@@ -7,9 +7,10 @@
 //! 1. the label is validated and prefixed (`ops::retention`) and the
 //!    per-camera capture cap is checked **before the camera is read**;
 //! 2. the body is captured (`ops::capture`);
-//! 3. an empty capture, and a capture that fails the baseline gate
-//!    (`ops::baseline`), are refused **in memory**, so a failed capture leaves no
-//!    file;
+//! 3. an empty capture, a capture that fails the baseline gate
+//!    (`ops::baseline`) and a capture of a different firmware that lacks
+//!    capabilities the baseline reads ([`firmware_shortfall`]) are refused **in
+//!    memory**, so a failed capture leaves no file;
 //! 4. the snapshot is written create-new, never over an existing file.
 //!
 //! Session handling (lock, SDK, choosing the body by USB serial, the
@@ -20,7 +21,10 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::ops::baseline::{GateOutcome, MissingCapability, gate};
+use crate::ops::baseline::{
+    GateOutcome, MissingCapability, NoBaselineReason, baseline_for, capabilities_phrase, describe_missing_list, gate,
+    missing_capabilities,
+};
 use crate::ops::capture::{CaptureStats, capture};
 use crate::ops::list::ListError;
 use crate::ops::port::CameraPort;
@@ -84,6 +88,68 @@ impl CaptureOutcome {
     }
 }
 
+/// A capture the gate could not judge because its firmware differs from the one the baseline
+/// was seeded from, that also lacks capabilities the baseline reads. A firmware update can drop
+/// capabilities, but an interrupted capture or a USB reset looks exactly the same, so the
+/// front ends refuse it unless told the shortfall is expected (the CLI's `--allow-partial`; the
+/// MCP has no such opt-in).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirmwareShortfall {
+    pub model: String,
+    /// The firmware the baseline was seeded from.
+    pub baseline_firmware: String,
+    /// The firmware the capture records (never empty: an unknown firmware is not evidence of a
+    /// change, and the gate then says `Failed`, not `FirmwareChanged`).
+    pub capture_firmware: String,
+    pub missing: Vec<MissingCapability>,
+}
+
+/// The shortfall behind a `NoBaseline(FirmwareChanged)` verdict, or `None` for any other verdict
+/// and for a firmware change whose readable set differs only by *added* capabilities.
+pub fn firmware_shortfall(snap: &Snapshot, verdict: &GateOutcome) -> Option<FirmwareShortfall> {
+    let GateOutcome::NoBaseline(NoBaselineReason::FirmwareChanged { baseline, capture }) = verdict else {
+        return None;
+    };
+    let missing = baseline_for(&snap.camera.model).map(|b| missing_capabilities(b, snap)).unwrap_or_default();
+    (!missing.is_empty()).then(|| FirmwareShortfall {
+        model: snap.camera.model.clone(),
+        baseline_firmware: baseline.clone(),
+        capture_firmware: capture.clone(),
+        missing,
+    })
+}
+
+/// The `detail` of a `capture_incomplete` error result: what could not be read.
+pub fn incomplete_detail(missing: &[MissingCapability], stats: &CaptureStats) -> serde_json::Value {
+    serde_json::json!({"missing": missing, "read_ok": stats.read_ok, "read_err": stats.read_err})
+}
+
+/// The `detail` of a `firmware_shortfall` error result: the same shape plus the two firmwares.
+pub fn shortfall_detail(shortfall: &FirmwareShortfall, stats: &CaptureStats) -> serde_json::Value {
+    let mut v = incomplete_detail(&shortfall.missing, stats);
+    v["baseline_firmware"] = shortfall.baseline_firmware.clone().into();
+    v["capture_firmware"] = shortfall.capture_firmware.clone().into();
+    v
+}
+
+impl std::fmt::Display for FirmwareShortfall {
+    /// The CLI's and the MCP's one wording for this refusal (without the "what to do next" tail,
+    /// which differs by front end).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this capture is of firmware {}, but the {:?} baseline was seeded from firmware {}, \
+             and {} that baseline reads could not be read: {}. A firmware update can remove capabilities, but \
+             an interrupted capture or a USB reset looks exactly the same.",
+            self.capture_firmware,
+            self.model,
+            self.baseline_firmware,
+            capabilities_phrase(self.missing.len()),
+            describe_missing_list(&self.missing),
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum CaptureError {
     Label(LabelError),
@@ -93,6 +159,8 @@ pub enum CaptureError {
     NothingReadable { read_err: usize },
     /// The baseline gate failed: an incomplete capture. Not written.
     Incomplete { missing: Vec<MissingCapability>, stats: CaptureStats },
+    /// A different firmware than the baseline's, lacking capabilities the baseline reads. Not written.
+    FirmwareShortfall { shortfall: FirmwareShortfall, stats: CaptureStats },
     /// Creating the file failed, including "already exists".
     Write(SnapshotError),
 }
@@ -106,6 +174,7 @@ impl CaptureError {
             CaptureError::DataDirFull(e) => e.tag(),
             CaptureError::NothingReadable { .. } => "nothing_readable",
             CaptureError::Incomplete { .. } => "capture_incomplete",
+            CaptureError::FirmwareShortfall { .. } => "firmware_shortfall",
             CaptureError::Write(_) => "write_failed",
         }
     }
@@ -121,15 +190,31 @@ impl std::fmt::Display for CaptureError {
                 write!(f, "no capability could be read ({read_err} read error(s)); nothing was written")
             }
             CaptureError::Incomplete { missing, .. } => {
-                write!(f, "capture is incomplete: {} baseline capabilit{} could not be read; nothing was written",
-                    missing.len(), if missing.len() == 1 { "y" } else { "ies" })
+                write!(f, "capture is incomplete: {} in the baseline could not be read; nothing was written",
+                    capabilities_phrase(missing.len()))
             }
+            CaptureError::FirmwareShortfall { shortfall, .. } => write!(
+                f,
+                "{shortfall}\nNothing was written. Re-capture; if the same capabilities are missing again, tell the user: \
+                 the baseline needs re-seeding for the new firmware (`nikon-fleet baseline seed`)."
+            ),
             CaptureError::Write(e) => write!(f, "could not create the snapshot file: {e}"),
         }
     }
 }
 
 impl std::error::Error for CaptureError {}
+
+impl CaptureError {
+    /// Structured detail for the error result, for the errors that have any.
+    pub fn detail(&self) -> Option<serde_json::Value> {
+        match self {
+            CaptureError::Incomplete { missing, stats } => Some(incomplete_detail(missing, stats)),
+            CaptureError::FirmwareShortfall { shortfall, stats } => Some(shortfall_detail(shortfall, stats)),
+            _ => None,
+        }
+    }
+}
 
 /// Run the capture workflow. `progress` is told `"captured"` after the read
 /// and `"written"` after the file exists.
@@ -154,6 +239,9 @@ pub fn capture_snapshot<P: CameraPort + ?Sized>(
     let verdict = gate(&snap);
     if let GateOutcome::Failed { missing } = verdict {
         return Err(CaptureError::Incomplete { missing, stats });
+    }
+    if let Some(shortfall) = firmware_shortfall(&snap, &verdict) {
+        return Err(CaptureError::FirmwareShortfall { shortfall, stats });
     }
 
     std::fs::create_dir_all(req.snapshots_dir)
@@ -245,6 +333,140 @@ mod tests {
             assert_eq!(err.tag(), "capture_incomplete");
             assert!(files(d.path()).is_empty(), "{dropped}: a failed gate must leave no file");
         }
+    }
+
+    /// `req` for a Z 9 running `firmware` (the baseline was seeded from 5.31).
+    fn req_fw<'a>(dir: &'a Path, firmware: &str, names: &'a HashMap<u32, String>) -> CaptureRequest<'a> {
+        let mut r = req(dir, "Z 9", None, names);
+        r.camera.firmware = firmware.into();
+        r
+    }
+
+    #[test]
+    fn a_capture_of_a_different_firmware_that_lacks_baseline_capabilities_is_refused_and_leaves_no_file() {
+        // G19 / review #33: the baseline gate calls this `NoBaseline(FirmwareChanged)` ("cannot judge"),
+        // which used to be written. An interrupted capture looks exactly like it, so it is refused, as
+        // the CLI refuses it unless `--allow-partial`.
+        let d = TempDir::new().unwrap();
+        for dropped in [1usize, 2, 5, 178, 195] {
+            let (cam, names) = z9(dropped);
+            let err = capture_snapshot(&cam, &req_fw(d.path(), "5.40", &names), &mut |_| {}).unwrap_err();
+            let CaptureError::FirmwareShortfall { shortfall, stats } = &err else { panic!("{dropped}: {err:?}") };
+            assert_eq!(shortfall.missing.len(), dropped);
+            assert_eq!((shortfall.baseline_firmware.as_str(), shortfall.capture_firmware.as_str()), ("5.31", "5.40"));
+            assert_eq!(stats.read_ok, 196 - dropped);
+            assert_eq!(err.tag(), "firmware_shortfall");
+            assert!(files(d.path()).is_empty(), "{dropped}: a refused capture must leave no file");
+        }
+    }
+
+    #[test]
+    fn the_refusal_uses_the_clis_wording_and_counts_in_the_clis_plural() {
+        let d = TempDir::new().unwrap();
+        let (cam, names) = z9(1);
+        let one = capture_snapshot(&cam, &req_fw(d.path(), "5.40", &names), &mut |_| {}).unwrap_err().to_string();
+        let first = baseline_for("Z 9").unwrap().readable[0].clone();
+        assert!(
+            one.starts_with(&format!(
+                "this capture is of firmware 5.40, but the \"Z 9\" baseline was seeded from firmware 5.31, and 1 capability that baseline \
+                 reads could not be read: {} ({:#x}). A firmware update can remove capabilities, but an interrupted capture or a USB reset \
+                 looks exactly the same.",
+                first.name, first.code
+            )),
+            "{one}"
+        );
+        assert!(one.contains("Nothing was written"), "{one}");
+        let (cam, names) = z9(16);
+        let many = capture_snapshot(&cam, &req_fw(d.path(), "5.40", &names), &mut |_| {}).unwrap_err().to_string();
+        assert!(many.contains("and 16 capabilities that baseline reads"), "{many}");
+        assert!(many.contains(", and 1 more"), "the list shows 15 names, then how many more: {many}");
+    }
+
+    #[test]
+    fn a_different_firmware_that_only_adds_capabilities_is_still_written_unjudged() {
+        let d = TempDir::new().unwrap();
+        let (cam, names) = z9(0);
+        let extra = (0u32..).find(|c| !baseline_for("Z 9").unwrap().readable.iter().any(|r| r.code == *c)).unwrap();
+        let cam = cam.with(extra, OP_GET, json!(1));
+        let out = capture_snapshot(&cam, &req_fw(d.path(), "5.40", &names), &mut |_| {}).unwrap();
+        assert_eq!(
+            out.gate,
+            GateOutcome::NoBaseline(NoBaselineReason::FirmwareChanged { baseline: "5.31".into(), capture: "5.40".into() })
+        );
+        assert_eq!((out.expected_unreadable, out.unexpected_unreadable), (None, None), "not judged");
+        assert_eq!(files(d.path()), [out.file]);
+    }
+
+    #[test]
+    fn a_complete_capture_of_a_different_firmware_passes() {
+        let d = TempDir::new().unwrap();
+        let (cam, names) = z9(0);
+        let out = capture_snapshot(&cam, &req_fw(d.path(), "5.40", &names), &mut |_| {}).unwrap();
+        assert_eq!(out.gate, GateOutcome::Passed, "exactly the baseline's set on another firmware is a pass");
+    }
+
+    #[test]
+    fn an_unreadable_firmware_is_not_evidence_of_a_change() {
+        // `""` is what the body reports when its USB record was not read; the gate must then say
+        // "incomplete" (Failed), not "firmware changed" (which is only a shortfall for a *known* firmware).
+        let d = TempDir::new().unwrap();
+        let (cam, names) = z9(3);
+        let err = capture_snapshot(&cam, &req_fw(d.path(), "", &names), &mut |_| {}).unwrap_err();
+        assert!(matches!(&err, CaptureError::Incomplete { missing, .. } if missing.len() == 3), "{err:?}");
+        assert_eq!(err.tag(), "capture_incomplete");
+        assert!(files(d.path()).is_empty());
+        // ... and a complete capture with no firmware at all is fine.
+        let (cam, names) = z9(0);
+        assert_eq!(capture_snapshot(&cam, &req_fw(d.path(), "", &names), &mut |_| {}).unwrap().gate, GateOutcome::Passed);
+    }
+
+    fn snap_of(model: &str, firmware: &str, drop: usize) -> Snapshot {
+        let b = baseline_for("Z 9").unwrap();
+        let mut s = Snapshot::new(Camera { model: model.into(), serial: "S".into(), firmware: firmware.into() }, Transport::Usb, AT.into());
+        for c in b.readable.iter().skip(drop) {
+            s.insert(c.name.clone(), c.code, json!(1));
+        }
+        s
+    }
+
+    #[test]
+    fn firmware_shortfall_is_only_for_a_changed_firmware_verdict_with_something_missing() {
+        // The one case: a known other firmware and capabilities missing (below, at and above one).
+        let nothing_missing = snap_of("Z 9", "5.40", 0);
+        assert_eq!(firmware_shortfall(&nothing_missing, &gate(&nothing_missing)), None, "nothing missing");
+        for dropped in [1usize, 2] {
+            let s = snap_of("Z 9", "5.40", dropped);
+            let f = firmware_shortfall(&s, &gate(&s)).expect("a shortfall");
+            assert_eq!((f.missing.len(), f.model.as_str()), (dropped, "Z 9"));
+        }
+        // Every other verdict is not a shortfall, whatever is missing.
+        let same_fw = snap_of("Z 9", "5.31", 4);
+        assert!(matches!(gate(&same_fw), GateOutcome::Failed { .. }));
+        assert_eq!(firmware_shortfall(&same_fw, &gate(&same_fw)), None, "same firmware is `Failed`, the other refusal");
+        let unknown_fw = snap_of("Z 9", "", 4);
+        assert_eq!(firmware_shortfall(&unknown_fw, &gate(&unknown_fw)), None, "unknown firmware is `Failed` too");
+        let z5 = snap_of("Z 5", "1.43", 4);
+        assert_eq!(gate(&z5), GateOutcome::NoBaseline(NoBaselineReason::UnknownModel));
+        assert_eq!(firmware_shortfall(&z5, &gate(&z5)), None, "no baseline: nothing to fall short of");
+        let passed = snap_of("Z 9", "5.31", 0);
+        assert_eq!(firmware_shortfall(&passed, &GateOutcome::Passed), None);
+    }
+
+    #[test]
+    fn the_error_results_carry_what_was_missing_and_both_firmwares() {
+        let d = TempDir::new().unwrap();
+        let (cam, names) = z9(3);
+        let inc = capture_snapshot(&cam, &req_fw(d.path(), "5.31", &names), &mut |_| {}).unwrap_err();
+        let v = inc.detail().expect("an incomplete capture has detail");
+        assert_eq!((v["read_ok"].clone(), v["read_err"].clone(), v["missing"].as_array().map(Vec::len)), (json!(193), json!(0), Some(3)));
+        assert!(v.get("baseline_firmware").is_none(), "only the shortfall names two firmwares");
+        let short = capture_snapshot(&cam, &req_fw(d.path(), "5.40", &names), &mut |_| {}).unwrap_err();
+        let v = short.detail().expect("a shortfall has detail");
+        assert_eq!((v["baseline_firmware"].clone(), v["capture_firmware"].clone()), (json!("5.31"), json!("5.40")));
+        assert_eq!((v["read_ok"].clone(), v["missing"].as_array().map(Vec::len)), (json!(193), Some(3)));
+        assert_eq!(v["missing"][0]["name"], json!(baseline_for("Z 9").unwrap().readable[0].name));
+        // The errors that have nothing structured to say say nothing.
+        assert!(CaptureError::NothingReadable { read_err: 1 }.detail().is_none());
     }
 
     #[test]

@@ -93,3 +93,57 @@ fn read_argv_is_accepted_by_the_real_cli() {
         );
     }
 }
+
+fn dry_run_of(p: &FtpProfile) -> std::process::Output {
+    let mut argv = vendor_write_ftp_argv(p, None);
+    argv.push("--dry-run".to_string());
+    run_with_stdin(&argv, &p.password)
+}
+
+/// The CLI used to encode an all-empty profile and, without --dry-run, send it to the camera:
+/// only the GUIs checked the required fields. Every required field is refused on its own, with
+/// its name, before anything is encoded, previewed or sent (`--dry-run` shares the refusal, so
+/// the preview never shows a profile the real write would not send).
+#[test]
+fn every_required_field_is_checked_by_the_cli_before_anything_is_encoded() {
+    let fields: [(&str, fn(&mut FtpProfile)); 6] = [
+        ("profile name", |p| p.profile_name = String::new()),
+        ("SSID (2.4GHz)", |p| p.ssid_24ghz = String::new()),
+        ("SSID (5GHz)", |p| p.ssid_5ghz = String::new()),
+        ("host", |p| p.host = String::new()),
+        ("username", |p| p.username = String::new()),
+        ("password", |p| p.password = String::new()),
+    ];
+    for (name, blank) in fields {
+        let mut p = profile();
+        blank(&mut p);
+        let out = dry_run_of(&p);
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(1), "{name}: {stdout}{stderr}");
+        assert!(stderr.contains(&format!("missing field(s): {name}")), "{name}: {stderr}");
+        assert!(!stdout.contains("Would write"), "{name}: a refused profile must not be previewed: {stdout}");
+    }
+}
+
+#[test]
+fn an_all_empty_profile_names_every_field_and_a_blank_but_not_empty_one_is_refused_too() {
+    let empty = FtpProfile {
+        profile_name: String::new(), ssid_24ghz: String::new(), ssid_5ghz: String::new(),
+        host: String::new(), port: 21, username: String::new(), password: String::new(),
+    };
+    let out = dry_run_of(&empty);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("profile name, SSID (2.4GHz), SSID (5GHz), host, username, password"), "{stderr}");
+    assert!(out.stdout.is_empty());
+
+    // Whitespace-only counts as empty for every field but the password (a space can be a real
+    // password character): the boundary is pinned on both sides.
+    let mut blank = profile();
+    blank.profile_name = "   ".to_string();
+    assert_eq!(dry_run_of(&blank).status.code(), Some(1));
+    let mut space_password = profile();
+    space_password.password = " ".to_string();
+    let ok = dry_run_of(&space_password);
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+}

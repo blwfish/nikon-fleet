@@ -11,8 +11,9 @@ use serde::Serialize;
 
 use crate::diff::{Diff, DiffError, DiffOptions, diff_with_schema};
 use crate::maid_layer::MaidLayerConfig;
-use crate::ops::baseline::{GateOutcome, MissingCapability, gate};
+use crate::ops::baseline::{GateOutcome, MissingCapability, capabilities_phrase, gate};
 use crate::ops::capture::{CaptureStats, capture};
+use crate::ops::capture_snapshot::{FirmwareShortfall, firmware_shortfall, incomplete_detail, shortfall_detail};
 use crate::ops::port::CameraPort;
 use crate::snapshot::{Camera, Snapshot, Transport};
 
@@ -40,6 +41,9 @@ pub struct CheckReport {
 pub enum CheckError {
     NothingReadable { read_err: usize },
     Incomplete { missing: Vec<MissingCapability>, stats: CaptureStats },
+    /// The body runs a different firmware than the baseline's and lacks capabilities the baseline
+    /// reads: indistinguishable from an interrupted capture, so not compared.
+    FirmwareShortfall { shortfall: FirmwareShortfall, stats: CaptureStats },
     Diff(DiffError),
 }
 
@@ -48,6 +52,7 @@ impl CheckError {
         match self {
             CheckError::NothingReadable { .. } => "nothing_readable",
             CheckError::Incomplete { .. } => "capture_incomplete",
+            CheckError::FirmwareShortfall { .. } => "firmware_shortfall",
             CheckError::Diff(DiffError::ModelMismatch { .. }) => "model_mismatch",
         }
     }
@@ -61,9 +66,13 @@ impl std::fmt::Display for CheckError {
             }
             CheckError::Incomplete { missing, .. } => write!(
                 f,
-                "the live capture is incomplete ({} baseline capabilit{} could not be read), so a comparison would show them as removed",
-                missing.len(),
-                if missing.len() == 1 { "y" } else { "ies" }
+                "the live capture is incomplete ({} in the baseline could not be read), so a comparison would show them as removed",
+                capabilities_phrase(missing.len())
+            ),
+            CheckError::FirmwareShortfall { shortfall, .. } => write!(
+                f,
+                "{shortfall}\nNothing was compared, because the missing capabilities would show as removed. Re-run the check; \
+                 if the same capabilities are missing again, tell the user: the baseline needs re-seeding for the new firmware."
             ),
             CheckError::Diff(e) => write!(f, "{e}"),
         }
@@ -71,6 +80,17 @@ impl std::fmt::Display for CheckError {
 }
 
 impl std::error::Error for CheckError {}
+
+impl CheckError {
+    /// Structured detail for the error result: the same shapes as the capture's.
+    pub fn detail(&self) -> Option<serde_json::Value> {
+        match self {
+            CheckError::Incomplete { missing, stats } => Some(incomplete_detail(missing, stats)),
+            CheckError::FirmwareShortfall { shortfall, stats } => Some(shortfall_detail(shortfall, stats)),
+            CheckError::NothingReadable { .. } | CheckError::Diff(_) => None,
+        }
+    }
+}
 
 pub fn check<P: CameraPort + ?Sized>(port: &P, req: &CheckRequest<'_>) -> Result<CheckReport, CheckError> {
     let mut live = Snapshot::new(req.live_camera.clone(), Transport::Usb, req.captured_at.clone());
@@ -82,6 +102,9 @@ pub fn check<P: CameraPort + ?Sized>(port: &P, req: &CheckRequest<'_>) -> Result
     let verdict = gate(&live);
     if let GateOutcome::Failed { missing } = verdict {
         return Err(CheckError::Incomplete { missing, stats });
+    }
+    if let Some(shortfall) = firmware_shortfall(&live, &verdict) {
+        return Err(CheckError::FirmwareShortfall { shortfall, stats });
     }
     let d = diff_with_schema(req.reference, &live, &DiffOptions::default(), req.schema).map_err(CheckError::Diff)?;
     Ok(CheckReport::new(req.live_camera.clone(), req.reference, verdict, stats, d))
@@ -189,6 +212,39 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(err.tag(), "capture_incomplete");
+    }
+
+    #[test]
+    fn a_live_capture_of_a_different_firmware_that_lacks_baseline_capabilities_is_not_compared() {
+        // Same hole as the capture's (G19): the gate cannot judge another firmware, so the shortfall
+        // used to be diffed as a pile of removals. The CLI's `check` refuses it; so does this.
+        let (_, names, reference) = z9();
+        let b = baseline_for("Z 9").unwrap();
+        let sc = schema();
+        for dropped in [1usize, 5] {
+            let mut cam = FakeCamera::new();
+            for c in b.readable.iter().skip(dropped) {
+                cam = cam.with(c.code, OP_GET, json!(1));
+            }
+            let mut r = req(&reference, &names, &sc);
+            r.live_camera.firmware = "5.40".into();
+            let err = check(&cam, &r).unwrap_err();
+            let CheckError::FirmwareShortfall { shortfall, stats } = &err else { panic!("{dropped}: {err:?}") };
+            assert_eq!((shortfall.missing.len(), stats.read_ok), (dropped, 196 - dropped));
+            assert_eq!(err.tag(), "firmware_shortfall");
+            assert!(err.to_string().contains("firmware 5.40"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_different_firmware_with_nothing_missing_is_compared() {
+        let (cam, names, reference) = z9();
+        let sc = schema();
+        let mut r = req(&reference, &names, &sc);
+        r.live_camera.firmware = "5.40".into();
+        let report = check(&cam, &r).unwrap();
+        assert_eq!(report.gate, GateOutcome::Passed);
+        assert_eq!(report.differences, 0);
     }
 
     #[test]

@@ -1,0 +1,72 @@
+{
+  "dir": "tests/fixtures/snapshot_validity/snapshots",
+  "dir_exists": true,
+  "entries": [
+    {
+      "file": "bad_transport.json",
+      "status": "unreadable",
+      "error_kind": "json",
+      "error": "JSON error: unknown variant `carrier-pigeon`, expected one of `usb`, `ptpip`, `file` at line 10 column 31"
+    },
+    {
+      "file": "broken.json",
+      "status": "unreadable",
+      "error_kind": "json",
+      "error": "JSON error: key must be a string at line 1 column 3"
+    },
+    {
+      "file": "future_version.json",
+      "status": "unreadable",
+      "error_kind": "unsupported_version",
+      "error": "unsupported format_version 999; this build expects 1"
+    },
+    {
+      "file": "no_properties.json",
+      "status": "unreadable",
+      "error_kind": "json",
+      "error": "JSON error: missing field `properties` at line 11 column 1"
+    },
+    {
+      "file": "no_transport.json",
+      "status": "unreadable",
+      "error_kind": "json",
+      "error": "JSON error: missing field `transport` at line 20 column 1"
+    },
+    {
+      "file": "no_version.json",
+      "status": "unreadable",
+      "error_kind": "json",
+      "error": "JSON error: missing field `format_version` at line 20 column 1"
+    },
+    {
+      "file": "ok.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "0000003023668",
+      "firmware": "5.31",
+      "label": "fixture",
+      "captured_at": "2026-10-27T12:00:00Z",
+      "property_count": 2,
+      "is_reference": false
+    },
+    {
+      "file": "ok_extra_key_null_label.json",
+      "status": "ok",
+      "model": "Z 9",
+      "serial": "0000003023668",
+      "firmware": "5.31",
+      "label": null,
+      "captured_at": "2026-10-27T12:00:00Z",
+      "property_count": 2,
+      "is_reference": false
+    },
+    {
+      "file": "property_without_code.json",
+      "status": "unreadable",
+      "error_kind": "json",
+      "error": "JSON error: missing field `code` at line 14 column 5"
+    }
+  ],
+  "skipped_dir_entries": 0,
+  "reference_read_failures": 0
+}

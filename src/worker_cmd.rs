@@ -24,8 +24,8 @@ use nikon_fleet::camera_lock::LockError;
 use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::ops::apply::{ApplyError, ApplyRequest, apply_transplant, require_confirmation};
 use nikon_fleet::ops::cameras::require_unambiguous;
-use nikon_fleet::ops::capture_snapshot::{CaptureError, CaptureRequest, capture_snapshot};
-use nikon_fleet::ops::check::{CheckError, CheckRequest, check};
+use nikon_fleet::ops::capture_snapshot::{CaptureRequest, capture_snapshot};
+use nikon_fleet::ops::check::{CheckRequest, check};
 use nikon_fleet::ops::list::reference_filename;
 use nikon_fleet::ops::paths::resolve_existing;
 use nikon_fleet::ops::plan::{PlanInput, build_plan};
@@ -34,7 +34,7 @@ use nikon_fleet::ops::baseline::GatePolicy;
 use nikon_fleet::ops::restore_flow::{
     BodyPolicy, RestoreApplyError, RestoreApplyRequest, RestorePlanInput, apply_restore, build_restore_plan,
 };
-use nikon_fleet::ops::target::select_by_usb_serial;
+use nikon_fleet::ops::target::{body_firmware, select_by_usb_serial};
 use nikon_fleet::ops::worker::{Emitter, Outcome, PHASE_WRITING, open_result_fd};
 use nikon_fleet::ops::port::CameraPort;
 use nikon_fleet::sdk::Device;
@@ -358,7 +358,7 @@ fn with_body(
     }
     let body = Body {
         device: &device,
-        camera: Camera { model: target.name.clone(), serial: usb.serial.clone(), firmware: usb.firmware.clone() },
+        camera: Camera { model: target.name.clone(), serial: usb.serial.clone(), firmware: body_firmware(&target, &Some(usb.clone())) },
         schema: &schema,
     };
     let outcome = f(em, &body);
@@ -407,13 +407,7 @@ fn capture(
         match result {
             Ok(outcome) => Outcome::ok_report(&outcome),
             Err(e) => {
-                let detail = match &e {
-                    CaptureError::Incomplete { missing, stats } => {
-                        Some(json!({"missing": missing, "read_ok": stats.read_ok, "read_err": stats.read_err}))
-                    }
-                    _ => None,
-                };
-                Outcome::err(e.tag(), e.to_string(), detail)
+                Outcome::err(e.tag(), e.to_string(), e.detail())
             }
         }
     })
@@ -450,13 +444,7 @@ fn op_check(em: &mut Emitter<File>, teardown: Teardown, data_dir: &Path, bundle:
         match check(body.device, &req) {
             Ok(report) => Outcome::ok_report(&report),
             Err(e) => {
-                let detail = match &e {
-                    CheckError::Incomplete { missing, stats } => {
-                        Some(json!({"missing": missing, "read_ok": stats.read_ok, "read_err": stats.read_err}))
-                    }
-                    _ => None,
-                };
-                Outcome::err(e.tag(), e.to_string(), detail)
+                Outcome::err(e.tag(), e.to_string(), e.detail())
             }
         }
     })

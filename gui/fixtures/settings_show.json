@@ -1,0 +1,12 @@
+{
+  "settings_path": "/home/u/settings.json",
+  "settings_exist": true,
+  "data_dir": "/Volumes/Files/nikon-data",
+  "effective_data_dir": "/Volumes/Files/nikon-data",
+  "keys": {
+    "data_dir": "/Volumes/Files/nikon-data",
+    "window": {
+      "w": 860
+    }
+  }
+}

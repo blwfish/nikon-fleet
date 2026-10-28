@@ -1,0 +1,11 @@
+{
+  "bad_transport.json": "json",
+  "broken.json": "json",
+  "future_version.json": "unsupported_version",
+  "no_properties.json": "json",
+  "no_transport.json": "json",
+  "no_version.json": "json",
+  "ok.json": "ok",
+  "ok_extra_key_null_label.json": "ok",
+  "property_without_code.json": "json"
+}

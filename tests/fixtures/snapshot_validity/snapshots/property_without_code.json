@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "camera": {
+    "model": "Z 9",
+    "serial": "0000003023668",
+    "firmware": "5.31"
+  },
+  "captured_at": "2026-10-27T12:00:00Z",
+  "label": "fixture",
+  "transport": "usb",
+  "properties": {
+    "A": {
+      "value": 1
+    }
+  }
+}

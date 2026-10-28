@@ -18,8 +18,59 @@ use std::path::{Path, PathBuf};
 
 /// A single plain path component: non-empty, not `.` or `..`, no separators,
 /// no NUL.
+///
+/// The one definition of "plain" for the library: `ops::list` (the reference
+/// lookup), `firmware` (archive names) and this module's resolvers all call it,
+/// and the GUIs reach it through [`checked_reference_filename`] and
+/// `ops::list::is_plain_name_component` (an alias). `PLAIN_COMPONENT_TABLE` is
+/// the table every caller's test runs.
 pub fn is_safe_path_component(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
+}
+
+/// The file name of the reference for a camera, for a model and serial that
+/// came from a data file (a snapshot's own `camera` fields) rather than from a
+/// body this process just read: `{model_slug}_{serial}.json`, or
+/// [`PathError::Unsafe`] when either is not a plain component. Every writer of
+/// `references/` (`ref set`, both GUIs) builds the name through this, so a `/`
+/// or `..` in a snapshot's serial cannot steer the write out of the directory.
+pub fn checked_reference_filename(model: &str, serial: &str) -> Result<String, PathError> {
+    for value in [model, serial] {
+        if !is_safe_path_component(value) {
+            return Err(PathError::Unsafe { name: value.to_string() });
+        }
+    }
+    Ok(crate::ops::list::reference_filename(model, serial))
+}
+
+/// Write `bytes` to `path` so a reader sees the old file or the whole new one, never half: a
+/// temporary file in the same directory (a name no other writer in this process or another can
+/// pick), synced to disk, then a rename over `path`. The temporary file is removed when any step
+/// fails. The directory must exist. When `path` is a symlink the file it points to is replaced and
+/// the link is kept (a dotfile-managed settings.json stays managed).
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = std::fs::File::create(&tmp)
+        .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
+        .and_then(|()| std::fs::rename(&tmp, &target));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp); // best effort; `written` is the error to report
+    }
+    written
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +144,39 @@ pub fn resolve_new(dir: &Path, name: &str) -> Result<PathBuf, PathError> {
     Ok(canonical_dir(dir)?.join(name))
 }
 
+/// Every value any caller of the plain-component predicate must agree on, and
+/// whether it is plain. `ops::list`, `firmware` and this module's tests each run
+/// their own entry point over this one table, so a copy that drifts fails there.
+#[cfg(test)]
+pub(crate) const PLAIN_COMPONENT_TABLE: &[(&str, bool)] = &[
+    ("5.31", true),
+    ("Z_9", true),
+    ("Z 9", true),
+    ("a.json", true),
+    ("...", true),
+    (".hidden", true),
+    ("id-1", true),
+    ("é", true),
+    ("0000003023668", true),
+    // Pinned: control characters other than NUL are plain today.
+    ("a\nb", true),
+    ("a ", true),
+    ("", false),
+    (".", false),
+    ("..", false),
+    ("../../../../tmp/pwned", false),
+    ("../x", false),
+    ("./a", false),
+    ("a/b", false),
+    ("a/", false),
+    ("/", false),
+    ("/etc/passwd", false),
+    ("a\\b", false),
+    ("\\", false),
+    ("a\0b", false),
+    ("\0", false),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,12 +185,98 @@ mod tests {
 
     #[test]
     fn plain_components_and_boundaries() {
-        for ok in ["5.31", "Z_9", "a.json", "...", ".hidden", "id-1", "é"] {
-            assert!(is_safe_path_component(ok), "{ok:?}");
+        for (value, plain) in PLAIN_COMPONENT_TABLE {
+            assert_eq!(is_safe_path_component(value), *plain, "{value:?}");
         }
-        for bad in ["", ".", "..", "../../../../tmp/pwned", "a/b", "a\\b", "/etc/passwd", "a\0b", "./a", "a/"] {
-            assert!(!is_safe_path_component(bad), "{bad:?}");
+    }
+
+    #[test]
+    fn checked_reference_filename_accepts_plain_and_refuses_everything_else() {
+        assert_eq!(checked_reference_filename("Z 9", "30012345").unwrap(), "Z_9_30012345.json");
+        assert_eq!(checked_reference_filename("Z6_3", "id-1").unwrap(), "Z6_3_id-1.json");
+        // Each field is checked on its own: a plain model never excuses a hostile serial, or the reverse.
+        for (value, plain) in PLAIN_COMPONENT_TABLE {
+            assert_eq!(checked_reference_filename("Z 9", value).is_ok(), *plain, "serial {value:?}");
+            assert_eq!(checked_reference_filename(value, "1").is_ok(), *plain, "model {value:?}");
         }
+        assert_eq!(
+            checked_reference_filename("Z 9", "x/y").unwrap_err(),
+            PathError::Unsafe { name: "x/y".into() }
+        );
+        assert_eq!(checked_reference_filename("../evil", "1").unwrap_err().tag(), "unsafe_name");
+    }
+
+    #[test]
+    fn the_checked_name_is_the_unchecked_name_for_plain_input() {
+        // One naming rule: checking never changes the name, it only refuses.
+        for (m, s) in [("Z 9", "1"), ("Z6_3", "id-12"), ("Z 5", "0000003023668")] {
+            assert_eq!(checked_reference_filename(m, s).unwrap(), crate::ops::list::reference_filename(m, s));
+        }
+    }
+
+    #[test]
+    fn write_atomic_replaces_whole_and_leaves_no_temp() {
+        let d = TempDir::new().unwrap();
+        let p = d.path().join("f.json");
+        write_atomic(&p, b"one").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"one");
+        write_atomic(&p, b"two-longer").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"two-longer");
+        write_atomic(&p, b"").unwrap(); // zero bytes is a write, not a no-op
+        assert_eq!(fs::read(&p).unwrap(), b"");
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1, "no temp file left");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_through_a_symlink_replaces_its_target_and_keeps_the_link() {
+        let d = TempDir::new().unwrap();
+        let real = d.path().join("managed");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("settings.json"), "old").unwrap();
+        let link = d.path().join("settings.json");
+        std::os::unix::fs::symlink(real.join("settings.json"), &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link is kept");
+        assert_eq!(fs::read_to_string(real.join("settings.json")).unwrap(), "new");
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 1, "no temp file left beside the target");
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_to_one_path_never_share_a_temp_name() {
+        let d = TempDir::new().unwrap();
+        let p = d.path().join("f.json");
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        write_atomic(&p, format!("{{\"writer\":{i}}}").as_bytes()).expect("a concurrent write must not collide");
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.starts_with("{\"writer\":") && text.ends_with('}'), "a whole file from one writer: {text}");
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1, "no temp files left");
+    }
+
+    #[test]
+    fn a_failed_atomic_write_keeps_the_old_content_and_cleans_up() {
+        let d = TempDir::new().unwrap();
+        // The target is a non-empty directory: the rename cannot replace it.
+        let p = d.path().join("f.json");
+        fs::create_dir(&p).unwrap();
+        fs::write(p.join("keep"), "x").unwrap();
+        assert!(write_atomic(&p, b"new").is_err());
+        assert!(p.join("keep").exists());
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1, "temp removed");
+        // A missing directory fails and creates nothing.
+        assert!(write_atomic(&d.path().join("no/such/f.json"), b"x").is_err());
+        assert!(!d.path().join("no").exists());
     }
 
     #[test]

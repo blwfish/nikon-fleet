@@ -1,0 +1,20 @@
+{
+  "camera": {
+    "model": "Z 9",
+    "serial": "0000003023668",
+    "firmware": "5.31"
+  },
+  "captured_at": "2026-10-27T12:00:00Z",
+  "label": "fixture",
+  "transport": "usb",
+  "properties": {
+    "kNkMAIDCapability_A": {
+      "code": 1,
+      "value": 1
+    },
+    "kNkMAIDCapability_B": {
+      "code": 2,
+      "value": "x"
+    }
+  }
+}

@@ -36,7 +36,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::diff::{Diff, DiffOptions, diff};
-use crate::ops::baseline::{GateOutcome, GatePolicy, MissingCapability, NoBaselineReason, gate};
+use crate::ops::baseline::{GateOutcome, GatePolicy, MissingCapability, NoBaselineReason, capabilities_phrase, gate};
 use crate::ops::capture::{CaptureStats, capture};
 use crate::ops::list::ListError;
 use crate::ops::plan::{PlanInput, digest, summary_text, would_change};
@@ -212,9 +212,8 @@ impl std::fmt::Display for ApplyError {
             }
             ApplyError::RestorePointIncomplete { missing, .. } => write!(
                 f,
-                "the restore point capture is incomplete ({} baseline capabilit{} unreadable); nothing was written",
-                missing.len(),
-                if missing.len() == 1 { "y" } else { "ies" }
+                "the restore point capture is incomplete ({} in the baseline unreadable); nothing was written",
+                capabilities_phrase(missing.len())
             ),
             ApplyError::RestorePointWrite(e) => write!(f, "could not create the restore point file: {e}; nothing was written"),
         }

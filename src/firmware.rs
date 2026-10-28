@@ -185,8 +185,13 @@ pub enum IngestOutcome {
 }
 
 fn safe_component(what: &'static str, value: &str) -> Result<(), FirmwareError> {
-    let ok = !value.is_empty() && value != "." && value != ".." && !value.contains(['/', '\\']);
-    if ok { Ok(()) } else { Err(FirmwareError::UnsafePathComponent { what, value: value.to_owned() }) }
+    // The library's one definition of a plain path component (ops::paths); the NUL check
+    // this module's own copy lacked comes with it.
+    if crate::ops::paths::is_safe_path_component(value) {
+        Ok(())
+    } else {
+        Err(FirmwareError::UnsafePathComponent { what, value: value.to_owned() })
+    }
 }
 
 /// Archive `src` as `(model, version)` with provenance. Never replaces an
@@ -266,62 +271,264 @@ pub fn ingest_bundle(
 
 // ─── Listing ─────────────────────────────────────────────────────────────────
 
+/// One valid archive entry: what `metadata.json` says, and where it lives.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArchiveEntry {
     pub model: String,
     pub version: String,
     pub meta: FirmwareMeta,
+    /// The entry's directory (`<data-dir>/firmware/{model_slug}/{version}/`, as found on disk).
+    pub directory: PathBuf,
+    /// `firmware.bin` exists in `directory`. `metadata.json` is the entry's existence marker, so
+    /// an entry whose binary was deleted by hand is still listed, and says so here.
+    pub bin_present: bool,
 }
 
-/// Walk `firmware/` and return all valid entries sorted by model then version.
-/// Reads `model` and `firmware_version` from each `metadata.json` (not the
-/// directory names) so the display name uses canonical spacing.
-pub fn list_archives(data_dir: &Path, model_filter: Option<&str>) -> Vec<ArchiveEntry> {
-    let root = firmware_root(data_dir);
-    if !root.exists() {
-        return Vec::new();
+/// Why a directory under `firmware/` that looks like an entry is not listed as one.
+/// Closed vocabulary for structured output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveSkipKind {
+    /// `metadata.json` exists but could not be read.
+    MetadataUnreadable,
+    /// `metadata.json` is not valid metadata JSON.
+    MetadataCorrupt,
+    /// `metadata.json` has a `format_version` this build does not read.
+    UnsupportedVersion,
+    /// A `firmware.bin` (or its `.part` temp) with no `metadata.json`: an interrupted archive.
+    IncompleteArchive,
+}
+
+/// A directory that was not listed, and why. Never silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveSkip {
+    pub directory: PathBuf,
+    pub kind: ArchiveSkipKind,
+    pub error: String,
+    /// The `{model_slug}` directory the skipped entry sits in, for the model filter.
+    model_dir: String,
+}
+
+/// Everything one walk of `firmware/` found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArchiveScan {
+    /// `<data-dir>/firmware/`
+    pub root: PathBuf,
+    pub root_exists: bool,
+    /// Valid entries, sorted by model then version.
+    pub entries: Vec<ArchiveEntry>,
+    /// Entries that could not be listed, sorted by directory.
+    pub skipped: Vec<ArchiveSkip>,
+    /// Directory entries the OS failed to yield. Counted, never silently dropped.
+    pub skipped_dir_entries: usize,
+}
+
+impl ArchiveScan {
+    /// Say each skipped entry on stderr, in the form the CLI has always used.
+    pub fn warn_skipped(&self) {
+        for skip in &self.skipped {
+            eprintln!("warning: skipping {}: {}", skip.directory.display(), skip.error);
+        }
+        if self.skipped_dir_entries > 0 {
+            eprintln!(
+                "warning: {} director{} under {} could not be read and {} not listed",
+                self.skipped_dir_entries,
+                if self.skipped_dir_entries == 1 { "y" } else { "ies" },
+                self.root.display(),
+                if self.skipped_dir_entries == 1 { "was" } else { "were" },
+            );
+        }
     }
-    let mut entries: Vec<ArchiveEntry> = Vec::new();
+}
 
-    let Ok(model_dirs) = fs::read_dir(&root) else { return Vec::new(); };
+/// Walk `firmware/`: every valid entry (model and version are read from each
+/// `metadata.json`, not the directory names, so the display name uses
+/// canonical spacing) and every directory that looks like an entry but could
+/// not be listed. `model_filter` keeps only that model's entries, and the
+/// skipped ones in that model's directory. This is the one validation rule for
+/// the archive: [`list_archives`] and `fleet firmware ls --json` both use it.
+pub fn scan_archives(data_dir: &Path, model_filter: Option<&str>) -> ArchiveScan {
+    let root = firmware_root(data_dir);
+    let mut scan = ArchiveScan {
+        root_exists: root.exists(),
+        root,
+        entries: Vec::new(),
+        skipped: Vec::new(),
+        skipped_dir_entries: 0,
+    };
+    if !scan.root_exists {
+        return scan;
+    }
+    // A root that exists but cannot be read is an empty walk with one skipped directory entry,
+    // not an empty archive.
+    let Ok(model_dirs) = fs::read_dir(&scan.root) else {
+        scan.skipped_dir_entries = 1;
+        return scan;
+    };
+    let filter_slug = model_filter.map(model_slug);
 
-    for model_dir in model_dirs.filter_map(|e| e.ok()) {
-        if !model_dir.path().is_dir() { continue; }
-        let Ok(version_dirs) = fs::read_dir(model_dir.path()) else { continue; };
+    for model_dir in model_dirs {
+        let Ok(model_dir) = model_dir else {
+            scan.skipped_dir_entries += 1;
+            continue;
+        };
+        if !model_dir.path().is_dir() {
+            continue;
+        }
+        let model_dir_name = model_dir.file_name().to_string_lossy().into_owned();
+        let Ok(version_dirs) = fs::read_dir(model_dir.path()) else {
+            scan.skipped_dir_entries += 1;
+            continue;
+        };
 
-        for version_dir in version_dirs.filter_map(|e| e.ok()) {
-            if !version_dir.path().is_dir() { continue; }
-            let meta_path = version_dir.path().join("metadata.json");
-            if !meta_path.exists() { continue; }
-            let Ok(text) = fs::read_to_string(&meta_path) else {
-                eprintln!("warning: could not read {}", meta_path.display());
+        for version_dir in version_dirs {
+            let Ok(version_dir) = version_dir else {
+                scan.skipped_dir_entries += 1;
                 continue;
             };
-            let Ok(meta) = serde_json::from_str::<FirmwareMeta>(&text) else {
-                eprintln!("warning: skipping corrupt metadata at {}", meta_path.display());
+            let directory = version_dir.path();
+            if !directory.is_dir() {
                 continue;
+            }
+            let meta_path = directory.join("metadata.json");
+            let mut skip = |kind: ArchiveSkipKind, error: String| {
+                scan.skipped.push(ArchiveSkip {
+                    directory: directory.clone(),
+                    kind,
+                    error,
+                    model_dir: model_dir_name.clone(),
+                });
+            };
+            if !meta_path.exists() {
+                if directory.join("firmware.bin").exists() || directory.join("firmware.bin.part").exists() {
+                    skip(
+                        ArchiveSkipKind::IncompleteArchive,
+                        "a firmware binary without a metadata.json (interrupted archive?)".to_string(),
+                    );
+                }
+                continue;
+            }
+            let text = match fs::read_to_string(&meta_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    skip(ArchiveSkipKind::MetadataUnreadable, format!("could not read {}: {e}", meta_path.display()));
+                    continue;
+                }
+            };
+            let meta = match serde_json::from_str::<FirmwareMeta>(&text) {
+                Ok(m) => m,
+                Err(e) => {
+                    skip(ArchiveSkipKind::MetadataCorrupt, format!("corrupt metadata at {}: {e}", meta_path.display()));
+                    continue;
+                }
             };
             if meta.format_version != FIRMWARE_META_FORMAT_VERSION {
-                eprintln!(
-                    "warning: skipping {} (format_version={}, expected {})",
-                    meta_path.display(), meta.format_version, FIRMWARE_META_FORMAT_VERSION
+                skip(
+                    ArchiveSkipKind::UnsupportedVersion,
+                    format!(
+                        "{} has format_version={}, expected {}",
+                        meta_path.display(), meta.format_version, FIRMWARE_META_FORMAT_VERSION
+                    ),
                 );
                 continue;
             }
             if let Some(f) = model_filter {
-                if meta.model != f { continue; }
+                if meta.model != f {
+                    continue;
+                }
             }
-            entries.push(ArchiveEntry {
+            scan.entries.push(ArchiveEntry {
                 model: meta.model.clone(),
                 version: meta.firmware_version.clone(),
+                bin_present: directory.join("firmware.bin").is_file(),
+                directory,
                 meta,
             });
         }
     }
 
-    entries.sort_by(|a, b| {
+    if let Some(slug) = &filter_slug {
+        scan.skipped.retain(|s| &s.model_dir == slug);
+    }
+    scan.skipped.sort_by(|a, b| a.directory.cmp(&b.directory));
+    scan.entries.sort_by(|a, b| {
         a.model.cmp(&b.model).then_with(|| version_sort_key(&a.version).cmp(&version_sort_key(&b.version)))
     });
-    entries
+    scan
+}
+
+/// `fleet firmware ls --json`: the same envelope as `ls --json` (`dir`, `dir_exists`, `entries`,
+/// `skipped_dir_entries`), built from one [`ArchiveScan`]. Entries that could not be listed are in
+/// `entries` too, with `status: "unreadable"` and a closed `error_kind`, as in `ls --json`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ArchiveListing {
+    pub dir: String,
+    pub dir_exists: bool,
+    /// Valid entries first (model, then version), then the unreadable ones (by directory).
+    pub entries: Vec<ArchiveListEntry>,
+    pub skipped_dir_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ArchiveListEntry {
+    Ok {
+        model: String,
+        version: String,
+        directory: String,
+        /// `firmware.bin` exists in `directory`.
+        bin_present: bool,
+        /// As recorded when the bundle was archived; nothing here re-hashes the file.
+        bin_sha256: String,
+        bin_size_bytes: u64,
+        archived_at: String,
+        archived_by: String,
+        canonical_snapshot_path: Option<String>,
+        notes: Option<String>,
+        provenance: Option<Provenance>,
+    },
+    Unreadable {
+        directory: String,
+        error_kind: ArchiveSkipKind,
+        error: String,
+    },
+}
+
+impl ArchiveListing {
+    pub fn from_scan(scan: &ArchiveScan) -> Self {
+        let ok = scan.entries.iter().map(|e| ArchiveListEntry::Ok {
+            model: e.model.clone(),
+            version: e.version.clone(),
+            directory: e.directory.display().to_string(),
+            bin_present: e.bin_present,
+            bin_sha256: e.meta.bin_sha256.clone(),
+            bin_size_bytes: e.meta.bin_size_bytes,
+            archived_at: e.meta.archived_at.clone(),
+            archived_by: e.meta.archived_by.clone(),
+            canonical_snapshot_path: e.meta.canonical_snapshot_path.clone(),
+            notes: e.meta.notes.clone(),
+            provenance: e.meta.provenance.clone(),
+        });
+        let bad = scan.skipped.iter().map(|s| ArchiveListEntry::Unreadable {
+            directory: s.directory.display().to_string(),
+            error_kind: s.kind,
+            error: s.error.clone(),
+        });
+        ArchiveListing {
+            dir: scan.root.display().to_string(),
+            dir_exists: scan.root_exists,
+            entries: ok.chain(bad).collect(),
+            skipped_dir_entries: scan.skipped_dir_entries,
+        }
+    }
+}
+
+/// The valid entries of [`scan_archives`], sorted by model then version, with a stderr warning
+/// for each skipped one. Callers that must account for the skipped ones use `scan_archives`.
+pub fn list_archives(data_dir: &Path, model_filter: Option<&str>) -> Vec<ArchiveEntry> {
+    let scan = scan_archives(data_dir, model_filter);
+    scan.warn_skipped();
+    scan.entries
 }
 
 /// Sort key for firmware version strings like `"5.31"` — numeric (major,
@@ -648,6 +855,165 @@ mod tests {
             version_sort_key("10.00"),
             version_sort_key("common"),
         ]);
+    }
+
+    // ── scan_archives / the --json listing ───────────────────────────────
+
+    fn kinds(scan: &ArchiveScan) -> Vec<(String, ArchiveSkipKind)> {
+        scan.skipped
+            .iter()
+            .map(|s| (s.directory.file_name().unwrap().to_string_lossy().into_owned(), s.kind))
+            .collect()
+    }
+
+    #[test]
+    fn scan_reports_every_kind_of_unlistable_entry_with_a_closed_kind() {
+        let dir = TempDir::new().unwrap();
+        write_meta(dir.path(), "Z 9", "5.31");
+        let bad = |v: &str| {
+            let d = archive_dir(dir.path(), "Z 9", v);
+            fs::create_dir_all(&d).unwrap();
+            d
+        };
+        fs::write(bad("1.corrupt").join("metadata.json"), b"not json").unwrap();
+        let future = bad("2.future");
+        fs::write(
+            future.join("metadata.json"),
+            serde_json::to_string(&serde_json::json!({
+                "format_version": 99, "model": "Z 9", "firmware_version": "2.future", "archived_at": "t",
+                "archived_by": "x", "bin_sha256": "x", "bin_size_bytes": 1, "source_path": "p",
+                "canonical_snapshot_path": null, "notes": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(bad("3.orphan").join("firmware.bin"), b"orphan").unwrap();
+        fs::write(bad("4.part").join("firmware.bin.part"), b"half").unwrap();
+        // A metadata.json that is a directory exists but cannot be read.
+        fs::create_dir_all(bad("5.unreadable").join("metadata.json")).unwrap();
+        // Boundary: an empty version directory is not an entry and not an error.
+        bad("6.empty");
+
+        let scan = scan_archives(dir.path(), None);
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(
+            kinds(&scan),
+            [
+                ("1.corrupt".to_string(), ArchiveSkipKind::MetadataCorrupt),
+                ("2.future".to_string(), ArchiveSkipKind::UnsupportedVersion),
+                ("3.orphan".to_string(), ArchiveSkipKind::IncompleteArchive),
+                ("4.part".to_string(), ArchiveSkipKind::IncompleteArchive),
+                ("5.unreadable".to_string(), ArchiveSkipKind::MetadataUnreadable),
+            ]
+        );
+        assert!(scan.skipped.iter().all(|s| !s.error.is_empty()));
+    }
+
+    #[test]
+    fn scan_model_filter_keeps_only_that_models_skipped_entries() {
+        let dir = TempDir::new().unwrap();
+        for model in ["Z 9", "Z6_3"] {
+            let d = archive_dir(dir.path(), model, "1.00");
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("metadata.json"), b"{").unwrap();
+        }
+        assert_eq!(scan_archives(dir.path(), None).skipped.len(), 2);
+        let z9 = scan_archives(dir.path(), Some("Z 9"));
+        assert_eq!(z9.skipped.len(), 1);
+        assert!(z9.skipped[0].directory.to_string_lossy().contains("Z_9"));
+        assert!(scan_archives(dir.path(), Some("Z 5")).skipped.is_empty());
+    }
+
+    #[test]
+    fn list_archives_is_exactly_the_scans_entries() {
+        // One validation rule: the text listing and --json cannot disagree about what is valid.
+        let dir = TempDir::new().unwrap();
+        write_meta(dir.path(), "Z 9", "5.31");
+        write_meta(dir.path(), "Z6_3", "2.00");
+        let bad = archive_dir(dir.path(), "Z 9", "4.00");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("metadata.json"), b"{").unwrap();
+        let scan = scan_archives(dir.path(), None);
+        let listed = list_archives(dir.path(), None);
+        assert_eq!(listed, scan.entries);
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[test]
+    fn a_missing_firmware_root_is_an_empty_scan_not_an_error() {
+        let dir = TempDir::new().unwrap();
+        let scan = scan_archives(dir.path(), None);
+        assert!(!scan.root_exists && scan.entries.is_empty() && scan.skipped.is_empty());
+        fs::create_dir_all(firmware_root(dir.path())).unwrap();
+        let scan = scan_archives(dir.path(), None);
+        assert!(scan.root_exists && scan.entries.is_empty());
+    }
+
+    #[test]
+    fn entries_say_whether_their_binary_is_present() {
+        let (data, src) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f = file_with(src.path(), "in.bin", b"hello");
+        ingest_bundle(data.path(), "Z 9", "5.33", &f, &prov(), None).unwrap();
+        write_meta(data.path(), "Z 9", "5.40"); // metadata only: its binary was never there
+        let by_version: Vec<(String, bool)> = scan_archives(data.path(), None)
+            .entries
+            .into_iter()
+            .map(|e| (e.version, e.bin_present))
+            .collect();
+        assert_eq!(by_version, [("5.33".to_string(), true), ("5.40".to_string(), false)]);
+        // A directory with that name is not a binary.
+        let dir = archive_dir(data.path(), "Z 9", "5.40");
+        fs::create_dir_all(dir.join("firmware.bin")).unwrap();
+        assert!(!scan_archives(data.path(), None).entries[1].bin_present);
+    }
+
+    #[test]
+    fn listing_json_has_the_ls_envelope_and_one_row_per_entry() {
+        let (data, src) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f = file_with(src.path(), "in.bin", b"hello");
+        ingest_bundle(data.path(), "Z 9", "5.33", &f, &prov(), None).unwrap();
+        let bad = archive_dir(data.path(), "Z 9", "5.10");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("metadata.json"), b"{").unwrap();
+
+        let v = serde_json::to_value(ArchiveListing::from_scan(&scan_archives(data.path(), None))).unwrap();
+        assert_eq!(v["dir_exists"], serde_json::json!(true));
+        assert_eq!(v["skipped_dir_entries"], serde_json::json!(0));
+        assert!(v["dir"].as_str().unwrap().ends_with("firmware"));
+        let (ok, unreadable) = (&v["entries"][0], &v["entries"][1]);
+        assert_eq!(v["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(ok["status"], "ok");
+        assert_eq!((ok["model"].as_str(), ok["version"].as_str()), (Some("Z 9"), Some("5.33")));
+        assert_eq!(ok["bin_sha256"], "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(ok["bin_size_bytes"], 5);
+        assert_eq!(ok["bin_present"], true);
+        assert!(ok["directory"].as_str().unwrap().ends_with("5.33"));
+        assert_eq!(ok["canonical_snapshot_path"], serde_json::Value::Null);
+        assert_eq!(ok["provenance"]["source_id"], "test");
+        assert_eq!(unreadable["status"], "unreadable");
+        assert_eq!(unreadable["error_kind"], "metadata_corrupt");
+        assert!(unreadable.get("model").is_none());
+        // A missing root is `dir_exists: false`, not an error.
+        let v = serde_json::to_value(ArchiveListing::from_scan(&scan_archives(src.path(), None))).unwrap();
+        assert_eq!((v["dir_exists"].as_bool(), v["entries"].as_array().map(Vec::len)), (Some(false), Some(0)));
+    }
+
+    #[test]
+    fn ingest_names_agree_with_the_shared_plain_component_table() {
+        // `ingest_bundle` is this module's caller of the predicate; the shared table is what
+        // ops::list and ops::paths run too.
+        let (data, src) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let f = file_with(src.path(), "in.bin", b"hello");
+        for (value, plain) in crate::ops::paths::PLAIN_COMPONENT_TABLE {
+            let r = ingest_bundle(data.path(), "Z 9", value, &f, &prov(), None);
+            let refused = matches!(r, Err(FirmwareError::UnsafePathComponent { .. }));
+            assert_eq!(!refused, *plain, "version {value:?}: {r:?}");
+        }
+        // NUL in particular: the copy this module used to carry did not refuse it.
+        assert!(matches!(
+            ingest_bundle(data.path(), "Z 9", "5\0.31", &f, &prov(), None),
+            Err(FirmwareError::UnsafePathComponent { .. })
+        ));
     }
 
     // ── capability_map_for_fw boundary ───────────────────────────────────

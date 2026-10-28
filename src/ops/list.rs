@@ -13,6 +13,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::firmware::model_slug;
+use crate::ops::paths::checked_reference_filename;
 use crate::snapshot::{Snapshot, SnapshotError};
 
 /// Whether a snapshot `name` (a filename) belongs to the camera identified
@@ -28,16 +29,17 @@ pub fn camera_filename_matches(name: &str, filter: &str) -> bool {
 
 /// File name of the reference for a camera: `{model_slug}_{serial}.json`.
 /// The CLI's `ref set`, the Rust GUI and the Python GUI all write this name.
+/// For a model and serial read from a data file, use
+/// `ops::paths::checked_reference_filename`, which refuses a non-plain value.
 pub fn reference_filename(model: &str, serial: &str) -> String {
     format!("{}_{serial}.json", model_slug(model))
 }
 
-/// A value that is safe to splice into a file name: non-empty, no path
-/// separator or NUL, not `.` or `..`. Snapshot files are data, so the model
-/// and serial inside them must not steer a lookup out of `references/`.
-pub fn is_plain_name_component(s: &str) -> bool {
-    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
-}
+/// A value that is safe to splice into a file name. Snapshot files are data, so
+/// the model and serial inside them must not steer a lookup out of
+/// `references/`. The rule is `ops::paths::is_safe_path_component`'s, kept under
+/// this name for the GUIs that already import it; there is no second copy.
+pub use crate::ops::paths::is_safe_path_component as is_plain_name_component;
 
 #[derive(Debug, Error)]
 pub enum ListError {
@@ -126,12 +128,12 @@ impl<'a> References<'a> {
     /// mis-flags snapshots taken in the same second; a filename comparison
     /// never matches, because promoting copies the file under a canonical name.
     fn is_reference(&mut self, model: &str, serial: &str, snapshot_bytes: &[u8]) -> bool {
-        if !is_plain_name_component(model) || !is_plain_name_component(serial) {
+        let Ok(file_name) = checked_reference_filename(model, serial) else {
             return false;
-        }
+        };
         let key = (model.to_string(), serial.to_string());
         if !self.cache.contains_key(&key) {
-            let path = self.dir.join(reference_filename(model, serial));
+            let path = self.dir.join(file_name);
             let bytes = match fs::read(&path) {
                 Ok(b) => Some(b),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -386,6 +388,39 @@ mod tests {
         assert_eq!(seen, expected_total, "every expected file was listed");
     }
 
+    /// The validity fixture (`tests/fixtures/snapshot_validity`): the same files, the same verdicts
+    /// for every reader of snapshot files. `format_version`, `properties` and `transport` are all
+    /// required, so an incomplete file is listed unreadable (`json`) and a future one
+    /// `unsupported_version`, never as a normal entry.
+    #[test]
+    fn listing_agrees_with_the_shared_validity_fixture() {
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/snapshot_validity");
+        let expected: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&fs::read_to_string(fx.join("expected.json")).unwrap()).unwrap();
+        let l = list_dir(&fx.join("snapshots"), None, None).unwrap();
+        let got: std::collections::BTreeMap<String, String> = l
+            .entries
+            .iter()
+            .map(|e| {
+                let verdict = match &e.state {
+                    EntryState::Ok { .. } => "ok".to_string(),
+                    EntryState::Unreadable { error_kind, .. } => error_kind.to_string(),
+                };
+                (e.file.clone(), verdict)
+            })
+            .collect();
+        assert_eq!(got, expected);
+        // And the lenient reader the GUIs used to carry would have listed more of them.
+        let lenient_ok = expected
+            .keys()
+            .filter(|f| {
+                let text = fs::read_to_string(fx.join("snapshots").join(f)).unwrap();
+                serde_json::from_str::<crate::snapshot::SnapshotSummary>(&text).is_ok()
+            })
+            .count();
+        assert!(lenient_ok > expected.values().filter(|v| *v == "ok").count(), "the fixture must tell the two apart");
+    }
+
     fn two_snapshots_one_reference() -> TempDir {
         let d = TempDir::new().unwrap();
         fs::create_dir_all(d.path().join("snapshots")).unwrap();
@@ -478,11 +513,28 @@ mod tests {
 
     #[test]
     fn plain_name_component_boundaries() {
-        for ok in ["id-1", "0000003023668", "a", "...", "Z 9", ".hidden"] {
-            assert!(is_plain_name_component(ok), "{ok:?}");
+        // The shared table: this alias and the predicate it names are one rule.
+        for (value, plain) in crate::ops::paths::PLAIN_COMPONENT_TABLE {
+            assert_eq!(is_plain_name_component(value), *plain, "{value:?}");
         }
-        for bad in ["", ".", "..", "a/b", "/", "a\\b", "a\0b"] {
-            assert!(!is_plain_name_component(bad), "{bad:?}");
+    }
+
+    #[test]
+    fn the_reference_mark_refuses_exactly_what_the_shared_table_refuses() {
+        // A snapshot whose serial is `value` is marked only when `value` is plain
+        // AND a byte-identical reference sits at the checked name.
+        for (value, plain) in crate::ops::paths::PLAIN_COMPONENT_TABLE {
+            let d = TempDir::new().unwrap();
+            let (sd, rd) = (d.path().join("snapshots"), d.path().join("references"));
+            fs::create_dir_all(&sd).unwrap();
+            fs::create_dir_all(&rd).unwrap();
+            let s = snap("Z 9", value, None);
+            put(&sd, "s.json", &s);
+            if *plain {
+                fs::copy(sd.join("s.json"), rd.join(reference_filename("Z 9", value))).unwrap();
+            }
+            let l = list_dir(&sd, None, Some(&rd)).unwrap();
+            assert_eq!(flags(&l), [("s.json", Some(*plain))], "serial {value:?}");
         }
     }
 

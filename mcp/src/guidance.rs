@@ -96,12 +96,27 @@ pub fn notes() -> Vec<Note> {
         )
         .detail(
             "Run list_cameras first and pass its `serial`. A body with no readable serial (`serial_readable: false`) cannot be a target. \
-             `ambiguous_pairing` means two attached bodies share a model: the pairing of serial to physical body depends on enumeration order \
+             `ambiguous_pairing` means two attached bodies share a model (list_cameras marks both `pairing_ambiguous: true`): the pairing of serial to physical body depends on enumeration order \
              and cannot be verified, so a capture could be stamped with the wrong serial or a write could reach the wrong body. \
-             Ask the user to unplug one. A body that cannot be named by serial is refused with `no_usb_serial`. `known_model: false` means the model is not one this server has verified.",
+             Ask the user to unplug one. A body that cannot be named by serial is refused with `no_usb_serial`. `known_model: false` means the model is not one this server has verified. \
+             `known_model: true` is not \"can be applied to\": `baseline: false` (the Z 5 today) means no capture baseline ships for the model, so it can be \
+             read, captured and planned for, but every apply to it is refused as `no_baseline` and a plan does not say so in advance. \
+             Its captures say `gate: no_baseline`, and nothing about them is judged for completeness.",
         )
         .tags(&["serials"])
-        .addresses(&["no_usb_serial", "ambiguous_pairing", "id-1", "which camera", "two cameras", "same model", "pairing_ambiguous"]),
+        .addresses(&[
+            "no_usb_serial",
+            "ambiguous_pairing",
+            "id-1",
+            "which camera",
+            "two cameras",
+            "same model",
+            "pairing_ambiguous",
+            "no_baseline",
+            "baseline false",
+            "known_model",
+            "z 5",
+        ]),
         Note::new(
             "unreadable-is-normal",
             d,
@@ -119,12 +134,24 @@ pub fn notes() -> Vec<Note> {
              as `cap_0x1`, `cap_0x6`, `cap_0x9`, `cap_0xb` and `cap_0xc`: generic device facts (the model name, the interface \"USB\") that are the \
              same on both bodies. That is normal; a different count, or other `cap_0x` names, means the schema file is out of date for this firmware.\n\
              `capture_incomplete` means the gate failed and nothing was written. The usual cause is a body that is asleep, mid-reset or in \
-             an unusual state: ask the user to wake it, then try once more.\n\
+             an unusual state: ask the user to wake it, then try once more. `firmware_shortfall` is the same refusal on a body whose firmware \
+             differs from the one its baseline was captured on (`detail.baseline_firmware`, `detail.capture_firmware`) and that also lacks \
+             some of the baseline's properties: an update can drop properties, but an interrupted read looks identical, so retry once; if the same \
+             ones are missing again, tell the user the baseline needs re-seeding for the new firmware (a CLI step, not a tool here).\n\
              Some settings cannot be read through this SDK at all, notably Picture Controls. They are never copied or restored; \
              tell the user that explicitly when a transplant is discussed.",
         )
         .tags(&["capture"])
-        .addresses(&["failed reads", "capture incomplete", "capture_incomplete", "read errors", "-126", "gate", "unreadable properties"]),
+        .addresses(&[
+            "failed reads",
+            "capture incomplete",
+            "capture_incomplete",
+            "firmware_shortfall",
+            "read errors",
+            "-126",
+            "gate",
+            "unreadable properties",
+        ]),
         Note::new(
             "reading-a-plan",
             d,
@@ -251,10 +278,12 @@ pub fn notes() -> Vec<Note> {
         )
         .detail(
             "Progress notifications are sent when the client supplies a progress token. Deadlines are 90 s for a capture, 120 s for a check, \
-             150 s for a plan and 300 s for an apply. A read-only or plan call that hits its deadline was stopped and changed nothing.",
+             150 s for a plan and 300 s for an apply. A read-only or plan call that hits its deadline was stopped and changed nothing. \
+             The tools that only read local files or USB descriptors answer `tool_deadline` after 30 s (firmware_status, which uses the network, after 180 s) \
+             and are abandoned; nothing was changed.",
         )
         .tags(&["camera"])
-        .addresses(&["timeout", "slow", "deadline", "worker_no_result", "hang"]),
+        .addresses(&["timeout", "slow", "deadline", "worker_no_result", "hang", "tool_deadline"]),
         Note::new(
             "comparing-bodies",
             d,
@@ -265,7 +294,7 @@ pub fn notes() -> Vec<Note> {
         .detail(
             "Two attached bodies of the same model are refused for capture, so capture one, have the user unplug it and attach the other. \
              diff_snapshots ignores settings that change by themselves and enum default indexes unless `include_volatile` is set; \
-             results come counts first, then pages (`page.next` says where to continue).",
+             results come counts first, then pages (`page.next`, when set, is the offset to continue at; it is null for `limit` 0 and on the last page).",
         )
         .tags(&["snapshots"])
         .addresses(&["differences between two cameras", "compare bodies", "what is different", "diff", "two z 9s"]),
@@ -382,6 +411,81 @@ mod tests {
         for tag in ["stale_plan", "ambiguous_pairing", "no_usb_serial", "camera_busy", "capture_incomplete", "data_dir_full", "worker_no_result", "empty_selection"] {
             assert!(text.contains(tag), "{tag}");
         }
+    }
+
+    #[test]
+    fn the_baseline_refusals_and_deadline_the_notes_name_are_the_codes_real_tags() {
+        use nikon_fleet::ops::apply::ApplyError;
+        use nikon_fleet::ops::baseline::NoBaselineReason;
+        use nikon_fleet::ops::capture::CaptureStats;
+        use nikon_fleet::ops::capture_snapshot::{CaptureError, FirmwareShortfall};
+        use nikon_fleet::ops::check::CheckError;
+        let text: String = notes().iter().map(|n| format!("{} {}", n.summary, n.detail)).collect::<Vec<_>>().join("\n");
+        let shortfall = || FirmwareShortfall {
+            model: "Z 9".into(),
+            baseline_firmware: "5.31".into(),
+            capture_firmware: "5.40".into(),
+            missing: vec![],
+        };
+        // A body with no baseline is refused by the apply with this tag (there is no `skipped` reason for it: a plan
+        // does not mention the baseline at all, so the refusal tag is all there is to name).
+        let tags = [
+            ApplyError::NoBaseline(NoBaselineReason::UnknownModel).tag(),
+            ApplyError::NoBaseline(NoBaselineReason::FirmwareChanged { baseline: "a".into(), capture: "b".into() }).tag(),
+            CaptureError::FirmwareShortfall { shortfall: shortfall(), stats: CaptureStats::default() }.tag(),
+            CheckError::FirmwareShortfall { shortfall: shortfall(), stats: CaptureStats::default() }.tag(),
+        ];
+        assert_eq!(tags[0], tags[1], "both ways an apply is refused for want of a baseline share one tag");
+        for tag in [tags[0], tags[2]] {
+            assert!(text.contains(tag), "the notes never mention the real tag {tag}");
+        }
+        assert_eq!(tags[2], tags[3], "capture and check refuse a firmware shortfall under one tag");
+        // The detail keys the notes tell the agent to look at are the ones the error result really has,
+        // and any key beyond the incomplete capture's own is explained.
+        let stats = CaptureStats::default();
+        let base = nikon_fleet::ops::capture_snapshot::incomplete_detail(&[], &stats);
+        let full = CaptureError::FirmwareShortfall { shortfall: shortfall(), stats: CaptureStats::default() }.detail().unwrap();
+        for key in full.as_object().unwrap().keys().filter(|k| base.get(k.as_str()).is_none()) {
+            assert!(text.contains(&format!("`detail.{key}`")), "a firmware_shortfall carries `{key}` but no note names it");
+        }
+        for key in ["baseline_firmware", "capture_firmware"] {
+            assert!(full.get(key).is_some() && text.contains(&format!("`detail.{key}`")), "{key}");
+        }
+        // And what the notes call the tool deadline is what the server answers.
+        let r = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(crate::server::blocking_read(std::time::Duration::ZERO, "x", || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                crate::server::failure("never", "m", None)
+            }));
+        let tag = r.structured_content.unwrap()["error"]["tag"].as_str().unwrap().to_string();
+        assert!(text.contains(&tag), "the notes never mention the real deadline tag {tag}");
+    }
+
+    #[test]
+    fn the_camera_fields_the_notes_name_are_the_ones_list_cameras_really_serialises() {
+        use nikon_fleet::ops::cameras::describe;
+        use nikon_fleet::sdk::UsbCameraInfo;
+        let usb = UsbCameraInfo { product_id: 1, serial: "S".into(), firmware: "1.0".into(), model: "Z 5".into() };
+        let v = serde_json::to_value(&describe(&[usb])[0]).unwrap();
+        let keys: BTreeSet<String> = v.as_object().unwrap().keys().cloned().collect();
+        // Identity fields every note's examples assume rather than explain; everything else a camera
+        // reports has to be explained somewhere, so a field added to `UsbCamera` fails this until it is.
+        let identity = ["model", "serial", "firmware"];
+        for k in identity {
+            assert!(keys.contains(k), "{k} is not a UsbCamera field any more");
+        }
+        let text: String = notes().iter().map(|n| format!("{} {}", n.summary, n.detail)).collect::<Vec<_>>().join("\n");
+        for k in keys.iter().filter(|k| !identity.contains(&k.as_str())) {
+            assert!(text.contains(&format!("`{k}")), "list_cameras reports `{k}` but no note explains it");
+        }
+        // The other direction, for the field this note is about: the key the note says to look at exists,
+        // and it is a bool that is false for the one model that is known but has no baseline.
+        assert_eq!(v["known_model"], serde_json::json!(true));
+        assert_eq!(v["baseline"], serde_json::json!(false), "the Z 5 is the documented known_model:true, baseline:false body");
+        assert!(text.contains("`baseline: false`") && text.contains("`known_model: true`"));
     }
 
     #[test]

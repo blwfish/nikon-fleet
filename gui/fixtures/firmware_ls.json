@@ -1,0 +1,67 @@
+{
+  "dir": "/data/firmware",
+  "dir_exists": true,
+  "entries": [
+    {
+      "status": "ok",
+      "model": "Z 5",
+      "version": "1.10",
+      "directory": "/data/firmware/Z_5/1.10",
+      "bin_present": false,
+      "bin_sha256": "486a09ae5132d89fea43081faf614c5b5632cc8c8f901b510b5bb2f33eee345c",
+      "bin_size_bytes": 4096,
+      "archived_at": "2026-10-28T16:00:00Z",
+      "archived_by": "fleet firmware add",
+      "canonical_snapshot_path": null,
+      "notes": null,
+      "provenance": null
+    },
+    {
+      "status": "ok",
+      "model": "Z 9",
+      "version": "5.31",
+      "directory": "/data/firmware/Z_9/5.31",
+      "bin_present": true,
+      "bin_sha256": "486a09ae5132d89fea43081faf614c5b5632cc8c8f901b510b5bb2f33eee345c",
+      "bin_size_bytes": 4096,
+      "archived_at": "2026-10-28T16:00:00Z",
+      "archived_by": "fleet firmware add",
+      "canonical_snapshot_path": null,
+      "notes": null,
+      "provenance": null
+    },
+    {
+      "status": "ok",
+      "model": "Z6_3",
+      "version": "2.00",
+      "directory": "/data/firmware/Z6_3/2.00",
+      "bin_present": true,
+      "bin_sha256": "486a09ae5132d89fea43081faf614c5b5632cc8c8f901b510b5bb2f33eee345c",
+      "bin_size_bytes": 4096,
+      "archived_at": "2026-10-28T16:00:00Z",
+      "archived_by": "fleet firmware add",
+      "canonical_snapshot_path": null,
+      "notes": null,
+      "provenance": null
+    },
+    {
+      "status": "unreadable",
+      "directory": "/data/firmware/Z_6/1.00",
+      "error_kind": "unsupported_version",
+      "error": "/data/firmware/Z_6/1.00/metadata.json has format_version=7, expected 1"
+    },
+    {
+      "status": "unreadable",
+      "directory": "/data/firmware/Z_7/4.00",
+      "error_kind": "incomplete_archive",
+      "error": "a firmware binary without a metadata.json (interrupted archive?)"
+    },
+    {
+      "status": "unreadable",
+      "directory": "/data/firmware/Z_8/3.10",
+      "error_kind": "metadata_corrupt",
+      "error": "corrupt metadata at /data/firmware/Z_8/3.10/metadata.json: key must be a string at line 1 column 3"
+    }
+  ],
+  "skipped_dir_entries": 0
+}

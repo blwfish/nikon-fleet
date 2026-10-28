@@ -75,3 +75,20 @@ fn json_does_not_change_what_is_checked_before_the_sdk() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("SDK bundle not found"), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(String::from_utf8_lossy(&o.stdout).trim().is_empty());
 }
+
+#[test]
+fn a_label_that_starts_with_a_dash_is_a_value_not_a_flag() {
+    // `snapshot --label -guest` used to die in clap ("unexpected argument '-g'"); it now gets as
+    // far as the missing SDK bundle, which is the first thing the command checks.
+    let d = tempfile::tempdir().unwrap();
+    for args in [&["snapshot", "--label", "-guest"][..], &["snapshot", "--label=-guest"], &["snapshot", "--label", "--odd"]] {
+        let o = run(d.path(), args);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {err}");
+        assert!(err.contains("SDK bundle not found"), "{args:?}: {err}");
+        assert!(!err.contains("unexpected argument"), "{args:?}: {err}");
+    }
+    // A real flag after the label is still a flag.
+    let o = run(d.path(), &["snapshot", "--label", "x", "--allow-partial"]);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("SDK bundle not found"));
+}

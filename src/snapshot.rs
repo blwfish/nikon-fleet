@@ -184,11 +184,13 @@ impl Snapshot {
     /// Suggested filename: `{model_slug}_{serial}_{label}_{timestamp}.json`.
     /// Spaces in model names become underscores. Timestamps lose colons.
     pub fn suggested_filename(&self) -> String {
-        let model = crate::firmware::model_slug(&self.camera.model);
+        // model and serial come from the camera (USB descriptors) or, in a restore point, from
+        // a snapshot file: neither may carry a separator into the join below.
+        let model = sanitize_filename_component(&crate::firmware::model_slug(&self.camera.model));
         let serial = if self.camera.serial.is_empty() {
             "unknown".to_string()
         } else {
-            self.camera.serial.clone()
+            sanitize_filename_component(&self.camera.serial)
         };
         // label is free-text (CLI --label or a GUI text field) — a "/" in it
         // would otherwise be re-split into path components by Path::join,
@@ -200,11 +202,14 @@ impl Snapshot {
 }
 
 /// The subset of a snapshot's fields needed to list it (a GUI's snapshot
-/// list, `fleet ls`) without deserializing the full `properties` map —
-/// potentially hundreds of capability entries per file that listing never
-/// looks at. `#[serde(deny_unknown_fields)]` is deliberately NOT used: this
-/// must accept the same on-disk JSON `Snapshot::from_json` does, just
-/// ignoring fields it doesn't need.
+/// list, `fleet ls`).
+///
+/// It accepts exactly the files [`Snapshot::from_json`] accepts: [`SnapshotSummary::from_json`]
+/// parses the whole file (`format_version`, `properties` and `transport` included) and keeps the
+/// summary fields, so a listing never shows a file that loading it for use would refuse. There is
+/// one set of validity rules. Parsing the `properties` map costs nothing a listing of a few
+/// hundred small files would notice. The derived `Deserialize` is lenient (it reads these four
+/// fields and ignores the rest); use `from_json` / `load_from_file`, not `serde_json::from_str`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SnapshotSummary {
     pub format_version: u32,
@@ -220,18 +225,13 @@ impl SnapshotSummary {
     }
 
     pub fn from_json(text: &str) -> Result<Self, SnapshotError> {
-        let summary: SnapshotSummary = serde_json::from_str(text)?;
-        // Same check Snapshot::from_json makes — without it, a snapshot
-        // whose format has moved on would silently show up in a listing
-        // (which used to correctly hide it) even though loading the full
-        // Snapshot to actually use it would still fail.
-        if summary.format_version != CURRENT_FORMAT_VERSION {
-            return Err(SnapshotError::UnsupportedVersion {
-                found: summary.format_version,
-                expected: CURRENT_FORMAT_VERSION,
-            });
-        }
-        Ok(summary)
+        let snap = Snapshot::from_json(text)?;
+        Ok(SnapshotSummary {
+            format_version: snap.format_version,
+            camera: snap.camera,
+            captured_at: snap.captured_at,
+            label: snap.label,
+        })
     }
 }
 
@@ -346,6 +346,57 @@ mod tests {
         assert_eq!(summary.camera, original.camera);
         assert_eq!(summary.captured_at, original.captured_at);
         assert_eq!(summary.label, original.label);
+    }
+
+    #[test]
+    fn filename_model_and_serial_with_separators_are_sanitized_too() {
+        let mut s = sample_snapshot();
+        s.camera.serial = "../x/y".into();
+        s.camera.model = "Z/9\\".into();
+        let name = s.suggested_filename();
+        assert!(!name.contains(['/', '\\']), "{name}");
+        assert_eq!(name, "Z_9__.._x_y_baseline_20260524T173000Z.json");
+        // A plain serial is unchanged: the name every existing snapshot has.
+        assert_eq!(sample_snapshot().suggested_filename(), "Z_9_ABC123_baseline_20260524T173000Z.json");
+    }
+
+    /// Every way a snapshot file can be wrong or right, and what each reader must say.
+    fn validity_cases() -> Vec<(&'static str, String, bool)> {
+        let good = serde_json::to_value(sample_snapshot()).unwrap();
+        let without = |key: &str| {
+            let mut v = good.clone();
+            v.as_object_mut().unwrap().remove(key);
+            v.to_string()
+        };
+        let with = |key: &str, value: serde_json::Value| {
+            let mut v = good.clone();
+            v[key] = value;
+            v.to_string()
+        };
+        vec![
+            ("valid", good.to_string(), true),
+            ("wrong format_version", with("format_version", json!(999)), false),
+            ("format_version 0", with("format_version", json!(0)), false),
+            ("no format_version", without("format_version"), false),
+            ("no properties", without("properties"), false),
+            ("properties not a map", with("properties", json!([1])), false),
+            ("property without a code", with("properties", json!({"A": {"value": 1}})), false),
+            ("no transport", without("transport"), false),
+            ("unknown transport", with("transport", json!("carrier-pigeon")), false),
+            ("no camera", without("camera"), false),
+            ("no captured_at", without("captured_at"), false),
+            ("null label is fine", with("label", json!(null)), true),
+            ("extra unknown key is fine", with("extra", json!({"x": 1})), true),
+            ("not json", "{ nope".to_string(), false),
+        ]
+    }
+
+    #[test]
+    fn the_summary_accepts_exactly_the_files_the_snapshot_reader_accepts() {
+        for (what, text, ok) in validity_cases() {
+            assert_eq!(Snapshot::from_json(&text).is_ok(), ok, "Snapshot: {what}");
+            assert_eq!(SnapshotSummary::from_json(&text).is_ok(), ok, "SnapshotSummary: {what}");
+        }
     }
 
     #[test]
