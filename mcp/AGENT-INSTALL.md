@@ -22,8 +22,9 @@ Prerequisites: macOS, the SDK runtime set up (`scripts/setup-sdk-runtime.sh`), a
    `transplant_apply` and `restore_apply` tools do not exist at all. Other flags: `--worker`,
    `--sdk-bundle`, `--schema`, `--deadline-secs` (see `fleet-mcp --help`).
 
-3. Check: the assistant should see ten tools (twelve with `--enable-writes`), and `list_cameras`
-   should list the attached bodies.
+3. Check: the assistant should see eleven tools (thirteen with `--enable-writes`), and `list_cameras`
+   should list the attached bodies. The handshake carries the server's instructions; `get_usage_guidance`
+   serves the full notes (`mcp/src/guidance.rs`).
 
 Notes:
 - Camera tools take a body's **USB serial** (from `list_cameras`). Two attached bodies of the same

@@ -594,6 +594,22 @@ post-result teardown hang on the apply (killed after the result line was read, F
   snapshots need re-capturing.
 - Not covered: Claude Desktop, any apply through the server, a client cancellation of a live camera call.
 
+## F21. The same Claude Code run, with server instructions (2026-10-28)
+
+`fleet-mcp` now sends `InitializeResult.instructions` (a bounded render of its notes, from the `mcp-agent-notes`
+design) and serves the full notes through `get_usage_guidance`. The F20 prompt was run again, headless, with the same
+three calls and the same source snapshot (the agent was also allowed to call `get_usage_guidance`; it did not).
+
+- The two things the agent had questioned in F20 were now read correctly from the handshake alone: it called the
+  capture's 196 read and 11 unreadable "the expected Z 9 profile", and it attributed the 67 `malformed_source` skips to
+  the 2026-06-02 source being older than the packed-string fix, citing the instruction text, and advised capturing
+  again. Same plan digest as before (`80ef8847…bdad36`), same counts.
+- Still unexplained to it, so candidates for new notes or for result fields: `unknown_schema: 5` in the capture stats,
+  `source_label: null` in the plan, and `changes: null` on `EnableBracketing`, `IsoControl` and `MovieISOControl`
+  (written without a prior read, so whether they change is unknown).
+- One run, one model, one prompt that asked it to say what looked wrong. It shows the instructions are read and used;
+  it does not show that a weaker model follows the plan-then-apply rules (still untested, and no apply was involved).
+
 ## F13. Still unverified
 
 - Whether `available` / `connected_pid` can be obtained, and what they mean while another process

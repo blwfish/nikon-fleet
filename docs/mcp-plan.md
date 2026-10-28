@@ -776,3 +776,15 @@ automating the firmware licence; FTP profile writes; firmware flashing.
 - **Through a real client (F20):** registered in Claude Code (`claude mcp add nikon-fleet -- .../fleet-mcp
   --data-dir <repo>`), a headless run called `list_cameras`, `capture_snapshot` and `transplant_plan` correctly.
   Open usability item: the capture result should say how many unreadable properties are normal for the model.
+- **Instructions and guidance (F21).** The handshake now carries `instructions` (capability statement saying
+  whether writes are enabled; the critical and high notes as one-liners; recently added notes; the calling
+  convention for `get_usage_guidance`), and `get_usage_guidance(operation=strategy|tactics|find, topic?, problem?)`
+  serves the full notes. `mcp/src/notes.rs` is a Rust port of `mcp-agent-notes` 0.2.0, checked against golden
+  vectors generated from the Python reference (`mcp/tests/fixtures/agent_notes_golden.json`); the fleet's own notes
+  are in `mcp/src/guidance.rs`. With writes off, the `apply` topic is a one-liner in the strategy overview and full
+  when asked for by name. Optional tool arguments now have plain JSON Schema (no `format`, no `["x","null"]`
+  unions) and `serverInfo` is `fleet-mcp`; a stdio test pins both. Re-running the F20 session with this in place,
+  the agent no longer questioned the expected unreadable count or the `malformed_source` skips.
+- **Maintenance rule.** The notes are the one place a model that never saw this repository learns how the tools
+  behave. Change a status, tag or flow and its note in the same commit; `guidance.rs` has a test that the notes
+  still mention each status and error tag they rely on.
