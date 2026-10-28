@@ -30,8 +30,9 @@ use nikon_fleet::ops::list::reference_filename;
 use nikon_fleet::ops::paths::resolve_existing;
 use nikon_fleet::ops::plan::{PlanInput, build_plan};
 use nikon_fleet::ops::restore::resolve_only;
+use nikon_fleet::ops::baseline::GatePolicy;
 use nikon_fleet::ops::restore_flow::{
-    RestoreApplyError, RestoreApplyRequest, RestorePlanInput, apply_restore, build_restore_plan,
+    BodyPolicy, RestoreApplyError, RestoreApplyRequest, RestorePlanInput, apply_restore, build_restore_plan,
 };
 use nikon_fleet::ops::target::select_by_usb_serial;
 use nikon_fleet::ops::worker::{Emitter, Outcome, open_result_fd};
@@ -460,6 +461,7 @@ fn op_transplant(
                     expected_digest: digest,
                     expected_summary: summary,
                     captured_at,
+                    gate_policy: GatePolicy::Strict,
                 };
                 // Each phase is emitted as it happens: the parent decides what a cancellation
                 // can still do from the last one it has seen, and "writing" is the last safe point.
@@ -532,6 +534,7 @@ fn op_restore(
             source_bytes: &source_bytes,
             target: &body.camera,
             only: only.as_ref(),
+            body_policy: BodyPolicy::SameBody,
         };
         match confirmation {
             None => {
@@ -554,6 +557,7 @@ fn op_restore(
                     expected_digest: digest,
                     expected_summary: summary,
                     captured_at,
+                    gate_policy: GatePolicy::Strict,
                 };
                 // As for the transplant: "writing" is the last phase at which cancelling is safe.
                 match apply_restore(body.device, &req, &mut |p| progress(em, p)) {

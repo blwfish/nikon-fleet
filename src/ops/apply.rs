@@ -36,7 +36,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::diff::{Diff, DiffOptions, diff};
-use crate::ops::baseline::{GateOutcome, MissingCapability, NoBaselineReason, gate};
+use crate::ops::baseline::{GateOutcome, GatePolicy, MissingCapability, NoBaselineReason, gate};
 use crate::ops::capture::{CaptureStats, capture};
 use crate::ops::list::ListError;
 use crate::ops::plan::{PlanInput, digest, summary_text, would_change};
@@ -66,6 +66,7 @@ pub struct ApplyRequest<'a> {
     pub expected_summary: &'a str,
     /// Used for the restore point's label and file name.
     pub captured_at: String,
+    pub gate_policy: GatePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -103,6 +104,9 @@ pub struct ApplyReport {
     pub no_op: bool,
     pub plan_digest: String,
     pub restore_point: Option<RestorePoint>,
+    /// The restore point failed or could not be judged against the baseline and the caller
+    /// allowed that (`GatePolicy::AllowPartial`). Always false under `Strict`.
+    pub restore_point_gate_waived: bool,
     /// Properties actually written, in name order.
     pub written: Vec<String>,
     pub write_errors: Vec<WriteError>,
@@ -249,6 +253,7 @@ pub fn apply_transplant<P: CameraPort + ?Sized>(
             no_op: true,
             plan_digest: now_digest,
             restore_point: None,
+            restore_point_gate_waived: false,
             written: Vec::new(),
             write_errors: Vec::new(),
             outcomes: planned,
@@ -270,12 +275,14 @@ pub fn apply_transplant<P: CameraPort + ?Sized>(
     if rp_stats.read_ok == 0 {
         return Err(ApplyError::NothingReadable { read_err: rp_stats.read_err });
     }
-    match gate(&restore_point) {
-        GateOutcome::Passed => {}
-        GateOutcome::Failed { missing } => {
+    let mut gate_waived = false;
+    match (gate(&restore_point), req.gate_policy) {
+        (GateOutcome::Passed, _) => {}
+        (GateOutcome::Failed { .. } | GateOutcome::NoBaseline(_), GatePolicy::AllowPartial) => gate_waived = true,
+        (GateOutcome::Failed { missing }, GatePolicy::Strict) => {
             return Err(ApplyError::RestorePointIncomplete { missing, stats: rp_stats });
         }
-        GateOutcome::NoBaseline(reason) => return Err(ApplyError::NoBaseline(reason)),
+        (GateOutcome::NoBaseline(reason), GatePolicy::Strict) => return Err(ApplyError::NoBaseline(reason)),
     }
     std::fs::create_dir_all(req.snapshots_dir).map_err(|e| ApplyError::RestorePointWrite(SnapshotError::Io(e)))?;
     let rp_file = restore_point.suggested_filename();
@@ -309,7 +316,13 @@ pub fn apply_transplant<P: CameraPort + ?Sized>(
     } else {
         Some(gate(&after))
     };
-    let complete = matches!(after_gate, Some(GateOutcome::Passed));
+    // Under `AllowPartial` a read-back that cannot be judged for completeness (no baseline) is
+    // still compared: the caller waived the judgement, not the comparison.
+    let complete = match (&after_gate, req.gate_policy) {
+        (Some(GateOutcome::Passed), _) => true,
+        (Some(GateOutcome::NoBaseline(_)), GatePolicy::AllowPartial) => true,
+        _ => false,
+    };
 
     let (diff_vs_rp, effects) = if complete {
         let d = diff(&restore_point, &after, &DiffOptions::default()).ok();
@@ -351,6 +364,7 @@ pub fn apply_transplant<P: CameraPort + ?Sized>(
         no_op: false,
         plan_digest: now_digest,
         restore_point: Some(RestorePoint { file: rp_file, label }),
+        restore_point_gate_waived: gate_waived,
         written: written.into_iter().collect(),
         write_errors,
         outcomes,
@@ -446,6 +460,17 @@ mod tests {
     }
 
     fn run(w: &World, f: &Fixture, digest: &str, summary: &str, phases: &mut Vec<String>) -> Result<ApplyReport, ApplyError> {
+        run_with(w, f, digest, summary, phases, GatePolicy::Strict)
+    }
+
+    fn run_with(
+        w: &World,
+        f: &Fixture,
+        digest: &str,
+        summary: &str,
+        phases: &mut Vec<String>,
+        gate_policy: GatePolicy,
+    ) -> Result<ApplyReport, ApplyError> {
         apply_transplant(
             &w.cam,
             &ApplyRequest {
@@ -456,6 +481,7 @@ mod tests {
                 expected_digest: digest,
                 expected_summary: summary,
                 captured_at: AT.into(),
+                gate_policy,
             },
             &mut |p| phases.push(p.to_string()),
         )
@@ -707,6 +733,80 @@ mod tests {
         let e = apply_planned(&w, &f).unwrap_err();
         assert!(matches!(e, ApplyError::NoBaseline(NoBaselineReason::UnknownModel)), "{e:?}");
         assert_eq!(e.tag(), "no_baseline");
+        assert!(w.cam.writes().is_empty() && dir_files(&w).is_empty());
+    }
+
+    // ── the CLI's escape hatch (GatePolicy::AllowPartial) ─────────────────
+
+    #[test]
+    fn strict_is_the_default_and_refuses_what_allow_partial_lets_through() {
+        assert_eq!(GatePolicy::default(), GatePolicy::Strict);
+        let w = world_with(|c, _| c, 178);
+        let f = fixture(&w, true);
+        let p = plan(&w, &f);
+        assert!(run_with(&w, &f, &p.digest, &p.summary, &mut Vec::new(), GatePolicy::Strict).is_err());
+        assert!(w.cam.writes().is_empty());
+    }
+
+    #[test]
+    fn allow_partial_goes_ahead_with_an_incomplete_restore_point_and_says_so() {
+        let w = world_with(|c, _| c, 178);
+        let f = fixture(&w, true);
+        let p = plan(&w, &f);
+        let r = run_with(&w, &f, &p.digest, &p.summary, &mut Vec::new(), GatePolicy::AllowPartial).unwrap();
+        assert!(r.restore_point_gate_waived);
+        assert_eq!(r.written.len(), 4, "the writes happened");
+        let rp = r.restore_point.as_ref().expect("the restore point is still taken");
+        assert!(w.dir.path().join(&rp.file).exists());
+        assert_eq!(r.status, ApplyStatus::AppliedUnverified, "an incomplete read-back is still not a verification");
+    }
+
+    #[test]
+    fn a_passing_restore_point_is_not_marked_waived_even_under_allow_partial() {
+        let w = world();
+        let f = fixture(&w, true);
+        let p = plan(&w, &f);
+        let r = run_with(&w, &f, &p.digest, &p.summary, &mut Vec::new(), GatePolicy::AllowPartial).unwrap();
+        assert!(!r.restore_point_gate_waived);
+        assert_eq!(r.status, ApplyStatus::AppliedVerified);
+    }
+
+    #[test]
+    fn allow_partial_applies_to_a_model_without_a_baseline_and_still_compares_the_read_back() {
+        let mut cam = FakeCamera::new();
+        let mut names = HashMap::new();
+        for code in 1..=3u32 {
+            cam = cam.with(code, RW, json!("old"));
+            names.insert(code, format!("kNkMAIDCapability_P{code}"));
+        }
+        let w = World { cam, names, codes: vec![("kNkMAIDCapability_P1".into(), 1), ("kNkMAIDCapability_P2".into(), 2), ("kNkMAIDCapability_P3".into(), 3), ("kNkMAIDCapability_P3".into(), 3)], dir: TempDir::new().unwrap() };
+        let mut f = fixture(&w, false);
+        f.target.model = "Z 5".into();
+        let caps: Vec<(&str, u32)> = vec![("P1", 1), ("P2", 2), ("P3", 3)];
+        let cfg = parse_config(&[("Z6_3", &caps), ("Z 5", &caps)]);
+        f.guard = CodeNameGuard::new(&cfg, "Z6_3", "Z 5").unwrap();
+        let p = plan(&w, &f);
+        let r = run_with(&w, &f, &p.digest, &p.summary, &mut Vec::new(), GatePolicy::AllowPartial).unwrap();
+        assert!(r.restore_point_gate_waived);
+        assert!(!r.written.is_empty());
+        assert_eq!(r.status, ApplyStatus::AppliedVerified, "the read-back was compared even though it could not be judged for completeness");
+    }
+
+    #[test]
+    fn allow_partial_still_refuses_a_restore_point_that_read_nothing() {
+        let b = baseline_for("Z 9").unwrap();
+        let mut cam = FakeCamera::new();
+        let mut names = HashMap::new();
+        for c in &b.readable {
+            cam = cam.with(c.code, OP_SET, json!(1));
+            names.insert(c.code, c.name.clone());
+        }
+        let codes: Vec<(String, u32)> = b.readable.iter().skip(6).take(4).map(|c| (c.name.clone(), c.code)).collect();
+        let w = World { cam, names, codes, dir: TempDir::new().unwrap() };
+        let f = fixture(&w, true);
+        let p = plan(&w, &f);
+        let e = run_with(&w, &f, &p.digest, &p.summary, &mut Vec::new(), GatePolicy::AllowPartial).unwrap_err();
+        assert!(matches!(e, ApplyError::NothingReadable { .. }), "{e:?}");
         assert!(w.cam.writes().is_empty() && dir_files(&w).is_empty());
     }
 

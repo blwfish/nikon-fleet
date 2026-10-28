@@ -144,6 +144,20 @@ pub enum NoBaselineReason {
     FirmwareChanged { baseline: String, capture: String },
 }
 
+/// How strictly a restore point and a read-back are held to the model's baseline.
+///
+/// `Strict` is what the MCP uses: a restore point that misses a baseline capability, or a model
+/// with no baseline, refuses the apply before any write. `AllowPartial` is the CLI's escape hatch
+/// (`--allow-partial`, as for `snapshot`): the apply goes ahead, the report says the gate was
+/// waived, and a read-back that cannot be judged for completeness is compared anyway. A restore
+/// point that read nothing at all is refused under either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GatePolicy {
+    #[default]
+    Strict,
+    AllowPartial,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum GateOutcome {

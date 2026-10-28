@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::ops::apply::{ApplyStatus, RestorePoint, WriteError, require_confirmation, took_effect};
-use crate::ops::baseline::{GateOutcome, MissingCapability, NoBaselineReason, gate};
+use crate::ops::baseline::{GateOutcome, GatePolicy, MissingCapability, NoBaselineReason, gate};
 use crate::ops::capture::{CaptureStats, capture};
 use crate::ops::list::ListError;
 use crate::ops::plan::NOT_TRANSFERABLE;
@@ -48,6 +48,7 @@ pub struct RestorePlanInput<'a> {
     pub target: &'a Camera,
     /// Resolved property names (see `restore::resolve_only`), or all of them.
     pub only: Option<&'a BTreeSet<String>>,
+    pub body_policy: BodyPolicy,
 }
 
 /// Why a restore was refused before the body was touched.
@@ -83,8 +84,21 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-fn same_body(source: &Snapshot, target: &Camera) -> Result<(), Refusal> {
-    if source.camera.serial != target.serial {
+/// Which body a snapshot may be restored onto.
+///
+/// `SameBody` (the MCP): the snapshot's serial and model must both be the target's; copying onto
+/// another body is a transplant. `SameModel` (the CLI's `restore --serial`): the model must match,
+/// the serial may differ, which is how one body's settings are put on a second body of the same
+/// model. A model mismatch is refused under both; use `transplant` for that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BodyPolicy {
+    #[default]
+    SameBody,
+    SameModel,
+}
+
+fn same_body(source: &Snapshot, target: &Camera, policy: BodyPolicy) -> Result<(), Refusal> {
+    if policy == BodyPolicy::SameBody && source.camera.serial != target.serial {
         return Err(Refusal::SerialMismatch { snapshot: source.camera.serial.clone(), target: target.serial.clone() });
     }
     if source.camera.model != target.model {
@@ -196,7 +210,7 @@ pub fn build_restore_plan<P: CameraPort + ?Sized>(
     port: &P,
     input: &RestorePlanInput<'_>,
 ) -> Result<RestorePlanReport, Refusal> {
-    same_body(input.source, input.target)?;
+    same_body(input.source, input.target, input.body_policy)?;
     let (steps, run) = plan_steps(port, input.source, input.only);
     let would_change = count_changes(&steps);
     Ok(RestorePlanReport {
@@ -221,6 +235,7 @@ pub struct RestoreApplyRequest<'a> {
     pub expected_digest: &'a str,
     pub expected_summary: &'a str,
     pub captured_at: String,
+    pub gate_policy: GatePolicy,
 }
 
 #[derive(Debug)]
@@ -303,11 +318,16 @@ pub struct RestoreApplyReport {
     pub no_op: bool,
     pub plan_digest: String,
     pub restore_point: Option<RestorePoint>,
+    /// The restore point failed or could not be judged against the baseline and the caller allowed
+    /// that (`GatePolicy::AllowPartial`). Always false under `Strict`.
+    pub restore_point_gate_waived: bool,
     /// Properties actually written, in name order.
     pub written: Vec<String>,
     pub write_errors: Vec<WriteError>,
     /// Named by `only` but not written.
     pub unrestored: Vec<(String, &'static str)>,
+    /// Tallies over the whole run (properties not selected are counted, not listed in `steps`).
+    pub counts: Counts,
     pub steps: Vec<StepResult>,
     pub verification: Option<Verification>,
     /// What changed without being written (vs the restore point). Absent if there was no complete read-back.
@@ -328,7 +348,7 @@ pub fn apply_restore<P: CameraPort + ?Sized>(
     progress: &mut dyn FnMut(&str),
 ) -> Result<RestoreApplyReport, RestoreApplyError> {
     require_confirmation(req.expected_digest, req.expected_summary)?;
-    same_body(req.plan.source, req.plan.target).map_err(RestoreApplyError::Refused)?;
+    same_body(req.plan.source, req.plan.target, req.plan.body_policy).map_err(RestoreApplyError::Refused)?;
 
     // 1. Recompute the plan on the live body and compare.
     let (steps_now, _) = plan_steps(port, req.plan.source, req.plan.only);
@@ -355,9 +375,11 @@ pub fn apply_restore<P: CameraPort + ?Sized>(
             no_op: true,
             plan_digest: now_digest,
             restore_point: None,
+            restore_point_gate_waived: false,
             written: Vec::new(),
             write_errors: Vec::new(),
             unrestored,
+            counts: dry.counts(),
             steps: dry.steps.into_iter().filter(|s| s.outcome != StepOutcome::NotSelected).collect(),
             verification: None,
             side_effects: None,
@@ -377,10 +399,14 @@ pub fn apply_restore<P: CameraPort + ?Sized>(
     if rp_stats.read_ok == 0 {
         return Err(RestoreApplyError::NothingReadable { read_err: rp_stats.read_err });
     }
-    match gate(&restore_point) {
-        GateOutcome::Passed => {}
-        GateOutcome::Failed { missing } => return Err(RestoreApplyError::RestorePointIncomplete { missing, stats: rp_stats }),
-        GateOutcome::NoBaseline(reason) => return Err(RestoreApplyError::NoBaseline(reason)),
+    let mut gate_waived = false;
+    match (gate(&restore_point), req.gate_policy) {
+        (GateOutcome::Passed, _) => {}
+        (GateOutcome::Failed { .. } | GateOutcome::NoBaseline(_), GatePolicy::AllowPartial) => gate_waived = true,
+        (GateOutcome::Failed { missing }, GatePolicy::Strict) => {
+            return Err(RestoreApplyError::RestorePointIncomplete { missing, stats: rp_stats });
+        }
+        (GateOutcome::NoBaseline(reason), GatePolicy::Strict) => return Err(RestoreApplyError::NoBaseline(reason)),
     }
     std::fs::create_dir_all(req.snapshots_dir).map_err(|e| RestoreApplyError::RestorePointWrite(SnapshotError::Io(e)))?;
     let rp_file = restore_point.suggested_filename();
@@ -427,9 +453,11 @@ pub fn apply_restore<P: CameraPort + ?Sized>(
         no_op: false,
         plan_digest: now_digest,
         restore_point: Some(RestorePoint { file: rp_file, label }),
+        restore_point_gate_waived: gate_waived,
         written: written.into_iter().collect(),
         write_errors,
         unrestored,
+        counts: run.counts(),
         steps: run.steps.into_iter().filter(|s| s.outcome != StepOutcome::NotSelected).collect(),
         verification: Some(verification),
         side_effects: effects,
@@ -511,7 +539,7 @@ mod tests {
     }
 
     fn input<'a>(f: &'a Fixture, only: Option<&'a BTreeSet<String>>) -> RestorePlanInput<'a> {
-        RestorePlanInput { source: &f.source, source_name: "Z_9_base.json", source_bytes: &f.bytes, target: &f.target, only }
+        RestorePlanInput { source: &f.source, source_name: "Z_9_base.json", source_bytes: &f.bytes, target: &f.target, only, body_policy: BodyPolicy::SameBody }
     }
 
     fn plan_of(w: &World, f: &Fixture) -> RestorePlanReport {
@@ -528,6 +556,7 @@ mod tests {
                 expected_digest: digest,
                 expected_summary: summary,
                 captured_at: AT.into(),
+                gate_policy: GatePolicy::Strict,
             },
             &mut |p| phases.push(p.to_string()),
         )
@@ -761,6 +790,7 @@ mod tests {
                 expected_digest: &p.digest,
                 expected_summary: &p.summary,
                 captured_at: AT.into(),
+                gate_policy: GatePolicy::Strict,
             },
             &mut |_| {},
         )
@@ -955,6 +985,7 @@ mod tests {
                 expected_digest: &p.digest,
                 expected_summary: &p.summary,
                 captured_at: AT.into(),
+                gate_policy: GatePolicy::Strict,
             },
             &mut |_| {},
         )
@@ -999,6 +1030,72 @@ mod tests {
         assert_eq!(w.cam.writes().len(), writes);
     }
 
+    // ── the CLI's policies ───────────────────────────────────────────────
+
+    fn run_policy(w: &World, f: &Fixture, body: BodyPolicy, gate: GatePolicy) -> Result<RestoreApplyReport, RestoreApplyError> {
+        let plan_input = RestorePlanInput { body_policy: body, ..input(f, Some(&f.only)) };
+        let p = build_restore_plan(&w.cam, &plan_input).map_err(RestoreApplyError::Refused)?;
+        apply_restore(
+            &w.cam,
+            &RestoreApplyRequest {
+                plan: RestorePlanInput { body_policy: body, ..input(f, Some(&f.only)) },
+                snapshots_dir: w.dir.path(),
+                name_lookup: &w.names,
+                expected_digest: &p.digest,
+                expected_summary: &p.summary,
+                captured_at: AT.into(),
+                gate_policy: gate,
+            },
+            &mut |_| {},
+        )
+    }
+
+    #[test]
+    fn same_model_lets_a_snapshot_of_another_body_be_restored_but_same_body_does_not() {
+        let w = world();
+        let mut f = fixture(&w);
+        f.source.camera.serial = "OTHER".into();
+        let e = run_policy(&w, &f, BodyPolicy::SameBody, GatePolicy::Strict).unwrap_err();
+        assert_eq!(e.tag(), "serial_mismatch");
+        assert!(w.cam.writes().is_empty());
+        let r = run_policy(&w, &f, BodyPolicy::SameModel, GatePolicy::Strict).unwrap();
+        assert_eq!(r.status, ApplyStatus::AppliedVerified);
+        assert_eq!(r.written.len(), 4);
+    }
+
+    #[test]
+    fn a_model_mismatch_is_refused_under_both_body_policies() {
+        let w = world();
+        let mut f = fixture(&w);
+        f.source.camera.model = "Z6_3".into();
+        for policy in [BodyPolicy::SameBody, BodyPolicy::SameModel] {
+            let e = run_policy(&w, &f, policy, GatePolicy::Strict).unwrap_err();
+            assert_eq!(e.tag(), "model_mismatch", "{policy:?}");
+        }
+        assert!(w.cam.writes().is_empty() && dir_files(&w).is_empty());
+    }
+
+    #[test]
+    fn allow_partial_goes_ahead_with_an_incomplete_restore_point_and_says_so() {
+        let w = world_with(|c, _| c, 178);
+        let f = fixture(&w);
+        assert!(run_policy(&w, &f, BodyPolicy::SameBody, GatePolicy::Strict).is_err());
+        assert!(w.cam.writes().is_empty());
+        let r = run_policy(&w, &f, BodyPolicy::SameBody, GatePolicy::AllowPartial).unwrap();
+        assert!(r.restore_point_gate_waived);
+        assert_eq!(r.written.len(), 4);
+        assert!(r.restore_point.is_some());
+        assert_eq!(r.status, ApplyStatus::AppliedUnverified);
+    }
+
+    #[test]
+    fn a_passing_restore_point_is_not_marked_waived() {
+        let w = world();
+        let f = fixture(&w);
+        let r = run_policy(&w, &f, BodyPolicy::SameBody, GatePolicy::AllowPartial).unwrap();
+        assert!(!r.restore_point_gate_waived);
+    }
+
     // ── the undo of a restore is a restore of its restore point ──────────
 
     #[test]
@@ -1024,6 +1121,7 @@ mod tests {
                 expected_digest: &up.digest,
                 expected_summary: &up.summary,
                 captured_at: "2026-10-27T17:27:00.000001Z".into(),
+                gate_policy: GatePolicy::Strict,
             },
             &mut |p| w2_phases.push(p.to_string()),
         )

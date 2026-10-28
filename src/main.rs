@@ -3,6 +3,8 @@
 //! All real logic lives in the `nikon_fleet` library; this file is just
 //! the command-line surface.
 
+mod cli_report;
+use cli_report::unrestored_error;
 mod worker_cmd;
 
 use std::collections::HashMap;
@@ -168,6 +170,10 @@ struct SnapshotArgs {
     /// this an incomplete capture is refused and nothing is written.
     #[arg(long)]
     allow_partial: bool,
+    /// Print the result as JSON on stdout (the same value the MCP worker's `capture` returns);
+    /// progress and warnings go to stderr.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -223,6 +229,10 @@ struct CheckArgs {
     /// baseline reads. The diff will then show them as removed.
     #[arg(long)]
     allow_partial: bool,
+    /// Print the result as JSON on stdout (the same value the MCP worker's `check` returns);
+    /// progress and warnings go to stderr.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -443,6 +453,16 @@ struct RestoreArgs {
     /// command exits non-zero rather than report a partial undo as done.
     #[arg(long = "only", value_name = "PROPERTY")]
     only: Vec<String>,
+    /// Go ahead even if the restore point (a capture of the camera as it is now,
+    /// taken before any write) is missing capabilities the model's baseline reads,
+    /// or the model has no baseline. The restore point is still taken and the
+    /// read-back still compared.
+    #[arg(long)]
+    allow_partial: bool,
+    /// Print the plan (with --dry-run) or the result as JSON on stdout (the same value the MCP
+    /// worker's `restore-plan` / `restore-apply` return); progress and warnings go to stderr.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -473,6 +493,16 @@ struct TransplantArgs {
     /// prefix. Run with --dry-run first to see what each would set.
     #[arg(long = "allow-raw-code", value_name = "PROPERTY")]
     allow_raw_code: Vec<String>,
+    /// Go ahead even if the restore point (a capture of the camera as it is now,
+    /// taken before any write) is missing capabilities the model's baseline reads,
+    /// or the model has no baseline. The restore point is still taken and the
+    /// read-back still compared.
+    #[arg(long)]
+    allow_partial: bool,
+    /// Print the plan (with --dry-run) or the result as JSON on stdout (the same value the MCP
+    /// worker's `transplant-plan` / `transplant-apply` return); progress and warnings go to stderr.
+    #[arg(long)]
+    json: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -775,6 +805,8 @@ fn open_sdk(bundle_path: &Path, no_usb_reset: bool) -> Result<SdkSession> {
 }
 
 fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs, no_usb_reset: bool) -> Result<()> {
+    // The SDK prints its own line to stdout when it initialises; keep that off --json's stdout.
+    let mut json_out = nikon_fleet::json_out::JsonOut::redirect(args.json)?;
     let sdk = open_sdk(bundle_path, no_usb_reset)?;
     let enriched = enrich_devices(sdk.devices()?);
     if enriched.is_empty() {
@@ -783,7 +815,7 @@ fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs, no_usb_reset: bool) -> 
             // than a hand-typed literal — the two used to be two different
             // code paths producing the same logical shape with no compiler
             // tie between them if the schema ever gains a field.
-            println!("{}", serde_json::json!({ "cameras": Vec::<serde_json::Value>::new() }));
+            json_out.emit(&serde_json::json!({ "cameras": Vec::<serde_json::Value>::new() }).to_string())?;
         } else {
             println!("(no Nikon cameras detected)");
         }
@@ -796,7 +828,7 @@ fn cmd_discover(bundle_path: &Path, args: &DiscoverArgs, no_usb_reset: bool) -> 
             let firmware = usb.as_ref().map(|u| u.firmware.as_str()).unwrap_or(dev.version.as_str()).to_string();
             serde_json::json!({ "model": dev.name, "serial": serial, "firmware": firmware })
         }).collect();
-        println!("{}", serde_json::json!({ "cameras": cameras }));
+        json_out.emit(&serde_json::json!({ "cameras": cameras }).to_string())?;
     } else {
         println!("{} device(s):", enriched.len());
         for (dev, usb) in &enriched {
@@ -875,15 +907,15 @@ fn warn_if_unknown_schema(unknown_schema: usize, schema_path: &Path) {
 /// before anything is written. An incomplete capture is an error unless
 /// `allow_partial`; a capture the gate cannot judge is noted on stderr and
 /// allowed (a new model has to be capturable to be baselined).
-fn apply_capture_gate(snap: &Snapshot, allow_partial: bool) -> Result<()> {
+fn apply_capture_gate(snap: &Snapshot, allow_partial: bool) -> Result<nikon_fleet::ops::baseline::GateOutcome> {
     use nikon_fleet::ops::baseline::{GateOutcome, NoBaselineReason, describe_failure, gate};
-    match gate(snap) {
-        GateOutcome::Passed => Ok(()),
+    let verdict = gate(snap);
+    match &verdict {
+        GateOutcome::Passed => {}
         GateOutcome::Failed { missing } => {
-            let text = describe_failure(snap, &missing);
+            let text = describe_failure(snap, missing);
             if allow_partial {
                 eprintln!("warning: {text} Continuing because --allow-partial was given.");
-                Ok(())
             } else {
                 bail!("{text}\nNothing was written. Re-run the capture, or pass --allow-partial to keep it anyway.")
             }
@@ -894,7 +926,6 @@ fn apply_capture_gate(snap: &Snapshot, allow_partial: bool) -> Result<()> {
                  (`nikon-fleet baseline seed <snapshot>` makes one).",
                 snap.camera.model
             );
-            Ok(())
         }
         GateOutcome::NoBaseline(NoBaselineReason::FirmwareChanged { baseline, capture }) => {
             eprintln!(
@@ -902,8 +933,17 @@ fn apply_capture_gate(snap: &Snapshot, allow_partial: bool) -> Result<()> {
                  too; this capture was not checked for completeness (re-seed the baseline for the new firmware).",
                 snap.camera.model
             );
-            Ok(())
         }
+    }
+    Ok(verdict)
+}
+
+/// Human output: stdout normally, stderr under `--json` so that stdout holds only the JSON.
+fn say(json: bool, text: &str) {
+    if json {
+        eprint!("{text}");
+    } else {
+        print!("{text}");
     }
 }
 
@@ -947,6 +987,7 @@ fn cmd_baseline(sub: &BaselineCmd) -> Result<()> {
 }
 
 fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &SnapshotArgs, no_usb_reset: bool) -> Result<()> {
+    let mut json_out = nikon_fleet::json_out::JsonOut::redirect(args.json)?;
     let mut sdk = open_sdk(bundle, no_usb_reset)?;
     let devices = sdk.devices()?;
     if devices.is_empty() {
@@ -954,7 +995,7 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     }
     let enriched = enrich_devices(devices);
     let (target, usb_info) = select_device(enriched, args.serial.as_deref())?;
-    println!("Connecting to {:?} (id={})…", target.name, target.id);
+    say(args.json, &format!("Connecting to {:?} (id={})…\n", target.name, target.id));
 
     let schema = MaidLayerConfig::parse_file(schema_path)
         .with_context(|| format!("loading schema from {}", schema_path.display()))?;
@@ -968,7 +1009,7 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
 
     let device = sdk.connect(target.id)?;
     ensure_capabilities_present(device.capabilities.len())?;
-    println!("Reading {} capabilities…", device.capabilities.len());
+    say(args.json, &format!("Reading {} capabilities…\n", device.capabilities.len()));
 
     let captured_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
     let serial = snapshot_serial(&usb_info, target.id);
@@ -986,14 +1027,17 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     snap.label = args.label.clone();
 
     let stats = capture_capabilities(&device, &name_lookup, &mut snap);
-    println!(
-        "  ok={}  err={}  skipped(no-get-bit)={}  unknown-schema={}",
-        stats.read_ok, stats.read_err, stats.skipped_no_get, stats.unknown_schema
+    say(
+        args.json,
+        &format!(
+            "  ok={}  err={}  skipped(no-get-bit)={}  unknown-schema={}\n",
+            stats.read_ok, stats.read_err, stats.skipped_no_get, stats.unknown_schema
+        ),
     );
     warn_if_unknown_schema(stats.unknown_schema, schema_path);
 
     // Judge completeness in memory, before anything is written.
-    apply_capture_gate(&snap, args.allow_partial)?;
+    let verdict = apply_capture_gate(&snap, args.allow_partial)?;
 
     // Save under snapshots/.
     let dir = snapshots_dir(data_dir);
@@ -1003,7 +1047,19 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     // create-new: a capture must never replace an existing snapshot.
     snap.save_new(&path)
         .with_context(|| format!("writing {}", path.display()))?;
-    println!("Wrote {}", path.display());
+    say(args.json, &format!("Wrote {}\n", path.display()));
+    if args.json {
+        // The same value the MCP worker's `capture` op returns.
+        let outcome = nikon_fleet::ops::capture_snapshot::CaptureOutcome::new(
+            filename.clone(),
+            snap.label.clone(),
+            snap.camera.clone(),
+            snap.properties.len(),
+            stats.clone(),
+            verdict,
+        );
+        json_out.emit(&serde_json::to_string_pretty(&outcome)?)?;
+    }
     if snapshot_capture_failed(stats.read_ok) {
         // The file is still written (matches prior behavior), but a
         // script/CI checking exit status must be able to tell this run was
@@ -1106,35 +1162,8 @@ fn ensure_capabilities_present(count: usize) -> Result<()> {
     Ok(())
 }
 
-/// Whether a restore should be treated as a hard failure: zero writes
-/// succeeded and at least one real error occurred — not a routine skip
-/// (absent/read-only/unsupported-type capabilities are expected and don't
-/// count as errors).
-fn restore_completely_failed(written: usize, errors: usize) -> bool {
-    written == 0 && errors > 0
-}
-
-/// The error for a targeted restore that did not write everything it was
-/// asked to: `named` is how many properties `--only` selected (`None` for a
-/// full restore, which skips many properties routinely and never fails for
-/// that), `unrestored` each named property that was not written (or, in a dry
-/// run, would not be) with a closed reason tag. `None` when everything named
-/// was (or would be) written.
-fn unrestored_error(named: Option<usize>, unrestored: &[(String, &'static str)]) -> Option<String> {
-    let named = named?;
-    if unrestored.is_empty() {
-        return None;
-    }
-    let list: Vec<String> = unrestored.iter().map(|(n, why)| format!("{n} ({why})")).collect();
-    Some(format!(
-        "targeted restore incomplete: {} of {named} named propert{} not written: {}",
-        unrestored.len(),
-        if unrestored.len() == 1 { "y was" } else { "ies were" },
-        list.join(", ")
-    ))
-}
-
 fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArgs, no_usb_reset: bool) -> Result<()> {
+    let mut json_out = nikon_fleet::json_out::JsonOut::redirect(args.json)?;
     let mut sdk = open_sdk(bundle, no_usb_reset)?;
     let devices = sdk.devices()?;
     if devices.is_empty() {
@@ -1165,7 +1194,7 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     live.label = Some("live".into());
     let stats = capture_capabilities(&device, &name_lookup, &mut live);
     warn_if_unknown_schema(stats.unknown_schema, schema_path);
-    apply_capture_gate(&live, args.allow_partial)?;
+    let verdict = apply_capture_gate(&live, args.allow_partial)?;
 
     // Reference for this body.
     let ref_path = references_dir(data_dir).join(reference_filename(&target.name, &serial));
@@ -1179,7 +1208,13 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     let reference = Snapshot::load_from_file(&ref_path)?;
 
     let d = diff_with_schema(&reference, &live, &DiffOptions::default(), &schema)?;
-    print_diff_human(&reference, &live, &d);
+    if args.json {
+        // The same value the MCP worker's `check` op returns.
+        let report = nikon_fleet::ops::check::CheckReport::new(live.camera.clone(), &reference, verdict, stats, d);
+        json_out.emit(&serde_json::to_string_pretty(&report)?)?;
+    } else {
+        print_diff_human(&reference, &live, &d);
+    }
     Ok(())
 }
 
@@ -1797,9 +1832,16 @@ fn ingest_user_file(data_dir: &Path, source_id: &str, release: &Release, file: &
 }
 
 fn cmd_restore(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &RestoreArgs, no_usb_reset: bool) -> Result<()> {
+    use nikon_fleet::ops::baseline::GatePolicy;
+    use nikon_fleet::ops::restore_flow::{BodyPolicy, RestoreApplyRequest, RestorePlanInput, apply_restore, build_restore_plan};
+
+    let json = args.json;
+    let mut json_out = nikon_fleet::json_out::JsonOut::redirect(json)?;
     let snap_path = resolve_snapshot_path(data_dir, &args.snapshot_path);
-    let snap = Snapshot::load_from_file(&snap_path)
+    let source_bytes = fs::read(&snap_path).with_context(|| format!("loading {}", snap_path.display()))?;
+    let snap = Snapshot::from_json(&String::from_utf8(source_bytes.clone()).with_context(|| format!("loading {}", snap_path.display()))?)
         .with_context(|| format!("loading {}", snap_path.display()))?;
+    let source_name = snap_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 
     // Validated before the camera is touched: a mistyped --only must fail here,
     // not run as a restore that quietly had nothing to do.
@@ -1826,61 +1868,77 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Restor
             target_serial, snap.camera.model, snap.camera.serial
         ))?;
 
-    if target.name != snap.camera.model {
-        eprintln!(
-            "warning: snapshot is for model {:?} but connected camera is {:?}",
-            snap.camera.model, target.name
-        );
-    }
-
-    println!("Connecting to {:?} (id={})…", target.name, target.id);
+    say(json, &format!("Connecting to {:?} (id={})…\n", target.name, target.id));
     let device = sdk.connect(target.id)?;
     ensure_capabilities_present(device.capabilities.len())?;
 
-    let run = restore::execute(&device, &snap.properties, only.as_ref(), args.dry_run);
-    for step in &run.steps {
-        match &step.outcome {
-            restore::StepOutcome::WouldWrite => println!("  would write  {} [{:#x}]", step.name, step.code),
-            restore::StepOutcome::WriteFailed(msg) => eprintln!("  warn: {} [{:#x}]: {}", step.name, step.code, msg),
-            _ => {}
-        }
-    }
-    let restore::Counts { written, skipped_absent, skipped_read_only, skipped_type, skipped_never, not_selected, errors } =
-        run.counts();
-    let unrestored = run.unrestored();
+    let schema = MaidLayerConfig::parse_file(schema_path)
+        .with_context(|| format!("loading schema from {}", schema_path.display()))?;
+    let name_lookup = schema.name_map_for_model(&target.name);
+    let identity = Camera {
+        model: target.name.clone(),
+        serial: usb_info.as_ref().map(|u| u.serial.clone()).unwrap_or_else(|| snap.camera.serial.clone()),
+        firmware: usb_info.as_ref().map(|u| u.firmware.clone()).unwrap_or_else(|| snap.camera.firmware.clone()),
+    };
+    // The CLI picked the body by serial above (including the id-N and SDK-id forms the MCP refuses),
+    // so only the model is checked here. A different model is a transplant, not a restore.
+    let input = RestorePlanInput {
+        source: &snap,
+        source_name: &source_name,
+        source_bytes: &source_bytes,
+        target: &identity,
+        only: only.as_ref(),
+        body_policy: BodyPolicy::SameModel,
+    };
+    let plan = build_restore_plan(&device, &input).map_err(|r| {
+        anyhow::anyhow!("{r}\nUse `nikon-fleet transplant` to copy settings between models.")
+    })?;
+    let named = only.as_ref().map(|o| o.len());
 
-    let not_selected_note = if only.is_some() { format!("  skipped(not-selected)={not_selected}") } else { String::new() };
-    println!(
-        "{} written={written}  skipped(absent)={skipped_absent}  \
-         skipped(read-only)={skipped_read_only}  \
-         skipped(unsupported-type)={skipped_type}  skipped(never-copied)={skipped_never}{not_selected_note}  errors={errors}",
-        if args.dry_run { "Dry run:" } else { "Restore complete:" }
-    );
-    if !args.dry_run && restore_completely_failed(written, errors) {
-        bail!("all {errors} capability write(s) failed (see warnings above); nothing was restored");
+    if args.dry_run {
+        say(json, &cli_report::render_restore_dry_run(&plan.steps, &plan.counts, only.is_some()));
+        say(json, &format!("Plan: {}\nDigest: {}\n", plan.summary, plan.digest));
+        if json {
+            json_out.emit(&serde_json::to_string_pretty(&plan)?)?;
+        }
+        if let Some(msg) = unrestored_error(named, &plan.unrestorable) {
+            bail!("{msg}");
+        }
+        return Ok(());
     }
-    if let Some(msg) = unrestored_error(only.as_ref().map(|o| o.len()), &unrestored) {
+
+    let snapshots = snapshots_dir(data_dir);
+    let captured_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    let req = RestoreApplyRequest {
+        plan: input,
+        snapshots_dir: &snapshots,
+        name_lookup: &name_lookup,
+        expected_digest: &plan.digest,
+        expected_summary: &plan.summary,
+        captured_at,
+        gate_policy: if args.allow_partial { GatePolicy::AllowPartial } else { GatePolicy::Strict },
+    };
+    let report = apply_restore(&device, &req, &mut |_| {}).map_err(|e| {
+        let hint = cli_report::refusal_hint(e.tag()).map(|h| format!("\n{h}")).unwrap_or_default();
+        anyhow::anyhow!("{e}{hint}")
+    })?;
+
+    for w in cli_report::restore_write_warnings(&report.steps) {
+        eprintln!("{w}");
+    }
+    say(json, &cli_report::restore_tally("Restore complete:", &report.counts, only.is_some()));
+    say(json, &cli_report::render_restore_apply(&report));
+    if let Some(v) = &report.verification {
+        let (line, _) = restore_verification_text(v);
+        say(json, &format!("{line}\n"));
+    }
+    if json {
+        json_out.emit(&serde_json::to_string_pretty(&report)?)?;
+    }
+
+    let readback_failed = report.verification.as_ref().map(|v| restore_verification_text(v).1).unwrap_or(false);
+    if let Some(msg) = cli_report::restore_failure(&report, named, readback_failed) {
         bail!("{msg}");
-    }
-
-    // A write call that returns success proves nothing (F18): read the body back and
-    // compare what was written with the snapshot. Not for a dry run, which wrote nothing.
-    if !args.dry_run {
-        let schema = MaidLayerConfig::parse_file(schema_path)
-            .with_context(|| format!("loading schema from {}", schema_path.display()))?;
-        let name_lookup = schema.name_map_for_model(&target.name);
-        let identity = Camera {
-            model: target.name.clone(),
-            serial: usb_info.as_ref().map(|u| u.serial.clone()).unwrap_or_else(|| snap.camera.serial.clone()),
-            firmware: usb_info.as_ref().map(|u| u.firmware.clone()).unwrap_or_else(|| snap.camera.firmware.clone()),
-        };
-        let captured_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
-        let v = restore::verify(&device, &name_lookup, &identity, &snap, &run.written_names(), &captured_at);
-        let (line, failing) = restore_verification_text(&v);
-        println!("{line}");
-        if failing {
-            bail!("the restore did not take effect as reported; see the read-back above");
-        }
     }
     Ok(())
 }
@@ -1928,8 +1986,15 @@ fn restore_verification_text(v: &restore::Verification) -> (String, bool) {
 /// for the translation strategy and why capability *codes* (not menu
 /// position, not per-model renumbering) are the right join key here.
 fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &TransplantArgs, no_usb_reset: bool) -> Result<()> {
+    use nikon_fleet::ops::apply::{ApplyRequest, apply_transplant};
+    use nikon_fleet::ops::baseline::GatePolicy;
+    use nikon_fleet::ops::plan::{PlanInput, build_plan};
+
+    let json = args.json;
+    let mut json_out = nikon_fleet::json_out::JsonOut::redirect(json)?;
     let snap_path = resolve_snapshot_path(data_dir, &args.snapshot_path);
-    let snap = Snapshot::load_from_file(&snap_path)
+    let source_bytes = fs::read(&snap_path).with_context(|| format!("loading {}", snap_path.display()))?;
+    let snap = Snapshot::from_json(&String::from_utf8(source_bytes.clone()).with_context(|| format!("loading {}", snap_path.display()))?)
         .with_context(|| format!("loading {}", snap_path.display()))?;
 
     // Validated before the camera is touched: a mistyped opt-in must fail
@@ -1959,7 +2024,7 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
              target (transplant writes to physical camera hardware — refusing to guess which one)"
         );
     }
-    let (target, _usb) = select_device(enriched, args.serial.as_deref())?;
+    let (target, usb_info) = select_device(enriched, args.serial.as_deref())?;
 
     // Before connecting: refuse non-Z-series models and build the per-code
     // name check. Needs the schema (MaidLayer.config) — unlike restore,
@@ -1967,158 +2032,76 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
     let schema = MaidLayerConfig::parse_file(schema_path)
         .with_context(|| format!("loading schema from {}", schema_path.display()))?;
     let guard = transplant::CodeNameGuard::new(&schema, &snap.camera.model, &target.name)?;
+    let name_lookup = schema.name_map_for_model(&target.name);
 
     if target.name == snap.camera.model {
-        println!(
-            "note: source and target are both {:?} — transplant works the same either way, \
-             but `fleet restore` is the simpler/faster tool for a same-model copy.",
-            target.name
+        say(
+            json,
+            &format!(
+                "note: source and target are both {:?} — transplant works the same either way, \
+                 but `fleet restore` is the simpler/faster tool for a same-model copy.\n",
+                target.name
+            ),
         );
     }
 
-    println!("Connecting to {:?} (id={})…", target.name, target.id);
+    say(json, &format!("Connecting to {:?} (id={})…\n", target.name, target.id));
     let device = sdk.connect(target.id)?;
     ensure_capabilities_present(device.capabilities.len())?;
 
-    let outcomes = transplant::transplant(&device, &snap.properties, &guard, &options, args.dry_run);
+    let identity = Camera {
+        model: target.name.clone(),
+        serial: snapshot_serial(&usb_info, target.id),
+        firmware: usb_info.as_ref().map(|u| u.firmware.clone()).unwrap_or_else(|| target.version.clone()),
+    };
+    let input = PlanInput { source: &snap, source_bytes: &source_bytes, target: &identity, options: &options };
+    let plan = build_plan(&device, &guard, &input);
 
-    let mut written_literal = 0usize;
-    let mut written_enum_label = 0usize;
-    let mut written_enum_raw = 0usize;
-    let mut written_range = 0usize;
-    let mut skipped_absent = 0usize;
-    let mut skipped_read_only = 0usize;
-    let mut skipped_unsupported_type = 0usize;
-    let mut skipped_no_match = 0usize;
-    let mut skipped_type_mismatch = 0usize;
-    let mut skipped_sdk_decode_failure = 0usize;
-    let mut skipped_name_mismatch = 0usize;
-    let mut skipped_ambiguous = 0usize;
-    let mut skipped_never = 0usize;
-    let mut skipped_raw_unconfirmed = 0usize;
-    let mut raw_unconfirmed: Vec<(String, String)> = Vec::new();
-    let mut skipped_literal_unconfirmed = 0usize;
-    let mut literal_unconfirmed: Vec<(String, String)> = Vec::new();
-    let mut skipped_other = 0usize;
-    let mut errors = 0usize;
-
-    for outcome in &outcomes {
-        match &outcome.result {
-            Ok(strategy) => {
-                if args.dry_run {
-                    match &outcome.choice {
-                        Some(c) => println!("  would write  {} [{:#x}]  via {strategy}: {c}", outcome.name, outcome.code),
-                        None => println!("  would write  {} [{:#x}]  via {strategy}", outcome.name, outcome.code),
-                    }
-                }
-                match strategy {
-                    transplant::Strategy::Literal => written_literal += 1,
-                    transplant::Strategy::EnumByLabel => written_enum_label += 1,
-                    transplant::Strategy::EnumByRawValue => written_enum_raw += 1,
-                    transplant::Strategy::RangeClamped => written_range += 1,
-                }
-            }
-            Err(reason) => {
-                // The match below decides which counter bucket this outcome
-                // belongs in; whether it is warn-worthy comes from
-                // `SkipReason::severity`, and the actual eprintln! lives once,
-                // after the match.
-                match reason {
-                    transplant::SkipReason::AbsentOnTarget => {
-                        skipped_absent += 1;
-                    }
-                    transplant::SkipReason::ReadOnly => {
-                        skipped_read_only += 1;
-                    }
-                    transplant::SkipReason::UnsupportedWriteType => {
-                        skipped_unsupported_type += 1;
-                    }
-                    transplant::SkipReason::NoMatchingOption => {
-                        skipped_no_match += 1;
-                    }
-                    transplant::SkipReason::WriteFailed(_) => {
-                        errors += 1;
-                    }
-                    transplant::SkipReason::EnumTypeMismatch { .. } => {
-                        skipped_type_mismatch += 1;
-                    }
-                    transplant::SkipReason::EnumUndecodedBySdk { .. } => {
-                        skipped_sdk_decode_failure += 1;
-                    }
-                    transplant::SkipReason::CapabilityNameMismatch { .. } => {
-                        skipped_name_mismatch += 1;
-                    }
-                    transplant::SkipReason::AmbiguousLabel { .. } => {
-                        skipped_ambiguous += 1;
-                    }
-                    // Policy skips, not problems: routine and numerous, so
-                    // counted but not warned about one by one (the per-property
-                    // lines are in the summary hint below).
-                    transplant::SkipReason::NeverCopied { .. } => {
-                        skipped_never += 1;
-                    }
-                    transplant::SkipReason::RawCodeUnconfirmed { proposed } => {
-                        skipped_raw_unconfirmed += 1;
-                        raw_unconfirmed.push((outcome.name.clone(), proposed.clone()));
-                    }
-                    transplant::SkipReason::LiteralUnconfirmed { proposed } => {
-                        skipped_literal_unconfirmed += 1;
-                        literal_unconfirmed.push((outcome.name.clone(), proposed.clone()));
-                    }
-                    transplant::SkipReason::UnsupportedValueShape
-                    | transplant::SkipReason::TargetReadFailed(_)
-                    | transplant::SkipReason::MalformedSource => {
-                        skipped_other += 1;
-                    }
-                }
-                // Whether to warn is the reason's own severity, not a second table here.
-                let warn = matches!(reason.severity(), transplant::Severity::Warn | transplant::Severity::Error);
-                if warn {
-                    eprintln!("  warn: {} [{:#x}]: {reason}", outcome.name, outcome.code);
-                }
-            }
+    if args.dry_run {
+        let text = cli_report::render_transplant(&plan.outcomes, true);
+        for w in &text.warnings {
+            eprintln!("{w}");
         }
+        say(json, &text.stdout);
+        say(json, &format!("Plan: {}\nDigest: {}\n", plan.summary, plan.digest));
+        if json {
+            json_out.emit(&serde_json::to_string_pretty(&plan)?)?;
+        }
+        return Ok(());
     }
 
-    let written = written_literal + written_enum_label + written_enum_raw + written_range;
-    println!(
-        "{} written={written} (literal={written_literal} enum-by-label={written_enum_label} \
-         enum-by-raw-value={written_enum_raw} range-clamped={written_range})\n  \
-         skipped(absent)={skipped_absent} skipped(read-only)={skipped_read_only} \
-         skipped(unsupported-type)={skipped_unsupported_type} skipped(no-matching-option)={skipped_no_match} \
-         skipped(type-mismatch)={skipped_type_mismatch} skipped(sdk-decode-failure)={skipped_sdk_decode_failure} \
-         skipped(name-mismatch)={skipped_name_mismatch} skipped(ambiguous-label)={skipped_ambiguous} \
-         skipped(never-copied)={skipped_never} skipped(raw-code-unconfirmed)={skipped_raw_unconfirmed} \
-         skipped(literal-unconfirmed)={skipped_literal_unconfirmed} \
-         skipped(other)={skipped_other}  errors={errors}",
-        if args.dry_run { "Dry run:" } else { "Transplant complete:" }
-    );
-    if !raw_unconfirmed.is_empty() {
-        println!(
-            "\n{} propert{} matched only by raw numeric code and would change the target; not written \
-             (nothing guarantees both bodies number the same option the same way). Review, then opt in \
-             per property with --allow-raw-code <name>:",
-            raw_unconfirmed.len(),
-            if raw_unconfirmed.len() == 1 { "y was" } else { "ies were" }
-        );
-        for (name, proposed) in &raw_unconfirmed {
-            println!("  {name}: would set {proposed}");
-        }
+    // The same sequence the MCP's transplant_apply runs: recompute the plan, take a restore point,
+    // write, read back. The plan above is this command's own, so its digest and summary are what
+    // apply is given: running the command is the consent, the digest only guards the gap between
+    // the two reads.
+    let snapshots = snapshots_dir(data_dir);
+    let req = ApplyRequest {
+        plan: input,
+        guard: &guard,
+        snapshots_dir: &snapshots,
+        name_lookup: &name_lookup,
+        expected_digest: &plan.digest,
+        expected_summary: &plan.summary,
+        captured_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
+        gate_policy: if args.allow_partial { GatePolicy::AllowPartial } else { GatePolicy::Strict },
+    };
+    let report = apply_transplant(&device, &req, &mut |_| {}).map_err(|e| {
+        let hint = cli_report::refusal_hint(e.tag()).map(|h| format!("\n{h}")).unwrap_or_default();
+        anyhow::anyhow!("{e}{hint}")
+    })?;
+
+    let text = cli_report::render_transplant(&report.outcomes, false);
+    for w in &text.warnings {
+        eprintln!("{w}");
     }
-    if !literal_unconfirmed.is_empty() {
-        println!(
-            "\n{} numeric propert{} copied as-is would change the target; not written \
-             (an integer is no more self-describing than a raw code, so nothing says both bodies \
-             give it the same meaning). Review, then opt in per property with --allow-raw-code <name>:",
-            literal_unconfirmed.len(),
-            if literal_unconfirmed.len() == 1 { "y" } else { "ies" }
-        );
-        for (name, proposed) in &literal_unconfirmed {
-            println!("  {name}: would set {proposed}");
-        }
+    say(json, &text.stdout);
+    let closing = cli_report::render_transplant_apply(&report);
+    say(json, &closing.stdout);
+    if json {
+        json_out.emit(&serde_json::to_string_pretty(&report)?)?;
     }
-    if !args.dry_run && restore_completely_failed(written, errors) {
-        bail!("all {errors} capability write(s) failed (see warnings above); nothing was transplanted");
+    if let Some(msg) = closing.failing {
+        bail!("{msg}");
     }
     Ok(())
 }
@@ -2393,7 +2376,7 @@ mod tests {
         assert_eq!(snapshot_serial(&Some(usb("")), 7), "id-7");
     }
 
-    // ── snapshot_capture_failed / restore_completely_failed ─────────────────
+    // ── snapshot_capture_failed ─────────────────
 
     #[test]
     fn snapshot_capture_failed_zero_ok_zero_err_is_failure() {
@@ -2425,23 +2408,6 @@ mod tests {
         // Boundary: even a single successful read means this isn't a total
         // failure, regardless of how many others failed.
         assert!(!snapshot_capture_failed(1)); // 99 failed reads alongside don't matter
-    }
-
-    #[test]
-    fn restore_completely_failed_zero_written_zero_errors_is_not_failure() {
-        // e.g. every capability was skipped as absent/read-only — routine,
-        // not an error.
-        assert!(!restore_completely_failed(0, 0));
-    }
-
-    #[test]
-    fn restore_completely_failed_zero_written_nonzero_errors_is_failure() {
-        assert!(restore_completely_failed(0, 1));
-    }
-
-    #[test]
-    fn restore_completely_failed_any_written_is_not_failure() {
-        assert!(!restore_completely_failed(1, 99));
     }
 
     // name_map_for_model's tests now live once, canonically, in

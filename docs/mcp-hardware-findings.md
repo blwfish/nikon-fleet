@@ -610,6 +610,31 @@ three calls and the same source snapshot (the agent was also allowed to call `ge
 - One run, one model, one prompt that asked it to say what looked wrong. It shows the instructions are read and used;
   it does not show that a weaker model follows the plan-then-apply rules (still untested, and no apply was involved).
 
+## F22. The CLI on the shared ops path (2026-10-28)
+
+`nikon-fleet transplant` and `restore` now plan and apply through `ops::plan` / `ops::apply` and
+`ops::restore_flow`, the code the MCP worker runs, so they take a restore point first, hold it and the read-back to
+the model's baseline, and report a status (`--allow-partial` waives the baseline for a restore point that is
+incomplete or has no baseline). `snapshot`, `check`, `transplant` and `restore` gained `--json`, printing the same
+values the worker returns. Read-only, on the Z 9:
+
+- `transplant --dry-run --json` of the 2026-06-02 Z6III snapshot printed digest `80ef8847…bdad36`, the same digest the
+  MCP's `transplant_plan` returned for the same source and body (F20, F21): one plan, two front ends.
+- `snapshot --json` and `restore --dry-run --json --only WBTuneAuto` returned the worker-shaped values; the human
+  `restore --dry-run` text is unchanged apart from two added lines (`Plan:` and `Digest:`).
+- **A defect this found, present before the change:** the SDK prints `InitializeSDK Execution duration: N` to stdout
+  itself, so every `--json` command that opened the SDK (including `discover --json`) printed that line before its
+  JSON. `json_out::JsonOut` now moves stdout to stderr for the rest of the process and writes the JSON to a saved
+  handle; stdout is pure JSON for all five commands (checked on the camera for `discover` and `transplant`).
+- **Not run on hardware:** a non-dry-run `transplant` or `restore` through the CLI. The ops it calls are the ones run
+  on the Z 9 in F18 and F19, and the CLI-side rendering is unit-tested, but the CLI apply path itself has not written
+  to a camera.
+
+Behaviour changes for CLI users: a real `transplant` or `restore` writes a restore point (`mcp-restore-pre-...`) into
+`snapshots/`, refuses (`no_baseline`, `restore_point_incomplete`) unless `--allow-partial`, and exits non-zero on
+any rejected write (before, only when every write failed) or when a written property does not read back. `restore`
+across models, which used to warn and write anyway, is now refused with a pointer to `transplant`.
+
 ## F13. Still unverified
 
 - Whether `available` / `connected_pid` can be obtained, and what they mean while another process

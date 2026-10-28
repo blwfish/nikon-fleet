@@ -42,12 +42,28 @@ pub struct CaptureRequest<'a> {
 pub struct CaptureOutcome {
     /// File name inside the snapshots directory.
     pub file: String,
-    pub label: String,
+    /// The label stored in the file. The MCP always has one (`mcp-...`); the CLI's is optional.
+    pub label: Option<String>,
     pub camera: Camera,
     pub stats: CaptureStats,
     /// `Passed`, or `NoBaseline` (the capture was written but not judged).
     pub gate: GateOutcome,
     pub property_count: usize,
+}
+
+impl CaptureOutcome {
+    /// The one place this value is built, so the CLI's `snapshot --json` and the worker's
+    /// `capture` result cannot drift apart.
+    pub fn new(
+        file: String,
+        label: Option<String>,
+        camera: Camera,
+        property_count: usize,
+        stats: CaptureStats,
+        gate: GateOutcome,
+    ) -> Self {
+        CaptureOutcome { file, label, camera, stats, gate, property_count }
+    }
 }
 
 #[derive(Debug)]
@@ -128,14 +144,7 @@ pub fn capture_snapshot<P: CameraPort + ?Sized>(
     snap.save_new(req.snapshots_dir.join(&file)).map_err(CaptureError::Write)?;
     progress("written");
 
-    Ok(CaptureOutcome {
-        file,
-        label,
-        camera: req.camera.clone(),
-        property_count: snap.properties.len(),
-        stats,
-        gate: verdict,
-    })
+    Ok(CaptureOutcome::new(file, Some(label), req.camera.clone(), snap.properties.len(), stats, verdict))
 }
 
 #[cfg(test)]
@@ -183,7 +192,7 @@ mod tests {
         let (cam, names) = z9(0);
         let mut phases = Vec::new();
         let out = capture_snapshot(&cam, &req(d.path(), "Z 9", Some("wedding"), &names), &mut |p| phases.push(p.to_string())).unwrap();
-        assert_eq!(out.label, "mcp-wedding");
+        assert_eq!(out.label.as_deref(), Some("mcp-wedding"));
         assert_eq!(out.gate, GateOutcome::Passed);
         assert_eq!(out.property_count, 196);
         assert_eq!(phases, ["captured", "written"]);
@@ -199,7 +208,7 @@ mod tests {
         let d = TempDir::new().unwrap();
         let (cam, names) = z9(0);
         let out = capture_snapshot(&cam, &req(d.path(), "Z 9", None, &names), &mut |_| {}).unwrap();
-        assert_eq!(out.label, "mcp-snap");
+        assert_eq!(out.label.as_deref(), Some("mcp-snap"));
     }
 
     #[test]
@@ -325,5 +334,17 @@ mod tests {
         assert_eq!(v["stats"]["read_ok"], json!(196));
         assert_eq!(v["camera"]["serial"], json!("0000003023668"));
         assert_eq!(v["property_count"], json!(196));
+    }
+
+    #[test]
+    fn the_cli_and_the_worker_build_the_same_value_and_an_absent_label_is_null() {
+        let cam = Camera { model: "Z 9".into(), serial: "S".into(), firmware: "5.31".into() };
+        let with = CaptureOutcome::new("f.json".into(), Some("mcp-x".into()), cam.clone(), 3, CaptureStats::default(), GateOutcome::Passed);
+        let without = CaptureOutcome::new("f.json".into(), None, cam, 3, CaptureStats::default(), GateOutcome::Passed);
+        let (a, b) = (serde_json::to_value(&with).unwrap(), serde_json::to_value(&without).unwrap());
+        assert_eq!(a["label"], serde_json::json!("mcp-x"));
+        assert_eq!(b["label"], serde_json::Value::Null);
+        let keys = |v: &serde_json::Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&a), keys(&b));
     }
 }

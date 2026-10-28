@@ -84,16 +84,24 @@ pub fn check<P: CameraPort + ?Sized>(port: &P, req: &CheckRequest<'_>) -> Result
         return Err(CheckError::Incomplete { missing, stats });
     }
     let d = diff_with_schema(req.reference, &live, &DiffOptions::default(), req.schema).map_err(CheckError::Diff)?;
-    let differences = d.changed.len() + d.only_in_a.len() + d.only_in_b.len();
-    Ok(CheckReport {
-        camera: req.live_camera.clone(),
-        reference_label: req.reference.label.clone(),
-        reference_captured_at: req.reference.captured_at.clone(),
-        gate: verdict,
-        stats,
-        diff: d,
-        differences,
-    })
+    Ok(CheckReport::new(req.live_camera.clone(), req.reference, verdict, stats, d))
+}
+
+impl CheckReport {
+    /// The one place this value is built, so the CLI's `check --json` and the worker's `check`
+    /// result cannot drift apart.
+    pub fn new(camera: Camera, reference: &Snapshot, gate: GateOutcome, stats: CaptureStats, diff: Diff) -> Self {
+        let differences = diff.changed.len() + diff.only_in_a.len() + diff.only_in_b.len();
+        CheckReport {
+            camera,
+            reference_label: reference.label.clone(),
+            reference_captured_at: reference.captured_at.clone(),
+            gate,
+            stats,
+            diff,
+            differences,
+        }
+    }
 }
 
 #[cfg(test)]
