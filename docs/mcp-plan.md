@@ -135,7 +135,9 @@ that exists but cannot be read (`reference_read_failures`) instead of treating i
     error. (F3's hangs were ended with SIGTERM or an alarm and the camera was healthy afterwards;
     SIGKILL of the worker has not been tried separately, §8.2.) F24 found the cause of most hangs
     (an unserviced main run loop before `DisconnectDevice`) and `Device::drop` now pumps it first;
-    this grace-then-kill stays as the backstop, since the hang is rare after the pump, not impossible.
+    this grace-then-kill stays as the backstop, since the hang is rare after the pump, not impossible. The read-only
+    operations (`capture`, `check`, both plans) go further: they flush and `_exit` as soon as the result is written,
+    skipping `DisconnectDevice` altogether (120 hardware runs, no hang, F24); the applies keep the ordinary disconnect.
   - No `result` by the deadline, or the worker died: typed `worker_no_result`, carrying the last
     `progress` phase. For an apply that is the `indeterminate` outcome (§5.5): writes may or may
     not have happened and the count is unknown. There is no automatic retry.

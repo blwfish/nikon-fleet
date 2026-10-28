@@ -761,7 +761,16 @@ scratch build with env-var hooks (branch `f3-experiments`, not on master). A run
   an open session left behind by an exiting process does not wedge either body, matching what killed hung workers
   already showed (F3, F14). Not tested: a write followed by a skipped disconnect, and a longer idle gap between
   processes. The cost saved is the fixed 1.5 s the SDK takes to close.
-- **Not yet verified:** the residual-hang cause, a write path (`transplant`/`restore`),
+- **Shipped: read-only commands exit without closing the session.** `snapshot`, `check` and the worker's `capture`,
+  `check`, `transplant-plan` and `restore-plan` now flush and `_exit` as soon as their output is written
+  (`process_exit::exit_now`); both applies, `list-cameras` and every failure path keep the ordinary disconnect with the
+  300 ms pump. Verified on hardware with the release binary: **CLI `snapshot` 30/30 per body exited normally** (Z 9 1.7
+  to 3.1 s, Z6III 2.8 to 3.0 s), **worker `capture` 30/30 per body** (Z 9: exit 0, 196 properties, gate passed, 2.9
+  to 3.1 s; Z6III: exit 0, 200 properties, gate passed, 1.7 to 3.0 s). **120 runs, no hang**, every open succeeded
+  without a replug, and `discover` listed both bodies afterwards. The pre-fix control was 17/56 hung (30%) and the
+  300 ms pump alone about 7%. Not exercised: `check` and the two plans through the worker (same code path and same
+  `Teardown`, but only `capture` and CLI `snapshot` were run), and any write path, which is unchanged.
+- **Not yet verified:** the residual-hang cause on write paths, a write path (`transplant`/`restore`),
   and the worker process. The supervisor's post-result grace and SIGKILL stay as a backstop regardless; the hang was
   never shown to be impossible, only rare after the pump.
 - Camera state was healthy after every kill, as in F3 and F14.
