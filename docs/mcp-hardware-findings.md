@@ -838,6 +838,12 @@ property only: `ISOAutoShutterTimeAutoValue` (33584), the same property as F23, 
     position the Z 9 uses as its default; **that is a guess, nothing read says what 0 means or whether the bodies treat it
     alike.** Copying by number would set the Z6III to 0; harmless if 0 means off, a possible burst blocker if it means zero
     frames. Settling it needs the two bodies' continuous-shooting-limit menu entries read (no write).
+  - **Settled by the user at the cameras (2026-10-28).** It is Custom Setting d2, "maximum shots per burst": **infinity on
+    the Z 9, 200 on the Z6III, which can also be set to infinity.** So index 0 is "infinity", the scale is shared, and the
+    bodies are just set differently; the "zero frames per burst" worry is gone and copying by number is a faithful copy.
+    The concern above ("a range whose defaults differ may not be safe to copy by number") is **withdrawn** for this
+    property. Not verified: that the Z6III's "infinity" reads as index 0 (a read after the user sets it would show it), and
+    why the reported default indexes differ (0 against 200) when the SDK table gives 200 for both.
 - **Waiting on the user's naming (the opt-in rule):** the plan holds five `literal_unconfirmed` skips
   (`ElectronicVR`, `MovieRecMicrophone`, `MovieWBAutoType`, `MovieWindNoiseReduction`, `WBAutoType`) and seven
   `raw_code_unconfirmed` skips (`AEBracketingStep`, `AEBracketingType`, `AFSubjectDetection`, `ImageColorSpace`,

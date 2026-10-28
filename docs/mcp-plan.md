@@ -818,8 +818,11 @@ automating the firmware licence; FTP profile writes; firmware flashing.
   (null when the gate did not judge the capture), which closes the usability item from F20. The three fields F21 left
   unexplained (`unknown_schema: 5`, `source_label: null`, `changes: null`) are explained in the `unreadable-is-normal`
   and new `reading-a-plan` notes: the five `cap_0x…` names are the same generic device facts on both bodies.
-- **Open: range defaults that differ between bodies (F25, read-only follow-up, 2026-10-28).** `ShootingLimit` (33086,
-  "Continuous Shooting Limit") is a `range_clamped` plan item copied by number, but the Z 9 reports index 0 (default 0)
-  and the Z6III index 200 (default 200); the SDK's `RangeValue.config` says range 1 to 200, default 200. It is the one
-  range of 39 whose default differs. What 0 means is not known, so it has not been written and the strategy is
-  unchanged. Candidate policy, not yet decided: skip a range whose `default_index` differs between source and target.
+- **Range defaults that differ between bodies: explained, no policy change (F25, 2026-10-28).** `ShootingLimit` (33086,
+  "Continuous Shooting Limit") is the one range of 39 whose `default_index` differs: Z 9 index 0, Z6III index 200. The
+  user read the cameras: it is Custom Setting d2, "maximum shots per burst", set to **infinity on the Z 9 and 200 on the
+  Z6III, which can also be set to infinity**. So index 0 is the "infinity" position on a scale both bodies share, and the
+  two bodies are simply set differently. Copying by number is then a faithful copy of the setting, not a hazard, and the
+  candidate policy of skipping a range whose defaults differ is **not adopted** (it would skip a real setting).
+  Still unverified: that the Z6III's "infinity" is index 0 (taken from the user's statement and the shared scale, not
+  read back), and why the reported defaults differ (the SDK table says 200 for both). Unwritten on hardware.
