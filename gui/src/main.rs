@@ -209,6 +209,20 @@ struct UnreadableRow {
 }
 
 impl SnapListing {
+    /// The bodies that have stored snapshots but are not among `cameras`, as (model, serial), sorted
+    /// and without repeats. They are what the sidebar offers when no camera is plugged in.
+    fn stored_only_bodies(&self, cameras: &[CameraRow]) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .rows
+            .iter()
+            .filter(|r| !cameras.iter().any(|c| c.model == r.model && c.serial == r.serial))
+            .map(|r| (r.model.clone(), r.serial.clone()))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     fn rows_for<'a>(&'a self, model: &'a str, serial: &'a str) -> impl Iterator<Item = &'a SnapRow> {
         self.rows.iter().filter(move |r| r.model == model && r.serial == serial)
     }
@@ -483,6 +497,9 @@ struct FleetApp {
     evt_rx: mpsc::Receiver<Evt>,
     cameras: Vec<CameraRow>,
     selected: Option<usize>,
+    /// A body that is not connected but has stored snapshots, picked from the sidebar's "Stored" list
+    /// (model, serial). Only ever set while `selected` is `None`.
+    selected_stored: Option<(String, String)>,
     listing: Option<SnapListing>,
     viewers: SnapshotViewers,
     view_tx: mpsc::Sender<ViewLoad>,
@@ -526,6 +543,7 @@ impl FleetApp {
             evt_rx,
             cameras: Vec::new(),
             selected: None,
+            selected_stored: None,
             listing: None,
             viewers: SnapshotViewers::default(),
             view_tx,
@@ -649,6 +667,9 @@ impl FleetApp {
                     };
                     self.cameras = found.rows;
                     self.selected = (!self.cameras.is_empty()).then_some(0);
+                    if self.selected.is_some() {
+                        self.selected_stored = None;
+                    }
                     self.notices = found.notices;
                     self.cli_log = found.cli_log;
                 }
@@ -1075,6 +1096,8 @@ impl FleetApp {
 
     fn ui_sidebar(&mut self, ctx: &egui::Context) {
         let mut cam_select: Option<usize> = None;
+        let mut stored_select: Option<(String, String)> = None;
+        let stored = self.listing.as_ref().map(|l| l.stored_only_bodies(&self.cameras)).unwrap_or_default();
         egui::SidePanel::left("cameras").min_width(180.0).show(ctx, |ui| {
             ui.heading("Cameras");
             ui.separator();
@@ -1090,10 +1113,28 @@ impl FleetApp {
                     cam_select = Some(i);
                 }
             }
+            if !stored.is_empty() {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Stored, not connected").weak());
+                ui.separator();
+                for body in &stored {
+                    let picked = self.selected.is_none() && self.selected_stored.as_ref() == Some(body);
+                    if ui.selectable_label(picked, format!("{}\n{}", body.0, body.1)).clicked() {
+                        stored_select = Some(body.clone());
+                    }
+                }
+            }
         });
         if let Some(i) = cam_select {
             self.label = label_after_selection(self.selected, i, std::mem::take(&mut self.label));
             self.selected = Some(i);
+            self.selected_stored = None;
+        }
+        if let Some(body) = stored_select {
+            // A label typed for a connected body must not stay on a screen where nothing can be captured.
+            self.label.clear();
+            self.selected = None;
+            self.selected_stored = Some(body);
         }
     }
 
@@ -1105,42 +1146,54 @@ impl FleetApp {
         let data_ready = self.settings.data_dir.is_some();
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(cam) = self.selected.and_then(|i| self.cameras.get(i)) else {
+            let connected = self.selected.and_then(|i| self.cameras.get(i));
+            let stored = if connected.is_none() { self.selected_stored.clone() } else { None };
+            let Some((model, serial)) =
+                connected.map(|c| (c.model.clone(), c.serial.clone())).or(stored)
+            else {
                 ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Select a camera to see snapshots").italics().weak());
+                    ui.label(egui::RichText::new("Select a camera, or a stored body, to see snapshots").italics().weak());
                 });
                 return;
             };
 
-            ui.horizontal(|ui| {
-                ui.heading(&cam.model);
-                ui.label(egui::RichText::new(format!("{}  fw {}", cam.serial, cam.firmware)).weak());
-            });
-            if !cam.known_model {
-                ui.colored_label(egui::Color32::from_rgb(200, 120, 0), "Not one of the surveyed models.");
-            } else if !cam.baseline {
-                ui.colored_label(
-                    egui::Color32::from_rgb(200, 120, 0),
-                    "No capture baseline for this model: a snapshot is saved without a completeness check.",
-                );
-            }
-            if cam.pairing_ambiguous() {
-                ui.colored_label(
-                    egui::Color32::from_rgb(200, 60, 60),
-                    AmbiguousPairing { model: cam.model.clone(), count: cam.model_count }.to_string(),
-                );
-            }
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(!busy && data_ready && !cam.pairing_ambiguous(), |ui| {
-                    ui.label("Label:");
-                    ui.text_edit_singleline(&mut self.label);
-                    if ui.button("Take Snapshot").clicked() {
-                        snap_trigger = true;
-                    }
+            if let Some(cam) = connected {
+                ui.horizontal(|ui| {
+                    ui.heading(&cam.model);
+                    ui.label(egui::RichText::new(format!("{}  fw {}", cam.serial, cam.firmware)).weak());
                 });
-            });
+                if !cam.known_model {
+                    ui.colored_label(egui::Color32::from_rgb(200, 120, 0), "Not one of the surveyed models.");
+                } else if !cam.baseline {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 120, 0),
+                        "No capture baseline for this model: a snapshot is saved without a completeness check.",
+                    );
+                }
+                if cam.pairing_ambiguous() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 60, 60),
+                        AmbiguousPairing { model: cam.model.clone(), count: cam.model_count }.to_string(),
+                    );
+                }
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!busy && data_ready && !cam.pairing_ambiguous(), |ui| {
+                        ui.label("Label:");
+                        ui.text_edit_singleline(&mut self.label);
+                        if ui.button("Take Snapshot").clicked() {
+                            snap_trigger = true;
+                        }
+                    });
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.heading(&model);
+                    ui.label(egui::RichText::new(&serial).weak());
+                });
+                ui.label(egui::RichText::new("Not connected: its stored snapshots can be viewed and one set as the reference.").weak());
+            }
             ui.separator();
 
             let Some(listing) = &self.listing else {
@@ -1159,7 +1212,7 @@ impl FleetApp {
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for snap in listing.rows_for(&cam.model, &cam.serial) {
+                for snap in listing.rows_for(&model, &serial) {
                     ui.horizontal(|ui| {
                         let ts = snap.captured_at.get(..19).unwrap_or(&snap.captured_at);
                         let lbl = snap.label.as_deref().unwrap_or("(no label)");
@@ -3287,6 +3340,54 @@ mod tests {
             assert_eq!(&got, want, "serial {serial:?}");
         }
         assert!(l.unreadable.iter().any(|u| u.file == "broken.json"));
+    }
+
+    fn stored(file: &str, model: &str, serial: &str) -> SnapRow {
+        SnapRow {
+            file: file.into(),
+            model: model.into(),
+            serial: serial.into(),
+            label: None,
+            captured_at: "2026-01-01T00:00:00Z".into(),
+            is_reference: false,
+            name_lossy: false,
+        }
+    }
+
+    #[test]
+    fn with_no_camera_attached_every_stored_body_is_offered_once_in_order() {
+        let l = SnapListing {
+            rows: vec![
+                stored("1.json", "Z 9", "S2"),
+                stored("2.json", "Z 5", "S1"),
+                stored("3.json", "Z 9", "S2"),
+                stored("4.json", "Z 9", "S1"),
+            ],
+            ..SnapListing::default()
+        };
+        let want: Vec<(String, String)> =
+            [("Z 5", "S1"), ("Z 9", "S1"), ("Z 9", "S2")].iter().map(|(m, s)| (m.to_string(), s.to_string())).collect();
+        assert_eq!(l.stored_only_bodies(&[]), want, "sorted by model then serial, two files of one body counted once");
+        assert!(SnapListing::default().stored_only_bodies(&[]).is_empty(), "nothing stored, nothing offered");
+    }
+
+    #[test]
+    fn a_connected_body_is_not_offered_again_but_the_same_model_or_serial_alone_does_not_hide_one() {
+        let l = SnapListing {
+            rows: vec![
+                stored("a.json", "Z 9", "S1"),
+                stored("b.json", "Z 9", "S2"),
+                stored("c.json", "Z 5", "S1"),
+            ],
+            ..SnapListing::default()
+        };
+        let connected = [row("Z 9", "S1", 1)];
+        let got = l.stored_only_bodies(&connected);
+        assert_eq!(
+            got,
+            [("Z 5".to_string(), "S1".to_string()), ("Z 9".to_string(), "S2".to_string())],
+            "Z 9/S1 is connected; the other Z 9 (S2) and the Z 5 with the same serial are still stored-only"
+        );
     }
 
     #[test]
