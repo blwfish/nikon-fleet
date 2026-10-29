@@ -29,6 +29,12 @@ use serde::Deserialize;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
+mod restore;
+
+use restore::{
+    RestoreApplyJson, RestorePlanJson, RestoreRequest, RestoreUi, SourceView, UndoOffer, RestoreActionLike,
+};
+
 // This GUI is a thin front end over the `nikon-fleet` CLI and the `nikon_fleet`
 // library. Everything that touches a camera (discover, snapshot, the vendor ops)
 // runs as a CLI subprocess with a timeout, so a hung SDK call can never wedge this
@@ -102,6 +108,11 @@ enum Cmd {
     /// WRITES TO THE CAMERA, only the plan with this digest and summary (the ones that were shown
     /// and confirmed).
     TransplantApply { request: TransplantRequest, digest: String, summary: String },
+    /// Read-only: plan putting a stored snapshot of a connected body back on it.
+    RestorePlan { request: RestoreRequest },
+    /// WRITES TO THE CAMERA, only the plan with this digest and summary (the ones that were shown
+    /// and confirmed).
+    RestoreApply { request: RestoreRequest, digest: String, summary: String },
 }
 
 enum Evt {
@@ -111,6 +122,8 @@ enum Evt {
     Vendor { op: VendorOp, result: Result<VendorOut, String> },
     TransplantPlanned { request: TransplantRequest, result: Result<(PlanJson, String), String> },
     TransplantApplied { request: TransplantRequest, outcome: ApplyOutcome },
+    RestorePlanned { request: RestoreRequest, result: Result<(RestorePlanJson, String, SourceView), String> },
+    RestoreApplied { request: RestoreRequest, outcome: ApplyOutcome<RestoreApplyJson> },
     Err(String),
 }
 
@@ -540,6 +553,7 @@ struct FleetApp {
     pending_write: Option<PendingWrite>,
     vendor_write_result: String,
     transplant: TransplantUi,
+    restore: RestoreUi,
 }
 
 impl FleetApp {
@@ -583,6 +597,7 @@ impl FleetApp {
             pending_write: None,
             vendor_write_result: String::new(),
             transplant: TransplantUi::default(),
+            restore: RestoreUi::default(),
         };
         app.refresh_listing();
         app
@@ -631,6 +646,7 @@ impl FleetApp {
     /// Tell the worker which directory the (re)loaded settings name, and re-list it.
     fn use_settings_data_dir(&mut self) {
         self.transplant.data_dir_changed();
+        self.restore.data_dir_changed();
         if self.cmd_tx.send(Cmd::SetDataDir(self.settings.data_dir_or_err())).is_err() {
             self.status = Status::new(Level::Error, "The worker thread has stopped; restart the app.");
             return;
@@ -687,6 +703,7 @@ impl FleetApp {
         self.busy_since = None;
         self.status = Status::new(Level::Error, "The worker thread has stopped; restart the app.");
         self.transplant.worker_lost();
+        self.restore.worker_lost();
     }
 
     fn poll(&mut self) {
@@ -755,6 +772,22 @@ impl FleetApp {
                         self.refresh_listing();
                     }
                 }
+                Evt::RestorePlanned { request, result } => {
+                    self.status = match &result {
+                        Ok((plan, _, _)) => Status::new(Level::Info, format!("Restore plan: {}", plan.summary)),
+                        Err(e) => Status::new(Level::Error, e.lines().next().unwrap_or("").to_string()),
+                    };
+                    self.restore.plan_arrived(request, result);
+                }
+                Evt::RestoreApplied { request, outcome } => {
+                    self.status = applied_status_of("Restore", &outcome);
+                    // A restore point may have been written, and the camera may have changed.
+                    let wrote = !matches!(outcome, ApplyOutcome::NotApplied { .. });
+                    self.restore.applied(request, outcome);
+                    if wrote {
+                        self.refresh_listing();
+                    }
+                }
                 Evt::Err(msg) => self.status = Status::new(Level::Error, format!("Error: {msg}")),
             }
         }
@@ -798,11 +831,13 @@ impl eframe::App for FleetApp {
         self.poll_views();
         self.drop_stale_confirmation();
         self.transplant.sync(&self.cameras);
+        self.restore.sync(&self.cameras);
         self.ui_toolbar(ctx);
         self.ui_notices(ctx);
         self.ui_preferences(ctx);
         self.ui_vendor_ops(ctx);
         self.ui_transplant(ctx);
+        self.ui_restore(ctx);
         self.ui_sidebar(ctx);
         self.ui_main(ctx);
         self.ui_snapshot_viewers(ctx);
@@ -826,6 +861,9 @@ impl FleetApp {
                 }
                 if ui.button("⇄ Transplant").clicked() {
                     self.transplant.open = !self.transplant.open;
+                }
+                if ui.button("↺ Restore").clicked() {
+                    self.restore.open = !self.restore.open;
                 }
                 ui.separator();
                 if let Some(since) = self.busy_since {
@@ -1210,6 +1248,7 @@ impl FleetApp {
         let mut ref_action: Option<String> = None;
         let mut view_action: Option<(String, bool, bool)> = None;
         let mut transplant_from: Option<((String, String), String)> = None;
+        let mut restore_from: Option<((String, String), String)> = None;
         let busy = self.busy();
         let data_ready = self.settings.data_dir.is_some();
 
@@ -1306,6 +1345,15 @@ impl FleetApp {
                         });
                         ui.add_enabled_ui(!busy && !snap.name_lossy, |ui| {
                             if ui
+                                .small_button("Restore…")
+                                .on_hover_text("Put this snapshot's settings back on its own body (you will see a plan first)")
+                                .clicked()
+                            {
+                                restore_from = Some(((snap.model.clone(), snap.serial.clone()), snap.file.clone()));
+                            }
+                        });
+                        ui.add_enabled_ui(!busy && !snap.name_lossy, |ui| {
+                            if ui
                                 .small_button("Transplant…")
                                 .on_hover_text("Copy this snapshot's settings onto a connected body (you will see a plan first)")
                                 .clicked()
@@ -1332,6 +1380,9 @@ impl FleetApp {
         }
         if let Some((body, file)) = transplant_from {
             self.start_transplant_from(body, file);
+        }
+        if let Some((body, file)) = restore_from {
+            self.start_restore_from(body, file);
         }
     }
 
@@ -1474,6 +1525,27 @@ fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Evt>, ctx: egui::Context, in
                     Evt::TransplantPlanned { request, result }
                 }
                 Err(e) => Evt::TransplantPlanned { request, result: Err(e.clone()) },
+            },
+            Cmd::RestorePlan { request } => match data_dir.as_ref() {
+                Ok(d) => {
+                    let result = restore::do_restore_plan(d, &request);
+                    Evt::RestorePlanned { request, result }
+                }
+                Err(e) => Evt::RestorePlanned { request, result: Err(e.clone()) },
+            },
+            Cmd::RestoreApply { request, digest, summary } => match data_dir.as_ref() {
+                Ok(d) => {
+                    let outcome = restore::do_restore_apply(d, &request, &digest, &summary);
+                    Evt::RestoreApplied { request, outcome }
+                }
+                Err(message) => Evt::RestoreApplied {
+                    request,
+                    outcome: ApplyOutcome::NotApplied {
+                        why: NotAppliedWhy::Refused,
+                        message: message.clone(),
+                        cli_log: String::new(),
+                    },
+                },
             },
             Cmd::TransplantApply { request, digest, summary } => match data_dir.as_ref() {
                 Ok(d) => {
@@ -2651,9 +2723,9 @@ fn check_plan_is_for(plan: &PlanJson, request: &TransplantRequest) -> Result<(),
 /// What an apply came to. The CLI's report decides; without one, the way the run ended says only
 /// whether the camera was certainly not written.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ApplyOutcome {
+enum ApplyOutcome<R = ApplyJson> {
     /// The CLI reported (the report's `status` is the verdict).
-    Report { report: Box<ApplyJson>, note: Option<String>, cli_log: String },
+    Report { report: Box<R>, note: Option<String>, cli_log: String },
     /// Refused before any write; the camera is as it was.
     NotApplied { why: NotAppliedWhy, message: String, cli_log: String },
     /// No report and a run that may have written: the camera may have changed.
@@ -2707,13 +2779,41 @@ fn transplant_apply_via(
 /// also ends 1 for an apply that wrote but did not fully take, and a report this program cannot
 /// read (a newer CLI, a report cut off) looks the same as no report.
 fn classify_apply(result: Result<CliOutput, CliError>, confirmed_digest: &str) -> ApplyOutcome {
-    let report_of = |stdout: &str| serde_json::from_str::<ApplyJson>(stdout.trim()).ok();
+    classify_apply_as::<ApplyJson>(result, confirmed_digest)
+}
+
+/// What an apply's JSON report says that the way it ended depends on, whichever command printed it.
+trait AppliedReport: serde::de::DeserializeOwned {
+    fn plan_digest(&self) -> &str;
+    fn status(&self) -> ApplyStatus;
+    fn restore_point(&self) -> Option<&RestorePointJson>;
+    /// The properties an undo of this apply puts back.
+    fn undo_set(&self) -> &[String];
+}
+
+impl AppliedReport for ApplyJson {
+    fn plan_digest(&self) -> &str {
+        &self.plan_digest
+    }
+    fn status(&self) -> ApplyStatus {
+        self.status
+    }
+    fn restore_point(&self) -> Option<&RestorePointJson> {
+        self.restore_point.as_ref()
+    }
+    fn undo_set(&self) -> &[String] {
+        &self.undo_set
+    }
+}
+
+fn classify_apply_as<R: AppliedReport>(result: Result<CliOutput, CliError>, confirmed_digest: &str) -> ApplyOutcome<R> {
+    let report_of = |stdout: &str| serde_json::from_str::<R>(stdout.trim()).ok();
     let (stdout, stderr, failure) = match result {
         Ok(out) => (out.stdout, out.stderr, None),
         Err(e) => (e.stdout.clone(), e.stderr.clone(), Some(e)),
     };
     if let Some(report) = report_of(&stdout) {
-        if report.plan_digest != confirmed_digest {
+        if report.plan_digest() != confirmed_digest {
             return ApplyOutcome::Indeterminate {
                 message: "The command reported a different plan than the one that was confirmed, so what it wrote \
                           is not what you approved."
@@ -2765,8 +2865,8 @@ fn status_headline(status: ApplyStatus) -> (Level, &'static str) {
 
 /// What a failed apply leaves unsaid: the writes are made one after another, so one that failed
 /// does not mean the others did not land. Said only where there is a restore point to point to.
-fn failed_aftermath(r: &ApplyJson) -> Option<&'static str> {
-    (r.status == ApplyStatus::Failed && r.restore_point.is_some()).then_some(
+fn failed_aftermath<R: AppliedReport>(r: &R) -> Option<&'static str> {
+    (r.status() == ApplyStatus::Failed && r.restore_point().is_some()).then_some(
         "Some writes may have landed even though this failed. Compare the camera with the restore point below; the command under it puts back what this changed.",
     )
 }
@@ -3186,23 +3286,28 @@ impl TransplantUi {
     }
 }
 
-/// The status-bar line for an apply outcome.
+/// The status-bar line for a transplant outcome.
 fn applied_status(outcome: &ApplyOutcome) -> Status {
+    applied_status_of("Transplant", outcome)
+}
+
+/// The status-bar line for the outcome of `what` (a transplant, a restore).
+fn applied_status_of<R: AppliedReport>(what: &str, outcome: &ApplyOutcome<R>) -> Status {
     match outcome {
         ApplyOutcome::Report { report, .. } => {
-            let (level, text) = status_headline(report.status);
-            let aftermath = failed_aftermath(report).map(|_| " Some writes may have landed: a restore point was saved, see the result.");
-            Status::new(level, format!("Transplant {}: {text}{}", report.status.tag(), aftermath.unwrap_or("")))
+            let (level, text) = status_headline(report.status());
+            let aftermath = failed_aftermath(&**report).map(|_| " Some writes may have landed: a restore point was saved, see the result.");
+            Status::new(level, format!("{what} {}: {text}{}", report.status().tag(), aftermath.unwrap_or("")))
         }
         ApplyOutcome::NotApplied { why, message, .. } => Status::new(
             Level::Warn,
             match why {
-                NotAppliedWhy::PlanStale => "Transplant not_applied: the camera no longer matches the plan you approved; nothing was written. Plan again.".to_string(),
-                NotAppliedWhy::Refused => format!("Transplant not_applied: {message}"),
+                NotAppliedWhy::PlanStale => format!("{what} not_applied: the camera no longer matches the plan you approved; nothing was written. Plan again."),
+                NotAppliedWhy::Refused => format!("{what} not_applied: {message}"),
             },
         ),
         ApplyOutcome::Indeterminate { message, .. } => {
-            Status::new(Level::Error, format!("Transplant indeterminate: {message} Take a snapshot and compare before trying again."))
+            Status::new(Level::Error, format!("{what} indeterminate: the camera may have been changed. {message} Take a snapshot and compare before trying again."))
         }
     }
 }
@@ -3223,6 +3328,7 @@ enum TransplantAction {
     Discard,
     View(String),
     Copy(String),
+    Undo(UndoOffer),
 }
 
 const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 120, 0);
@@ -3356,7 +3462,7 @@ fn draw_plan(ui: &mut egui::Ui, p: &PlannedTransplant, can_opt_in: bool, busy: b
     }
 }
 
-fn draw_applied(ui: &mut egui::Ui, a: &AppliedTransplant, action: &mut Option<TransplantAction>) {
+fn draw_applied(ui: &mut egui::Ui, a: &AppliedTransplant, busy: bool, action: &mut Option<TransplantAction>) {
     let t = &a.request.target;
     ui.label(egui::RichText::new(format!("{}  →  {} {}", a.request.source_file, t.model, t.serial)).weak());
     match &a.outcome {
@@ -3375,27 +3481,13 @@ fn draw_applied(ui: &mut egui::Ui, a: &AppliedTransplant, action: &mut Option<Tr
                 ui.label(egui::RichText::new(format!("{skipped} propert(ies) were skipped, as the plan showed.")).weak());
             }
             if let Some(rp) = &report.restore_point {
-                ui.separator();
-                ui.label(egui::RichText::new("Restore point").strong());
-                ui.label("The camera as it was just before this apply:");
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&rp.file).monospace());
-                    if ui.small_button("View").clicked() {
-                        *action = Some(TransplantAction::View(rp.file.clone()));
-                    }
-                });
-                let undo = undo_command(&rp.file, &report.undo_set);
-                ui.label("To put back what this changed, run:");
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(&undo).monospace());
-                    if ui.small_button("Copy").clicked() {
-                        *action = Some(TransplantAction::Copy(undo.clone()));
-                    }
-                });
-                if !report.undo_set.is_empty() {
-                    egui::CollapsingHeader::new(format!("Properties an undo puts back ({})", report.undo_set.len()))
-                        .id_salt("tp_undo_set")
-                        .show(ui, |ui| ui.label(names_list(&report.undo_set)));
+                let offer = restore::undo_offer(&a.request.target, &a.outcome);
+                if let Some(c) = restore::draw_restore_point(ui, rp, offer.as_ref(), &report.undo_set, busy) {
+                    *action = Some(match c {
+                        RestoreActionLike::View(f) => TransplantAction::View(f),
+                        RestoreActionLike::Copy(c) => TransplantAction::Copy(c),
+                        RestoreActionLike::Undo(o) => TransplantAction::Undo(o),
+                    });
                 }
             }
             if !cli_log.trim().is_empty() {
@@ -3593,7 +3685,7 @@ impl FleetApp {
                             );
                         }
                         TransplantStage::Done(a) => {
-                            draw_applied(ui, a, &mut action);
+                            draw_applied(ui, a, busy, &mut action);
                             ui.separator();
                             if ui.button("Close this result").clicked() {
                                 action = Some(TransplantAction::Discard);
@@ -3635,6 +3727,7 @@ impl FleetApp {
             TransplantAction::Discard => self.transplant.discard(),
             TransplantAction::View(file) => self.open_snapshot(ctx, &file, false, false),
             TransplantAction::Copy(text) => ctx.copy_text(text),
+            TransplantAction::Undo(offer) => self.start_undo(offer),
         }
     }
 
@@ -4584,12 +4677,12 @@ mod tests {
 
     /// A path that is absolute on this platform: `/x` is only relative on Windows, where the
     /// settings code refuses it.
-    fn abs_path(unix: &str) -> String {
+    pub(crate) fn abs_path(unix: &str) -> String {
         if cfg!(windows) { format!("C:{}", unix.replace('/', "\\")) } else { unix.to_string() }
     }
 
     #[cfg(unix)]
-    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    pub(crate) fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -4598,7 +4691,7 @@ mod tests {
 
     #[cfg(unix)]
     /// A stand-in for the CLI: records its argv (one per line) and stdin next to it, then runs `tail`.
-    fn recording_cli(dir: &Path, tail: &str) -> PathBuf {
+    pub(crate) fn recording_cli(dir: &Path, tail: &str) -> PathBuf {
         script(
             dir,
             "nikon-fleet",
@@ -4609,7 +4702,7 @@ mod tests {
         )
     }
 
-    fn argv_of(dir: &Path) -> Vec<String> {
+    pub(crate) fn argv_of(dir: &Path) -> Vec<String> {
         fs::read_to_string(dir.join("argv.txt")).unwrap().lines().map(str::to_string).collect()
     }
 
@@ -4624,7 +4717,7 @@ mod tests {
         s.to_pretty_json().unwrap().into_bytes()
     }
 
-    fn write_snapshot(dir: &Path, file: &str, model: &str, serial: &str, captured_at: &str) {
+    pub(crate) fn write_snapshot(dir: &Path, file: &str, model: &str, serial: &str, captured_at: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join(file), snapshot_bytes(model, serial, captured_at, "test")).unwrap();
     }
@@ -4661,7 +4754,7 @@ mod tests {
         fs::write(dir.join("source-page.html"), b"<html></html>").unwrap();
     }
 
-    fn row(model: &str, serial: &str, model_count: usize) -> CameraRow {
+    pub(crate) fn row(model: &str, serial: &str, model_count: usize) -> CameraRow {
         CameraRow {
             model: model.into(),
             serial: serial.into(),
@@ -4672,11 +4765,11 @@ mod tests {
         }
     }
 
-    fn usb(model: &str, serial: &str) -> UsbCameraInfo {
+    pub(crate) fn usb(model: &str, serial: &str) -> UsbCameraInfo {
         UsbCameraInfo { product_id: 0, serial: serial.into(), firmware: "5.31".into(), model: model.into() }
     }
 
-    fn scan_of(cameras: Vec<UsbCameraInfo>) -> CameraList {
+    pub(crate) fn scan_of(cameras: Vec<UsbCameraInfo>) -> CameraList {
         describe_scan(&UsbScan { cameras, ..UsbScan::default() })
     }
 
@@ -7302,12 +7395,12 @@ mod tests {
 
     // ── how an apply ended ───────────────────────────────────────────────
 
-    fn cli_error(kind: CliFailure, code: Option<i32>, stdout: &str) -> CliError {
+    pub(crate) fn cli_error(kind: CliFailure, code: Option<i32>, stdout: &str) -> CliError {
         CliError { kind, message: "the message".into(), stdout: stdout.into(), stderr: "log".into(), code }
     }
 
     /// The library's own apply reports, in the three ways an apply that wrote can end.
-    fn library_apply_json(scenario: &str) -> (String, ApplyStatus) {
+    pub(crate) fn library_apply_json(scenario: &str) -> (String, ApplyStatus) {
         let b = baseline_for("Z 9").unwrap();
         let codes: Vec<(String, u32)> = b.readable.iter().skip(6).take(4).map(|c| (c.name.clone(), c.code)).collect();
         let mut cam = FakeCamera::new();
@@ -7697,7 +7790,7 @@ mod tests {
 
     /// An app with no worker behind it: what it sends is read back from `cmd_rx`, and an answer is
     /// delivered through `evt_tx`.
-    fn test_app() -> (FleetApp, mpsc::Receiver<Cmd>, mpsc::Sender<Evt>, TempDir) {
+    pub(crate) fn test_app() -> (FleetApp, mpsc::Receiver<Cmd>, mpsc::Sender<Evt>, TempDir) {
         let dir = TempDir::new().unwrap();
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = mpsc::channel();
@@ -7735,6 +7828,7 @@ mod tests {
             pending_write: None,
             vendor_write_result: String::new(),
             transplant: TransplantUi::default(),
+            restore: RestoreUi::default(),
         };
         (app, cmd_rx, evt_tx, dir)
     }
