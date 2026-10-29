@@ -26,6 +26,12 @@
 //!   within a few hundred iterations). Callers treat `Busy` as "try again
 //!   later", which is the contract anyway; nothing here waits.
 //!
+//! - On Windows the same lock is `LockFileEx` through `std::fs::File::try_lock` (Rust 1.89+),
+//!   held on the open handle and released by the OS when the process dies. It lives under
+//!   `%LOCALAPPDATA%\nikon-fleet\camera.lock`. Std opens the handle non-inheritable, so a child
+//!   process does not keep it. Only the unix branch has been run against a real camera session;
+//!   the Windows branch is exercised by the `windows` CI job and by docs/windows-smoke-test.md.
+//!
 //! The lock cannot exclude USB clients outside this project (NX Studio,
 //! Image Capture, other PTP software).
 
@@ -35,6 +41,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+
+/// The environment variable the default lock path is built under: the user's home on unix, the
+/// per-user local application data directory on Windows.
+#[cfg(windows)]
+const HOME_VAR: &str = "LOCALAPPDATA";
+#[cfg(not(windows))]
+const HOME_VAR: &str = "HOME";
 
 /// Environment override for the lock path (tests, unusual layouts). An empty
 /// value is ignored, like an unset one.
@@ -53,7 +66,7 @@ pub enum LockError {
         #[source]
         source: io::Error,
     },
-    #[error("cannot determine the camera lock path: {LOCK_PATH_ENV} and HOME are both unset or empty")]
+    #[error("cannot determine the camera lock path: {LOCK_PATH_ENV} and {HOME_VAR} are both unset or empty")]
     NoPath,
     #[error("the camera lock is not supported on this platform")]
     Unsupported,
@@ -81,7 +94,7 @@ pub struct CameraLock {
 impl CameraLock {
     /// Take the lock at the default path (see [`lock_path_from`]).
     pub fn acquire() -> Result<Self, LockError> {
-        let path = lock_path_from(std::env::var_os(LOCK_PATH_ENV), std::env::var_os("HOME"))?;
+        let path = lock_path_from(std::env::var_os(LOCK_PATH_ENV), std::env::var_os(HOME_VAR))?;
         Self::acquire_at(&path)
     }
 
@@ -129,13 +142,22 @@ fn try_flock_exclusive(file: &File, path: &Path) -> Result<(), LockError> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn try_flock_exclusive(file: &File, path: &Path) -> Result<(), LockError> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(fs::TryLockError::WouldBlock) => Err(LockError::Busy { path: path.to_path_buf() }),
+        Err(fs::TryLockError::Error(source)) => Err(LockError::Io { path: path.to_path_buf(), source }),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn try_flock_exclusive(_file: &File, _path: &Path) -> Result<(), LockError> {
     Err(LockError::Unsupported)
 }
 
 /// The lock path: the override if set and non-empty, else a fixed per-user
-/// location under `home`. Pure so the choice is testable without touching the
+/// location under `home` (`HOME`, or `%LOCALAPPDATA%` on Windows). Pure so the choice is testable without touching the
 /// environment.
 pub fn lock_path_from(
     env_override: Option<OsString>,
@@ -146,7 +168,9 @@ pub fn lock_path_from(
     }
     let home = home.filter(|h| !h.is_empty()).ok_or(LockError::NoPath)?;
     let base = PathBuf::from(home);
-    Ok(if cfg!(target_os = "macos") {
+    Ok(if cfg!(windows) {
+        base.join("nikon-fleet").join("camera.lock")
+    } else if cfg!(target_os = "macos") {
         base.join("Library/Application Support/nikon-fleet/camera.lock")
     } else {
         base.join(".local/state/nikon-fleet/camera.lock")
