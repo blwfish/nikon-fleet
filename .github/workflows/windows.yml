@@ -1,0 +1,24 @@
+# Does the Windows build work? Until this job existed nothing had ever compiled the library, the CLI
+# or the egui GUI for Windows (docs/firmware-source-findings.md says so). It builds the same crates
+# a Windows user needs and runs their tests. No camera, SDK or display is involved.
+#
+# Left out on purpose: fleet-mcp (it uses tokio's unix signal pipe; the MCP server is macOS/Linux only,
+# docs/mcp-plan.md) and the Python/tk GUI (gui/*.py).
+name: windows
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The crates are edition 2024: needs Rust 1.85 or newer.
+      - run: rustup update stable
+      - run: rustc --version && cargo --version
+      - run: cargo build -p nikon-fleet -p fleet-gui
+      - run: cargo test -p nikon-fleet -p fleet-gui --no-fail-fast
