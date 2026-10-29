@@ -37,6 +37,7 @@ use nikon_fleet::ops::capture::{self as ops_capture, CaptureStats};
 use nikon_fleet::ops::firmware_latest::{LatestReport, ModelSurvey, survey_json, survey_models, watch_models};
 use nikon_fleet::ops::paths::{checked_reference_filename, is_safe_path_component, write_atomic};
 use nikon_fleet::ops::list::{EntryState, Listing, list_dir};
+use nikon_fleet::ops::render;
 use nikon_fleet::ops::restore;
 use nikon_fleet::ops::target::{
     TargetError, body_firmware, raw_usb_serial_arg, select_by_cli_serial, storable_serial,
@@ -133,6 +134,10 @@ enum Cmd {
 
     /// List stored snapshots.
     Ls(LsArgs),
+
+    /// Show what a stored snapshot holds. Reads one file; no camera, no SDK.
+    #[command(after_help = SHOW_HELP)]
+    Show(ShowArgs),
 
     /// Remove a stored snapshot.
     Rm(RmArgs),
@@ -297,6 +302,32 @@ struct LsArgs {
     camera: Option<String>,
     /// Output as JSON (one object: dir, dir_exists, entries, skipped_dir_entries).
     /// An unreadable file is listed with status "unreadable" and an error_kind.
+    #[arg(long)]
+    json: bool,
+}
+
+const SHOW_HELP: &str = "\
+Reads one snapshot or reference file and prints each property as `name [0xCODE] = value`, sorted
+by name, with the kNkMAIDCapability_ prefix left off. Nothing touches a camera or the SDK.
+
+SNAPSHOT_FILE is a path, or a bare file name (as `ls` prints it) looked up in snapshots/ and then
+references/ of --data-dir, and failing that in the current directory.
+
+Values that are missing or unusable are shown as such, never as a default: `(missing)`,
+`(malformed: why)`. --filter keeps the properties whose name, shown value, hex code (0xd053 or
+d053) or decimal code contains TEXT, ignoring case. --json prints the whole result (header,
+rows with a kind and notes per value, filtered_out, truncated) as one JSON document.
+
+Exit status: 0 shown, 1 the file is missing or not a valid snapshot, 2 bad arguments.";
+
+#[derive(Args, Debug)]
+struct ShowArgs {
+    /// A snapshot or reference file: a path, or a bare file name from snapshots/ or references/.
+    snapshot_file: PathBuf,
+    /// Only the properties whose name, value or code contains TEXT (ignoring case).
+    #[arg(long, value_name = "TEXT")]
+    filter: Option<String>,
+    /// Print the result as one JSON document instead of text.
     #[arg(long)]
     json: bool,
 }
@@ -782,6 +813,18 @@ fn cmd_ls(data_dir: &Path, args: &LsArgs) -> Result<()> {
     }
     if listing.entries.is_empty() {
         println!("(no snapshots match)");
+    }
+    Ok(())
+}
+
+fn cmd_show(data_dir: &Path, args: &ShowArgs) -> Result<()> {
+    let path = render::locate(data_dir, &args.snapshot_file)?;
+    let snapshot = render::load(&path)?;
+    let rendered = render::render_snapshot(&snapshot, args.filter.as_deref());
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&rendered)?);
+    } else {
+        print!("{}", rendered.to_text(args.filter.as_deref()));
     }
     Ok(())
 }
@@ -2685,6 +2728,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Check(args) => cmd_check(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
         Cmd::Diff(args) => cmd_diff(&cli.data_dir, &cli.schema, args),
         Cmd::Ls(args) => cmd_ls(&cli.data_dir, args),
+        Cmd::Show(args) => cmd_show(&cli.data_dir, args),
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
         Cmd::Baseline(sub) => cmd_baseline(sub),

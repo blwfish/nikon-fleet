@@ -13,6 +13,7 @@ use nikon_fleet::firmware::{
 use nikon_fleet::ops::cameras::{AmbiguousPairing, CameraList, duplicate_models, list_cameras};
 use nikon_fleet::ops::list::{EntryState, list_dir};
 use nikon_fleet::ops::paths::{checked_reference_filename, is_safe_path_component, write_atomic};
+use nikon_fleet::ops::render::{self, Row, RowFilter};
 use nikon_fleet::ops::target::storable_serial;
 use nikon_fleet::ptp_usb::{self, FtpField, FtpProfile};
 use nikon_fleet::settings::{self, Settings};
@@ -285,6 +286,161 @@ fn list_all(data_dir: &Path) -> SnapListing {
     out
 }
 
+// ── Snapshot viewer ───────────────────────────────────────────────────────
+
+/// One snapshot window's state. Loading and drawing happen elsewhere; this is the part that has
+/// rules: what is shown, what the filter keeps, what a failed load looks like.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotViewer {
+    /// The file's name in `snapshots/`: what identifies the window.
+    file: String,
+    is_reference: bool,
+    loading: bool,
+    /// Why the file cannot be shown. When set there are no rows: an unreadable file shows its
+    /// error, not an empty table that reads as "nothing in it".
+    error: Option<String>,
+    header: Option<render::Header>,
+    /// Every property, sorted by name; [`SnapshotViewer::visible_rows`] applies the filter.
+    rows: Vec<Row>,
+    filter: String,
+}
+
+impl SnapshotViewer {
+    fn loading(file: &str, is_reference: bool) -> Self {
+        SnapshotViewer {
+            file: file.to_string(),
+            is_reference,
+            loading: true,
+            error: None,
+            header: None,
+            rows: Vec::new(),
+            filter: String::new(),
+        }
+    }
+
+    /// The load's answer: the rendered snapshot, or why there is none.
+    fn finish(&mut self, result: Result<render::RenderedSnapshot, String>) {
+        self.loading = false;
+        match result {
+            Ok(r) => {
+                self.error = None;
+                self.header = Some(r.header);
+                self.rows = r.rows;
+            }
+            Err(e) => {
+                self.error = Some(e);
+                self.header = None;
+                self.rows.clear();
+            }
+        }
+    }
+
+    /// The rows the filter keeps, in name order: the library's one filter rule.
+    fn visible_rows(&self) -> Vec<&Row> {
+        let filter = RowFilter::new(&self.filter);
+        self.rows.iter().filter(|r| filter.matches(r)).collect()
+    }
+
+    /// "N of M properties", once there is something loaded to count.
+    fn count_line(&self) -> Option<String> {
+        self.header.as_ref()?;
+        Some(format!("{} of {} properties", self.visible_rows().len(), self.rows.len()))
+    }
+
+    /// Model, serial, firmware, label and capture time; the file name until the file is read.
+    fn title(&self) -> String {
+        let mark = if self.is_reference { "  ◄ ref" } else { "" };
+        match &self.header {
+            Some(h) => format!(
+                "{} {}  fw {}  {}  {}{mark}",
+                h.model,
+                h.serial,
+                h.firmware,
+                h.label.as_deref().unwrap_or("(no label)"),
+                h.captured_at.get(..19).unwrap_or(&h.captured_at),
+            ),
+            None => format!("{}{mark}", self.file),
+        }
+    }
+}
+
+/// The snapshot windows that are open, at most one per file.
+#[derive(Debug, Default)]
+struct SnapshotViewers {
+    open: Vec<SnapshotViewer>,
+}
+
+impl SnapshotViewers {
+    /// Open the window for `file`. True when its file needs reading: a new window, or one that
+    /// failed before (opening it again is the retry). A window that already shows the file is left
+    /// as it is, filter text included.
+    fn open(&mut self, file: &str, is_reference: bool) -> bool {
+        match self.open.iter_mut().find(|v| v.file == file) {
+            Some(v) if v.error.is_none() => false,
+            Some(v) => {
+                *v = SnapshotViewer::loading(file, is_reference);
+                true
+            }
+            None => {
+                self.open.push(SnapshotViewer::loading(file, is_reference));
+                true
+            }
+        }
+    }
+
+    /// Hand a load's answer to its window. False when the window was closed meanwhile.
+    fn finish(&mut self, file: &str, result: Result<render::RenderedSnapshot, String>) -> bool {
+        match self.open.iter_mut().find(|v| v.file == file) {
+            Some(v) => {
+                v.finish(result);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Close the window for `file`; false if none was open.
+    fn close(&mut self, file: &str) -> bool {
+        let before = self.open.len();
+        self.open.retain(|v| v.file != file);
+        self.open.len() != before
+    }
+
+    /// Keep each window's reference mark current with the listing (a reference set while the
+    /// window is open).
+    fn sync_reference(&mut self, listing: &SnapListing) {
+        for v in &mut self.open {
+            if let Some(row) = listing.rows.iter().find(|r| r.file == v.file) {
+                v.is_reference = row.is_reference;
+            }
+        }
+    }
+}
+
+/// A finished load, from the thread that read the file.
+struct ViewLoad {
+    file: String,
+    result: Result<render::RenderedSnapshot, String>,
+}
+
+/// Find, read, validate and render `snapshots/<file>` by the library's rules, so the window shows
+/// what `nikon-fleet show` prints. Reads a file: call it off the UI thread.
+fn load_for_view(data_dir: &Path, file: &str) -> Result<render::RenderedSnapshot, String> {
+    let path = render::find_named(&[&data_dir.join("snapshots")], file).map_err(|e| e.to_string())?;
+    let snapshot = render::load(&path).map_err(|e| e.to_string())?;
+    Ok(render::render_snapshot(&snapshot, None))
+}
+
+fn spawn_view_load(data_dir: PathBuf, file: String, tx: mpsc::Sender<ViewLoad>, ctx: egui::Context) -> std::io::Result<()> {
+    std::thread::Builder::new().name("snapshot-view".into()).spawn(move || {
+        let result = load_for_view(&data_dir, &file);
+        // The receiver is gone only when the window closed; there is no one to tell.
+        let _ = tx.send(ViewLoad { file, result });
+        ctx.request_repaint();
+    })?;
+    Ok(())
+}
+
 // ── App ───────────────────────────────────────────────────────────────────
 
 struct FleetApp {
@@ -293,6 +449,9 @@ struct FleetApp {
     cameras: Vec<CameraRow>,
     selected: Option<usize>,
     listing: Option<SnapListing>,
+    viewers: SnapshotViewers,
+    view_tx: mpsc::Sender<ViewLoad>,
+    view_rx: mpsc::Receiver<ViewLoad>,
     label: String,
     status: Status,
     notices: Vec<String>,
@@ -322,6 +481,7 @@ impl FleetApp {
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = mpsc::channel();
+        let (view_tx, view_rx) = mpsc::channel();
         let ctx = cc.egui_ctx.clone();
         let initial = settings.data_dir_or_err();
         std::thread::spawn(move || worker(cmd_rx, evt_tx, ctx, initial));
@@ -332,6 +492,9 @@ impl FleetApp {
             cameras: Vec::new(),
             selected: None,
             listing: None,
+            viewers: SnapshotViewers::default(),
+            view_tx,
+            view_rx,
             label: String::new(),
             status,
             notices: Vec::new(),
@@ -407,6 +570,31 @@ impl FleetApp {
             self.pending_write = None;
             self.vendor_write_result =
                 "Confirmation withdrawn: the form or the selected camera changed. Nothing was written.".into();
+        }
+    }
+
+    /// Open the window for a stored snapshot and read its file off the UI thread. Reading is not
+    /// a worker command: it must not wait behind a camera operation, and it changes nothing.
+    fn open_snapshot(&mut self, ctx: &egui::Context, file: &str, is_reference: bool, name_lossy: bool) {
+        if name_lossy {
+            self.status = Status::new(Level::Warn, "That file's name is not valid UTF-8, so it cannot be opened here.");
+            return;
+        }
+        let Some(data_dir) = self.settings.data_dir.clone() else {
+            self.status = Status::new(Level::Error, "The data directory is unknown, so no snapshot can be opened.");
+            return;
+        };
+        if !self.viewers.open(file, is_reference) {
+            return;
+        }
+        if let Err(e) = spawn_view_load(data_dir, file.to_string(), self.view_tx.clone(), ctx.clone()) {
+            self.viewers.finish(file, Err(format!("could not start reading the file: {e}")));
+        }
+    }
+
+    fn poll_views(&mut self) {
+        while let Ok(load) = self.view_rx.try_recv() {
+            self.viewers.finish(&load.file, load.result);
         }
     }
 
@@ -489,6 +677,7 @@ impl eframe::App for FleetApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        self.poll_views();
         self.drop_stale_confirmation();
         self.ui_toolbar(ctx);
         self.ui_notices(ctx);
@@ -496,6 +685,7 @@ impl eframe::App for FleetApp {
         self.ui_vendor_ops(ctx);
         self.ui_sidebar(ctx);
         self.ui_main(ctx);
+        self.ui_snapshot_viewers(ctx);
     }
 }
 
@@ -875,6 +1065,7 @@ impl FleetApp {
     fn ui_main(&mut self, ctx: &egui::Context) {
         let mut snap_trigger = false;
         let mut ref_action: Option<String> = None;
+        let mut view_action: Option<(String, bool, bool)> = None;
         let busy = self.busy();
         let data_ready = self.settings.data_dir.is_some();
 
@@ -937,7 +1128,12 @@ impl FleetApp {
                     ui.horizontal(|ui| {
                         let ts = snap.captured_at.get(..19).unwrap_or(&snap.captured_at);
                         let lbl = snap.label.as_deref().unwrap_or("(no label)");
-                        ui.label(format!("{ts}  {lbl}"));
+                        let text = ui
+                            .add(egui::Label::new(format!("{ts}  {lbl}")).sense(egui::Sense::click()))
+                            .on_hover_text("Double-click to see what this snapshot holds");
+                        if text.double_clicked() {
+                            view_action = Some((snap.file.clone(), snap.is_reference, snap.name_lossy));
+                        }
                         if snap.is_reference {
                             ui.label(egui::RichText::new("◀ ref").color(egui::Color32::LIGHT_GREEN));
                         } else {
@@ -947,6 +1143,11 @@ impl FleetApp {
                                 }
                             });
                         }
+                        ui.add_enabled_ui(!snap.name_lossy, |ui| {
+                            if ui.small_button("View").clicked() {
+                                view_action = Some((snap.file.clone(), snap.is_reference, snap.name_lossy));
+                            }
+                        });
                     });
                 }
             });
@@ -961,7 +1162,79 @@ impl FleetApp {
         if let Some(file) = ref_action {
             self.send(Cmd::SetReference { file });
         }
+        if let Some((file, is_reference, name_lossy)) = view_action {
+            self.open_snapshot(ctx, &file, is_reference, name_lossy);
+        }
     }
+
+    /// One resizable window per open snapshot: a filter box, a count line and the rows in a
+    /// scrollable monospace grid. Problems are orange, placeholders and cut values dim.
+    fn ui_snapshot_viewers(&mut self, ctx: &egui::Context) {
+        if let Some(listing) = &self.listing {
+            self.viewers.sync_reference(listing);
+        }
+        let mut closed = Vec::new();
+        for viewer in &mut self.viewers.open {
+            let mut open = true;
+            egui::Window::new(viewer.title())
+                .id(egui::Id::new(("snapshot_viewer", &viewer.file)))
+                .open(&mut open)
+                .resizable(true)
+                .default_size([720.0, 480.0])
+                .show(ctx, |ui| draw_snapshot_viewer(ui, viewer));
+            if !open {
+                closed.push(viewer.file.clone());
+            }
+        }
+        for file in closed {
+            self.viewers.close(&file);
+        }
+    }
+}
+
+fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) {
+    if viewer.loading {
+        ui.label(egui::RichText::new("Reading the file…").italics().weak());
+        return;
+    }
+    if let Some(e) = &viewer.error {
+        ui.colored_label(egui::Color32::from_rgb(200, 60, 60), format!("{} cannot be shown: {e}", viewer.file));
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.label("Filter:");
+        ui.add(egui::TextEdit::singleline(&mut viewer.filter).hint_text("name, value or code"));
+        if ui.small_button("Clear").clicked() {
+            viewer.filter.clear();
+        }
+    });
+    if let Some(line) = viewer.count_line() {
+        ui.label(egui::RichText::new(line).weak());
+    }
+    ui.separator();
+    let warn = egui::Color32::from_rgb(200, 120, 0);
+    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+        egui::Grid::new(("snapshot_rows", &viewer.file)).striped(true).num_columns(3).show(ui, |ui| {
+            for row in viewer.visible_rows() {
+                ui.label(egui::RichText::new(row.short_name()).monospace());
+                ui.label(egui::RichText::new(row.code_hex()).monospace().weak());
+                let text = egui::RichText::new(&row.value.display).monospace();
+                let text = if row.value.is_problem() {
+                    text.color(warn)
+                } else if row.value.notes.is_empty() {
+                    text
+                } else {
+                    text.weak()
+                };
+                let shown = ui.label(text);
+                if !row.value.notes.is_empty() {
+                    let tags: Vec<&str> = row.value.notes.iter().map(|n| n.tag()).collect();
+                    shown.on_hover_text(tags.join(", "));
+                }
+                ui.end_row();
+            }
+        });
+    });
 }
 
 // ── Worker thread ─────────────────────────────────────────────────────────
@@ -4405,5 +4678,207 @@ mod tests {
         assert!(do_export(data.path(), &dest).unwrap_err().contains("moving the archive"));
         assert!(dest.is_dir());
         assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1, "no temporary file is left");
+    }
+
+    // ── snapshot viewer ────────────────────────────────────────────────────
+
+    fn viewer_snapshot() -> Snapshot {
+        let mut s = Snapshot::new(
+            Camera { model: "Z 9".into(), serial: "30012345".into(), firmware: "5.31".into() },
+            Transport::Usb,
+            "2026-10-27T12:34:56Z".into(),
+        );
+        s.label = Some("base".into());
+        s.insert("kNkMAIDCapability_Beta", 0xd053, serde_json::json!("Auto ISO"));
+        s.insert("kNkMAIDCapability_Alpha", 12, serde_json::json!(true));
+        s.insert("kNkMAIDCapability_Gamma", 4242, serde_json::json!({"lower": 0.0, "upper": 10.0, "steps": 11, "value": 0.0, "value_index": 99}));
+        s
+    }
+
+    fn rendered() -> render::RenderedSnapshot {
+        render::render_snapshot(&viewer_snapshot(), None)
+    }
+
+    fn loaded_viewer() -> SnapshotViewer {
+        let mut v = SnapshotViewer::loading("a.json", false);
+        v.finish(Ok(rendered()));
+        v
+    }
+
+    fn visible(v: &SnapshotViewer) -> Vec<&str> {
+        v.visible_rows().iter().map(|r| r.short_name()).collect()
+    }
+
+    #[test]
+    fn opening_a_snapshot_starts_a_load_once_and_closing_removes_the_window() {
+        let mut vs = SnapshotViewers::default();
+        assert!(vs.open("a.json", false), "a new window needs its file read");
+        assert!(vs.open("b.json", true));
+        assert_eq!(vs.open.len(), 2);
+        assert!(vs.open[0].loading && vs.open[0].rows.is_empty());
+        assert!(vs.finish("a.json", Ok(rendered())));
+        vs.open[0].filter = "beta".into();
+        assert!(!vs.open("a.json", false), "already showing the file: no second window, no reload");
+        assert_eq!(vs.open.len(), 2);
+        assert_eq!(vs.open[0].filter, "beta", "the filter text survives a second open");
+        assert!(vs.close("a.json"));
+        assert_eq!(vs.open.iter().map(|v| v.file.as_str()).collect::<Vec<_>>(), ["b.json"]);
+        assert!(!vs.close("a.json"), "closing a window that is not open changes nothing");
+        assert!(vs.open("a.json", false), "after closing, opening reads the file again");
+    }
+
+    #[test]
+    fn a_window_that_failed_is_reloaded_when_opened_again() {
+        let mut vs = SnapshotViewers::default();
+        vs.open("a.json", false);
+        vs.finish("a.json", Err("gone".into()));
+        assert!(vs.open("a.json", false), "opening again is the retry");
+        assert!(vs.open[0].loading && vs.open[0].error.is_none());
+        assert_eq!(vs.open.len(), 1);
+    }
+
+    #[test]
+    fn a_load_that_finishes_after_its_window_was_closed_is_dropped() {
+        let mut vs = SnapshotViewers::default();
+        vs.open("a.json", false);
+        vs.close("a.json");
+        assert!(!vs.finish("a.json", Ok(rendered())));
+        assert!(vs.open.is_empty());
+    }
+
+    #[test]
+    fn an_empty_filter_shows_every_row_in_name_order() {
+        let v = loaded_viewer();
+        assert_eq!(visible(&v), ["Alpha", "Beta", "Gamma"]);
+        assert_eq!(v.count_line().as_deref(), Some("3 of 3 properties"));
+    }
+
+    #[test]
+    fn the_filter_keeps_matching_rows_and_none_when_nothing_matches() {
+        let mut v = loaded_viewer();
+        v.filter = "beta".into();
+        assert_eq!(visible(&v), ["Beta"]);
+        assert_eq!(v.count_line().as_deref(), Some("1 of 3 properties"));
+        v.filter = "no such property".into();
+        assert!(v.visible_rows().is_empty());
+        assert_eq!(v.count_line().as_deref(), Some("0 of 3 properties"), "a filter that matches nothing is not an empty file");
+        v.filter = String::new();
+        assert_eq!(visible(&v).len(), 3, "clearing the filter brings every row back");
+    }
+
+    #[test]
+    fn the_filter_ignores_case_and_looks_at_values_and_codes_too() {
+        let mut v = loaded_viewer();
+        for (text, want) in [
+            ("BETA", "Beta"),
+            ("bEtA", "Beta"),
+            ("auto iso", "Beta"),
+            ("0XD053", "Beta"),
+            ("4242", "Gamma"),
+            ("malformed", "Gamma"),
+            ("yes", "Alpha"),
+        ] {
+            v.filter = text.into();
+            assert_eq!(visible(&v), [want], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_that_cannot_be_shown_shows_its_error_and_no_rows() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("snapshots")).unwrap();
+        fs::write(dir.path().join("snapshots/broken.json"), "{ nope").unwrap();
+        let mut v = SnapshotViewer::loading("broken.json", false);
+        v.finish(load_for_view(dir.path(), "broken.json"));
+        assert!(!v.loading);
+        assert!(v.error.as_deref().is_some_and(|e| e.contains("broken.json") && e.contains("JSON")), "{:?}", v.error);
+        assert!(v.rows.is_empty() && v.header.is_none());
+        assert!(v.visible_rows().is_empty());
+        assert_eq!(v.count_line(), None, "no count for a file that was not read");
+    }
+
+    #[test]
+    fn a_failed_reload_clears_the_rows_of_the_earlier_success() {
+        let mut v = loaded_viewer();
+        assert_eq!(v.rows.len(), 3);
+        v.finish(Err("the file changed".into()));
+        assert!(v.rows.is_empty(), "stale rows must not stay under an error");
+        assert!(v.header.is_none());
+        assert_eq!(v.error.as_deref(), Some("the file changed"));
+        v.finish(Ok(rendered()));
+        assert!(v.error.is_none(), "a later success clears the error");
+        assert_eq!(v.rows.len(), 3);
+    }
+
+    #[test]
+    fn the_title_names_model_serial_firmware_label_and_capture_time_and_marks_the_reference() {
+        let mut v = SnapshotViewer::loading("a.json", false);
+        assert_eq!(v.title(), "a.json", "until the file is read, the file name");
+        v.finish(Ok(rendered()));
+        assert_eq!(v.title(), "Z 9 30012345  fw 5.31  base  2026-10-27T12:34:56");
+        v.is_reference = true;
+        assert!(v.title().ends_with("  ◄ ref"), "{}", v.title());
+        let mut unlabelled = viewer_snapshot();
+        unlabelled.label = None;
+        v.finish(Ok(render::render_snapshot(&unlabelled, None)));
+        assert!(v.title().contains("(no label)"), "{}", v.title());
+        v.finish(Err("x".into()));
+        assert_eq!(v.title(), "a.json  ◄ ref", "an unreadable file is still named, and still marked");
+    }
+
+    #[test]
+    fn a_reference_set_while_a_window_is_open_marks_it() {
+        let listing = SnapListing {
+            rows: vec![
+                SnapRow { file: "a.json".into(), model: "Z 9".into(), serial: "1".into(), label: None, captured_at: "t".into(), is_reference: true, name_lossy: false },
+                SnapRow { file: "b.json".into(), model: "Z 9".into(), serial: "1".into(), label: None, captured_at: "t".into(), is_reference: false, name_lossy: false },
+            ],
+            ..SnapListing::default()
+        };
+        let mut vs = SnapshotViewers::default();
+        vs.open("a.json", false);
+        vs.open("b.json", true);
+        vs.open("gone.json", true);
+        vs.sync_reference(&listing);
+        let marks: Vec<bool> = vs.open.iter().map(|v| v.is_reference).collect();
+        assert_eq!(marks, [true, false, true], "a is now the reference, b no longer is, a file not in the listing keeps its mark");
+    }
+
+    #[test]
+    fn load_for_view_reads_a_snapshot_from_snapshots_and_nowhere_else() {
+        let dir = TempDir::new().unwrap();
+        let snapshots = dir.path().join("snapshots");
+        fs::create_dir_all(&snapshots).unwrap();
+        fs::create_dir_all(dir.path().join("references")).unwrap();
+        viewer_snapshot().save_to_file(snapshots.join("ok.json")).unwrap();
+        viewer_snapshot().save_to_file(dir.path().join("references/ref.json")).unwrap();
+        let r = load_for_view(dir.path(), "ok.json").unwrap();
+        assert_eq!((r.header.property_count, r.rows.len(), r.filtered_out), (3, 3, 0));
+        assert!(load_for_view(dir.path(), "ref.json").unwrap_err().contains("ref.json"), "a listing row is a snapshots/ file");
+        assert!(load_for_view(dir.path(), "missing.json").unwrap_err().contains("missing.json"));
+        for hostile in ["../references/ref.json", "..", "", "a/b.json"] {
+            assert!(load_for_view(dir.path(), hostile).is_err(), "{hostile:?}");
+        }
+        let old = viewer_snapshot().to_pretty_json().unwrap().replace("\"format_version\": 1", "\"format_version\": 7");
+        fs::write(snapshots.join("old.json"), old).unwrap();
+        assert!(load_for_view(dir.path(), "old.json").unwrap_err().contains("unsupported format_version 7"));
+    }
+
+    #[test]
+    fn the_loader_thread_answers_on_the_channel_with_the_file_it_read() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("snapshots")).unwrap();
+        viewer_snapshot().save_to_file(dir.path().join("snapshots/ok.json")).unwrap();
+        fs::write(dir.path().join("snapshots/bad.json"), "[]").unwrap();
+        let (tx, rx) = mpsc::channel();
+        for file in ["ok.json", "bad.json"] {
+            spawn_view_load(dir.path().to_path_buf(), file.into(), tx.clone(), egui::Context::default()).unwrap();
+        }
+        let mut got: Vec<(String, bool)> = (0..2)
+            .map(|_| rx.recv_timeout(T).expect("a load answers"))
+            .map(|l| (l.file, l.result.is_ok()))
+            .collect();
+        got.sort();
+        assert_eq!(got, [("bad.json".to_string(), false), ("ok.json".to_string(), true)]);
     }
 }

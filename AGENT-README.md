@@ -114,6 +114,16 @@ expect `git log` to have history for them.
   arrays) and this is intentional — see the design-choices comment at the
   top of `snapshot.rs`. Properties are stored in a `BTreeMap` specifically
   so JSON diffs in git show real changes, not key reordering.
+- **What a snapshot holds is shown by one formatter, `ops::render`.**
+  `nikon-fleet show <file-or-name> [--filter TEXT] [--json]` (CLI, read-only,
+  no camera or SDK) and the egui GUI's snapshot window (double-click a row,
+  or its View button) both call `ops::render::render_snapshot`; the Python
+  GUI's `fmt_cap_value` must agree with it, and
+  `gui/tests-fixtures/render_values.json` is the table both sides are tested
+  against. A value that is missing or unusable is shown as `(missing)` or
+  `(malformed: why)` with a closed `kind` and `notes`, never as a default;
+  stepped ranges read their position from `value_index` through
+  `value_shape`. Change the display rules there, not in a UI.
 - **Cross-model diffing is out of scope.** `diff.rs` only diffs two
   snapshots from the *same* camera model — see the module doc comment for
   why (semantic alignment between bodies needs per-model MaidLayer
