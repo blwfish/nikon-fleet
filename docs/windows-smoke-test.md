@@ -15,8 +15,10 @@ happened. Where something fails, the exact output is the useful part; a fix is n
 
 ## The cameras
 
-Vic has several Nikon bodies: **Z30 (two), Z6II and Z8**. None of these four has ever been read by this
-project (it knows the Z 5, Z 9 and Z6III). Every camera step below is run **once per body**, one body at
+Vic has several Nikon bodies: **Z30 (two), Z6II and Z8**, and a **ZR** if Vic has one (the maintainer
+expects it and owns none of these). None has ever been read by this project (it knows the Z 5, Z 9 and
+Z6III). The SDK folder you are given may predate the ZR; if `discover` does not list it, or lists it
+with an unknown model, that is a finding, not a failure of yours. Every camera step below is run **once per body**, one body at
 a time, and the report is per body (model string exactly as printed, firmware, result of each step).
 
 - The **Z30** question: nobody has been able to check whether a Z30 reports a serial number over USB,
@@ -230,15 +232,62 @@ With the person looking at the screen, check and report each:
 6. Closing the main window quits the program (check Task Manager that `fleet-gui.exe` and any
    `nikon-fleet.exe` are gone).
 
-## 7. Next body
+## 7. Windows-only checks
 
-Steps 4 and 5 (and the Device Manager details from step 4) are per camera. Step 6 (the GUI) only needs
-one body, with a second body if Vic is happy to repeat it. Ask Vic to switch off and unplug this body
-and connect the next one, then repeat from step 4. Do the **two Z30s**, the **Z6II** and the **Z8**.
+These test the places where the Windows code differs from the macOS code, and where a quiet failure is
+possible. Each was chosen because it is a known difference, not a guess. Use one body that worked in
+step 5; skip this step entirely if step 5 did not work, and say so.
+
+1. **Clean JSON.** On macOS the program moves anything the SDK prints to stdout over to stderr so that
+   `--json` output is pure JSON; on Windows that guard is switched off (the code says the SDK needs no
+   protection there; nobody has checked). Run `discover --json` and `snapshot --json` and parse each
+   stdout with `ConvertFrom-Json`. If stdout has anything before the `{` (for example
+   `InitializeSDK Execution duration: ...`), the GUI, which reads this output, will fail on Windows.
+   Report the first lines of raw stdout.
+2. **Does it exit?** The SDK's disconnect hangs about 1 time in 14 on macOS, so read-only commands end
+   with `_exit` there; on Windows they end with the ordinary `exit`, which does not skip the SDK's
+   cleanup. Run `discover --json` 20 times in a row (a loop with `Measure-Command`), ending each after
+   60 seconds if it has not returned (`Wait-Process -Timeout 60`, then kill it). Report how many
+   returned, how long they took, and whether a hung one needed the camera replugged afterwards.
+3. **No USB reset.** macOS resets the camera's USB before starting the SDK; on Windows that step does
+   nothing. Run `snapshot` twice back to back without touching the camera, then a third time after
+   switching the camera off and on. Report which of them failed or returned fewer properties than the
+   first.
+4. **The lock, and a killed holder.** Start `snapshot`, and while it runs, end it from Task Manager
+   (End task). Then immediately run `discover`. It should work at once, not report `camera busy`
+   (Windows releases the lock when its holder dies; this is untested). Report it.
+5. **Atomic writes.** Run `ref set` (or the GUI's "Set reference") on the same snapshot three times in
+   a row, then once while the data folder is open in Explorer and Windows' search indexer is running.
+   The files are written by renaming over the old one, which Windows refuses if something holds the old
+   file open. Report any "access denied" or "being used by another process".
+6. **Files from the other platforms.** The snapshot format is meant to be identical on both systems.
+   Ask Vic for a snapshot file made on a Mac (the maintainer can send one) and run `show` and `diff`
+   on it against one made on Windows. Then copy a Windows-made snapshot into a folder whose name
+   contains a space and run `show` on it from there. Report any difference in what is shown.
+7. **The settings file.** `settings show` should name `%APPDATA%\net.blw.fleet\settings.json`. Set a
+   data folder in the GUI, close the GUI, and run `settings data-dir`: it should print the same folder.
+   Say whether the CLI's default (the current folder) surprised Vic when they ran a command in a
+   different folder from the GUI's.
+8. **The GUI's graphics.** Note which graphics backend it chose (the console prints it when started
+   from PowerShell with `$env:RUST_LOG="wgpu=info"`), whether text shows `→` and the other symbols or
+   empty boxes, and whether dragging the snapshot viewer to a second monitor works.
+9. **Firmware download.** `firmware latest` checks Nikon's site and needs no camera. Run it and report
+   the output. The "Download from Nikon" web view is not built by default; if you try the button in
+   the GUI, report what it shows.
+
+Do not run anything that writes to a camera in this step either. A supervised write test (a restore of
+one harmless setting, verified by reading it back) is the next stage, and the maintainer will run it
+with Vic on a call once these results are in.
+
+## 8. Next body
+
+Steps 4 and 5 (and the Device Manager details from step 4) are per camera. Steps 6 and 7 (the GUI and
+the Windows-only checks) only need one body, with a second body if Vic is happy to repeat them. Ask Vic to switch off and unplug this body
+and connect the next one, then repeat from step 4. Do the **two Z30s**, the **Z6II**, the **Z8** and the **ZR**.
 Vic may not want to do all four in one sitting: do as many as they are happy to, and say in the report
 which ones were done.
 
-## 8. Report
+## 9. Report
 
 Write `windows-smoke-report.md` in the scratch directory (not in the repo) with, in order: the
 machine (Windows version, Rust version, GPU), each numbered step with **worked / failed / skipped** and
