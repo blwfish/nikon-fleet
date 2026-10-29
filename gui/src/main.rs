@@ -29,8 +29,10 @@ use serde::Deserialize;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
+mod check;
 mod restore;
 
+use check::{CheckRequest, CheckUi, CheckView};
 use restore::{
     RestoreApplyJson, RestorePlanJson, RestoreRequest, RestoreUi, SourceView, UndoOffer, RestoreActionLike,
 };
@@ -113,6 +115,8 @@ enum Cmd {
     /// WRITES TO THE CAMERA, only the plan with this digest and summary (the ones that were shown
     /// and confirmed).
     RestoreApply { request: RestoreRequest, digest: String, summary: String },
+    /// Read-only: capture a connected body and compare it with its reference.
+    Check { request: CheckRequest },
 }
 
 enum Evt {
@@ -124,6 +128,7 @@ enum Evt {
     TransplantApplied { request: TransplantRequest, outcome: ApplyOutcome },
     RestorePlanned { request: RestoreRequest, result: Result<(RestorePlanJson, String, SourceView), String> },
     RestoreApplied { request: RestoreRequest, outcome: ApplyOutcome<RestoreApplyJson> },
+    Checked { request: CheckRequest, result: Result<CheckView, String> },
     Err(String),
 }
 
@@ -554,6 +559,7 @@ struct FleetApp {
     vendor_write_result: String,
     transplant: TransplantUi,
     restore: RestoreUi,
+    check: CheckUi,
 }
 
 impl FleetApp {
@@ -598,6 +604,7 @@ impl FleetApp {
             vendor_write_result: String::new(),
             transplant: TransplantUi::default(),
             restore: RestoreUi::default(),
+            check: CheckUi::default(),
         };
         app.refresh_listing();
         app
@@ -647,6 +654,7 @@ impl FleetApp {
     fn use_settings_data_dir(&mut self) {
         self.transplant.data_dir_changed();
         self.restore.data_dir_changed();
+        self.check.data_dir_changed();
         if self.cmd_tx.send(Cmd::SetDataDir(self.settings.data_dir_or_err())).is_err() {
             self.status = Status::new(Level::Error, "The worker thread has stopped; restart the app.");
             return;
@@ -704,6 +712,7 @@ impl FleetApp {
         self.status = Status::new(Level::Error, "The worker thread has stopped; restart the app.");
         self.transplant.worker_lost();
         self.restore.worker_lost();
+        self.check.worker_lost();
     }
 
     fn poll(&mut self) {
@@ -788,6 +797,16 @@ impl FleetApp {
                         self.refresh_listing();
                     }
                 }
+                Evt::Checked { request, result } => {
+                    self.status = match &result {
+                        Ok(view) => {
+                            let (level, text) = check::check_headline(view);
+                            Status::new(level, format!("Check {} {}: {text}", request.target.model, request.target.serial))
+                        }
+                        Err(e) => Status::new(Level::Error, e.lines().next().unwrap_or("").to_string()),
+                    };
+                    self.check.arrived(request, result);
+                }
                 Evt::Err(msg) => self.status = Status::new(Level::Error, format!("Error: {msg}")),
             }
         }
@@ -832,12 +851,14 @@ impl eframe::App for FleetApp {
         self.drop_stale_confirmation();
         self.transplant.sync(&self.cameras);
         self.restore.sync(&self.cameras);
+        self.check.sync(&self.cameras);
         self.ui_toolbar(ctx);
         self.ui_notices(ctx);
         self.ui_preferences(ctx);
         self.ui_vendor_ops(ctx);
         self.ui_transplant(ctx);
         self.ui_restore(ctx);
+        self.ui_check(ctx);
         self.ui_sidebar(ctx);
         self.ui_main(ctx);
         self.ui_snapshot_viewers(ctx);
@@ -864,6 +885,9 @@ impl FleetApp {
                 }
                 if ui.button("↺ Restore").clicked() {
                     self.restore.open = !self.restore.open;
+                }
+                if ui.button("✓ Check").clicked() {
+                    self.check.open = !self.check.open;
                 }
                 ui.separator();
                 if let Some(since) = self.busy_since {
@@ -1245,6 +1269,7 @@ impl FleetApp {
 
     fn ui_main(&mut self, ctx: &egui::Context) {
         let mut snap_trigger = false;
+        let mut check_trigger = false;
         let mut ref_action: Option<String> = None;
         let mut view_action: Option<(String, bool, bool)> = None;
         let mut transplant_from: Option<((String, String), String)> = None;
@@ -1293,6 +1318,13 @@ impl FleetApp {
                             snap_trigger = true;
                         }
                     });
+                    if ui
+                        .button("Check against reference…")
+                        .on_hover_text("Read this body and list how it differs from its reference snapshot (writes nothing)")
+                        .clicked()
+                    {
+                        check_trigger = true;
+                    }
                 });
             } else {
                 ui.horizontal(|ui| {
@@ -1371,6 +1403,9 @@ impl FleetApp {
                 let label = self.label.trim().to_string();
                 self.send(Cmd::Snapshot { camera, label });
             }
+        }
+        if check_trigger {
+            self.start_check_for_selected();
         }
         if let Some(file) = ref_action {
             self.send(Cmd::SetReference { file });
@@ -1532,6 +1567,13 @@ fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Evt>, ctx: egui::Context, in
                     Evt::RestorePlanned { request, result }
                 }
                 Err(e) => Evt::RestorePlanned { request, result: Err(e.clone()) },
+            },
+            Cmd::Check { request } => match data_dir.as_ref() {
+                Ok(d) => {
+                    let result = check::do_check(d, &request);
+                    Evt::Checked { request, result }
+                }
+                Err(e) => Evt::Checked { request, result: Err(e.clone()) },
             },
             Cmd::RestoreApply { request, digest, summary } => match data_dir.as_ref() {
                 Ok(d) => {
@@ -7829,6 +7871,7 @@ mod tests {
             vendor_write_result: String::new(),
             transplant: TransplantUi::default(),
             restore: RestoreUi::default(),
+            check: CheckUi::default(),
         };
         (app, cmd_rx, evt_tx, dir)
     }
