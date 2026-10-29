@@ -148,6 +148,7 @@ enum Cmd {
     Rm(RmArgs),
 
     /// Restore settings from a snapshot to a live camera.
+    #[command(after_help = RESTORE_HELP)]
     Restore(RestoreArgs),
 
     /// Copy settings from a snapshot onto a live camera of a possibly
@@ -424,6 +425,17 @@ Exit status:
 With --json, a refusal's message leaves out the advice to pass --allow-partial: a program reading it
 cannot act on that.";
 
+const RESTORE_HELP: &str = "\
+Exit status:
+  0  done (a dry run, or a restore that wrote and read back what it planned)
+  1  any other error, or a restore that wrote but did not fully take (the JSON report says which).
+     A restore that ends 1 with no JSON report may have written
+  2  command-line usage error
+  5  --expect-digest was given and the plan no longer matches: nothing was written
+  6  a restore (not a dry run) was refused before it could write anything: nothing was written
+With --json, a refusal's message leaves out the advice to pass --allow-partial: a program reading it
+cannot act on that.";
+
 const DEVICE_INFO_HELP: &str = "\
 Read-only: sends only the standard GetDeviceInfo (0x1001) inside a PTP session and changes nothing
 on the camera. The last line compares the PTP SerialNumber with the USB iSerialNumber:
@@ -642,6 +654,15 @@ struct RestoreArgs {
     /// read-back still compared.
     #[arg(long)]
     allow_partial: bool,
+    /// Apply only the plan that has this digest (from a `--dry-run` of the same snapshot, target
+    /// and `--only`, e.g. one a person has just reviewed). The plan is recomputed on the camera as
+    /// it is now; if it no longer matches, nothing is written and the command exits 5. Without
+    /// this the command applies the plan it has just computed itself. Needs --expect-summary.
+    #[arg(long, value_name = "DIGEST", requires = "expect_summary", conflicts_with = "dry_run")]
+    expect_digest: Option<String>,
+    /// The plan's summary line, copied from the same dry run as --expect-digest.
+    #[arg(long, value_name = "SUMMARY", requires = "expect_digest", conflicts_with = "dry_run")]
+    expect_summary: Option<String>,
     /// Print the plan (with --dry-run) or the result as JSON on stdout (the same value the MCP
     /// worker's `restore-plan` / `restore-apply` return); progress and warnings go to stderr.
     #[arg(long)]
@@ -2412,7 +2433,39 @@ fn ingest_user_file(data_dir: &Path, source_id: &str, release: &Release, file: &
     Ok(())
 }
 
+/// The digest and summary a restore apply is held to: the plan a person approved and presented
+/// (`--expect-digest`, `--expect-summary`), else the one just computed.
+fn restore_confirmation<'a>(args: &'a RestoreArgs, digest: &'a str, summary: &'a str) -> (&'a str, &'a str) {
+    (args.expect_digest.as_deref().unwrap_or(digest), args.expect_summary.as_deref().unwrap_or(summary))
+}
+
+/// A restore apply refused before any write, worded as a transplant's refusal is (the shared
+/// `ApplyError`), a stale plan with its own status.
+fn restore_refusal(e: nikon_fleet::ops::restore_flow::RestoreApplyError, json: bool) -> anyhow::Error {
+    use nikon_fleet::ops::restore_flow::RestoreApplyError;
+    match e {
+        RestoreApplyError::Apply(a) => transplant_refusal(a, json),
+        RestoreApplyError::Refused(r) => anyhow::anyhow!("{r}"),
+    }
+}
+
+/// Restore settings onto the camera. An apply that fails before it has a report in hand (every
+/// `RestoreApplyError` is raised before the first write) exits `EXIT_REFUSED_BEFORE_WRITE`, as a
+/// transplant does (see `transplant_exit`).
 fn cmd_restore(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &RestoreArgs, no_usb_reset: bool) -> Result<()> {
+    let mut report_in_hand = false;
+    restore_run(data_dir, bundle, schema_path, args, no_usb_reset, &mut report_in_hand)
+        .map_err(|e| transplant_exit(e, args.dry_run, !report_in_hand))
+}
+
+fn restore_run(
+    data_dir: &Path,
+    bundle: &Path,
+    schema_path: &Path,
+    args: &RestoreArgs,
+    no_usb_reset: bool,
+    report_in_hand: &mut bool,
+) -> Result<()> {
     use nikon_fleet::ops::baseline::GatePolicy;
     use nikon_fleet::ops::restore_flow::{BodyPolicy, RestoreApplyRequest, RestorePlanInput, apply_restore, build_restore_plan};
 
@@ -2486,19 +2539,21 @@ fn cmd_restore(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Restor
 
     let snapshots = snapshots_dir(data_dir);
     let captured_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    // Unless the caller presents a plan it approved (--expect-digest, the way the GUI does), the
+    // plan above is this command's own and running it is the consent.
+    let confirmation = restore_confirmation(args, &plan.digest, &plan.summary);
     let req = RestoreApplyRequest {
         plan: input,
         snapshots_dir: &snapshots,
         name_lookup: &name_lookup,
-        expected_digest: &plan.digest,
-        expected_summary: &plan.summary,
+        expected_digest: confirmation.0,
+        expected_summary: confirmation.1,
         captured_at,
         gate_policy: if args.allow_partial { GatePolicy::AllowPartial } else { GatePolicy::Strict },
     };
-    let report = apply_restore(&device, &req, &mut |_| {}).map_err(|e| {
-        let hint = cli_report::refusal_hint(e.tag()).map(|h| format!("\n{h}")).unwrap_or_default();
-        anyhow::anyhow!("{e}{hint}")
-    })?;
+    let report = apply_restore(&device, &req, &mut |_| {}).map_err(|e| restore_refusal(e, json))?;
+    // From here the camera may have been written.
+    *report_in_hand = true;
 
     for w in cli_report::restore_write_warnings(&report.steps) {
         eprintln!("{w}");
@@ -4004,6 +4059,48 @@ mod tests {
         assert_eq!(transplant_confirmation(&own, "fresh-digest", "fresh summary"), ("fresh-digest", "fresh summary"));
         let given = args(&["--expect-digest", "approved-digest", "--expect-summary", "approved summary"]);
         assert_eq!(transplant_confirmation(&given, "fresh-digest", "fresh summary"), ("approved-digest", "approved summary"));
+    }
+
+    #[test]
+    fn a_restore_is_held_to_the_plan_it_was_given_and_only_otherwise_to_its_own() {
+        use clap::Parser;
+        let args = |extra: &[&str]| {
+            let mut argv = vec!["nikon-fleet", "restore", "snap.json"];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).unwrap().cmd {
+                Cmd::Restore(a) => a,
+                _ => unreachable!(),
+            }
+        };
+        let own = args(&[]);
+        assert_eq!(restore_confirmation(&own, "fresh-digest", "fresh summary"), ("fresh-digest", "fresh summary"));
+        let given = args(&["--expect-digest", "approved-digest", "--expect-summary", "approved summary"]);
+        assert_eq!(restore_confirmation(&given, "fresh-digest", "fresh summary"), ("approved-digest", "approved summary"));
+        for bad in [&["--expect-digest", "d"][..], &["--expect-summary", "s"], &["--dry-run", "--expect-digest", "d", "--expect-summary", "s"]] {
+            let mut argv = vec!["nikon-fleet", "restore", "snap.json"];
+            argv.extend_from_slice(bad);
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_stale_restore_plan_exits_five_and_a_json_refusal_leaves_out_the_allow_partial_advice() {
+        use nikon_fleet::ops::apply::{ApplyError, EXIT_STALE_PLAN};
+        use nikon_fleet::ops::baseline::NoBaselineReason;
+        use nikon_fleet::ops::restore_flow::{Refusal, RestoreApplyError};
+        let stale = restore_refusal(RestoreApplyError::Apply(ApplyError::StalePlan { what: "summary" }), true);
+        assert_eq!(exit_code_for(&stale), EXIT_STALE_PLAN);
+        let no_baseline = |json| {
+            restore_refusal(RestoreApplyError::Apply(ApplyError::NoBaseline(NoBaselineReason::UnknownModel)), json).to_string()
+        };
+        assert!(no_baseline(false).contains("--allow-partial"), "a person at a terminal is told");
+        assert!(!no_baseline(true).contains("--allow-partial"), "a program cannot act on it");
+        let other_body = restore_refusal(
+            RestoreApplyError::Refused(Refusal::SerialMismatch { snapshot: "A".into(), target: "B".into() }),
+            true,
+        );
+        assert_eq!(exit_code_for(&other_body), 1, "before restore_run's own mapping to 6");
+        assert!(other_body.to_string().contains("transplant"), "{other_body}");
     }
 
     #[test]
