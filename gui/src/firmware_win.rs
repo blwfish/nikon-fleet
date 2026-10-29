@@ -1260,7 +1260,9 @@ fn draw_latest(ui: &mut egui::Ui, view: &LatestView, can_act: bool, action: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{firmware_unit, recording_cli, row, write_snapshot};
+    #[cfg(unix)]
+    use crate::tests::recording_cli;
+    use crate::tests::{firmware_unit, row, write_snapshot};
     use nikon_fleet::ops::firmware_latest::{
         LatestArchiveUnreadable, LatestCamera, LatestModel, LatestRelease, LatestReport, LatestUsbScan,
     };
@@ -1723,6 +1725,7 @@ mod tests {
         assert_eq!(f.confirm(), Some(FwOp::Browse { model: "Z 8".into() }));
     }
 
+    #[cfg(unix)]
     #[test]
     fn nothing_starts_while_an_operation_runs_and_a_pending_yes_waits_for_it() {
         let ctx = egui::Context::default();

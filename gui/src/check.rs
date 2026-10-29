@@ -572,7 +572,9 @@ impl FleetApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{argv_of, recording_cli, row, scan_of, test_app, usb};
+    #[cfg(unix)]
+    use crate::tests::{argv_of, recording_cli};
+    use crate::tests::{row, scan_of, test_app, usb};
     use nikon_fleet::diff::{Change, Diff, FirmwareAnnotation};
     use nikon_fleet::ops::baseline::{BaselineCapability, GateOutcome, NoBaselineReason};
     use nikon_fleet::ops::capture::{CaptureStats, FailedRead};
