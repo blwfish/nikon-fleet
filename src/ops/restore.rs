@@ -577,6 +577,27 @@ pub fn verify<P: CameraPort + ?Sized>(
     verify_with(port, name_lookup, camera, source, written, captured_at, GatePolicy::AllowPartial)
 }
 
+/// How many names an undo command line may carry before [`undo_command`] replaces it with a pointer
+/// to the `--json` report's `undo_set`: a command line that long is not something to copy and paste.
+/// The boundary is inclusive: exactly this many are listed, one more is not.
+const MAX_UNDO_NAMES: usize = 12;
+
+/// The command that undoes an apply, a targeted restore of its restore point. The CLI prints it and
+/// the GUI shows it next to the restore point, so both say the same thing.
+pub fn undo_command(restore_point_file: &str, undo_set: &[String]) -> String {
+    if undo_set.is_empty() {
+        return "nothing to undo".into();
+    }
+    if undo_set.len() > MAX_UNDO_NAMES {
+        return format!(
+            "{} properties to put back from {restore_point_file}; list them with --json (undo_set) and pass each as --only",
+            undo_set.len()
+        );
+    }
+    let only: String = undo_set.iter().map(|n| format!(" --only {}", n.trim_start_matches(crate::transplant::PROPERTY_PREFIX))).collect();
+    format!("nikon-fleet restore {restore_point_file}{only}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1441,5 +1462,16 @@ mod tests {
         for v in all {
             assert_eq!(serde_json::to_value(v).unwrap(), json!(v.tag()));
         }
+    }
+
+    #[test]
+    fn the_undo_command_strips_the_prefix_and_gives_up_past_the_limit() {
+        let names = |n: usize| (0..n).map(|i| format!("kNkMAIDCapability_P{i}")).collect::<Vec<_>>();
+        assert_eq!(undo_command("rp.json", &[]), "nothing to undo");
+        assert_eq!(undo_command("rp.json", &names(1)), "nikon-fleet restore rp.json --only P0");
+        assert!(undo_command("rp.json", &names(MAX_UNDO_NAMES)).matches("--only").count() == MAX_UNDO_NAMES);
+        let over = undo_command("rp.json", &names(MAX_UNDO_NAMES + 1));
+        assert!(over.contains("13 properties") && over.contains("--json"), "{over}");
+        assert!(!over.contains("--only P0"));
     }
 }

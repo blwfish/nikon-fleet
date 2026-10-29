@@ -3,7 +3,7 @@
 //! counting are testable without a camera; `main.rs` decides where each part is printed.
 
 use nikon_fleet::ops::apply::{ApplyReport, ApplyStatus, Readback};
-use nikon_fleet::ops::restore::{Counts, StepOutcome, StepResult};
+use nikon_fleet::ops::restore::{Counts, StepOutcome, StepResult, undo_command};
 use nikon_fleet::ops::restore_flow::{PlanStep, RestoreApplyReport};
 use nikon_fleet::transplant::{Severity, SkipReason, Strategy, TransplantOutcome};
 
@@ -149,24 +149,6 @@ pub fn restore_write_warnings(steps: &[StepResult]) -> Vec<String> {
             _ => None,
         })
         .collect()
-}
-
-/// How many names an undo command line may carry before it is replaced by a pointer to `--json`.
-const MAX_UNDO_NAMES: usize = 12;
-
-/// The command that undoes an apply: a targeted restore of its restore point.
-pub fn undo_command(restore_point_file: &str, undo_set: &[String]) -> String {
-    if undo_set.is_empty() {
-        return "nothing to undo".into();
-    }
-    if undo_set.len() > MAX_UNDO_NAMES {
-        return format!(
-            "{} properties to put back from {restore_point_file}; list them with --json (undo_set) and pass each as --only",
-            undo_set.len()
-        );
-    }
-    let only: String = undo_set.iter().map(|n| format!(" --only {}", n.trim_start_matches(nikon_fleet::transplant::PROPERTY_PREFIX))).collect();
-    format!("nikon-fleet restore {restore_point_file}{only}")
 }
 
 fn status_word(s: ApplyStatus) -> &'static str {
@@ -523,17 +505,6 @@ mod tests {
         rb.side_effects = None;
         let t = render_transplant_apply(&apply_report(ApplyStatus::AppliedUnverified, &["A"], Some(rb)));
         assert!(t.stdout.contains("Side effects: unknown"));
-    }
-
-    #[test]
-    fn the_undo_command_strips_the_prefix_and_gives_up_past_the_limit() {
-        let names = |n: usize| (0..n).map(|i| format!("kNkMAIDCapability_P{i}")).collect::<Vec<_>>();
-        assert_eq!(undo_command("rp.json", &[]), "nothing to undo");
-        assert_eq!(undo_command("rp.json", &names(1)), "nikon-fleet restore rp.json --only P0");
-        assert!(undo_command("rp.json", &names(MAX_UNDO_NAMES)).matches("--only").count() == MAX_UNDO_NAMES);
-        let over = undo_command("rp.json", &names(MAX_UNDO_NAMES + 1));
-        assert!(over.contains("13 properties") && over.contains("--json"), "{over}");
-        assert!(!over.contains("--only P0"));
     }
 
     #[test]

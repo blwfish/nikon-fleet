@@ -154,6 +154,7 @@ enum Cmd {
     /// *different* model, translating enum/range values into the target's
     /// own equivalents instead of assuming the same code/index means the
     /// same thing on both bodies. See src/transplant.rs for the strategy.
+    #[command(after_help = TRANSPLANT_HELP)]
     Transplant(TransplantArgs),
 
     /// Manage the firmware archive.
@@ -411,6 +412,17 @@ Exit status:
 /// from the plain failure (1) a script is allowed to retry blindly: this one needs a look at the
 /// camera first.
 const EXIT_WRITE_INDETERMINATE: i32 = 4;
+
+const TRANSPLANT_HELP: &str = "\
+Exit status:
+  0  done (a dry run, or an apply that wrote and read back what it planned)
+  1  any other error, or an apply that wrote but did not fully take (the JSON report says which).
+     An apply that ends 1 with no JSON report may have written
+  2  command-line usage error
+  5  --expect-digest was given and the plan no longer matches: nothing was written
+  6  an apply (not a dry run) was refused before it could write anything: nothing was written
+With --json, a refusal's message leaves out the advice to pass --allow-partial: a program reading it
+cannot act on that.";
 
 const DEVICE_INFO_HELP: &str = "\
 Read-only: sends only the standard GetDeviceInfo (0x1001) inside a PTP session and changes nothing
@@ -670,6 +682,15 @@ struct TransplantArgs {
     /// read-back still compared.
     #[arg(long)]
     allow_partial: bool,
+    /// Apply only the plan that has this digest (from a `--dry-run` of the same snapshot, target
+    /// and opt-ins, e.g. one a person has just reviewed). The plan is recomputed on the camera as
+    /// it is now; if it no longer matches, nothing is written and the command exits 5. Without
+    /// this the command applies the plan it has just computed itself. Needs --expect-summary.
+    #[arg(long, value_name = "DIGEST", requires = "expect_summary", conflicts_with = "dry_run")]
+    expect_digest: Option<String>,
+    /// The plan's summary line, copied from the same dry run as --expect-digest.
+    #[arg(long, value_name = "SUMMARY", requires = "expect_digest", conflicts_with = "dry_run")]
+    expect_summary: Option<String>,
     /// Print the plan (with --dry-run) or the result as JSON on stdout (the same value the MCP
     /// worker's `transplant-plan` / `transplant-apply` return); progress and warnings go to stderr.
     #[arg(long)]
@@ -2542,12 +2563,66 @@ fn restore_verification_text(v: &restore::Verification) -> (String, bool) {
     }
 }
 
+/// The digest and summary an apply is held to: the plan a person approved and presented
+/// (`--expect-digest`, `--expect-summary`), else the one just computed, whose approval is the
+/// running of the command itself.
+fn transplant_confirmation<'a>(args: &'a TransplantArgs, digest: &'a str, summary: &'a str) -> (&'a str, &'a str) {
+    (args.expect_digest.as_deref().unwrap_or(digest), args.expect_summary.as_deref().unwrap_or(summary))
+}
+
+/// A transplant apply refused before any write: its message with the hint for its tag (unless
+/// `json`: the caller is a program, which cannot pass `--allow-partial` for the person), and for a
+/// stale plan the status a caller tests (`EXIT_STALE_PLAN`) instead of reading the message.
+fn transplant_refusal(e: nikon_fleet::ops::apply::ApplyError, json: bool) -> anyhow::Error {
+    use nikon_fleet::ops::apply::{ApplyError, EXIT_STALE_PLAN};
+    let hint = if json { None } else { cli_report::refusal_hint(e.tag()) };
+    let message = format!("{e}{}", hint.map(|h| format!("\n{h}")).unwrap_or_default());
+    match e {
+        ApplyError::StalePlan { .. } => ExitCodeError { code: EXIT_STALE_PLAN, message }.into(),
+        _ => anyhow::anyhow!(message),
+    }
+}
+
+/// The result of `apply_transplant`: an `ApplyError` is a refusal before any write; a report in hand
+/// means the camera may have been written, which `report_in_hand` records for `transplant_exit`.
+fn after_apply<R>(result: Result<R, nikon_fleet::ops::apply::ApplyError>, json: bool, report_in_hand: &mut bool) -> Result<R> {
+    let report = result.map_err(|e| transplant_refusal(e, json))?;
+    *report_in_hand = true;
+    Ok(report)
+}
+
+/// How a failed `transplant` ends the process. An apply that failed before it had a report in hand
+/// (`wrote_nothing`: every `ApplyError` is raised before the first write) exits
+/// `EXIT_REFUSED_BEFORE_WRITE`, so a caller can tell "nothing was written" from "this may have
+/// written"; a stale plan keeps its own status. A dry run and an apply that had written keep the
+/// plain failure, 1.
+fn transplant_exit(e: anyhow::Error, dry_run: bool, wrote_nothing: bool) -> anyhow::Error {
+    if dry_run || !wrote_nothing || e.downcast_ref::<ExitCodeError>().is_some() {
+        return e;
+    }
+    ExitCodeError { code: nikon_fleet::ops::apply::EXIT_REFUSED_BEFORE_WRITE, message: format!("{e:?}") }.into()
+}
+
 /// Copy a snapshot's settings onto a live camera that may be a different
 /// model, translating enum/range values via `nikon_fleet::transplant`
 /// instead of `restore`'s literal same-model copy. See that module's docs
 /// for the translation strategy and why capability *codes* (not menu
 /// position, not per-model renumbering) are the right join key here.
 fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &TransplantArgs, no_usb_reset: bool) -> Result<()> {
+    // Set once `apply_transplant` has returned a report: from then on the camera may have been written.
+    let mut report_in_hand = false;
+    transplant_run(data_dir, bundle, schema_path, args, no_usb_reset, &mut report_in_hand)
+        .map_err(|e| transplant_exit(e, args.dry_run, !report_in_hand))
+}
+
+fn transplant_run(
+    data_dir: &Path,
+    bundle: &Path,
+    schema_path: &Path,
+    args: &TransplantArgs,
+    no_usb_reset: bool,
+    report_in_hand: &mut bool,
+) -> Result<()> {
     use nikon_fleet::ops::apply::{ApplyRequest, apply_transplant};
     use nikon_fleet::ops::baseline::GatePolicy;
     use nikon_fleet::ops::plan::{PlanInput, build_plan};
@@ -2630,24 +2705,23 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
     }
 
     // The same sequence the MCP's transplant_apply runs: recompute the plan, take a restore point,
-    // write, read back. The plan above is this command's own, so its digest and summary are what
+    // write, read back. Unless the caller presents a plan it approved (--expect-digest, the way
+    // the GUI does), the plan above is this command's own and its digest and summary are what
     // apply is given: running the command is the consent, the digest only guards the gap between
     // the two reads.
     let snapshots = snapshots_dir(data_dir);
+    let confirmation = transplant_confirmation(args, &plan.digest, &plan.summary);
     let req = ApplyRequest {
         plan: input,
         guard: &guard,
         snapshots_dir: &snapshots,
         name_lookup: &name_lookup,
-        expected_digest: &plan.digest,
-        expected_summary: &plan.summary,
+        expected_digest: confirmation.0,
+        expected_summary: confirmation.1,
         captured_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
         gate_policy: if args.allow_partial { GatePolicy::AllowPartial } else { GatePolicy::Strict },
     };
-    let report = apply_transplant(&device, &req, &mut |_| {}).map_err(|e| {
-        let hint = cli_report::refusal_hint(e.tag()).map(|h| format!("\n{h}")).unwrap_or_default();
-        anyhow::anyhow!("{e}{hint}")
-    })?;
+    let report = after_apply(apply_transplant(&device, &req, &mut |_| {}), json, report_in_hand)?;
 
     let text = cli_report::render_transplant(&report.outcomes, false);
     for w in &text.warnings {
@@ -2709,7 +2783,7 @@ fn is_already_archived(e: &anyhow::Error) -> bool {
 
 /// The process exit status for a failed run: 3 for "already archived" (`EXIT_ALREADY_ARCHIVED`),
 /// 4 for an indeterminate FTP-profile write (`EXIT_WRITE_INDETERMINATE`), a status an error
-/// carries itself, else 1.
+/// carries itself (5 for a stale transplant plan, `EXIT_STALE_PLAN`), else 1.
 fn exit_code_for(e: &anyhow::Error) -> i32 {
     if let Some(x) = e.downcast_ref::<ExitCodeError>() {
         x.code
@@ -3854,6 +3928,97 @@ mod tests {
         nikon_fleet::ptp_usb::PtpUsbError::FtpWriteIndeterminate {
             cause: Box::new(nikon_fleet::ptp_usb::PtpUsbError::ShortWrite { written: 40, expected: 82 }),
         }
+    }
+
+    #[test]
+    fn a_stale_transplant_plan_exits_five_and_every_other_refusal_exits_one() {
+        use nikon_fleet::ops::apply::{ApplyError, EXIT_STALE_PLAN};
+        let stale = transplant_refusal(ApplyError::StalePlan { what: "digest" }, false);
+        assert_eq!(exit_code_for(&stale), EXIT_STALE_PLAN);
+        assert_eq!(EXIT_STALE_PLAN, 5, "documented in --help; the GUI tests for it");
+        assert!(![1, 2, EXIT_ALREADY_ARCHIVED, EXIT_WRITE_INDETERMINATE].contains(&EXIT_STALE_PLAN));
+        let missing = transplant_refusal(ApplyError::MissingConfirmation { which: "digest" }, false);
+        assert_eq!(exit_code_for(&missing), 1, "before transplant_exit: the refusal itself is not what picks 6");
+        assert!(stale.to_string().contains("stale"), "the message still says why: {stale}");
+    }
+
+    #[test]
+    fn an_apply_refused_before_it_could_write_exits_six_and_no_other_failure_does() {
+        use nikon_fleet::ops::apply::{ApplyError, EXIT_REFUSED_BEFORE_WRITE, EXIT_STALE_PLAN};
+        assert_eq!(EXIT_REFUSED_BEFORE_WRITE, 6, "documented in --help; the GUI tests for it");
+        assert!(![1, 2, EXIT_ALREADY_ARCHIVED, EXIT_WRITE_INDETERMINATE, EXIT_STALE_PLAN].contains(&EXIT_REFUSED_BEFORE_WRITE));
+        let boom = || anyhow::anyhow!("no Nikon cameras detected");
+        // an apply with no report in hand: the camera was not written
+        let refused = transplant_exit(boom(), false, true);
+        assert_eq!(exit_code_for(&refused), EXIT_REFUSED_BEFORE_WRITE);
+        assert!(refused.to_string().contains("no Nikon cameras detected"), "the message is kept: {refused}");
+        // a failure once the report is in hand (the output could not be written, the apply did not fully take) may have written
+        assert_eq!(exit_code_for(&transplant_exit(boom(), false, false)), 1);
+        // a dry run never writes, and keeps the plain failure it always had
+        assert_eq!(exit_code_for(&transplant_exit(boom(), true, true)), 1);
+        // a stale plan keeps its own status
+        let stale = transplant_refusal(ApplyError::StalePlan { what: "digest" }, true);
+        assert_eq!(exit_code_for(&transplant_exit(stale, false, true)), EXIT_STALE_PLAN);
+        // a cause chain survives into the message
+        let chained = anyhow::Error::new(std::io::Error::other("disk gone")).context("loading snap.json");
+        let text = transplant_exit(chained, false, true).to_string();
+        assert!(text.contains("loading snap.json") && text.contains("disk gone"), "{text}");
+    }
+
+    #[test]
+    fn a_report_in_hand_is_remembered_and_a_refusal_is_not() {
+        use nikon_fleet::ops::apply::ApplyError;
+        let mut in_hand = false;
+        assert!(after_apply::<u8>(Err(ApplyError::StalePlan { what: "digest" }), false, &mut in_hand).is_err());
+        assert!(!in_hand, "a refusal is raised before any write");
+        assert_eq!(after_apply(Ok(7_u8), false, &mut in_hand).unwrap(), 7);
+        assert!(in_hand, "from the report on, a failure may have followed a write");
+    }
+
+    #[test]
+    fn a_json_refusal_leaves_out_the_allow_partial_advice_a_program_cannot_act_on() {
+        use nikon_fleet::ops::apply::ApplyError;
+        use nikon_fleet::ops::baseline::NoBaselineReason;
+        let refusal = |json| transplant_refusal(ApplyError::NoBaseline(NoBaselineReason::UnknownModel), json).to_string();
+        assert!(refusal(false).contains("--allow-partial"), "a person at a terminal is told");
+        let for_a_program = refusal(true);
+        assert!(!for_a_program.contains("--allow-partial"), "{for_a_program}");
+        assert!(for_a_program.contains("nothing was written"), "the refusal itself stays: {for_a_program}");
+        // a refusal with no advice is the same either way
+        let same = |json| transplant_refusal(ApplyError::MissingConfirmation { which: "digest" }, json).to_string();
+        assert_eq!(same(false), same(true));
+    }
+
+    #[test]
+    fn an_apply_is_held_to_the_plan_it_was_given_and_only_otherwise_to_its_own() {
+        use clap::Parser;
+        let args = |extra: &[&str]| {
+            let mut argv = vec!["nikon-fleet", "transplant", "snap.json"];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).unwrap().cmd {
+                Cmd::Transplant(a) => a,
+                _ => unreachable!(),
+            }
+        };
+        let own = args(&[]);
+        assert_eq!(transplant_confirmation(&own, "fresh-digest", "fresh summary"), ("fresh-digest", "fresh summary"));
+        let given = args(&["--expect-digest", "approved-digest", "--expect-summary", "approved summary"]);
+        assert_eq!(transplant_confirmation(&given, "fresh-digest", "fresh summary"), ("approved-digest", "approved summary"));
+    }
+
+    #[test]
+    fn expect_digest_and_expect_summary_come_together_and_never_with_a_dry_run() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["nikon-fleet", "transplant", "snap.json"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        assert!(parse(&[]).is_ok());
+        assert!(parse(&["--expect-digest", "d", "--expect-summary", "s"]).is_ok());
+        assert!(parse(&["--expect-digest", "d"]).is_err(), "a digest alone is half a confirmation");
+        assert!(parse(&["--expect-summary", "s"]).is_err(), "a summary alone is half a confirmation");
+        assert!(parse(&["--dry-run", "--expect-digest", "d", "--expect-summary", "s"]).is_err(), "a dry run writes nothing, so it has nothing to confirm");
     }
 
     #[test]
