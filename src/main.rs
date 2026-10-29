@@ -5,6 +5,9 @@
 
 mod cli_report;
 use cli_report::unrestored_error;
+// The MCP server's child process; it takes an inherited file descriptor, which Windows has no
+// equivalent of here (fleet-mcp is unix-only too).
+#[cfg(unix)]
 mod worker_cmd;
 
 use std::collections::HashMap;
@@ -114,6 +117,7 @@ enum Cmd {
 
     /// Internal: run one operation and report it on an inherited file
     /// descriptor (the MCP server's child process). Not for direct use.
+    #[cfg(unix)]
     #[command(hide = true)]
     Worker(worker_cmd::WorkerArgs),
 
@@ -2768,6 +2772,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
         Cmd::Baseline(sub) => cmd_baseline(sub),
         Cmd::Settings(sub) => cmd_settings(sub),
+        #[cfg(unix)]
         Cmd::Worker(args) => {
             let code = worker_cmd::run(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args);
             std::process::exit(code)
