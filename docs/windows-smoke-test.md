@@ -93,6 +93,13 @@ as `--data-dir` below. Run everything from PowerShell.
 
 ## 1. Get it and build it
 
+**Vic may already have a checkout and a Rust toolchain** from an earlier build (a few days before this
+file was written). Look first: find the existing `nikon-fleet` folder, run `git status` and `git log
+-1` in it, and ask Vic whether anything in it was changed by hand. If it is clean, `git pull` and
+rebuild instead of cloning; a lot has changed since (the CLI did not compile on Windows before
+2026-10-29). Note in the report which commit the earlier build was, and anything Vic remembers about
+how it behaved with a camera.
+
 (You do this part; Vic only has to say yes to the installs. If Rust or `git` is missing, offer to
 install them. If you can write and run the commands yourself, do not ask Vic to type any of it.)
 
