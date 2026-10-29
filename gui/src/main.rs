@@ -3008,6 +3008,12 @@ mod tests {
 
     // ── helpers ────────────────────────────────────────────────────────────
 
+    /// A path that is absolute on this platform: `/x` is only relative on Windows, where the
+    /// settings code refuses it.
+    fn abs_path(unix: &str) -> String {
+        if cfg!(windows) { format!("C:{}", unix.replace('/', "\\")) } else { unix.to_string() }
+    }
+
     #[cfg(unix)]
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
@@ -3186,10 +3192,11 @@ mod tests {
     fn saving_the_data_dir_keeps_every_key_it_does_not_own() {
         let d = TempDir::new().unwrap();
         let path = write_settings(d.path(), r#"{"data_dir": "/old", "window": {"w": 800}, "theme": "dark"}"#);
-        let s = save_data_dir(&path, "  /new/dir  ").unwrap();
-        assert_eq!(s.data_dir, Some(PathBuf::from("/new/dir")), "pasted whitespace is trimmed");
+        let new_dir = abs_path("/new/dir");
+        let s = save_data_dir(&path, &format!("  {new_dir}  ")).unwrap();
+        assert_eq!(s.data_dir, Some(PathBuf::from(&new_dir)), "pasted whitespace is trimmed");
         let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v["data_dir"], "/new/dir");
+        assert_eq!(v["data_dir"], new_dir.as_str());
         assert_eq!(v["window"]["w"], 800);
         assert_eq!(v["theme"], "dark");
     }
@@ -3208,7 +3215,7 @@ mod tests {
     fn saving_never_overwrites_a_settings_file_it_could_not_parse() {
         let d = TempDir::new().unwrap();
         let path = write_settings(d.path(), "{ half written");
-        let err = save_data_dir(&path, "/new").unwrap_err();
+        let err = save_data_dir(&path, &abs_path("/new")).unwrap_err();
         assert!(err.contains("left as it is"), "{err}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ half written");
     }
@@ -3221,7 +3228,8 @@ mod tests {
         assert!(err.contains("not an absolute path"), "{err}");
         assert!(!path.exists(), "a refused value writes nothing");
         // The boundary: an absolute path is accepted.
-        assert_eq!(save_data_dir(&path, "/abs").unwrap().data_dir, Some(PathBuf::from("/abs")));
+        let abs = abs_path("/abs");
+        assert_eq!(save_data_dir(&path, &abs).unwrap().data_dir, Some(PathBuf::from(&abs)));
         assert!(path.exists());
     }
 
@@ -3592,7 +3600,7 @@ mod tests {
     #[test]
     fn resolve_cli_missing_sibling_says_how_to_build_it() {
         let e = resolve_cli(None, Some(Path::new("/t/debug/fleet-gui")), "", |_| false).unwrap_err();
-        assert!(e.contains("/t/debug/nikon-fleet") && e.contains("cargo build --workspace") && e.contains(CLI_ENV), "{e}");
+        assert!(e.contains(&Path::new("/t/debug").join("nikon-fleet").display().to_string()) && e.contains("cargo build --workspace") && e.contains(CLI_ENV), "{e}");
     }
 
     #[test]

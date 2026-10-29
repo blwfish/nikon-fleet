@@ -16,6 +16,11 @@ struct Sandbox {
     file: PathBuf,
 }
 
+/// A path that is absolute on this platform (`/x` is not on Windows, and the CLI refuses a relative one).
+fn abs(unix: &str) -> String {
+    if cfg!(windows) { format!("C:{}", unix.replace('/', "\\")) } else { unix.to_string() }
+}
+
 fn sandbox() -> Sandbox {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
@@ -28,6 +33,7 @@ impl Sandbox {
     fn run(&self, args: &[&str]) -> Output {
         Command::new(BIN)
             .env("HOME", &self.home)
+            .env("APPDATA", self.appdata())
             .env("NIKON_FLEET_SETTINGS", &self.file)
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
@@ -37,9 +43,18 @@ impl Sandbox {
             .expect("spawn CLI")
     }
 
+    /// Where Windows keeps per-user settings; a scratch one so the real %APPDATA% is never read.
+    fn appdata(&self) -> PathBuf {
+        self.home.join("AppData").join("Roaming")
+    }
+
     fn default_dir(&self) -> String {
-        let home = self.home.clone();
-        let env = move |k: &str| (k == "HOME").then(|| OsString::from(&home));
+        let (home, appdata) = (self.home.clone(), self.appdata());
+        let env = move |k: &str| match k {
+            "HOME" => Some(OsString::from(&home)),
+            "APPDATA" => Some(OsString::from(&appdata)),
+            _ => None,
+        };
         default_data_dir_for(Os::CURRENT, &env).display().to_string()
     }
 
@@ -82,13 +97,14 @@ fn set_data_dir_keeps_every_other_key_and_unset_clears_only_its_own() {
     let other = json!({"theme": "dark", "window": {"w": 800}, "recent": ["a"], "n": 3});
     std::fs::write(&s.file, other.to_string()).unwrap();
 
-    let set = s.run(&["settings", "set-data-dir", "/Volumes/Files/snaps"]);
+    let snaps = abs("/Volumes/Files/snaps");
+    let set = s.run(&["settings", "set-data-dir", &snaps]);
     assert_eq!(set.status.code(), Some(0), "{}", stderr(&set));
     let mut want = other.as_object().unwrap().clone();
-    want.insert("data_dir".into(), json!("/Volumes/Files/snaps"));
+    want.insert("data_dir".into(), json!(snaps));
     assert_eq!(file_json(&s.file), Value::Object(want));
-    assert_eq!(stdout(&s.run(&["settings", "data-dir"])), "/Volumes/Files/snaps\n");
-    assert_eq!(s.json()["data_dir"], json!("/Volumes/Files/snaps"));
+    assert_eq!(stdout(&s.run(&["settings", "data-dir"])), format!("{snaps}\n"));
+    assert_eq!(s.json()["data_dir"], json!(snaps));
 
     let unset = s.run(&["settings", "set-data-dir", "--unset"]);
     assert_eq!(unset.status.code(), Some(0), "{}", stderr(&unset));
@@ -113,9 +129,10 @@ fn a_blank_data_dir_in_the_file_is_unset_everywhere() {
 fn a_settings_file_that_cannot_be_parsed_is_reported_and_never_overwritten() {
     let s = sandbox();
     std::fs::create_dir_all(s.file.parent().unwrap()).unwrap();
+    let new_dir = abs("/new");
     for corrupt in ["{ \"data_dir\": \"/x\"", "[]", "{\"data_dir\": 5}", ""] {
         std::fs::write(&s.file, corrupt).unwrap();
-        for args in [&["settings", "show"][..], &["settings", "data-dir"], &["settings", "set-data-dir", "/new"], &["settings", "set-data-dir", "--unset"]] {
+        for args in [&["settings", "show"][..], &["settings", "data-dir"], &["settings", "set-data-dir", &new_dir], &["settings", "set-data-dir", "--unset"]] {
             let o = s.run(args);
             assert_eq!(o.status.code(), Some(1), "{args:?} on {corrupt:?}: {}", stdout(&o));
             assert!(stderr(&o).contains("left it as it is") || stderr(&o).contains("left as it is"), "{}", stderr(&o));
@@ -147,7 +164,8 @@ fn the_cli_keeps_its_default_of_the_current_directory_and_says_so() {
     std::fs::write(&s.file, json!({"data_dir": "/definitely/not/used"}).to_string()).unwrap();
     let o = s.run(&["ls"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert!(stdout(&o).starts_with("(no snapshots — directory ./snapshots does not exist)"), "{}", stdout(&o));
+    let want = format!("(no snapshots — directory {} does not exist)", Path::new(".").join("snapshots").display());
+    assert!(stdout(&o).starts_with(&want), "{}", stdout(&o));
     // And the shell form the help text gives reaches the GUIs' directory.
     let help = Command::new(BIN).arg("--help").output().unwrap();
     let help = String::from_utf8_lossy(&help.stdout).into_owned();

@@ -114,7 +114,7 @@ fn ls_json_lists_valid_entries_and_accounts_for_the_unlistable_ones() {
     assert_eq!(ok["bin_sha256"], "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
     assert_eq!(ok["notes"], "-first", "a note starting with `-` is accepted and kept");
     assert_eq!(ok["archived_by"], "fleet firmware add");
-    assert!(ok["directory"].as_str().unwrap().ends_with("Z_9/5.31"));
+    assert!(Path::new(ok["directory"].as_str().unwrap()).ends_with(Path::new("Z_9").join("5.31")));
     assert_eq!(ok["canonical_snapshot_path"], Value::Null);
 
     let kinds: Vec<(&str, &str)> = rows[1..]
@@ -122,10 +122,15 @@ fn ls_json_lists_valid_entries_and_accounts_for_the_unlistable_ones() {
         .map(|r| {
             assert_eq!(r["status"], "unreadable");
             assert!(r["error"].as_str().is_some_and(|e| !e.is_empty()));
-            (r["directory"].as_str().unwrap().rsplit('/').next().unwrap(), r["error_kind"].as_str().unwrap())
+            (last_component(r["directory"].as_str().unwrap()), r["error_kind"].as_str().unwrap())
         })
         .collect();
     assert_eq!(kinds, [("2.00", "incomplete_archive"), ("4.00", "metadata_corrupt")]);
+}
+
+/// The last path component, whichever separator the platform prints.
+fn last_component(dir: &str) -> &str {
+    Path::new(dir).file_name().and_then(|n| n.to_str()).unwrap()
 }
 
 #[test]
@@ -135,7 +140,7 @@ fn ls_json_for_a_model_and_for_no_archive_at_all() {
     assert_eq!((none["dir_exists"].clone(), none["entries"].clone()), (json!(false), json!([])));
     archive_with_one_good_and_two_unlistable(d.path());
     let z9 = json_of(&run(d.path(), &["firmware", "ls", "--json", "--model", "Z 9"]));
-    let shown: Vec<&str> = z9["entries"].as_array().unwrap().iter().map(|e| e["directory"].as_str().unwrap().rsplit('/').next().unwrap()).collect();
+    let shown: Vec<&str> = z9["entries"].as_array().unwrap().iter().map(|e| last_component(e["directory"].as_str().unwrap())).collect();
     assert_eq!(shown, ["5.31", "4.00"], "the orphan under Z6_3 belongs to another model");
 }
 

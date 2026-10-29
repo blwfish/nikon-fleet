@@ -21,4 +21,8 @@ jobs:
       - run: rustup update stable
       - run: rustc --version && cargo --version
       - run: cargo build -p nikon-fleet -p fleet-gui
+      # GitHub sets CI=true, which makes the tests that need the Nikon SDK's files (sdk-runtime/,
+      # not redistributable) fail instead of skip; this job has none.
       - run: cargo test -p nikon-fleet -p fleet-gui --no-fail-fast
+        env:
+          CI: "0"

@@ -3647,7 +3647,8 @@ mod tests {
 
         result.unwrap();
         let meta = load_meta(Path::new(tmp.path()), "Z 9", "5.31").unwrap();
-        assert_eq!(meta.canonical_snapshot_path.as_deref(), Some("snapshots/foo.json"));
+        // Stored as the path was given, so with the platform's separator.
+        assert_eq!(meta.canonical_snapshot_path.as_deref(), Some(Path::new("snapshots").join("foo.json").to_str().unwrap()));
     }
 
     // ── cmd_firmware_rollback ─────────────────────────────────────────────

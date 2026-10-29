@@ -437,16 +437,22 @@ mod tests {
             settings_path_for(Os::Windows, &w),
             PathBuf::from(r"C:\Users\me\AppData\Roaming").join(APP_DIR).join(SETTINGS_FILE)
         );
+        // Expected paths are joined, not written with `/`: on a Windows host `join` puts a backslash in.
+        let under = |base: &str, rest: &[&str]| rest.iter().fold(PathBuf::from(base), |p, c| p.join(c));
         let home = env(&[("HOME", "/home/me")]);
-        assert_eq!(settings_path_for(Os::Other, &home), PathBuf::from("/home/me/.config/net.blw.fleet/settings.json"));
-        assert_eq!(default_data_dir_for(Os::Other, &home), PathBuf::from("/home/me/.local/share/net.blw.fleet"));
-        let xdg = env(&[("HOME", "/home/me"), ("XDG_CONFIG_HOME", "/cfg"), ("XDG_DATA_HOME", "/dat")]);
-        assert_eq!(settings_path_for(Os::Other, &xdg), PathBuf::from("/cfg/net.blw.fleet/settings.json"));
-        assert_eq!(default_data_dir_for(Os::Other, &xdg), PathBuf::from("/dat/net.blw.fleet"));
+        assert_eq!(settings_path_for(Os::Other, &home), under("/home/me", &[".config", APP_DIR, SETTINGS_FILE]));
+        assert_eq!(default_data_dir_for(Os::Other, &home), under("/home/me", &[".local", "share", APP_DIR]));
+        // An XDG value is honoured only when it is absolute, which "/cfg" is not on a Windows host.
+        let abs = |p: &str| if cfg!(windows) { format!("C:{p}") } else { p.to_string() };
+        let (cfg, dat) = (abs("/cfg"), abs("/dat"));
+        let pairs = [("HOME", "/home/me"), ("XDG_CONFIG_HOME", cfg.as_str()), ("XDG_DATA_HOME", dat.as_str())];
+        let xdg = env(&pairs);
+        assert_eq!(settings_path_for(Os::Other, &xdg), under(&cfg, &[APP_DIR, SETTINGS_FILE]));
+        assert_eq!(default_data_dir_for(Os::Other, &xdg), under(&dat, &[APP_DIR]));
         // A relative or empty XDG value is ignored, as the spec says.
         let rel = env(&[("HOME", "/home/me"), ("XDG_CONFIG_HOME", "cfg"), ("XDG_DATA_HOME", "")]);
-        assert_eq!(settings_path_for(Os::Other, &rel), PathBuf::from("/home/me/.config/net.blw.fleet/settings.json"));
-        assert_eq!(default_data_dir_for(Os::Other, &rel), PathBuf::from("/home/me/.local/share/net.blw.fleet"));
+        assert_eq!(settings_path_for(Os::Other, &rel), under("/home/me", &[".config", APP_DIR, SETTINGS_FILE]));
+        assert_eq!(default_data_dir_for(Os::Other, &rel), under("/home/me", &[".local", "share", APP_DIR]));
     }
 
     #[test]
