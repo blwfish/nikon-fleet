@@ -1,24 +1,50 @@
-# Windows smoke test (instructions for an AI assistant)
+# Windows smoke test (instructions for Vic's Claude)
 
-You are an assistant helping a person find out whether nikon-fleet works on **Windows**. It was written
-and tested on macOS. Until the `windows` CI job existed (2026-10-29) nothing had compiled it for
-Windows, and **no camera has ever been driven from Windows**. This file is the procedure. Read all of
-it first, do it in order, and write down exactly what happened. Where something fails, the exact
-output is the useful part; a fix is not expected from you.
+**This file is addressed to you, the AI assistant on Vic's Windows computer, not to Vic.** Vic is a
+mechanical engineer, not a software engineer: do not expect them to run `git`, `cargo` or PowerShell
+commands, read build output, or know what a driver is. You do the technical work. Vic's part is
+physical and decisional: plug a camera in, switch it on, tell you which body it is, close Nikon's
+programs, look at the screen when a step says so, and say yes or no when you ask permission. Talk to
+them in plain language, say what you are about to do and why before you do it, and keep what you ask
+of them to one small thing at a time.
 
-The person is Vic. They have Z30 bodies, which nobody on the project has been able to read. Step 4
-answers a question the maintainer has been waiting on (does the Z30 report a serial number?).
+You are helping find out whether nikon-fleet works on **Windows**. It was written and tested on macOS.
+Until the `windows` CI job existed (2026-10-29) nothing had compiled it for Windows, and **no camera has
+ever been driven from Windows**. Read all of this first, do it in order, and write down exactly what
+happened. Where something fails, the exact output is the useful part; a fix is not expected from you.
+
+## The cameras
+
+Vic has several Nikon bodies: **Z30 (two), Z6II and Z8**. None of these four has ever been read by this
+project (it knows the Z 5, Z 9 and Z6III). Every camera step below is run **once per body**, one body at
+a time, and the report is per body (model string exactly as printed, firmware, result of each step).
+
+- The **Z30** question: nobody has been able to check whether a Z30 reports a serial number over USB,
+  or whether it matches the USB descriptor's. Step 4 (`device-info`) answers it.
+- For all four, the tool will say `known_model: false` and "no baseline" (expected, not an error; it
+  means nobody has yet recorded what a complete capture of that model looks like). A capture should
+  still work. A *refused* capture, or a very small property count (the Z 5 gave 165, the Z 9 196, the
+  Z6III 200), is a finding: report it verbatim.
+- Also record, for each body, the **USB product string, idProduct and bcdDevice** from Device Manager
+  (the camera's Details tab, Hardware Ids; `VID_04B0&PID_xxxx` is the vendor and product id). The
+  maintainer adds a model to the project's registry only from a real probe, never from a guess.
+- The two Z30 bodies are a chance to compare: same model, two serials. Note whether they differ only in
+  the serial.
 
 ## Rules
 
 - **Read-only for the camera.** Never run `restore`, `transplant`, `vendor-write-ftp`, `firmware add`
   or `firmware pin`, and never use a write button in the GUI. You may run `discover`, `snapshot`,
   `device-info`, `vendor-read`, `check`, `diff`, `ls`, `show` and `settings show`.
-- **Do not change system settings or install drivers yourself.** Binding a different USB driver
+- **Ask Vic before installing any software**, and say what it is, roughly how big, and whether it
+  needs administrator rights (Rust, the Visual Studio Build Tools and Python do; the Build Tools are
+  several gigabytes). Do it for them once they agree. **Do not change system settings or install
+  drivers yourself.** Binding a different USB driver
   (Zadig and the like) replaces what Windows, NX Studio and Nikon's own software use for the camera.
   If a step needs that, describe it to the person, say what it affects, and let them decide.
 - **Do not edit the code.** If something is wrong, put it in the report.
-- **One camera attached at a time.** If two Nikon bodies are attached, stop and ask which to use.
+- **One camera attached at a time.** If two Nikon bodies are attached, stop and ask which to use. When
+  you move to the next body, ask Vic to switch the first off and unplug it before connecting the next.
 - **Snapshots and `device-info` output contain the camera's serial number.** Keep snapshots on this
   machine, outside any git repository. Do not send or commit them. Say plainly in the report which
   excerpts contain a serial.
@@ -57,7 +83,8 @@ Not known, and the reason for this test:
   ("Desktop development with C++" in the Visual Studio Build Tools installer). `git`.
 - The Nikon SDK for Z cameras (`S-SDKZ-200BF-ALLIN`), unpacked. It is not redistributable and is not
   in the repository; the person has it or can download it from Nikon's developer site. Ask which folder.
-- A Nikon Z body, on, connected by USB, in normal shooting state.
+- A Nikon Z body (start with whichever Vic has to hand), on, connected by USB, in normal shooting
+  state, with its USB cable and a port on the computer itself (not through a hub).
 - Optional, for display names: Python 3.9+ and `pdftotext` (Poppler for Windows) for step 3. Skip if
   they are not installed; everything else works without them.
 
@@ -65,6 +92,9 @@ Use a scratch directory outside the repository for snapshots, for example `%USER
 as `--data-dir` below. Run everything from PowerShell.
 
 ## 1. Get it and build it
+
+(You do this part; Vic only has to say yes to the installs. If Rust or `git` is missing, offer to
+install them. If you can write and run the commands yourself, do not ask Vic to type any of it.)
 
 ```powershell
 git clone https://github.com/blwfish/nikon-fleet.git
@@ -193,14 +223,23 @@ With the person looking at the screen, check and report each:
 6. Closing the main window quits the program (check Task Manager that `fleet-gui.exe` and any
    `nikon-fleet.exe` are gone).
 
-## 7. Report
+## 7. Next body
+
+Steps 4 and 5 (and the Device Manager details from step 4) are per camera. Step 6 (the GUI) only needs
+one body, with a second body if Vic is happy to repeat it. Ask Vic to switch off and unplug this body
+and connect the next one, then repeat from step 4. Do the **two Z30s**, the **Z6II** and the **Z8**.
+Vic may not want to do all four in one sitting: do as many as they are happy to, and say in the report
+which ones were done.
+
+## 8. Report
 
 Write `windows-smoke-report.md` in the scratch directory (not in the repo) with, in order: the
 machine (Windows version, Rust version, GPU), each numbered step with **worked / failed / skipped** and
 the exact error text of any failure, the Device Manager details from step 4 if you ran them, the
 `device-info` verdict word and the model/firmware of each body you saw, and anything that surprised you
-that no step asked about. Remove serial numbers from anything you paste. Give the file to the person
-to send to the maintainer.
+that no step asked about. Remove serial numbers from anything you paste. Show Vic the file in plain
+language (what worked, what did not), then tell them how to send it to Brian (blw@blw.net) by
+email; the file contains no serial numbers.
 
 Do not summarise a failure as "didn't work". The value of this test is the exact message, the exact
 path, and the exact driver name.
