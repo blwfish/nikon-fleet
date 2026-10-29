@@ -25,7 +25,25 @@ use std::path::{Path, PathBuf};
 /// `ops::list::is_plain_name_component` (an alias). `PLAIN_COMPONENT_TABLE` is
 /// the table every caller's test runs.
 pub fn is_safe_path_component(s: &str) -> bool {
-    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
+    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0']) && !windows_unsafe_name(s)
+}
+
+/// Names Windows would not keep as written: the characters it forbids in a file name, control
+/// characters, a trailing dot or space (it strips them, so `...` would name the directory itself and
+/// `a ` would silently become `a`), and the device names (`CON`, `NUL`, `COM1`, also with an
+/// extension). Always false elsewhere, where all of these are ordinary names.
+fn windows_unsafe_name(s: &str) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    if s.chars().any(|c| c.is_control() || "<>:\"|?*".contains(c)) || s.ends_with(['.', ' ']) {
+        return true;
+    }
+    let stem = s.split('.').next().unwrap_or(s).trim_end_matches(' ').to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|p| {
+            stem.strip_prefix(p).is_some_and(|n| n.len() == 1 && matches!(n.as_bytes()[0], b'1'..=b'9'))
+        })
 }
 
 /// The file name of the reference for a camera, for a model and serial that
@@ -177,6 +195,18 @@ pub(crate) const PLAIN_COMPONENT_TABLE: &[(&str, bool)] = &[
     ("\0", false),
 ];
 
+/// Table entries that are plain on unix but not on Windows (see `windows_unsafe_name`), and names
+/// that only Windows refuses; a caller's expectation for `value` on this platform comes from
+/// [`plain_here`], not from the table's flag alone.
+#[cfg(test)]
+pub(crate) const WINDOWS_ONLY_UNSAFE: &[&str] = &["...", "a\nb", "a ", "a:b", "CON", "nul.txt", "com1", "LPT9", "a?", "a*", "a\"b", "a<b", "a|b"];
+
+/// Whether `value` is plain on THIS platform: the table's flag, unless Windows additionally refuses it.
+#[cfg(test)]
+pub(crate) fn plain_here(value: &str, plain: bool) -> bool {
+    plain && !(cfg!(windows) && WINDOWS_ONLY_UNSAFE.contains(&value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,7 +216,19 @@ mod tests {
     #[test]
     fn plain_components_and_boundaries() {
         for (value, plain) in PLAIN_COMPONENT_TABLE {
-            assert_eq!(is_safe_path_component(value), *plain, "{value:?}");
+            assert_eq!(is_safe_path_component(value), plain_here(value, *plain), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn what_only_windows_refuses_is_plain_everywhere_else_and_refused_there() {
+        for value in WINDOWS_ONLY_UNSAFE {
+            // Plain by the portable rule; Windows alone refuses it.
+            assert_eq!(is_safe_path_component(value), !cfg!(windows), "{value:?}");
+        }
+        // Not device names: a longer stem, or a digit outside 1..=9, is an ordinary name everywhere.
+        for ok in ["CONSOLE", "COM0", "COM10", "LPT", "com1x", "nul_", "Z 9", "5.31"] {
+            assert!(is_safe_path_component(ok), "{ok:?}");
         }
     }
 
@@ -196,8 +238,8 @@ mod tests {
         assert_eq!(checked_reference_filename("Z6_3", "id-1").unwrap(), "Z6_3_id-1.json");
         // Each field is checked on its own: a plain model never excuses a hostile serial, or the reverse.
         for (value, plain) in PLAIN_COMPONENT_TABLE {
-            assert_eq!(checked_reference_filename("Z 9", value).is_ok(), *plain, "serial {value:?}");
-            assert_eq!(checked_reference_filename(value, "1").is_ok(), *plain, "model {value:?}");
+            assert_eq!(checked_reference_filename("Z 9", value).is_ok(), plain_here(value, *plain), "serial {value:?}");
+            assert_eq!(checked_reference_filename(value, "1").is_ok(), plain_here(value, *plain), "model {value:?}");
         }
         assert_eq!(
             checked_reference_filename("Z 9", "x/y").unwrap_err(),

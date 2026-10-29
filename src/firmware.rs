@@ -1007,7 +1007,7 @@ mod tests {
         for (value, plain) in crate::ops::paths::PLAIN_COMPONENT_TABLE {
             let r = ingest_bundle(data.path(), "Z 9", value, &f, &prov(), None);
             let refused = matches!(r, Err(FirmwareError::UnsafePathComponent { .. }));
-            assert_eq!(!refused, *plain, "version {value:?}: {r:?}");
+            assert_eq!(!refused, crate::ops::paths::plain_here(value, *plain), "version {value:?}: {r:?}");
         }
         // NUL in particular: the copy this module used to carry did not refuse it.
         assert!(matches!(

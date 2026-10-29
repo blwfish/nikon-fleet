@@ -515,7 +515,7 @@ mod tests {
     fn plain_name_component_boundaries() {
         // The shared table: this alias and the predicate it names are one rule.
         for (value, plain) in crate::ops::paths::PLAIN_COMPONENT_TABLE {
-            assert_eq!(is_plain_name_component(value), *plain, "{value:?}");
+            assert_eq!(is_plain_name_component(value), crate::ops::paths::plain_here(value, *plain), "{value:?}");
         }
     }
 
@@ -524,6 +524,7 @@ mod tests {
         // A snapshot whose serial is `value` is marked only when `value` is plain
         // AND a byte-identical reference sits at the checked name.
         for (value, plain) in crate::ops::paths::PLAIN_COMPONENT_TABLE {
+            let plain = &crate::ops::paths::plain_here(value, *plain);
             let d = TempDir::new().unwrap();
             let (sd, rd) = (d.path().join("snapshots"), d.path().join("references"));
             fs::create_dir_all(&sd).unwrap();
