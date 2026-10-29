@@ -18,7 +18,6 @@ use nikon_fleet::ops::apply::{ApplyStatus, EXIT_REFUSED_BEFORE_WRITE, EXIT_STALE
 use nikon_fleet::ops::labels::Labels;
 use nikon_fleet::ops::plan::planned_would_change;
 use nikon_fleet::ops::render::{self, Row, RowFilter};
-use nikon_fleet::ops::restore::undo_command;
 use nikon_fleet::ops::target::{is_id_fallback, storable_serial};
 use nikon_fleet::ptp_usb::{self, FtpField, FtpProfile};
 use nikon_fleet::settings::{self, Settings};
@@ -28,6 +27,20 @@ use nikon_fleet::vendor_argv::{vendor_read_argv, vendor_write_ftp_argv};
 use serde::Deserialize;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
+
+mod check;
+mod guarded;
+mod firmware_win;
+mod restore;
+
+use check::{CheckRequest, CheckUi, CheckView};
+use guarded::{
+    Applied, AppliedAction, Flow, GuardedUi, PlanFailure, Stage, apply_via, check_plan_target, confirm_head, draw_applied_outcome, no_cli, plan_via,
+    write_target_refusal, CONFIRM_TAIL,
+};
+use nikon_fleet::gui_argv;
+use firmware_win::FwUi;
+use restore::{RestoreApplyJson, RestorePlanJson, RestoreRequest, RestoreUi, SourceView, UndoOffer};
 
 // This GUI is a thin front end over the `nikon-fleet` CLI and the `nikon_fleet`
 // library. Everything that touches a camera (discover, snapshot, the vendor ops)
@@ -97,11 +110,130 @@ enum Cmd {
     Import { src: PathBuf },
     VendorRead { propcode: u16, serial: Option<String> },
     VendorWriteFtp { profile: FtpProfile, serial: Option<String> },
-    /// Read-only: plan copying a stored snapshot onto a connected body.
-    TransplantPlan { request: TransplantRequest },
-    /// WRITES TO THE CAMERA, only the plan with this digest and summary (the ones that were shown
-    /// and confirmed).
-    TransplantApply { request: TransplantRequest, digest: String, summary: String },
+    /// Read-only: plan a guarded write (a transplant, a restore).
+    Plan(PlanJob),
+    /// WRITES TO THE CAMERA, only the plan with the digest and summary that were shown and confirmed.
+    Apply(ApplyJob),
+    /// Read-only: capture a connected body and compare it with its reference.
+    Check { request: CheckRequest },
+}
+
+/// A plan to make, by flow.
+#[derive(Debug)]
+enum PlanJob {
+    Transplant(TransplantRequest),
+    Restore(RestoreRequest),
+}
+
+/// An apply to run, by flow: the request and the digest and summary of the plan that was confirmed.
+#[derive(Debug)]
+enum ApplyJob {
+    Transplant { request: TransplantRequest, digest: String, summary: String },
+    Restore { request: RestoreRequest, digest: String, summary: String },
+}
+
+/// A plan that came back, by flow.
+enum PlannedEvt {
+    Transplant { request: TransplantRequest, result: Result<(PlanJson, String), String> },
+    Restore { request: RestoreRequest, result: Result<(RestorePlanJson, String, SourceView), String> },
+}
+
+/// An apply that ended, by flow.
+enum AppliedEvt {
+    Transplant { request: TransplantRequest, outcome: ApplyOutcome },
+    Restore { request: RestoreRequest, outcome: ApplyOutcome<RestoreApplyJson> },
+}
+
+impl PlanJob {
+    /// Run on the worker thread: the CLI reads the camera.
+    fn run(self, data_dir: &Path) -> Evt {
+        Evt::Planned(match self {
+            PlanJob::Transplant(request) => {
+                let result = do_transplant_plan(data_dir, &request);
+                PlannedEvt::Transplant { request, result }
+            }
+            PlanJob::Restore(request) => {
+                let result = restore::do_restore_plan(data_dir, &request);
+                PlannedEvt::Restore { request, result }
+            }
+        })
+    }
+
+    /// The plan could not even be started: the data directory is unusable.
+    fn fail(self, why: String) -> Evt {
+        Evt::Planned(match self {
+            PlanJob::Transplant(request) => PlannedEvt::Transplant { request, result: Err(why) },
+            PlanJob::Restore(request) => PlannedEvt::Restore { request, result: Err(why) },
+        })
+    }
+}
+
+impl ApplyJob {
+    fn run(self, data_dir: &Path) -> Evt {
+        Evt::Applied(match self {
+            ApplyJob::Transplant { request, digest, summary } => {
+                let outcome = do_transplant_apply(data_dir, &request, &digest, &summary);
+                AppliedEvt::Transplant { request, outcome }
+            }
+            ApplyJob::Restore { request, digest, summary } => {
+                let outcome = restore::do_restore_apply(data_dir, &request, &digest, &summary);
+                AppliedEvt::Restore { request, outcome }
+            }
+        })
+    }
+
+    /// Nothing was sent: the data directory is unusable.
+    fn refuse(self, message: String) -> Evt {
+        Evt::Applied(match self {
+            ApplyJob::Transplant { request, .. } => AppliedEvt::Transplant { request, outcome: no_cli(message) },
+            ApplyJob::Restore { request, .. } => AppliedEvt::Restore { request, outcome: no_cli(message) },
+        })
+    }
+}
+
+impl PlannedEvt {
+    fn status(&self) -> Status {
+        let (what, summary, error) = match self {
+            PlannedEvt::Transplant { result, .. } => ("Plan", result.as_ref().ok().map(|(p, _)| p.summary.clone()), result.as_ref().err()),
+            PlannedEvt::Restore { result, .. } => ("Restore plan", result.as_ref().ok().map(|(p, _, _)| p.summary.clone()), result.as_ref().err()),
+        };
+        match (summary, error) {
+            (Some(summary), _) => Status::new(Level::Info, format!("{what}: {summary}")),
+            (None, Some(e)) => Status::new(Level::Error, e.lines().next().unwrap_or("").to_string()),
+            (None, None) => unreachable!("a result is Ok or Err"),
+        }
+    }
+
+    fn deliver(self, app: &mut FleetApp) {
+        match self {
+            PlannedEvt::Transplant { request, result } => app.transplant.plan_arrived(request, result),
+            PlannedEvt::Restore { request, result } => app.restore.plan_arrived(request, result),
+        }
+    }
+}
+
+impl AppliedEvt {
+    fn status(&self) -> Status {
+        match self {
+            AppliedEvt::Transplant { outcome, .. } => applied_status_of("Transplant", outcome),
+            AppliedEvt::Restore { outcome, .. } => applied_status_of("Restore", outcome),
+        }
+    }
+
+    /// The camera, or the restore points beside it, may have changed.
+    fn may_have_written(&self) -> bool {
+        match self {
+            AppliedEvt::Transplant { outcome, .. } => outcome.may_have_written(),
+            AppliedEvt::Restore { outcome, .. } => outcome.may_have_written(),
+        }
+    }
+
+    fn deliver(self, app: &mut FleetApp) {
+        match self {
+            AppliedEvt::Transplant { request, outcome } => app.transplant.applied(request, outcome),
+            AppliedEvt::Restore { request, outcome } => app.restore.applied(request, outcome),
+        }
+    }
 }
 
 enum Evt {
@@ -109,8 +241,9 @@ enum Evt {
     Listing(SnapListing),
     Done(OpDone),
     Vendor { op: VendorOp, result: Result<VendorOut, String> },
-    TransplantPlanned { request: TransplantRequest, result: Result<(PlanJson, String), String> },
-    TransplantApplied { request: TransplantRequest, outcome: ApplyOutcome },
+    Planned(PlannedEvt),
+    Applied(AppliedEvt),
+    Checked { request: CheckRequest, result: Result<CheckView, String> },
     Err(String),
 }
 
@@ -206,6 +339,8 @@ struct SnapRow {
     file: String,
     model: String,
     serial: String,
+    /// The firmware the body ran when it was captured.
+    firmware: String,
     label: Option<String>,
     captured_at: String,
     is_reference: bool,
@@ -296,11 +431,12 @@ fn list_all(data_dir: &Path) -> SnapListing {
     };
     for entry in listing.entries {
         match entry.state {
-            EntryState::Ok { model, serial, label, captured_at, is_reference, .. } => out.rows.push(SnapRow {
+            EntryState::Ok { model, serial, firmware, label, captured_at, is_reference, .. } => out.rows.push(SnapRow {
                 name_lossy: entry.file.contains('\u{FFFD}'),
                 file: entry.file,
                 model,
                 serial,
+                firmware,
                 label,
                 captured_at,
                 is_reference: is_reference == Some(true),
@@ -540,6 +676,9 @@ struct FleetApp {
     pending_write: Option<PendingWrite>,
     vendor_write_result: String,
     transplant: TransplantUi,
+    restore: RestoreUi,
+    check: CheckUi,
+    firmware: FwUi,
 }
 
 impl FleetApp {
@@ -583,6 +722,9 @@ impl FleetApp {
             pending_write: None,
             vendor_write_result: String::new(),
             transplant: TransplantUi::default(),
+            restore: RestoreUi::default(),
+            check: CheckUi::default(),
+            firmware: FwUi::default(),
         };
         app.refresh_listing();
         app
@@ -631,6 +773,9 @@ impl FleetApp {
     /// Tell the worker which directory the (re)loaded settings name, and re-list it.
     fn use_settings_data_dir(&mut self) {
         self.transplant.data_dir_changed();
+        self.restore.data_dir_changed();
+        self.check.data_dir_changed();
+        self.firmware.data_dir_changed();
         if self.cmd_tx.send(Cmd::SetDataDir(self.settings.data_dir_or_err())).is_err() {
             self.status = Status::new(Level::Error, "The worker thread has stopped; restart the app.");
             return;
@@ -687,6 +832,8 @@ impl FleetApp {
         self.busy_since = None;
         self.status = Status::new(Level::Error, "The worker thread has stopped; restart the app.");
         self.transplant.worker_lost();
+        self.restore.worker_lost();
+        self.check.worker_lost();
     }
 
     fn poll(&mut self) {
@@ -739,21 +886,28 @@ impl FleetApp {
                         VendorOp::WriteFtp => self.vendor_write_result = text,
                     }
                 }
-                Evt::TransplantPlanned { request, result } => {
-                    self.status = match &result {
-                        Ok((plan, _)) => Status::new(Level::Info, format!("Plan: {}", plan.summary)),
-                        Err(e) => Status::new(Level::Error, e.lines().next().unwrap_or("").to_string()),
-                    };
-                    self.transplant.plan_arrived(request, result);
+                Evt::Planned(planned) => {
+                    self.status = planned.status();
+                    planned.deliver(self);
                 }
-                Evt::TransplantApplied { request, outcome } => {
-                    self.status = applied_status(&outcome);
+                Evt::Applied(applied) => {
+                    self.status = applied.status();
                     // A restore point may have been written, and the camera may have changed.
-                    let wrote = !matches!(outcome, ApplyOutcome::NotApplied { .. });
-                    self.transplant.applied(request, outcome);
+                    let wrote = applied.may_have_written();
+                    applied.deliver(self);
                     if wrote {
                         self.refresh_listing();
                     }
+                }
+                Evt::Checked { request, result } => {
+                    self.status = match &result {
+                        Ok(view) => {
+                            let (level, text) = check::check_headline(view);
+                            Status::new(level, format!("Check {} {}: {text}", request.target.model, request.target.serial))
+                        }
+                        Err(e) => Status::new(Level::Error, e.lines().next().unwrap_or("").to_string()),
+                    };
+                    self.check.arrived(request, result);
                 }
                 Evt::Err(msg) => self.status = Status::new(Level::Error, format!("Error: {msg}")),
             }
@@ -798,11 +952,17 @@ impl eframe::App for FleetApp {
         self.poll_views();
         self.drop_stale_confirmation();
         self.transplant.sync(&self.cameras);
+        self.restore.sync(&self.cameras);
+        self.check.sync(&self.cameras);
+        self.poll_firmware(ctx);
         self.ui_toolbar(ctx);
         self.ui_notices(ctx);
         self.ui_preferences(ctx);
         self.ui_vendor_ops(ctx);
         self.ui_transplant(ctx);
+        self.ui_restore(ctx);
+        self.ui_check(ctx);
+        self.ui_firmware(ctx);
         self.ui_sidebar(ctx);
         self.ui_main(ctx);
         self.ui_snapshot_viewers(ctx);
@@ -826,6 +986,15 @@ impl FleetApp {
                 }
                 if ui.button("⇄ Transplant").clicked() {
                     self.transplant.open = !self.transplant.open;
+                }
+                if ui.button("↺ Restore").clicked() {
+                    self.restore.open = !self.restore.open;
+                }
+                if ui.button("✓ Check").clicked() {
+                    self.check.open = !self.check.open;
+                }
+                if ui.button("⬆ Firmware").clicked() {
+                    self.firmware.open = !self.firmware.open;
                 }
                 ui.separator();
                 if let Some(since) = self.busy_since {
@@ -1207,9 +1376,11 @@ impl FleetApp {
 
     fn ui_main(&mut self, ctx: &egui::Context) {
         let mut snap_trigger = false;
+        let mut check_trigger = false;
         let mut ref_action: Option<String> = None;
         let mut view_action: Option<(String, bool, bool)> = None;
         let mut transplant_from: Option<((String, String), String)> = None;
+        let mut restore_from: Option<((String, String), String)> = None;
         let busy = self.busy();
         let data_ready = self.settings.data_dir.is_some();
 
@@ -1254,6 +1425,13 @@ impl FleetApp {
                             snap_trigger = true;
                         }
                     });
+                    if ui
+                        .button("Check against reference…")
+                        .on_hover_text("Read this body and list how it differs from its reference snapshot (writes nothing)")
+                        .clicked()
+                    {
+                        check_trigger = true;
+                    }
                 });
             } else {
                 ui.horizontal(|ui| {
@@ -1306,6 +1484,15 @@ impl FleetApp {
                         });
                         ui.add_enabled_ui(!busy && !snap.name_lossy, |ui| {
                             if ui
+                                .small_button("Restore…")
+                                .on_hover_text("Put this snapshot's settings back on its own body (you will see a plan first)")
+                                .clicked()
+                            {
+                                restore_from = Some(((snap.model.clone(), snap.serial.clone()), snap.file.clone()));
+                            }
+                        });
+                        ui.add_enabled_ui(!busy && !snap.name_lossy, |ui| {
+                            if ui
                                 .small_button("Transplant…")
                                 .on_hover_text("Copy this snapshot's settings onto a connected body (you will see a plan first)")
                                 .clicked()
@@ -1324,6 +1511,9 @@ impl FleetApp {
                 self.send(Cmd::Snapshot { camera, label });
             }
         }
+        if check_trigger {
+            self.start_check_for_selected();
+        }
         if let Some(file) = ref_action {
             self.send(Cmd::SetReference { file });
         }
@@ -1332,6 +1522,9 @@ impl FleetApp {
         }
         if let Some((body, file)) = transplant_from {
             self.start_transplant_from(body, file);
+        }
+        if let Some((body, file)) = restore_from {
+            self.start_restore_from(body, file);
         }
     }
 
@@ -1468,26 +1661,20 @@ fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Evt>, ctx: egui::Context, in
             Cmd::VendorWriteFtp { profile, serial } => {
                 Evt::Vendor { op: VendorOp::WriteFtp, result: do_vendor_write_ftp(&profile, serial.as_deref()) }
             }
-            Cmd::TransplantPlan { request } => match data_dir.as_ref() {
-                Ok(d) => {
-                    let result = do_transplant_plan(d, &request);
-                    Evt::TransplantPlanned { request, result }
-                }
-                Err(e) => Evt::TransplantPlanned { request, result: Err(e.clone()) },
+            Cmd::Plan(job) => match data_dir.as_ref() {
+                Ok(d) => job.run(d),
+                Err(e) => job.fail(e.clone()),
             },
-            Cmd::TransplantApply { request, digest, summary } => match data_dir.as_ref() {
+            Cmd::Apply(job) => match data_dir.as_ref() {
+                Ok(d) => job.run(d),
+                Err(e) => job.refuse(e.clone()),
+            },
+            Cmd::Check { request } => match data_dir.as_ref() {
                 Ok(d) => {
-                    let outcome = do_transplant_apply(d, &request, &digest, &summary);
-                    Evt::TransplantApplied { request, outcome }
+                    let result = check::do_check(d, &request);
+                    Evt::Checked { request, result }
                 }
-                Err(message) => Evt::TransplantApplied {
-                    request,
-                    outcome: ApplyOutcome::NotApplied {
-                        why: NotAppliedWhy::Refused,
-                        message: message.clone(),
-                        cli_log: String::new(),
-                    },
-                },
+                Err(e) => Evt::Checked { request, result: Err(e.clone()) },
             },
         };
         // The receiver is gone only when the window closed; there is no one to tell.
@@ -2533,54 +2720,14 @@ struct PlannedTransplant {
     cli_log: String,
 }
 
-/// Why a transplant is refused before the camera is touched, beyond what the CLI itself checks:
-/// a write must be aimed at one body with certainty.
-fn transplant_target_refusal(camera: &CameraRow) -> Option<String> {
-    if is_id_fallback(&camera.serial) {
-        return Some(format!(
-            "{} reports no USB serial (it is known only as {}), so a write cannot be aimed at it with certainty.",
-            camera.model, camera.serial
-        ));
-    }
-    camera
-        .pairing_ambiguous()
-        .then(|| AmbiguousPairing { model: camera.model.clone(), count: camera.model_count }.to_string())
-}
-
-/// The full pre-flight: the target's own check, then a fresh USB-only look at the bus (the same
-/// rule a snapshot uses to trust a serial pairing).
-fn transplant_refusal(camera: &CameraRow, scan: &CameraList) -> Option<String> {
-    let reason = transplant_target_refusal(camera).or_else(|| snapshot_refusal(camera, scan).map(|r| r.reason()))?;
-    Some(format!("Transplant refused, nothing was read or written: {reason}"))
-}
-
 /// The CLI arguments for a plan (`confirmed` is `None`) or an apply (the digest and summary the
-/// person confirmed). `--flag=value` throughout, so a value starting with `-` stays attached to
-/// its flag, and `--` before the source so a file name cannot be taken for a flag.
+/// person confirmed): `nikon_fleet::gui_argv`, which the CLI's own tests run through the real parser.
 fn transplant_argv(data_dir: &Path, request: &TransplantRequest, confirmed: Option<(&str, &str)>) -> Result<Vec<String>, String> {
     let dir = data_dir
         .to_str()
         .ok_or_else(|| format!("the data directory {} is not valid UTF-8", data_dir.display()))?;
     let source = snapshot_path_for_cli(data_dir, &request.source_file)?;
-    let mut argv = vec![
-        format!("--data-dir={dir}"),
-        "transplant".into(),
-        "--json".into(),
-        format!("--serial={}", request.target.serial),
-    ];
-    match confirmed {
-        None => argv.push("--dry-run".into()),
-        Some((digest, summary)) => {
-            argv.push(format!("--expect-digest={digest}"));
-            argv.push(format!("--expect-summary={summary}"));
-        }
-    }
-    for name in &request.allow_raw_code {
-        argv.push(format!("--allow-raw-code={name}"));
-    }
-    argv.push("--".into());
-    argv.push(source);
-    Ok(argv)
+    Ok(gui_argv::transplant_argv(dir, &request.target.serial, &request.allow_raw_code, confirmed, &source))
 }
 
 /// The snapshot as an absolute path. The CLI looks for a path that is not absolute in its own
@@ -2607,33 +2754,23 @@ fn transplant_plan_via(
     scan: &dyn Fn() -> CameraList,
     timeout: Duration,
 ) -> Result<(PlanJson, String), String> {
-    if let Some(refusal) = transplant_refusal(&request.target, &scan()) {
-        return Err(refusal);
-    }
-    let argv = transplant_argv(data_dir, request, None)?;
-    let out = run_cli(cli, &argv, None, timeout).map_err(|e| format!("Planning failed: {}", e.message))?;
-    let plan: PlanJson = serde_json::from_str(out.stdout.trim()).map_err(|e| {
-        format!("the plan command succeeded but its report could not be read ({e}); nothing was written")
-    })?;
+    let (plan, log) = plan_via::<PlanJson>(
+        "Transplant",
+        cli,
+        || transplant_argv(data_dir, request, None),
+        &request.target,
+        scan,
+        timeout,
+        PlanFailure::NoPlan,
+    )?;
     check_plan_is_for(&plan, request)?;
-    Ok((plan, out.stderr))
+    Ok((plan, log))
 }
 
 /// A plan is shown and confirmed only if it is for the snapshot, the body (at the firmware it runs
 /// now) and the opt-ins that were asked for.
 fn check_plan_is_for(plan: &PlanJson, request: &TransplantRequest) -> Result<(), String> {
-    if plan.target.serial != request.target.serial || plan.target.model != request.target.model {
-        return Err(format!(
-            "the plan is for {} {}, not for the {} {} that was asked for; nothing was written",
-            plan.target.model, plan.target.serial, request.target.model, request.target.serial
-        ));
-    }
-    if plan.target.firmware != request.target.firmware {
-        return Err(format!(
-            "the plan was made for firmware {} on {} {}, which is {} now; nothing was written",
-            plan.target.firmware, plan.target.model, plan.target.serial, request.target.firmware
-        ));
-    }
+    check_plan_target(&plan.target, &request.target)?;
     if (&plan.source.model, &plan.source.serial) != (&request.source_body.0, &request.source_body.1) {
         return Err(format!(
             "the plan is of a snapshot of {} {}, not of the {} {} that was chosen; nothing was written",
@@ -2651,13 +2788,25 @@ fn check_plan_is_for(plan: &PlanJson, request: &TransplantRequest) -> Result<(),
 /// What an apply came to. The CLI's report decides; without one, the way the run ended says only
 /// whether the camera was certainly not written.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ApplyOutcome {
+enum ApplyOutcome<R = ApplyJson> {
     /// The CLI reported (the report's `status` is the verdict).
-    Report { report: Box<ApplyJson>, note: Option<String>, cli_log: String },
+    Report { report: Box<R>, note: Option<String>, cli_log: String },
     /// Refused before any write; the camera is as it was.
     NotApplied { why: NotAppliedWhy, message: String, cli_log: String },
     /// No report and a run that may have written: the camera may have changed.
     Indeterminate { message: String, cli_log: String },
+}
+
+impl<R: AppliedReport> ApplyOutcome<R> {
+    /// Whether the camera may have been written to: what its status says, and for an outcome with
+    /// no report only a refusal says it was not (`ApplyStatus::may_have_written` is the one rule).
+    fn may_have_written(&self) -> bool {
+        match self {
+            ApplyOutcome::Report { report, .. } => report.status().may_have_written(),
+            ApplyOutcome::NotApplied { .. } => false,
+            ApplyOutcome::Indeterminate { .. } => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2673,7 +2822,7 @@ fn do_transplant_apply(data_dir: &Path, request: &TransplantRequest, digest: &st
         Ok(cli) => {
             transplant_apply_via(&cli, data_dir, request, digest, summary, &list_cameras, TRANSPLANT_APPLY_TIMEOUT)
         }
-        Err(message) => ApplyOutcome::NotApplied { why: NotAppliedWhy::Refused, message, cli_log: String::new() },
+        Err(message) => no_cli(message),
     }
 }
 
@@ -2688,15 +2837,15 @@ fn transplant_apply_via(
     scan: &dyn Fn() -> CameraList,
     timeout: Duration,
 ) -> ApplyOutcome {
-    let refused = |message: String| ApplyOutcome::NotApplied { why: NotAppliedWhy::Refused, message, cli_log: String::new() };
-    if let Some(refusal) = transplant_refusal(&request.target, &scan()) {
-        return refused(refusal);
-    }
-    let argv = match transplant_argv(data_dir, request, Some((digest, summary))) {
-        Ok(a) => a,
-        Err(e) => return refused(e),
-    };
-    classify_apply(run_cli(cli, &argv, None, timeout), digest)
+    apply_via::<ApplyJson>(
+        "Transplant",
+        cli,
+        || transplant_argv(data_dir, request, Some((digest, summary))),
+        &request.target,
+        digest,
+        scan,
+        timeout,
+    )
 }
 
 /// Read the way an apply ended. A report on stdout is the answer whatever the exit status was (a
@@ -2706,33 +2855,79 @@ fn transplant_apply_via(
 /// not be started wrote nothing either. Anything else may have written, exit 1 included: the CLI
 /// also ends 1 for an apply that wrote but did not fully take, and a report this program cannot
 /// read (a newer CLI, a report cut off) looks the same as no report.
+#[cfg(test)]
 fn classify_apply(result: Result<CliOutput, CliError>, confirmed_digest: &str) -> ApplyOutcome {
-    let report_of = |stdout: &str| serde_json::from_str::<ApplyJson>(stdout.trim()).ok();
+    classify_apply_as::<ApplyJson>(result, confirmed_digest)
+}
+
+/// What an apply's JSON report says that the way it ended depends on, whichever command printed it.
+trait AppliedReport: serde::de::DeserializeOwned {
+    fn plan_digest(&self) -> &str;
+    fn status(&self) -> ApplyStatus;
+    fn restore_point(&self) -> Option<&RestorePointJson>;
+    /// The properties an undo of this apply puts back.
+    fn undo_set(&self) -> &[String];
+}
+
+impl AppliedReport for ApplyJson {
+    fn plan_digest(&self) -> &str {
+        &self.plan_digest
+    }
+    fn status(&self) -> ApplyStatus {
+        self.status
+    }
+    fn restore_point(&self) -> Option<&RestorePointJson> {
+        self.restore_point.as_ref()
+    }
+    fn undo_set(&self) -> &[String] {
+        &self.undo_set
+    }
+}
+
+fn classify_apply_as<R: AppliedReport>(result: Result<CliOutput, CliError>, confirmed_digest: &str) -> ApplyOutcome<R> {
     let (stdout, stderr, failure) = match result {
         Ok(out) => (out.stdout, out.stderr, None),
         Err(e) => (e.stdout.clone(), e.stderr.clone(), Some(e)),
     };
-    if let Some(report) = report_of(&stdout) {
-        if report.plan_digest != confirmed_digest {
+    let parsed = serde_json::from_str::<R>(stdout.trim());
+    if let Ok(report) = parsed {
+        if report.plan_digest() != confirmed_digest {
+            // Not the answer to what was confirmed: but a report that names a restore point is
+            // information the person needs to look at the camera against.
+            let point = report
+                .restore_point()
+                .map(|p| format!(" Its restore point is {} (see the snapshot list).", nikon_fleet::ops::render::printable(&p.file)))
+                .unwrap_or_default();
             return ApplyOutcome::Indeterminate {
-                message: "The command reported a different plan than the one that was confirmed, so what it wrote \
-                          is not what you approved."
-                    .to_string(),
+                message: format!(
+                    "The command reported a different plan than the one that was confirmed, so what it wrote \
+                     is not what you approved.{point}"
+                ),
                 cli_log: stderr,
             };
         }
-        let note = failure.filter(|e| e.kind != CliFailure::Exit).map(|e| {
-            format!("The command was stopped after it reported ({}). The report is what it said before that.", e.message)
+        let note = failure.and_then(|e| match (e.kind, e.code) {
+            // The documented failure after a report: it wrote, or tried to, and did not fully take.
+            (CliFailure::Exit, Some(1)) => None,
+            (CliFailure::Exit, Some(code)) => Some(format!("The command ended with status {code} after it reported. The report is what it said before that.")),
+            (CliFailure::Exit, None) => Some("The command was ended by a signal after it reported. The report is what it said before that.".to_string()),
+            _ => Some(format!("The command was stopped after it reported ({}). The report is what it said before that.", e.message)),
         });
         return ApplyOutcome::Report { report: Box::new(report), note, cli_log: stderr };
     }
+    // What the CLI printed, if it printed anything, is a report this program could not read: a newer
+    // build, a report cut off. The cause is kept for the person.
+    let unreadable = match (&parsed, stdout.trim().is_empty()) {
+        (Err(e), false) => format!(" Its report could not be read ({e})."),
+        _ => String::new(),
+    };
     let Some(e) = failure else {
         return ApplyOutcome::Indeterminate {
-            message: "The command exited 0 but its report could not be read, so what it wrote is unknown.".to_string(),
+            message: format!("The command exited 0 but its report could not be read, so what it wrote is unknown.{unreadable}"),
             cli_log: stderr,
         };
     };
-    let unknown = |message: String| ApplyOutcome::Indeterminate { message, cli_log: stderr.clone() };
+    let unknown = |message: String| ApplyOutcome::Indeterminate { message: format!("{message}{unreadable}"), cli_log: stderr.clone() };
     match (e.kind, e.code) {
         (CliFailure::Exit, Some(code)) if code == EXIT_STALE_PLAN => {
             ApplyOutcome::NotApplied { why: NotAppliedWhy::PlanStale, message: e.message, cli_log: stderr }
@@ -2740,12 +2935,21 @@ fn classify_apply(result: Result<CliOutput, CliError>, confirmed_digest: &str) -
         (CliFailure::Exit, Some(code)) if code == EXIT_REFUSED_BEFORE_WRITE => {
             ApplyOutcome::NotApplied { why: NotAppliedWhy::Refused, message: e.message, cli_log: stderr }
         }
+        // Exit 2 is the command line parser's: it ran nothing (an older CLI without --expect-digest).
+        (CliFailure::Exit, Some(EXIT_USAGE)) => ApplyOutcome::NotApplied {
+            why: NotAppliedWhy::Refused,
+            message: format!("The command did not accept its arguments, so it ran nothing: {}", e.message),
+            cli_log: stderr,
+        },
         (CliFailure::Spawn, _) => {
             ApplyOutcome::NotApplied { why: NotAppliedWhy::Refused, message: e.message, cli_log: stderr }
         }
         _ => unknown(e.message),
     }
 }
+
+/// The command line parser's own exit status for a usage error (clap): the CLI has run nothing.
+const EXIT_USAGE: i32 = 2;
 
 // What the person is shown, as text with a level. Pure, so each is tested without a window.
 
@@ -2764,29 +2968,30 @@ fn status_headline(status: ApplyStatus) -> (Level, &'static str) {
 }
 
 /// What a failed apply leaves unsaid: the writes are made one after another, so one that failed
-/// does not mean the others did not land. Said only where there is a restore point to point to.
-fn failed_aftermath(r: &ApplyJson) -> Option<&'static str> {
-    (r.status == ApplyStatus::Failed && r.restore_point.is_some()).then_some(
-        "Some writes may have landed even though this failed. Compare the camera with the restore point below; the command under it puts back what this changed.",
+/// does not mean the others did not land. The same holds for a report whose status is unknown. Said
+/// only where there is a restore point to point to.
+fn failed_aftermath<R: AppliedReport>(r: &R) -> Option<&'static str> {
+    let unsettled = match r.status() {
+        ApplyStatus::Failed | ApplyStatus::Indeterminate => true,
+        ApplyStatus::AppliedVerified | ApplyStatus::AppliedUnverified | ApplyStatus::NotApplied => false,
+    };
+    (unsettled && r.status().may_have_written() && r.restore_point().is_some()).then_some(
+        "Some writes may have landed even though this did not finish cleanly. Compare the camera with the restore point below; Undo puts back what this changed.",
     )
 }
 
 /// The text of the confirmation for an apply: it names the body and carries the plan's summary,
 /// so what is approved is what is sent.
 fn apply_confirm_text(p: &PlannedTransplant) -> String {
-    let t = &p.request.target;
     let plan = &p.plan;
-    let mut s = format!(
-        "Write to {} (serial {}, firmware {}) the settings of {} ({} {}{})?\n{}",
-        t.model,
-        t.serial,
-        t.firmware,
+    let source = format!(
+        "of {} ({} {}{})",
         p.request.source_file,
         plan.source.model,
         plan.source.serial,
         plan.source_label.as_deref().map(|l| format!(", {l:?}")).unwrap_or_default(),
-        plan.summary,
     );
+    let mut s = confirm_head(&p.request.target, &source, &plan.summary);
     if !plan.allow_raw_code.is_empty() {
         let opted: Vec<String> = plan
             .allow_raw_code
@@ -2801,9 +3006,7 @@ fn apply_confirm_text(p: &PlannedTransplant) -> String {
             opted.join(", ")
         ));
     }
-    s.push_str(
-        "\nA restore point of the camera is saved first and every write is read back; the result says whether it took.",
-    );
+    s.push_str(CONFIRM_TAIL);
     s
 }
 
@@ -2903,29 +3106,57 @@ impl SideEffectsJson {
     }
 }
 
-/// Where a transplant is: one plan at a time, and a plan or a confirmation is good only for the
-/// request it was made for.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-enum TransplantStage {
-    #[default]
-    Idle,
-    /// A plan was asked for this request and has not come back.
-    Planning(TransplantRequest),
-    Planned(PlannedTransplant),
-    /// Asked to opt one property in; waiting for the extra confirmation.
-    OptIn { plan: PlannedTransplant, property: String },
-    /// Asked to apply; waiting for the confirmation.
-    ConfirmApply(PlannedTransplant),
-    /// Sent; the answer is the only thing that ends this.
-    Applying(TransplantRequest),
-    Done(Box<AppliedTransplant>),
+/// Transplant, as a guarded write.
+#[derive(Debug, Clone, PartialEq)]
+struct TransplantFlow;
+
+/// Asked to opt one property in; waiting for the extra confirmation.
+#[derive(Debug, Clone, PartialEq)]
+struct OptInAsk {
+    plan: PlannedTransplant,
+    property: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AppliedTransplant {
-    request: TransplantRequest,
-    outcome: ApplyOutcome,
+impl Flow for TransplantFlow {
+    type Request = TransplantRequest;
+    type Plan = PlannedTransplant;
+    type Aside = OptInAsk;
+    type Report = ApplyJson;
+
+    const APPLY_WORD: &'static str = "apply";
+    const CHOOSE_FIRST: &'static str = "Choose a source snapshot and a connected target first.";
+
+    fn request_target(r: &TransplantRequest) -> &CameraRow {
+        &r.target
+    }
+    fn plan_request(p: &PlannedTransplant) -> &TransplantRequest {
+        &p.request
+    }
+    fn aside_plan(a: &OptInAsk) -> &PlannedTransplant {
+        &a.plan
+    }
+    fn plan_digest(p: &PlannedTransplant) -> &str {
+        &p.plan.digest
+    }
+    fn plan_summary(p: &PlannedTransplant) -> &str {
+        &p.plan.summary
+    }
+    /// Only a plan that would write something can be applied.
+    fn applicable(p: &PlannedTransplant) -> bool {
+        p.plan.counts.would_change > 0
+    }
+    fn plan_cmd(request: TransplantRequest) -> Cmd {
+        Cmd::Plan(PlanJob::Transplant(request))
+    }
+    fn apply_cmd(request: TransplantRequest, digest: String, summary: String) -> Cmd {
+        Cmd::Apply(ApplyJob::Transplant { request, digest, summary })
+    }
 }
+
+/// Where a transplant is: one plan at a time, and a plan or a confirmation is good only for the
+/// request it was made for.
+type TransplantStage = Stage<TransplantFlow>;
+type AppliedTransplant = Applied<TransplantFlow>;
 
 /// The transplant window's state.
 #[derive(Debug, Default)]
@@ -2946,10 +3177,17 @@ struct TransplantUi {
     notice: String,
 }
 
-impl TransplantUi {
-    fn target_camera<'a>(&self, cameras: &'a [CameraRow]) -> Option<&'a CameraRow> {
-        let (model, serial) = self.target_key.as_ref()?;
-        cameras.iter().find(|c| &c.model == model && &c.serial == serial)
+impl GuardedUi for TransplantUi {
+    type F = TransplantFlow;
+
+    fn stage(&self) -> &TransplantStage {
+        &self.stage
+    }
+    fn stage_mut(&mut self) -> &mut TransplantStage {
+        &mut self.stage
+    }
+    fn notice_mut(&mut self) -> &mut String {
+        &mut self.notice
     }
 
     /// The request the form asks for now, if it asks for one.
@@ -2962,156 +3200,45 @@ impl TransplantUi {
         })
     }
 
-    /// Run every frame, before anything is drawn: opt-ins belong to the source and target they were
-    /// confirmed for, and a plan or confirmation does not outlive a change to its request.
-    fn sync(&mut self, cameras: &[CameraRow]) {
+    /// Opt-ins belong to the source and target they were confirmed for.
+    fn sync_selection(&mut self, cameras: &[CameraRow]) {
         let pair = self.source_file.clone().zip(self.target_camera(cameras).cloned());
         if self.optins_for != pair {
-            self.clear_optins();
+            self.clear_selection();
             self.optins_for = pair;
-        }
-        let held = match &self.stage {
-            TransplantStage::Planning(r) => Some(r),
-            TransplantStage::Planned(p) | TransplantStage::ConfirmApply(p) | TransplantStage::OptIn { plan: p, .. } => {
-                Some(&p.request)
-            }
-            _ => None,
-        };
-        if let Some(held) = held {
-            if self.request(cameras).as_ref() != Some(held) {
-                let was_confirming = matches!(self.stage, TransplantStage::ConfirmApply(_) | TransplantStage::OptIn { .. });
-                self.go_idle();
-                self.notice = format!(
-                    "{} withdrawn: the snapshot, the camera or the opt-ins changed. Nothing was written.",
-                    if was_confirming { "Confirmation" } else { "Plan" }
-                );
-            }
         }
     }
 
-    fn clear_optins(&mut self) {
+    /// The opt-ins go with the plan they were made for: they are shown only on a plan, so none may
+    /// wait unseen to ride into the next one.
+    fn clear_selection(&mut self) {
         self.optins.clear();
         self.optin_values.clear();
     }
+}
 
-    /// Nothing is held any more. The opt-ins go with the plan they were made for: they are shown
-    /// only on a plan, so none may wait unseen to ride into the next one.
-    fn go_idle(&mut self) {
-        self.stage = TransplantStage::Idle;
-        self.clear_optins();
+impl TransplantUi {
+    fn target_camera<'a>(&self, cameras: &'a [CameraRow]) -> Option<&'a CameraRow> {
+        let (model, serial) = self.target_key.as_ref()?;
+        cameras.iter().find(|c| &c.model == model && &c.serial == serial)
     }
 
-    /// "Discard plan" / "Close this result".
-    fn discard(&mut self) {
-        if matches!(self.stage, TransplantStage::Planned(_) | TransplantStage::Done(_)) {
-            self.go_idle();
-        }
-    }
-
-    /// The data directory changed under a plan or a confirmation: the snapshots and the restore
-    /// points it names are no longer where it said, so it is withdrawn. An apply on the wire is
-    /// not: its answer must still find it.
-    fn data_dir_changed(&mut self) {
-        if matches!(
-            self.stage,
-            TransplantStage::Planning(_) | TransplantStage::Planned(_) | TransplantStage::OptIn { .. } | TransplantStage::ConfirmApply(_)
-        ) {
-            self.go_idle();
-            self.notice = "Plan withdrawn: the data directory changed. Nothing was written.".to_string();
-        }
-    }
-
-    /// The worker thread is gone: nothing more will be answered. A plan being made is lost; an
-    /// apply on the wire may have written, whatever stopped.
-    fn worker_lost(&mut self) {
-        match &self.stage {
-            TransplantStage::Planning(_) => {
-                self.go_idle();
-                self.notice = "The worker thread stopped while the camera was being read. Nothing was written.".to_string();
-            }
-            TransplantStage::Applying(request) => {
-                let outcome = ApplyOutcome::Indeterminate {
-                    message: "The worker thread stopped while the apply was running, so what it wrote is unknown.".to_string(),
-                    cli_log: String::new(),
-                };
-                let request = request.clone();
-                self.clear_optins();
-                self.stage = TransplantStage::Done(Box::new(AppliedTransplant { request, outcome }));
-            }
-            _ => {}
-        }
-    }
-
-    /// A command could not be handed to the worker, which is gone: the camera was not asked.
-    fn not_sent(&mut self) {
-        match &self.stage {
-            TransplantStage::Planning(_) => {
-                self.go_idle();
-                self.notice = "The worker thread has stopped, so the camera was not read. Nothing was written.".to_string();
-            }
-            TransplantStage::Applying(request) => {
-                let outcome = ApplyOutcome::NotApplied {
-                    why: NotAppliedWhy::Refused,
-                    message: "The worker thread has stopped, so the apply was never sent.".to_string(),
-                    cli_log: String::new(),
-                };
-                let request = request.clone();
-                self.clear_optins();
-                self.stage = TransplantStage::Done(Box::new(AppliedTransplant { request, outcome }));
-            }
-            _ => {}
-        }
-    }
-
-    /// Start a plan for the form as it is. The command to send, or why not.
-    fn begin_plan(&mut self, cameras: &[CameraRow]) -> Result<Cmd, String> {
-        let request = self.request(cameras).ok_or("Choose a source snapshot and a connected target first.")?;
-        if let Some(why) = transplant_target_refusal(&request.target) {
-            return Err(why);
-        }
-        self.notice.clear();
-        self.stage = TransplantStage::Planning(request.clone());
-        Ok(Cmd::TransplantPlan { request })
+    #[cfg(test)]
+    fn clear_optins(&mut self) {
+        self.clear_selection();
     }
 
     /// A plan came back. Dropped unless it is the one asked for and still wanted.
     fn plan_arrived(&mut self, request: TransplantRequest, result: Result<(PlanJson, String), String>) {
-        if self.stage != TransplantStage::Planning(request.clone()) {
-            return;
-        }
-        match result {
-            Ok((plan, cli_log)) => {
-                let optin_values = self
-                    .optin_values
-                    .iter()
-                    .filter(|(name, _)| request.allow_raw_code.contains(*name))
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect();
-                self.stage = TransplantStage::Planned(PlannedTransplant { request, plan, optin_values, cli_log });
-            }
-            Err(e) => {
-                self.go_idle();
-                self.notice = e;
-            }
-        }
-    }
-
-    /// Ask for the confirmation to apply. Only a plan that would write something can be applied.
-    fn ask_apply(&mut self) {
-        if let TransplantStage::Planned(p) = &self.stage {
-            if p.plan.counts.would_change > 0 {
-                self.stage = TransplantStage::ConfirmApply(p.clone());
-            }
-        }
-    }
-
-    /// Back from a confirmation to the plan; nothing was asked of the camera.
-    fn cancel_confirmation(&mut self) {
-        let plan = match &self.stage {
-            TransplantStage::ConfirmApply(p) | TransplantStage::OptIn { plan: p, .. } => p.clone(),
-            _ => return,
-        };
-        self.stage = TransplantStage::Planned(plan);
+        self.plan_arrived_with(request, result, |me, request, (plan, cli_log)| {
+            let optin_values = me
+                .optin_values
+                .iter()
+                .filter(|(name, _)| request.allow_raw_code.contains(*name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            PlannedTransplant { request, plan, optin_values, cli_log }
+        });
     }
 
     /// Ask for the extra confirmation to opt `property` in. Only a property the plan skipped for
@@ -3119,14 +3246,14 @@ impl TransplantUi {
     fn ask_opt_in(&mut self, property: &str) {
         if let TransplantStage::Planned(p) = &self.stage {
             if p.plan.outcomes.iter().any(|o| o.name == property && o.needs_opt_in()) {
-                self.stage = TransplantStage::OptIn { plan: p.clone(), property: property.to_string() };
+                self.stage = TransplantStage::Aside(OptInAsk { plan: p.clone(), property: property.to_string() });
             }
         }
     }
 
     /// The opt-in was confirmed: add it and plan again, since the opt-ins are part of the digest.
     fn confirm_opt_in(&mut self, cameras: &[CameraRow]) -> Option<Cmd> {
-        let TransplantStage::OptIn { plan, property } = &self.stage else {
+        let TransplantStage::Aside(OptInAsk { plan, property }) = &self.stage else {
             return None;
         };
         let property = property.clone();
@@ -3161,48 +3288,31 @@ impl TransplantUi {
             }
         }
     }
-
-    /// The apply was confirmed: what is sent is the plan that was shown, not the form as it is now.
-    fn confirm_apply(&mut self) -> Option<Cmd> {
-        let TransplantStage::ConfirmApply(p) = &self.stage else {
-            return None;
-        };
-        let cmd = Cmd::TransplantApply {
-            request: p.request.clone(),
-            digest: p.plan.digest.clone(),
-            summary: p.plan.summary.clone(),
-        };
-        self.stage = TransplantStage::Applying(p.request.clone());
-        Some(cmd)
-    }
-
-    /// The answer to an apply. The opt-ins were for that apply and do not carry to the next plan.
-    fn applied(&mut self, request: TransplantRequest, outcome: ApplyOutcome) {
-        if self.stage != TransplantStage::Applying(request.clone()) {
-            return;
-        }
-        self.clear_optins();
-        self.stage = TransplantStage::Done(Box::new(AppliedTransplant { request, outcome }));
-    }
 }
 
-/// The status-bar line for an apply outcome.
+/// The status-bar line for a transplant outcome.
+#[cfg(test)]
 fn applied_status(outcome: &ApplyOutcome) -> Status {
+    applied_status_of("Transplant", outcome)
+}
+
+/// The status-bar line for the outcome of `what` (a transplant, a restore).
+fn applied_status_of<R: AppliedReport>(what: &str, outcome: &ApplyOutcome<R>) -> Status {
     match outcome {
         ApplyOutcome::Report { report, .. } => {
-            let (level, text) = status_headline(report.status);
-            let aftermath = failed_aftermath(report).map(|_| " Some writes may have landed: a restore point was saved, see the result.");
-            Status::new(level, format!("Transplant {}: {text}{}", report.status.tag(), aftermath.unwrap_or("")))
+            let (level, text) = status_headline(report.status());
+            let aftermath = failed_aftermath(&**report).map(|_| " Some writes may have landed: a restore point was saved, see the result.");
+            Status::new(level, format!("{what} {}: {text}{}", report.status().tag(), aftermath.unwrap_or("")))
         }
         ApplyOutcome::NotApplied { why, message, .. } => Status::new(
             Level::Warn,
             match why {
-                NotAppliedWhy::PlanStale => "Transplant not_applied: the camera no longer matches the plan you approved; nothing was written. Plan again.".to_string(),
-                NotAppliedWhy::Refused => format!("Transplant not_applied: {message}"),
+                NotAppliedWhy::PlanStale => format!("{what} not_applied: the camera no longer matches the plan you approved; nothing was written. Plan again."),
+                NotAppliedWhy::Refused => format!("{what} not_applied: {message}"),
             },
         ),
         ApplyOutcome::Indeterminate { message, .. } => {
-            Status::new(Level::Error, format!("Transplant indeterminate: {message} Take a snapshot and compare before trying again."))
+            Status::new(Level::Error, format!("{what} indeterminate: the camera may have been changed. {message} Take a snapshot and compare before trying again."))
         }
     }
 }
@@ -3221,8 +3331,7 @@ enum TransplantAction {
     ConfirmOptIn,
     RemoveOptIn(String),
     Discard,
-    View(String),
-    Copy(String),
+    Applied(AppliedAction),
 }
 
 const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 120, 0);
@@ -3356,78 +3465,17 @@ fn draw_plan(ui: &mut egui::Ui, p: &PlannedTransplant, can_opt_in: bool, busy: b
     }
 }
 
-fn draw_applied(ui: &mut egui::Ui, a: &AppliedTransplant, action: &mut Option<TransplantAction>) {
+fn draw_applied(ui: &mut egui::Ui, a: &AppliedTransplant, busy: bool, data_dir: Option<&Path>, action: &mut Option<TransplantAction>) {
     let t = &a.request.target;
     ui.label(egui::RichText::new(format!("{}  →  {} {}", a.request.source_file, t.model, t.serial)).weak());
-    match &a.outcome {
-        ApplyOutcome::Report { report, note, cli_log } => {
-            let (level, headline) = status_headline(report.status);
-            ui.heading(report.status.tag());
-            colored(ui, level, headline);
-            if let Some(note) = note {
-                colored(ui, Level::Warn, note.clone());
-            }
-            for (level, line) in apply_report_lines(report) {
-                colored(ui, level, line);
-            }
-            let skipped = report.outcomes.iter().filter(|o| o.status == OutcomeStatus::Skipped).count();
-            if skipped > 0 {
-                ui.label(egui::RichText::new(format!("{skipped} propert(ies) were skipped, as the plan showed.")).weak());
-            }
-            if let Some(rp) = &report.restore_point {
-                ui.separator();
-                ui.label(egui::RichText::new("Restore point").strong());
-                ui.label("The camera as it was just before this apply:");
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&rp.file).monospace());
-                    if ui.small_button("View").clicked() {
-                        *action = Some(TransplantAction::View(rp.file.clone()));
-                    }
-                });
-                let undo = undo_command(&rp.file, &report.undo_set);
-                ui.label("To put back what this changed, run:");
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(&undo).monospace());
-                    if ui.small_button("Copy").clicked() {
-                        *action = Some(TransplantAction::Copy(undo.clone()));
-                    }
-                });
-                if !report.undo_set.is_empty() {
-                    egui::CollapsingHeader::new(format!("Properties an undo puts back ({})", report.undo_set.len()))
-                        .id_salt("tp_undo_set")
-                        .show(ui, |ui| ui.label(names_list(&report.undo_set)));
-                }
-            }
-            if !cli_log.trim().is_empty() {
-                egui::CollapsingHeader::new("CLI messages").id_salt("tp_applied_log").show(ui, |ui| {
-                    ui.label(egui::RichText::new(cli_log.trim_end()).monospace());
-                });
-            }
+    let chosen = draw_applied_outcome(ui, t, "tp_applied", &a.outcome, busy, data_dir, apply_report_lines, |ui, report| {
+        let skipped = report.outcomes.iter().filter(|o| o.status == OutcomeStatus::Skipped).count();
+        if skipped > 0 {
+            ui.label(egui::RichText::new(format!("{skipped} propert(ies) were skipped, as the plan showed.")).weak());
         }
-        ApplyOutcome::NotApplied { why, message, cli_log } => {
-            ui.heading("not_applied");
-            colored(ui, Level::Warn, "The camera was not changed.");
-            if *why == NotAppliedWhy::PlanStale {
-                colored(
-                    ui,
-                    Level::Warn,
-                    "The camera or the snapshot no longer gives the plan you approved. Plan again to see what would be written now.",
-                );
-            }
-            ui.label(message);
-            if !cli_log.trim().is_empty() {
-                ui.label(egui::RichText::new(cli_log.trim_end()).monospace());
-            }
-        }
-        ApplyOutcome::Indeterminate { message, cli_log } => {
-            ui.heading("indeterminate");
-            colored(ui, Level::Error, "The camera may have been changed.");
-            ui.label(message);
-            ui.label("Take a snapshot of the camera and compare it with the one you started from before doing anything else.");
-            if !cli_log.trim().is_empty() {
-                ui.label(egui::RichText::new(cli_log.trim_end()).monospace());
-            }
-        }
+    });
+    if let Some(c) = chosen {
+        *action = Some(TransplantAction::Applied(c));
     }
 }
 
@@ -3440,6 +3488,8 @@ impl FleetApp {
         let mut action: Option<TransplantAction> = None;
         let busy = self.busy();
         let data_ready = self.settings.data_dir.is_some();
+        let data_dir = self.settings.data_dir.clone();
+        let data_dir = data_dir.as_deref();
 
         egui::Window::new("Transplant settings onto a camera")
             .open(&mut open)
@@ -3507,7 +3557,7 @@ impl FleetApp {
                     if t.target_key.is_some() && t.target_camera(cameras).is_none() {
                         ui.colored_label(WARN_COLOR, "That body is no longer connected.");
                     }
-                    let refusal = t.target_camera(cameras).and_then(transplant_target_refusal);
+                    let refusal = t.target_camera(cameras).and_then(write_target_refusal);
                     if let Some(why) = &refusal {
                         ui.colored_label(ERROR_COLOR, why);
                     }
@@ -3556,7 +3606,7 @@ impl FleetApp {
                                 ui.label(egui::RichText::new("This plan would change nothing, so there is nothing to apply.").weak());
                             }
                         }
-                        TransplantStage::OptIn { plan, property } => {
+                        TransplantStage::Aside(OptInAsk { plan, property }) => {
                             draw_plan(ui, plan, false, busy, &mut action);
                             ui.separator();
                             ui.colored_label(WARN_COLOR, opt_in_text(plan, property));
@@ -3593,7 +3643,7 @@ impl FleetApp {
                             );
                         }
                         TransplantStage::Done(a) => {
-                            draw_applied(ui, a, &mut action);
+                            draw_applied(ui, a, busy, data_dir, &mut action);
                             ui.separator();
                             if ui.button("Close this result").clicked() {
                                 action = Some(TransplantAction::Discard);
@@ -3633,8 +3683,7 @@ impl FleetApp {
                 }
             }
             TransplantAction::Discard => self.transplant.discard(),
-            TransplantAction::View(file) => self.open_snapshot(ctx, &file, false, false),
-            TransplantAction::Copy(text) => ctx.copy_text(text),
+            TransplantAction::Applied(a) => self.applied_action(ctx, a),
         }
     }
 
@@ -4553,6 +4602,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guarded::write_preflight;
 
     #[test]
     fn a_label_does_not_follow_the_selection_to_another_camera() {
@@ -4584,12 +4634,12 @@ mod tests {
 
     /// A path that is absolute on this platform: `/x` is only relative on Windows, where the
     /// settings code refuses it.
-    fn abs_path(unix: &str) -> String {
+    pub(crate) fn abs_path(unix: &str) -> String {
         if cfg!(windows) { format!("C:{}", unix.replace('/', "\\")) } else { unix.to_string() }
     }
 
     #[cfg(unix)]
-    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    pub(crate) fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -4598,7 +4648,7 @@ mod tests {
 
     #[cfg(unix)]
     /// A stand-in for the CLI: records its argv (one per line) and stdin next to it, then runs `tail`.
-    fn recording_cli(dir: &Path, tail: &str) -> PathBuf {
+    pub(crate) fn recording_cli(dir: &Path, tail: &str) -> PathBuf {
         script(
             dir,
             "nikon-fleet",
@@ -4609,7 +4659,7 @@ mod tests {
         )
     }
 
-    fn argv_of(dir: &Path) -> Vec<String> {
+    pub(crate) fn argv_of(dir: &Path) -> Vec<String> {
         fs::read_to_string(dir.join("argv.txt")).unwrap().lines().map(str::to_string).collect()
     }
 
@@ -4624,19 +4674,19 @@ mod tests {
         s.to_pretty_json().unwrap().into_bytes()
     }
 
-    fn write_snapshot(dir: &Path, file: &str, model: &str, serial: &str, captured_at: &str) {
+    pub(crate) fn write_snapshot(dir: &Path, file: &str, model: &str, serial: &str, captured_at: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join(file), snapshot_bytes(model, serial, captured_at, "test")).unwrap();
     }
 
-    fn sha_of(bytes: &[u8]) -> String {
+    pub(crate) fn sha_of(bytes: &[u8]) -> String {
         let f = tempfile::NamedTempFile::new().unwrap();
         fs::write(f.path(), bytes).unwrap();
         sha256_file(f.path()).unwrap()
     }
 
     /// Valid metadata for the binary `bin`, as the archive records it.
-    fn meta_bytes(model: &str, version: &str, bin: &[u8]) -> Vec<u8> {
+    pub(crate) fn meta_bytes(model: &str, version: &str, bin: &[u8]) -> Vec<u8> {
         let meta = FirmwareMeta {
             format_version: FIRMWARE_META_FORMAT_VERSION,
             model: model.into(),
@@ -4653,7 +4703,7 @@ mod tests {
         serde_json::to_vec_pretty(&meta).unwrap()
     }
 
-    fn firmware_unit(data: &Path, model: &str, slug: &str, version: &str, bin: &[u8]) {
+    pub(crate) fn firmware_unit(data: &Path, model: &str, slug: &str, version: &str, bin: &[u8]) {
         let dir = data.join("firmware").join(slug).join(version);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("firmware.bin"), bin).unwrap();
@@ -4661,7 +4711,7 @@ mod tests {
         fs::write(dir.join("source-page.html"), b"<html></html>").unwrap();
     }
 
-    fn row(model: &str, serial: &str, model_count: usize) -> CameraRow {
+    pub(crate) fn row(model: &str, serial: &str, model_count: usize) -> CameraRow {
         CameraRow {
             model: model.into(),
             serial: serial.into(),
@@ -4672,11 +4722,11 @@ mod tests {
         }
     }
 
-    fn usb(model: &str, serial: &str) -> UsbCameraInfo {
+    pub(crate) fn usb(model: &str, serial: &str) -> UsbCameraInfo {
         UsbCameraInfo { product_id: 0, serial: serial.into(), firmware: "5.31".into(), model: model.into() }
     }
 
-    fn scan_of(cameras: Vec<UsbCameraInfo>) -> CameraList {
+    pub(crate) fn scan_of(cameras: Vec<UsbCameraInfo>) -> CameraList {
         describe_scan(&UsbScan { cameras, ..UsbScan::default() })
     }
 
@@ -4868,6 +4918,7 @@ mod tests {
             file: file.into(),
             model: model.into(),
             serial: serial.into(),
+            firmware: "5.31".into(),
             label: None,
             captured_at: "2026-01-01T00:00:00Z".into(),
             is_reference: false,
@@ -6596,8 +6647,8 @@ mod tests {
     fn a_reference_set_while_a_window_is_open_marks_it() {
         let listing = SnapListing {
             rows: vec![
-                SnapRow { file: "a.json".into(), model: "Z 9".into(), serial: "1".into(), label: None, captured_at: "t".into(), is_reference: true, name_lossy: false },
-                SnapRow { file: "b.json".into(), model: "Z 9".into(), serial: "1".into(), label: None, captured_at: "t".into(), is_reference: false, name_lossy: false },
+                SnapRow { file: "a.json".into(), model: "Z 9".into(), serial: "1".into(), firmware: "5.31".into(), label: None, captured_at: "t".into(), is_reference: true, name_lossy: false },
+                SnapRow { file: "b.json".into(), model: "Z 9".into(), serial: "1".into(), firmware: "5.31".into(), label: None, captured_at: "t".into(), is_reference: false, name_lossy: false },
             ],
             ..SnapListing::default()
         };
@@ -7012,26 +7063,26 @@ mod tests {
 
     #[test]
     fn a_target_without_a_usb_serial_or_sharing_its_model_is_refused() {
-        assert!(transplant_target_refusal(&row("Z 9", "T1", 1)).is_none());
-        let id = transplant_target_refusal(&row("Z 9", "id-1", 1)).unwrap();
+        assert!(write_target_refusal(&row("Z 9", "T1", 1)).is_none());
+        let id = write_target_refusal(&row("Z 9", "id-1", 1)).unwrap();
         assert!(id.contains("no USB serial") && id.contains("id-1"), "{id}");
-        assert!(transplant_target_refusal(&row("Z 9", "id-12", 1)).is_some());
-        assert!(transplant_target_refusal(&row("Z 9", "id-", 1)).is_none(), "only id-<digits> is the fallback");
-        assert!(transplant_target_refusal(&row("Z 9", "T1", 2)).unwrap().contains("wrong physical body"), "two of one model cannot be told apart");
+        assert!(write_target_refusal(&row("Z 9", "id-12", 1)).is_some());
+        assert!(write_target_refusal(&row("Z 9", "id-", 1)).is_none(), "only id-<digits> is the fallback");
+        assert!(write_target_refusal(&row("Z 9", "T1", 2)).unwrap().contains("wrong physical body"), "two of one model cannot be told apart");
     }
 
     #[test]
     fn the_pre_flight_also_applies_the_snapshot_rule_for_the_bus() {
         let clean = scan_of(vec![usb("Z 9", "T1")]);
-        assert!(transplant_refusal(&tp_target(), &clean).is_none());
+        assert!(write_preflight("Transplant", &tp_target(), &clean).is_none());
         let two = scan_of(vec![usb("Z 9", "T1"), usb("Z 9", "T2")]);
-        assert!(transplant_refusal(&tp_target(), &two).unwrap().starts_with("Transplant refused, nothing was read or written:"));
+        assert!(write_preflight("Transplant", &tp_target(), &two).unwrap().starts_with("Transplant refused, nothing was read or written:"));
         let mut unreadable = scan_of(vec![usb("Z 9", "T1")]);
         unreadable.unreadable.push(unreadable_usb());
-        assert!(transplant_refusal(&tp_target(), &unreadable).unwrap().contains("could not be read"));
+        assert!(write_preflight("Transplant", &tp_target(), &unreadable).unwrap().contains("could not be read"));
         let mut failed = scan_of(vec![]);
         failed.enumeration_error = Some("usb gone".into());
-        assert!(transplant_refusal(&tp_target(), &failed).unwrap().contains("usb gone"));
+        assert!(write_preflight("Transplant", &tp_target(), &failed).unwrap().contains("usb gone"));
         // The snapshot's own wording is unchanged by sharing its reason.
         assert!(SnapshotRefusal::BodiesUnreadable { count: 1 }.to_string().starts_with("Snapshot refused, nothing was read: 1 Nikon USB"));
     }
@@ -7056,7 +7107,7 @@ mod tests {
         ui.sync(&cameras);
         ui.optins = optins.iter().map(|s| s.to_string()).collect();
         let cmd = ui.begin_plan(&cameras).unwrap();
-        let Cmd::TransplantPlan { request } = cmd else { panic!("a plan command") };
+        let Cmd::Plan(PlanJob::Transplant(request)) = cmd else { panic!("a plan command") };
         ui.plan_arrived(request, Ok((plan_json(optins), String::new())));
         assert!(matches!(ui.stage, TransplantStage::Planned(_)));
         (ui, cameras)
@@ -7073,7 +7124,7 @@ mod tests {
         ui.target_key = Some(("Z 9".into(), "T1".into()));
         assert!(ui.begin_plan(&[]).is_err(), "the chosen target is not connected");
         assert_eq!(ui.stage, TransplantStage::Idle);
-        assert!(matches!(ui.begin_plan(&[tp_target()]), Ok(Cmd::TransplantPlan { .. })));
+        assert!(matches!(ui.begin_plan(&[tp_target()]), Ok(Cmd::Plan(PlanJob::Transplant(_)))));
     }
 
     #[test]
@@ -7098,7 +7149,7 @@ mod tests {
     #[test]
     fn a_failed_plan_is_a_notice_and_leaves_nothing_to_confirm() {
         let (mut ui, cameras) = ui_ready();
-        let Cmd::TransplantPlan { request } = ui.begin_plan(&cameras).unwrap() else { panic!() };
+        let Cmd::Plan(PlanJob::Transplant(request)) = ui.begin_plan(&cameras).unwrap() else { panic!() };
         ui.plan_arrived(request, Err("Planning failed: camera busy".into()));
         assert_eq!(ui.stage, TransplantStage::Idle);
         assert_eq!(ui.notice, "Planning failed: camera busy");
@@ -7116,7 +7167,7 @@ mod tests {
         // The form changes under the confirmation without the frame sync having run yet: what is
         // sent is still what was confirmed.
         ui.source_file = Some("other.json".into());
-        let Some(Cmd::TransplantApply { request, digest, summary }) = ui.confirm_apply() else { panic!("an apply") };
+        let Some(Cmd::Apply(ApplyJob::Transplant { request, digest, summary })) = ui.confirm_apply() else { panic!("an apply") };
         assert_eq!(request, tp_request(&[]));
         assert_eq!((digest, summary), (shown.digest, shown.summary));
         assert_eq!(ui.stage, TransplantStage::Applying(tp_request(&[])));
@@ -7162,7 +7213,7 @@ mod tests {
         assert!(ui.optins.is_empty());
         ui.ask_opt_in(WB_AUTO);
         assert!(ui.optins.is_empty(), "asking is not opting in");
-        let Some(Cmd::TransplantPlan { request }) = ui.confirm_opt_in(&cameras) else { panic!("a new plan") };
+        let Some(Cmd::Plan(PlanJob::Transplant(request))) = ui.confirm_opt_in(&cameras) else { panic!("a new plan") };
         assert_eq!(request.allow_raw_code, BTreeSet::from([WB_AUTO.to_string()]), "exactly the property that was confirmed");
         assert!(matches!(&ui.stage, TransplantStage::Planning(r) if *r == request));
     }
@@ -7235,7 +7286,7 @@ mod tests {
     #[test]
     fn a_plan_still_being_made_is_withdrawn_by_a_change_and_its_answer_is_then_ignored() {
         let (mut ui, mut cameras) = ui_ready();
-        let Cmd::TransplantPlan { request } = ui.begin_plan(&cameras).unwrap() else { panic!() };
+        let Cmd::Plan(PlanJob::Transplant(request)) = ui.begin_plan(&cameras).unwrap() else { panic!() };
         ui.sync(&cameras);
         assert!(matches!(ui.stage, TransplantStage::Planning(_)));
         cameras[0].firmware = "9.99".into();
@@ -7283,7 +7334,7 @@ mod tests {
         ui.sync(&cameras);
         assert!(ui.remove_opt_in("kNkMAIDCapability_Nope", &cameras).is_none(), "not an opt-in: nothing happens");
         assert!(matches!(ui.stage, TransplantStage::Planned(_)));
-        let Some(Cmd::TransplantPlan { request }) = ui.remove_opt_in(WB_AUTO, &cameras) else { panic!("a new plan") };
+        let Some(Cmd::Plan(PlanJob::Transplant(request))) = ui.remove_opt_in(WB_AUTO, &cameras) else { panic!("a new plan") };
         assert_eq!(request.allow_raw_code, BTreeSet::from([METERING.to_string()]));
         assert!(matches!(&ui.stage, TransplantStage::Planning(r) if *r == request));
         ui.sync(&cameras);
@@ -7302,12 +7353,12 @@ mod tests {
 
     // ── how an apply ended ───────────────────────────────────────────────
 
-    fn cli_error(kind: CliFailure, code: Option<i32>, stdout: &str) -> CliError {
+    pub(crate) fn cli_error(kind: CliFailure, code: Option<i32>, stdout: &str) -> CliError {
         CliError { kind, message: "the message".into(), stdout: stdout.into(), stderr: "log".into(), code }
     }
 
     /// The library's own apply reports, in the three ways an apply that wrote can end.
-    fn library_apply_json(scenario: &str) -> (String, ApplyStatus) {
+    pub(crate) fn library_apply_json(scenario: &str) -> (String, ApplyStatus) {
         let b = baseline_for("Z 9").unwrap();
         let codes: Vec<(String, u32)> = b.readable.iter().skip(6).take(4).map(|c| (c.name.clone(), c.code)).collect();
         let mut cam = FakeCamera::new();
@@ -7434,9 +7485,8 @@ mod tests {
             cli_error(CliFailure::StdinWrite, None, ""),
             cli_error(CliFailure::Exit, None, ""),
             cli_error(CliFailure::Exit, Some(101), ""),
-            // 1 is also "wrote, but did not fully take"; 2 is the parser's, which no CLI of this build exits with mid-run
+            // 1 is also "wrote, but did not fully take"
             cli_error(CliFailure::Exit, Some(1), ""),
-            cli_error(CliFailure::Exit, Some(2), ""),
             cli_error(CliFailure::Exit, Some(3), ""),
             cli_error(CliFailure::Exit, Some(4), ""),
             cli_error(CliFailure::Exit, Some(0), ""),
@@ -7444,6 +7494,10 @@ mod tests {
             let out = classify_apply(Err(e.clone()), d);
             assert!(matches!(out, ApplyOutcome::Indeterminate { .. }), "{e:?} -> {out:?}");
         }
+        // 2 is the command line parser's: no CLI of this build exits with it mid-run, so it ran nothing
+        let usage = classify_apply(Err(cli_error(CliFailure::Exit, Some(2), "")), d);
+        let ApplyOutcome::NotApplied { why: NotAppliedWhy::Refused, message, .. } = usage else { panic!("{usage:?}") };
+        assert!(message.contains("did not accept its arguments"), "{message}");
         let unreadable = classify_apply(Ok(CliOutput { stdout: "not json".into(), stderr: String::new() }), d);
         assert!(matches!(unreadable, ApplyOutcome::Indeterminate { .. }), "exit 0 with no report is not a success");
         assert_eq!((EXIT_STALE_PLAN, EXIT_REFUSED_BEFORE_WRITE), (5, 6), "documented in the CLI's --help");
@@ -7697,7 +7751,7 @@ mod tests {
 
     /// An app with no worker behind it: what it sends is read back from `cmd_rx`, and an answer is
     /// delivered through `evt_tx`.
-    fn test_app() -> (FleetApp, mpsc::Receiver<Cmd>, mpsc::Sender<Evt>, TempDir) {
+    pub(crate) fn test_app() -> (FleetApp, mpsc::Receiver<Cmd>, mpsc::Sender<Evt>, TempDir) {
         let dir = TempDir::new().unwrap();
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = mpsc::channel();
@@ -7735,6 +7789,9 @@ mod tests {
             pending_write: None,
             vendor_write_result: String::new(),
             transplant: TransplantUi::default(),
+            restore: RestoreUi::default(),
+            check: CheckUi::default(),
+            firmware: FwUi::default(),
         };
         (app, cmd_rx, evt_tx, dir)
     }
@@ -7753,7 +7810,7 @@ mod tests {
         app.transplant_act(&ctx, TransplantAction::AskApply);
         assert!(cmd_rx.try_recv().is_err(), "asking is not applying");
         app.transplant_act(&ctx, TransplantAction::ConfirmApply);
-        let Ok(Cmd::TransplantApply { request, digest, summary }) = cmd_rx.try_recv() else { panic!("an apply") };
+        let Ok(Cmd::Apply(ApplyJob::Transplant { request, digest, summary })) = cmd_rx.try_recv() else { panic!("an apply") };
         let sent_digest = digest.clone();
         assert_eq!((request, digest, summary), (tp_request(&[]), shown.digest.clone(), shown.summary));
         assert!(cmd_rx.try_recv().is_err());
@@ -7773,7 +7830,7 @@ mod tests {
         assert!(matches!(outcome, ApplyOutcome::Report { .. }), "{outcome:?}");
         let mut request = tp_request(&[]);
         request.target = tp_target();
-        evt_tx.send(Evt::TransplantApplied { request: request.clone(), outcome }).unwrap();
+        evt_tx.send(Evt::Applied(AppliedEvt::Transplant { request: request.clone(), outcome })).unwrap();
         app.poll();
         assert_eq!(app.status.level, Level::Warn);
         assert!(app.status.text.starts_with("Transplant applied_unverified:"), "{}", app.status.text);
@@ -7791,7 +7848,7 @@ mod tests {
         app.transplant_act(&ctx, TransplantAction::ConfirmApply);
         cmd_rx.try_recv().unwrap();
         let outcome = classify_apply(Err(cli_error(CliFailure::Exit, Some(EXIT_STALE_PLAN), "")), "d");
-        evt_tx.send(Evt::TransplantApplied { request: tp_request(&[]), outcome }).unwrap();
+        evt_tx.send(Evt::Applied(AppliedEvt::Transplant { request: tp_request(&[]), outcome })).unwrap();
         app.poll();
         assert!(app.status.text.contains("no longer matches the plan you approved") && app.status.text.contains("nothing was written"), "{}", app.status.text);
         assert!(cmd_rx.try_recv().is_err(), "nothing was written, so nothing to re-list");
@@ -7803,7 +7860,7 @@ mod tests {
         let ctx = egui::Context::default();
         app.transplant = ui_ready().0;
         app.transplant_act(&ctx, TransplantAction::Plan);
-        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::TransplantPlan { request }) if request == tp_request(&[])));
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::Plan(PlanJob::Transplant(request))) if request == tp_request(&[])));
         app.transplant = ui_ready().0;
         app.cameras[0].model_count = 2;
         app.transplant_act(&ctx, TransplantAction::Plan);
@@ -7831,7 +7888,7 @@ mod tests {
             TransplantStage::Idle,
             TransplantStage::Planning(tp_request(&[])),
             TransplantStage::Planned(p.clone()),
-            TransplantStage::OptIn { plan: p.clone(), property: WB_AUTO.into() },
+            TransplantStage::Aside(OptInAsk { plan: p.clone(), property: WB_AUTO.into() }),
             TransplantStage::ConfirmApply(p),
             TransplantStage::Applying(tp_request(&[])),
             TransplantStage::Done(Box::new(applied.clone())),
@@ -7887,7 +7944,7 @@ mod tests {
             assert_eq!(ui.stage, TransplantStage::Idle, "{from}");
             assert!(ui.optins.is_empty() && ui.optin_values.is_empty(), "{from}");
             ui.sync(&cameras);
-            let Ok(Cmd::TransplantPlan { request }) = ui.begin_plan(&cameras) else { panic!("a plan") };
+            let Ok(Cmd::Plan(PlanJob::Transplant(request))) = ui.begin_plan(&cameras) else { panic!("a plan") };
             assert!(request.allow_raw_code.is_empty(), "{from}: the next plan starts with none");
         }
         // Only a plan or a result is discarded: a plan being made, a confirmation and an apply on the wire are not.
@@ -7909,12 +7966,12 @@ mod tests {
     fn a_plan_that_fails_takes_the_opt_ins_it_was_made_with() {
         let (mut ui, cameras) = ui_with_plan(&[]);
         ui.ask_opt_in(WB_AUTO);
-        let Some(Cmd::TransplantPlan { request }) = ui.confirm_opt_in(&cameras) else { panic!("a new plan") };
+        let Some(Cmd::Plan(PlanJob::Transplant(request))) = ui.confirm_opt_in(&cameras) else { panic!("a new plan") };
         assert!(ui.optins.contains(WB_AUTO));
         ui.plan_arrived(request, Err("Planning failed: camera busy".into()));
         assert_eq!(ui.stage, TransplantStage::Idle);
         assert!(ui.optins.is_empty() && ui.optin_values.is_empty(), "a failed plan leaves no opt-in waiting unseen");
-        let Ok(Cmd::TransplantPlan { request }) = ui.begin_plan(&cameras) else { panic!("a plan") };
+        let Ok(Cmd::Plan(PlanJob::Transplant(request))) = ui.begin_plan(&cameras) else { panic!("a plan") };
         assert!(request.allow_raw_code.is_empty());
     }
 
@@ -7939,7 +7996,7 @@ mod tests {
         // The firmware goes back: the opt-ins do not.
         cameras[0].firmware = "5.31".into();
         ui.sync(&cameras);
-        let Ok(Cmd::TransplantPlan { request }) = ui.begin_plan(&cameras) else { panic!("a plan") };
+        let Ok(Cmd::Plan(PlanJob::Transplant(request))) = ui.begin_plan(&cameras) else { panic!("a plan") };
         assert!(request.allow_raw_code.is_empty());
         // A withdrawal the key of the opt-ins does not see (same file, same row, another source body)
         // takes them too: leaving a plan always leaves its opt-ins.
@@ -7975,7 +8032,7 @@ mod tests {
     fn what_an_opt_in_sets_is_remembered_from_the_plan_that_offered_it_to_the_apply_confirmation() {
         let (mut ui, cameras) = ui_with_plan(&[]);
         ui.ask_opt_in(WB_AUTO);
-        let Some(Cmd::TransplantPlan { request }) = ui.confirm_opt_in(&cameras) else { panic!("a new plan") };
+        let Some(Cmd::Plan(PlanJob::Transplant(request))) = ui.confirm_opt_in(&cameras) else { panic!("a new plan") };
         // The re-made plan no longer carries the proposal: the skip became a copy.
         ui.plan_arrived(request, Ok((plan_json(&[WB_AUTO]), String::new())));
         ui.ask_apply();
@@ -7985,7 +8042,7 @@ mod tests {
         // A value belongs to an opt-in that is still in the request.
         let TransplantStage::ConfirmApply(p) = ui.stage.clone() else { panic!() };
         ui.stage = TransplantStage::Planned(p);
-        let Some(Cmd::TransplantPlan { request }) = ui.remove_opt_in(WB_AUTO, &cameras) else { panic!("a new plan") };
+        let Some(Cmd::Plan(PlanJob::Transplant(request))) = ui.remove_opt_in(WB_AUTO, &cameras) else { panic!("a new plan") };
         ui.plan_arrived(request, Ok((plan_json(&[]), String::new())));
         let TransplantStage::Planned(p) = &ui.stage else { panic!() };
         assert!(p.optin_values.is_empty());

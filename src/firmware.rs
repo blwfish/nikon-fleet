@@ -286,7 +286,7 @@ pub struct ArchiveEntry {
 
 /// Why a directory under `firmware/` that looks like an entry is not listed as one.
 /// Closed vocabulary for structured output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchiveSkipKind {
     /// `metadata.json` exists but could not be read.
