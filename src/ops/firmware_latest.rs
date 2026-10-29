@@ -2,7 +2,7 @@
 //! every verdict a closed snake_case enum. A contract with scripts, the GUI and
 //! (planned) the MCP, so it lives in the library rather than in `main.rs`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use std::path::Path;
 
@@ -39,7 +39,7 @@ pub struct ModelSurvey {
 // free-text `reason`/`detail` fields only explain a verdict, never carry it.
 
 /// Source verdict for one model.
-#[derive(Serialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LatestStatus {
     /// Published and not in the archive.
@@ -51,7 +51,7 @@ pub enum LatestStatus {
 }
 
 /// How one connected camera relates to the latest published version.
-#[derive(Serialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LatestRelation {
     Behind,
@@ -63,7 +63,7 @@ pub enum LatestRelation {
     LatestUnknown,
 }
 
-#[derive(Serialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LatestDownload {
     Gated,

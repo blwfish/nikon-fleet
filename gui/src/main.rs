@@ -30,9 +30,11 @@ use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
 mod check;
+mod firmware_win;
 mod restore;
 
 use check::{CheckRequest, CheckUi, CheckView};
+use firmware_win::FwUi;
 use restore::{
     RestoreApplyJson, RestorePlanJson, RestoreRequest, RestoreUi, SourceView, UndoOffer, RestoreActionLike,
 };
@@ -224,6 +226,8 @@ struct SnapRow {
     file: String,
     model: String,
     serial: String,
+    /// The firmware the body ran when it was captured.
+    firmware: String,
     label: Option<String>,
     captured_at: String,
     is_reference: bool,
@@ -314,11 +318,12 @@ fn list_all(data_dir: &Path) -> SnapListing {
     };
     for entry in listing.entries {
         match entry.state {
-            EntryState::Ok { model, serial, label, captured_at, is_reference, .. } => out.rows.push(SnapRow {
+            EntryState::Ok { model, serial, firmware, label, captured_at, is_reference, .. } => out.rows.push(SnapRow {
                 name_lossy: entry.file.contains('\u{FFFD}'),
                 file: entry.file,
                 model,
                 serial,
+                firmware,
                 label,
                 captured_at,
                 is_reference: is_reference == Some(true),
@@ -560,6 +565,7 @@ struct FleetApp {
     transplant: TransplantUi,
     restore: RestoreUi,
     check: CheckUi,
+    firmware: FwUi,
 }
 
 impl FleetApp {
@@ -605,6 +611,7 @@ impl FleetApp {
             transplant: TransplantUi::default(),
             restore: RestoreUi::default(),
             check: CheckUi::default(),
+            firmware: FwUi::default(),
         };
         app.refresh_listing();
         app
@@ -655,6 +662,7 @@ impl FleetApp {
         self.transplant.data_dir_changed();
         self.restore.data_dir_changed();
         self.check.data_dir_changed();
+        self.firmware.data_dir_changed();
         if self.cmd_tx.send(Cmd::SetDataDir(self.settings.data_dir_or_err())).is_err() {
             self.status = Status::new(Level::Error, "The worker thread has stopped; restart the app.");
             return;
@@ -852,6 +860,7 @@ impl eframe::App for FleetApp {
         self.transplant.sync(&self.cameras);
         self.restore.sync(&self.cameras);
         self.check.sync(&self.cameras);
+        self.poll_firmware(ctx);
         self.ui_toolbar(ctx);
         self.ui_notices(ctx);
         self.ui_preferences(ctx);
@@ -859,6 +868,7 @@ impl eframe::App for FleetApp {
         self.ui_transplant(ctx);
         self.ui_restore(ctx);
         self.ui_check(ctx);
+        self.ui_firmware(ctx);
         self.ui_sidebar(ctx);
         self.ui_main(ctx);
         self.ui_snapshot_viewers(ctx);
@@ -888,6 +898,9 @@ impl FleetApp {
                 }
                 if ui.button("✓ Check").clicked() {
                     self.check.open = !self.check.open;
+                }
+                if ui.button("⬆ Firmware").clicked() {
+                    self.firmware.open = !self.firmware.open;
                 }
                 ui.separator();
                 if let Some(since) = self.busy_since {
@@ -4764,14 +4777,14 @@ mod tests {
         fs::write(dir.join(file), snapshot_bytes(model, serial, captured_at, "test")).unwrap();
     }
 
-    fn sha_of(bytes: &[u8]) -> String {
+    pub(crate) fn sha_of(bytes: &[u8]) -> String {
         let f = tempfile::NamedTempFile::new().unwrap();
         fs::write(f.path(), bytes).unwrap();
         sha256_file(f.path()).unwrap()
     }
 
     /// Valid metadata for the binary `bin`, as the archive records it.
-    fn meta_bytes(model: &str, version: &str, bin: &[u8]) -> Vec<u8> {
+    pub(crate) fn meta_bytes(model: &str, version: &str, bin: &[u8]) -> Vec<u8> {
         let meta = FirmwareMeta {
             format_version: FIRMWARE_META_FORMAT_VERSION,
             model: model.into(),
@@ -4788,7 +4801,7 @@ mod tests {
         serde_json::to_vec_pretty(&meta).unwrap()
     }
 
-    fn firmware_unit(data: &Path, model: &str, slug: &str, version: &str, bin: &[u8]) {
+    pub(crate) fn firmware_unit(data: &Path, model: &str, slug: &str, version: &str, bin: &[u8]) {
         let dir = data.join("firmware").join(slug).join(version);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("firmware.bin"), bin).unwrap();
@@ -5003,6 +5016,7 @@ mod tests {
             file: file.into(),
             model: model.into(),
             serial: serial.into(),
+            firmware: "5.31".into(),
             label: None,
             captured_at: "2026-01-01T00:00:00Z".into(),
             is_reference: false,
@@ -6731,8 +6745,8 @@ mod tests {
     fn a_reference_set_while_a_window_is_open_marks_it() {
         let listing = SnapListing {
             rows: vec![
-                SnapRow { file: "a.json".into(), model: "Z 9".into(), serial: "1".into(), label: None, captured_at: "t".into(), is_reference: true, name_lossy: false },
-                SnapRow { file: "b.json".into(), model: "Z 9".into(), serial: "1".into(), label: None, captured_at: "t".into(), is_reference: false, name_lossy: false },
+                SnapRow { file: "a.json".into(), model: "Z 9".into(), serial: "1".into(), firmware: "5.31".into(), label: None, captured_at: "t".into(), is_reference: true, name_lossy: false },
+                SnapRow { file: "b.json".into(), model: "Z 9".into(), serial: "1".into(), firmware: "5.31".into(), label: None, captured_at: "t".into(), is_reference: false, name_lossy: false },
             ],
             ..SnapListing::default()
         };
@@ -7872,6 +7886,7 @@ mod tests {
             transplant: TransplantUi::default(),
             restore: RestoreUi::default(),
             check: CheckUi::default(),
+            firmware: FwUi::default(),
         };
         (app, cmd_rx, evt_tx, dir)
     }

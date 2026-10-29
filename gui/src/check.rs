@@ -912,6 +912,7 @@ mod tests {
             file: file.into(),
             model: "Z 9".into(),
             serial: "T1".into(),
+            firmware: "5.31".into(),
             label: Some("studio".into()),
             captured_at: "2026-10-27T10:00:00Z".into(),
             is_reference,
