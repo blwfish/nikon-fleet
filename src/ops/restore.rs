@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 
 use crate::ops::baseline::{GateOutcome, GatePolicy, gate};
@@ -469,7 +469,7 @@ pub fn execute_from<P: CameraPort + ?Sized>(
 }
 
 /// What a read-back after a restore showed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// Every written property reads back as the snapshot says.
@@ -496,6 +496,46 @@ impl Verdict {
             Verdict::ReadbackIncomplete => "readback_incomplete",
             Verdict::NothingWritten => "nothing_written",
             Verdict::Unjudged => "unjudged",
+        }
+    }
+}
+
+impl Verdict {
+    /// Every verdict, for tests and for anything that must name them all.
+    pub const ALL: [Verdict; 5] =
+        [Verdict::Verified, Verdict::ResidualFound, Verdict::ReadbackIncomplete, Verdict::NothingWritten, Verdict::Unjudged];
+
+    /// Whether the read-back found that the camera did not keep a write (the restore failed).
+    /// Everything else claims nothing, or claims success.
+    pub fn is_failure(&self) -> bool {
+        match self {
+            Verdict::ResidualFound => true,
+            Verdict::Verified | Verdict::ReadbackIncomplete | Verdict::NothingWritten | Verdict::Unjudged => false,
+        }
+    }
+}
+
+/// The one-line report of what the read-back showed, for the CLI and the GUI alike. `residual` names
+/// the properties of a `ResidualFound`.
+pub fn readback_line(verdict: Verdict, residual: Option<&crate::ops::readback::Residual>) -> String {
+    match verdict {
+        Verdict::Verified => "Read-back: verified — every written property reads back as restored".to_string(),
+        Verdict::NothingWritten => "Read-back: nothing was written, nothing to verify".to_string(),
+        Verdict::Unjudged => "Read-back: UNVERIFIED — none of the written properties could be compared (volatile-listed, \
+             never-copy or absent from the snapshot); nothing is claimed"
+            .to_string(),
+        Verdict::ReadbackIncomplete => "Read-back: INCOMPLETE — the camera could not be read back well enough to verify the writes; \
+             nothing is claimed"
+            .to_string(),
+        Verdict::ResidualFound => {
+            let r = residual.cloned().unwrap_or_default();
+            let mut names: Vec<String> = r.changed.iter().map(|n| format!("{n} (differs)")).collect();
+            names.extend(r.missing.iter().map(|n| format!("{n} (not readable)")));
+            format!(
+                "Read-back: UNVERIFIED — {} not read back as restored: {}. The camera accepted the write and did not keep it.",
+                if names.len() == 1 { "1 written property does".to_string() } else { format!("{} written properties do", names.len()) },
+                names.join(", ")
+            )
         }
     }
 }
@@ -588,14 +628,27 @@ pub fn undo_command(restore_point_file: &str, undo_set: &[String]) -> String {
     if undo_set.is_empty() {
         return "nothing to undo".into();
     }
-    if undo_set.len() > MAX_UNDO_NAMES {
-        return format!(
+    match undo_command_exact(restore_point_file, undo_set, None) {
+        Some(command) => command,
+        None => format!(
             "{} properties to put back from {restore_point_file}; list them with --json (undo_set) and pass each as --only",
             undo_set.len()
-        );
+        ),
+    }
+}
+
+/// The undo as a command that can be pasted and run: `None` when there is nothing to undo or too
+/// many properties to name on a command line (then [`undo_command`] is prose, which is not a
+/// command). `data_dir` is named when the restore point is not in the CLI's default directory.
+pub fn undo_command_exact(restore_point_file: &str, undo_set: &[String], data_dir: Option<&str>) -> Option<String> {
+    if undo_set.is_empty() || undo_set.len() > MAX_UNDO_NAMES {
+        return None;
     }
     let only: String = undo_set.iter().map(|n| format!(" --only {}", n.trim_start_matches(crate::transplant::PROPERTY_PREFIX))).collect();
-    format!("nikon-fleet restore {restore_point_file}{only}")
+    let dir = data_dir
+        .map(|d| if d.contains(char::is_whitespace) { format!(" --data-dir \"{d}\"") } else { format!(" --data-dir {d}") })
+        .unwrap_or_default();
+    Some(format!("nikon-fleet{dir} restore {restore_point_file}{only}"))
 }
 
 #[cfg(test)]
@@ -1474,4 +1527,41 @@ mod tests {
         assert!(over.contains("13 properties") && over.contains("--json"), "{over}");
         assert!(!over.contains("--only P0"));
     }
+    #[test]
+    fn the_undo_command_is_a_command_up_to_twelve_names_and_prose_after() {
+        let names = |n: usize| (0..n).map(|i| format!("kNkMAIDCapability_P{i}")).collect::<Vec<_>>();
+        assert_eq!(undo_command_exact("rp.json", &[], None), None, "nothing to undo");
+        let one = undo_command_exact("rp.json", &names(1), None).unwrap();
+        assert_eq!(one, "nikon-fleet restore rp.json --only P0");
+        assert_eq!(undo_command("rp.json", &names(1)), one, "the printed command is the exact one");
+        assert!(undo_command_exact("rp.json", &names(12), None).is_some(), "twelve is the last that is listed");
+        assert_eq!(undo_command_exact("rp.json", &names(13), None), None, "thirteen is prose, not a command");
+        assert!(undo_command("rp.json", &names(13)).starts_with("13 properties to put back"));
+        assert_eq!(undo_command("rp.json", &[]), "nothing to undo");
+        // the data directory is named when it is given, quoted when it has a space
+        assert_eq!(undo_command_exact("rp.json", &names(1), Some("/d")).unwrap(), "nikon-fleet --data-dir /d restore rp.json --only P0");
+        assert!(undo_command_exact("rp.json", &names(1), Some("/my data")).unwrap().contains("--data-dir \"/my data\" restore"));
+    }
+
+    #[test]
+    fn every_verdict_has_a_line_and_only_a_residual_is_a_failure() {
+        use crate::ops::readback::Residual;
+        let residual = Residual { changed: vec!["A".into()], missing: vec!["B".into(), "C".into()], unjudged: vec![], judged: 3 };
+        let mut lines = std::collections::BTreeSet::new();
+        for v in Verdict::ALL {
+            let line = readback_line(v, Some(&residual));
+            assert!(line.starts_with("Read-back:"), "{line}");
+            assert_eq!(v.is_failure(), v == Verdict::ResidualFound, "{}", v.tag());
+            lines.insert(line);
+        }
+        assert_eq!(lines.len(), 5, "five different sentences");
+        let found = readback_line(Verdict::ResidualFound, Some(&residual));
+        assert!(found.contains("3 written properties do") && found.contains("A (differs)") && found.contains("C (not readable)"), "{found}");
+        assert!(readback_line(Verdict::ResidualFound, Some(&Residual { changed: vec!["A".into()], ..Residual::default() })).contains("1 written property does"));
+        // the verdicts the JSON carries are the ones named here
+        for v in Verdict::ALL {
+            assert_eq!(serde_json::from_value::<Verdict>(serde_json::to_value(v).unwrap()).unwrap(), v);
+        }
+    }
+
 }

@@ -173,8 +173,15 @@ fn plan_steps<P: CameraPort + ?Sized>(
     (steps, run)
 }
 
+/// Whether a step would change the body or might: the one definition behind a plan's `would_change`
+/// count and the front ends that read the plan's JSON (`is_would_write`: its outcome tag is
+/// `would_write`; `changes`: its `changes` value, null for a live value that could not be read).
+pub fn step_would_change(is_would_write: bool, changes: Option<bool>) -> bool {
+    crate::ops::plan::planned_would_change(is_would_write.then_some(changes))
+}
+
 fn count_changes(steps: &[PlanStep]) -> usize {
-    steps.iter().filter(|s| s.outcome == StepOutcome::WouldWrite && s.changes != Some(false)).count()
+    steps.iter().filter(|s| step_would_change(s.outcome == StepOutcome::WouldWrite, s.changes)).count()
 }
 
 /// The line a human is shown and the caller must echo to apply.

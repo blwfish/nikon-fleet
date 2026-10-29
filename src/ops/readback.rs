@@ -17,7 +17,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::diff::{DiffError, DiffOptions, is_volatile, values_differ};
 use crate::snapshot::Snapshot;
@@ -89,7 +89,7 @@ pub fn side_effects(
 }
 
 /// Written properties that did not end up as the snapshot says.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Residual {
     /// Read back with a different value.
     pub changed: Vec<String>,

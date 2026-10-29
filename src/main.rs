@@ -2694,43 +2694,7 @@ fn restore_run(
 /// `residual_found` fails; an incomplete read-back is a warning: nothing is
 /// claimed either way, and the command's other checks have already passed.
 fn restore_verification_text(v: &restore::Verification) -> (String, bool) {
-    match v.verdict {
-        restore::Verdict::Verified => (
-            "Read-back: verified — every written property reads back as restored".to_string(),
-            false,
-        ),
-        restore::Verdict::NothingWritten => ("Read-back: nothing was written, nothing to verify".to_string(), false),
-        restore::Verdict::Unjudged => (
-            "Read-back: UNVERIFIED — none of the written properties could be compared (volatile-listed, \
-             never-copy or absent from the snapshot); nothing is claimed"
-                .to_string(),
-            false,
-        ),
-        restore::Verdict::ReadbackIncomplete => (
-            "Read-back: INCOMPLETE — the camera could not be read back well enough to verify the writes; \
-             nothing is claimed"
-                .to_string(),
-            false,
-        ),
-        restore::Verdict::ResidualFound => {
-            let r = v.residual.clone().unwrap_or_default();
-            let mut names: Vec<String> = r.changed.iter().map(|n| format!("{n} (differs)")).collect();
-            names.extend(r.missing.iter().map(|n| format!("{n} (not readable)")));
-            (
-                format!(
-                    "Read-back: UNVERIFIED — {} not read back as restored: {}. \
-                     The camera accepted the write and did not keep it.",
-                    if names.len() == 1 {
-                        "1 written property does".to_string()
-                    } else {
-                        format!("{} written properties do", names.len())
-                    },
-                    names.join(", ")
-                ),
-                true,
-            )
-        }
-    }
+    (restore::readback_line(v.verdict, v.residual.as_ref()), v.verdict.is_failure())
 }
 
 /// The digest and summary an apply is held to: the plan a person approved and presented

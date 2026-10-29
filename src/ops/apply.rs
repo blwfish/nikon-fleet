@@ -85,6 +85,18 @@ impl ApplyStatus {
         ApplyStatus::NotApplied,
     ];
 
+    /// Whether the camera may have been written to, as far as this status says. The one rule behind
+    /// "list the restore points again", "the apply may have landed" and the status text: it is true
+    /// for everything but `NotApplied`, including `Indeterminate` (the writes may have begun) and
+    /// `Failed` (the writes are made one after another, so a failed one does not mean the others
+    /// did not land). No wildcard: a new status must be classified here.
+    pub fn may_have_written(&self) -> bool {
+        match self {
+            ApplyStatus::AppliedVerified | ApplyStatus::AppliedUnverified | ApplyStatus::Failed | ApplyStatus::Indeterminate => true,
+            ApplyStatus::NotApplied => false,
+        }
+    }
+
     /// The closed tag clients read in `status` (the same string serde writes).
     pub fn tag(&self) -> &'static str {
         match self {
@@ -1356,4 +1368,15 @@ mod tests {
         assert_eq!(tags.len(), errs.len());
         assert!(errs.iter().all(|e| !e.to_string().is_empty()));
     }
+    #[test]
+    fn only_not_applied_says_the_camera_was_not_written() {
+        for status in ApplyStatus::ALL {
+            let expected = status != ApplyStatus::NotApplied;
+            assert_eq!(status.may_have_written(), expected, "{}", status.tag());
+        }
+        // an unknown ending is a possible write, never a safe one
+        assert!(ApplyStatus::Indeterminate.may_have_written());
+        assert!(ApplyStatus::Failed.may_have_written(), "the writes are made one after another");
+    }
+
 }
