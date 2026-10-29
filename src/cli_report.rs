@@ -151,7 +151,6 @@ pub fn restore_write_warnings(steps: &[StepResult]) -> Vec<String> {
         .collect()
 }
 
-/// How many names an undo command line may carry before it is replaced by a pointer to `--json`.
 fn status_word(s: ApplyStatus) -> &'static str {
     s.tag()
 }

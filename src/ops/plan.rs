@@ -90,9 +90,18 @@ pub struct PlanReport {
     pub cannot_read: &'static [NotTransferable],
 }
 
+/// Whether a copied property that has a planned write would, or might, change the target:
+/// `planned_changes` is `None` when there is no planned write at all, else the write's `changes`
+/// (`Some(None)`: the live value could not be read, so a change cannot be ruled out). The one
+/// definition behind a plan's `would_change` count, shared with the front ends that read the plan's
+/// JSON, where an absent `changes` key is the first case and `null` the second.
+pub fn planned_would_change(planned_changes: Option<Option<bool>>) -> bool {
+    planned_changes.is_some_and(|changes| changes != Some(false))
+}
+
 /// A copied property that would, or might, change the target.
 pub fn would_change(o: &TransplantOutcome) -> bool {
-    o.result.is_ok() && o.planned.as_ref().is_some_and(|p| p.changes != Some(false))
+    o.result.is_ok() && planned_would_change(o.planned.as_ref().map(|p| p.changes))
 }
 
 /// The line a human is shown and the caller must echo to apply.
@@ -570,6 +579,27 @@ mod tests {
         assert_eq!(p.counts.copied, 2);
         assert_eq!(p.counts.would_change, 1);
         assert!(p.summary.contains("1 property would change"), "{}", p.summary);
+    }
+
+    #[test]
+    fn a_copied_property_counts_as_a_possible_change_unless_its_write_is_known_to_change_nothing() {
+        use crate::transplant::{PlannedWrite, Strategy};
+        // no planned write at all, then each state of its `changes`
+        assert!(!planned_would_change(None));
+        assert!(planned_would_change(Some(None)), "unreadable: a change cannot be ruled out");
+        assert!(planned_would_change(Some(Some(true))));
+        assert!(!planned_would_change(Some(Some(false))));
+        // the library's own count goes through the same definition, including a copy with no planned write
+        let outcome = |planned| TransplantOutcome {
+            name: "P".into(),
+            code: 1,
+            result: Ok(Strategy::Literal),
+            choice: None,
+            planned,
+        };
+        assert!(!would_change(&outcome(None)));
+        assert!(would_change(&outcome(Some(PlannedWrite { value: json!(1), changes: None }))));
+        assert!(!would_change(&outcome(Some(PlannedWrite { value: json!(1), changes: Some(false) }))));
     }
 
     /// Pins the digest's composition: any change to what is hashed or how must show up here and

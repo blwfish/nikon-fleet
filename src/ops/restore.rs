@@ -577,6 +577,9 @@ pub fn verify<P: CameraPort + ?Sized>(
     verify_with(port, name_lookup, camera, source, written, captured_at, GatePolicy::AllowPartial)
 }
 
+/// How many names an undo command line may carry before [`undo_command`] replaces it with a pointer
+/// to the `--json` report's `undo_set`: a command line that long is not something to copy and paste.
+/// The boundary is inclusive: exactly this many are listed, one more is not.
 const MAX_UNDO_NAMES: usize = 12;
 
 /// The command that undoes an apply, a targeted restore of its restore point. The CLI prints it and

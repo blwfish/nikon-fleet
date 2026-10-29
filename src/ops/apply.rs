@@ -55,6 +55,13 @@ use crate::value_shape::{is_range_shape, range_values_agree};
 /// never the message; both read this constant.
 pub const EXIT_STALE_PLAN: i32 = 5;
 
+/// Process exit status of an `nikon-fleet transplant` apply that was refused before it could have
+/// written anything (the body or snapshot could not be read, the SDK or a restore point was not
+/// available, the baseline gate refused): the camera is as it was. Every other failure of an apply
+/// without a report may have written, so a caller treats that status, and no other, as "nothing was
+/// written". A stale plan has its own status ([`EXIT_STALE_PLAN`]).
+pub const EXIT_REFUSED_BEFORE_WRITE: i32 = 6;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyStatus {

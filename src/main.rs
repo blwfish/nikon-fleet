@@ -416,9 +416,13 @@ const EXIT_WRITE_INDETERMINATE: i32 = 4;
 const TRANSPLANT_HELP: &str = "\
 Exit status:
   0  done (a dry run, or an apply that wrote and read back what it planned)
-  1  any other error, or an apply that wrote but did not fully take (the JSON report says which)
+  1  any other error, or an apply that wrote but did not fully take (the JSON report says which).
+     An apply that ends 1 with no JSON report may have written
   2  command-line usage error
-  5  --expect-digest was given and the plan no longer matches: nothing was written";
+  5  --expect-digest was given and the plan no longer matches: nothing was written
+  6  an apply (not a dry run) was refused before it could write anything: nothing was written
+With --json, a refusal's message leaves out the advice to pass --allow-partial: a program reading it
+cannot act on that.";
 
 const DEVICE_INFO_HELP: &str = "\
 Read-only: sends only the standard GetDeviceInfo (0x1001) inside a PTP session and changes nothing
@@ -2559,11 +2563,6 @@ fn restore_verification_text(v: &restore::Verification) -> (String, bool) {
     }
 }
 
-/// Copy a snapshot's settings onto a live camera that may be a different
-/// model, translating enum/range values via `nikon_fleet::transplant`
-/// instead of `restore`'s literal same-model copy. See that module's docs
-/// for the translation strategy and why capability *codes* (not menu
-/// position, not per-model renumbering) are the right join key here.
 /// The digest and summary an apply is held to: the plan a person approved and presented
 /// (`--expect-digest`, `--expect-summary`), else the one just computed, whose approval is the
 /// running of the command itself.
@@ -2571,19 +2570,59 @@ fn transplant_confirmation<'a>(args: &'a TransplantArgs, digest: &'a str, summar
     (args.expect_digest.as_deref().unwrap_or(digest), args.expect_summary.as_deref().unwrap_or(summary))
 }
 
-/// A transplant apply refused before any write: its message with the hint for its tag, and for a stale
-/// plan the status a caller tests (`EXIT_STALE_PLAN`) instead of reading the message.
-fn transplant_refusal(e: nikon_fleet::ops::apply::ApplyError) -> anyhow::Error {
+/// A transplant apply refused before any write: its message with the hint for its tag (unless
+/// `json`: the caller is a program, which cannot pass `--allow-partial` for the person), and for a
+/// stale plan the status a caller tests (`EXIT_STALE_PLAN`) instead of reading the message.
+fn transplant_refusal(e: nikon_fleet::ops::apply::ApplyError, json: bool) -> anyhow::Error {
     use nikon_fleet::ops::apply::{ApplyError, EXIT_STALE_PLAN};
-    let hint = cli_report::refusal_hint(e.tag()).map(|h| format!("\n{h}")).unwrap_or_default();
-    let message = format!("{e}{hint}");
+    let hint = if json { None } else { cli_report::refusal_hint(e.tag()) };
+    let message = format!("{e}{}", hint.map(|h| format!("\n{h}")).unwrap_or_default());
     match e {
         ApplyError::StalePlan { .. } => ExitCodeError { code: EXIT_STALE_PLAN, message }.into(),
         _ => anyhow::anyhow!(message),
     }
 }
 
+/// The result of `apply_transplant`: an `ApplyError` is a refusal before any write; a report in hand
+/// means the camera may have been written, which `report_in_hand` records for `transplant_exit`.
+fn after_apply<R>(result: Result<R, nikon_fleet::ops::apply::ApplyError>, json: bool, report_in_hand: &mut bool) -> Result<R> {
+    let report = result.map_err(|e| transplant_refusal(e, json))?;
+    *report_in_hand = true;
+    Ok(report)
+}
+
+/// How a failed `transplant` ends the process. An apply that failed before it had a report in hand
+/// (`wrote_nothing`: every `ApplyError` is raised before the first write) exits
+/// `EXIT_REFUSED_BEFORE_WRITE`, so a caller can tell "nothing was written" from "this may have
+/// written"; a stale plan keeps its own status. A dry run and an apply that had written keep the
+/// plain failure, 1.
+fn transplant_exit(e: anyhow::Error, dry_run: bool, wrote_nothing: bool) -> anyhow::Error {
+    if dry_run || !wrote_nothing || e.downcast_ref::<ExitCodeError>().is_some() {
+        return e;
+    }
+    ExitCodeError { code: nikon_fleet::ops::apply::EXIT_REFUSED_BEFORE_WRITE, message: format!("{e:?}") }.into()
+}
+
+/// Copy a snapshot's settings onto a live camera that may be a different
+/// model, translating enum/range values via `nikon_fleet::transplant`
+/// instead of `restore`'s literal same-model copy. See that module's docs
+/// for the translation strategy and why capability *codes* (not menu
+/// position, not per-model renumbering) are the right join key here.
 fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &TransplantArgs, no_usb_reset: bool) -> Result<()> {
+    // Set once `apply_transplant` has returned a report: from then on the camera may have been written.
+    let mut report_in_hand = false;
+    transplant_run(data_dir, bundle, schema_path, args, no_usb_reset, &mut report_in_hand)
+        .map_err(|e| transplant_exit(e, args.dry_run, !report_in_hand))
+}
+
+fn transplant_run(
+    data_dir: &Path,
+    bundle: &Path,
+    schema_path: &Path,
+    args: &TransplantArgs,
+    no_usb_reset: bool,
+    report_in_hand: &mut bool,
+) -> Result<()> {
     use nikon_fleet::ops::apply::{ApplyRequest, apply_transplant};
     use nikon_fleet::ops::baseline::GatePolicy;
     use nikon_fleet::ops::plan::{PlanInput, build_plan};
@@ -2682,7 +2721,7 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
         captured_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
         gate_policy: if args.allow_partial { GatePolicy::AllowPartial } else { GatePolicy::Strict },
     };
-    let report = apply_transplant(&device, &req, &mut |_| {}).map_err(transplant_refusal)?;
+    let report = after_apply(apply_transplant(&device, &req, &mut |_| {}), json, report_in_hand)?;
 
     let text = cli_report::render_transplant(&report.outcomes, false);
     for w in &text.warnings {
@@ -3894,13 +3933,60 @@ mod tests {
     #[test]
     fn a_stale_transplant_plan_exits_five_and_every_other_refusal_exits_one() {
         use nikon_fleet::ops::apply::{ApplyError, EXIT_STALE_PLAN};
-        let stale = transplant_refusal(ApplyError::StalePlan { what: "digest" });
+        let stale = transplant_refusal(ApplyError::StalePlan { what: "digest" }, false);
         assert_eq!(exit_code_for(&stale), EXIT_STALE_PLAN);
         assert_eq!(EXIT_STALE_PLAN, 5, "documented in --help; the GUI tests for it");
         assert!(![1, 2, EXIT_ALREADY_ARCHIVED, EXIT_WRITE_INDETERMINATE].contains(&EXIT_STALE_PLAN));
-        let missing = transplant_refusal(ApplyError::MissingConfirmation { which: "digest" });
-        assert_eq!(exit_code_for(&missing), 1);
+        let missing = transplant_refusal(ApplyError::MissingConfirmation { which: "digest" }, false);
+        assert_eq!(exit_code_for(&missing), 1, "before transplant_exit: the refusal itself is not what picks 6");
         assert!(stale.to_string().contains("stale"), "the message still says why: {stale}");
+    }
+
+    #[test]
+    fn an_apply_refused_before_it_could_write_exits_six_and_no_other_failure_does() {
+        use nikon_fleet::ops::apply::{ApplyError, EXIT_REFUSED_BEFORE_WRITE, EXIT_STALE_PLAN};
+        assert_eq!(EXIT_REFUSED_BEFORE_WRITE, 6, "documented in --help; the GUI tests for it");
+        assert!(![1, 2, EXIT_ALREADY_ARCHIVED, EXIT_WRITE_INDETERMINATE, EXIT_STALE_PLAN].contains(&EXIT_REFUSED_BEFORE_WRITE));
+        let boom = || anyhow::anyhow!("no Nikon cameras detected");
+        // an apply with no report in hand: the camera was not written
+        let refused = transplant_exit(boom(), false, true);
+        assert_eq!(exit_code_for(&refused), EXIT_REFUSED_BEFORE_WRITE);
+        assert!(refused.to_string().contains("no Nikon cameras detected"), "the message is kept: {refused}");
+        // a failure once the report is in hand (the output could not be written, the apply did not fully take) may have written
+        assert_eq!(exit_code_for(&transplant_exit(boom(), false, false)), 1);
+        // a dry run never writes, and keeps the plain failure it always had
+        assert_eq!(exit_code_for(&transplant_exit(boom(), true, true)), 1);
+        // a stale plan keeps its own status
+        let stale = transplant_refusal(ApplyError::StalePlan { what: "digest" }, true);
+        assert_eq!(exit_code_for(&transplant_exit(stale, false, true)), EXIT_STALE_PLAN);
+        // a cause chain survives into the message
+        let chained = anyhow::Error::new(std::io::Error::other("disk gone")).context("loading snap.json");
+        let text = transplant_exit(chained, false, true).to_string();
+        assert!(text.contains("loading snap.json") && text.contains("disk gone"), "{text}");
+    }
+
+    #[test]
+    fn a_report_in_hand_is_remembered_and_a_refusal_is_not() {
+        use nikon_fleet::ops::apply::ApplyError;
+        let mut in_hand = false;
+        assert!(after_apply::<u8>(Err(ApplyError::StalePlan { what: "digest" }), false, &mut in_hand).is_err());
+        assert!(!in_hand, "a refusal is raised before any write");
+        assert_eq!(after_apply(Ok(7_u8), false, &mut in_hand).unwrap(), 7);
+        assert!(in_hand, "from the report on, a failure may have followed a write");
+    }
+
+    #[test]
+    fn a_json_refusal_leaves_out_the_allow_partial_advice_a_program_cannot_act_on() {
+        use nikon_fleet::ops::apply::ApplyError;
+        use nikon_fleet::ops::baseline::NoBaselineReason;
+        let refusal = |json| transplant_refusal(ApplyError::NoBaseline(NoBaselineReason::UnknownModel), json).to_string();
+        assert!(refusal(false).contains("--allow-partial"), "a person at a terminal is told");
+        let for_a_program = refusal(true);
+        assert!(!for_a_program.contains("--allow-partial"), "{for_a_program}");
+        assert!(for_a_program.contains("nothing was written"), "the refusal itself stays: {for_a_program}");
+        // a refusal with no advice is the same either way
+        let same = |json| transplant_refusal(ApplyError::MissingConfirmation { which: "digest" }, json).to_string();
+        assert_eq!(same(false), same(true));
     }
 
     #[test]
