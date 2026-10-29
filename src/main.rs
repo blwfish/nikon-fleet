@@ -427,14 +427,18 @@ cannot act on that.";
 
 const RESTORE_HELP: &str = "\
 Exit status:
-  0  done (a dry run, or a restore that wrote and read back what it planned)
+  0  done: a dry run, or a restore that was applied. The JSON report's `status` says whether it was
+     verified (applied_verified) or the read-back was incomplete (applied_unverified)
   1  any other error, or a restore that wrote but did not fully take (the JSON report says which).
      A restore that ends 1 with no JSON report may have written
-  2  command-line usage error
-  5  --expect-digest was given and the plan no longer matches: nothing was written
+  2  command-line usage error: nothing ran
+  5  the plan no longer matches, so nothing was written: --expect-digest was given and the camera or
+     snapshot differs from that plan, or (without --expect-*) the camera changed between this run's
+     own plan and its apply
   6  a restore (not a dry run) was refused before it could write anything: nothing was written
-With --json, a refusal's message leaves out the advice to pass --allow-partial: a program reading it
-cannot act on that.";
+A dry run that names a property which cannot be restored (--only) prints its plan and then exits 1.
+With --json, a refusal's message leaves out the advice to pass --allow-partial or to use another
+command: a program reading it cannot act on that.";
 
 const DEVICE_INFO_HELP: &str = "\
 Read-only: sends only the standard GetDeviceInfo (0x1001) inside a PTP session and changes nothing
@@ -2454,8 +2458,158 @@ fn restore_refusal(e: nikon_fleet::ops::restore_flow::RestoreApplyError, json: b
 /// transplant does (see `transplant_exit`).
 fn cmd_restore(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &RestoreArgs, no_usb_reset: bool) -> Result<()> {
     let mut report_in_hand = false;
-    restore_run(data_dir, bundle, schema_path, args, no_usb_reset, &mut report_in_hand)
-        .map_err(|e| transplant_exit(e, args.dry_run, !report_in_hand))
+    let result = restore_run(data_dir, bundle, schema_path, args, no_usb_reset, &mut report_in_hand);
+    restore_finish(result, args, report_in_hand)
+}
+
+/// How a restore ends: an apply that failed with no report in hand wrote nothing and exits
+/// `EXIT_REFUSED_BEFORE_WRITE`; a stale plan keeps its own status; anything once a report is in hand,
+/// and any dry run, keeps the plain failure (`transplant_exit`).
+fn restore_finish(result: Result<()>, args: &RestoreArgs, report_in_hand: bool) -> Result<()> {
+    result.map_err(|e| transplant_exit(e, args.dry_run, !report_in_hand))
+}
+
+/// One line of what a restore prints, in the order it is printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestoreOut {
+    /// Progress and results: stdout, or stderr when `--json` keeps stdout for the report.
+    Say(String),
+    /// A warning: stderr.
+    Warn(String),
+    /// The JSON document `--json` prints on stdout.
+    Json(String),
+}
+
+/// What `restore_on_port` produced, in order. Nothing is printed while it runs, so a test can read
+/// it, and so the caller prints it whether the restore succeeded or failed afterwards.
+#[derive(Debug, Default)]
+struct RestoreProduct {
+    out: Vec<RestoreOut>,
+}
+
+impl RestoreProduct {
+    fn say(&mut self, text: String) {
+        self.out.push(RestoreOut::Say(text));
+    }
+
+    /// The JSON the run printed, if it printed any.
+    fn json(&self) -> Option<&str> {
+        self.out.iter().find_map(|o| if let RestoreOut::Json(j) = o { Some(j.as_str()) } else { None })
+    }
+
+    fn print(&self, json: bool, json_out: &mut nikon_fleet::json_out::JsonOut) -> Result<()> {
+        for o in &self.out {
+            match o {
+                RestoreOut::Say(t) => say(json, t),
+                RestoreOut::Warn(w) => eprintln!("{w}"),
+                RestoreOut::Json(j) => json_out.emit(j)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The restore proper, on any camera: plan, then (unless `--dry-run`) apply held to the
+/// confirmation and report. Everything the call-site decides lives here, so it is tested with a fake
+/// camera: which digest and summary the apply is held to, and that `report_in_hand` is set exactly
+/// when `apply_restore` has returned a report (after which a failure may have followed a write).
+struct RestoreSetup<'a> {
+    snap: &'a Snapshot,
+    source_name: &'a str,
+    source_bytes: &'a [u8],
+    only: Option<&'a std::collections::BTreeSet<String>>,
+    identity: &'a Camera,
+    snapshots_dir: &'a Path,
+    name_lookup: &'a HashMap<u32, String>,
+    captured_at: String,
+}
+
+fn restore_on_port<P: nikon_fleet::ops::port::CameraPort + ?Sized>(
+    port: &P,
+    args: &RestoreArgs,
+    setup: &RestoreSetup<'_>,
+    product: &mut RestoreProduct,
+    report_in_hand: &mut bool,
+) -> Result<()> {
+    use nikon_fleet::ops::baseline::GatePolicy;
+    use nikon_fleet::ops::restore_flow::{BodyPolicy, RestoreApplyRequest, RestorePlanInput, apply_restore, build_restore_plan};
+
+    let json = args.json;
+    // The CLI picked the body by serial (including the id-N and SDK-id forms the MCP refuses), so
+    // only the model is checked here. A different model is a transplant, not a restore.
+    let input = RestorePlanInput {
+        source: setup.snap,
+        source_name: setup.source_name,
+        source_bytes: setup.source_bytes,
+        target: setup.identity,
+        only: setup.only,
+        body_policy: BodyPolicy::SameModel,
+    };
+    let plan = build_restore_plan(port, &input).map_err(|r| {
+        // A program reading --json cannot act on the advice to run another command.
+        if json { anyhow::anyhow!("{r}") } else { anyhow::anyhow!("{r}\nUse `nikon-fleet transplant` to copy settings between models.") }
+    })?;
+    let named = setup.only.map(|o| o.len());
+
+    if args.dry_run {
+        product.say(cli_report::render_restore_dry_run(&plan.steps, &plan.counts, setup.only.is_some()));
+        product.say(format!("Plan: {}\nDigest: {}\n", plan.summary, plan.digest));
+        if json {
+            product.out.push(RestoreOut::Json(serde_json::to_string_pretty(&plan)?));
+        }
+        // The plan is printed first and then a plan that names what cannot be restored fails the
+        // command (exit 1): a reader of --json gets the plan either way and tests the plan's own
+        // `unrestorable` list, not the status.
+        if let Some(msg) = unrestored_error(named, &plan.unrestorable) {
+            bail!("{msg}");
+        }
+        return Ok(());
+    }
+
+    // Unless the caller presents a plan it approved (--expect-digest, the way the GUI does), the
+    // plan above is this command's own and running it is the consent.
+    let confirmation = restore_confirmation(args, &plan.digest, &plan.summary);
+    let req = RestoreApplyRequest {
+        plan: input,
+        snapshots_dir: setup.snapshots_dir,
+        name_lookup: setup.name_lookup,
+        expected_digest: confirmation.0,
+        expected_summary: confirmation.1,
+        captured_at: setup.captured_at.clone(),
+        gate_policy: if args.allow_partial { GatePolicy::AllowPartial } else { GatePolicy::Strict },
+    };
+    let report = after_restore_apply(apply_restore(port, &req, &mut |_| {}), json, report_in_hand)?;
+
+    for w in cli_report::restore_write_warnings(&report.steps) {
+        product.out.push(RestoreOut::Warn(w));
+    }
+    product.say(cli_report::restore_tally("Restore complete:", &report.counts, setup.only.is_some()));
+    product.say(cli_report::render_restore_apply(&report));
+    if let Some(v) = &report.verification {
+        let (line, _) = restore_verification_text(v);
+        product.say(format!("{line}\n"));
+    }
+    if json {
+        product.out.push(RestoreOut::Json(serde_json::to_string_pretty(&report)?));
+    }
+
+    let readback_failed = report.verification.as_ref().map(|v| restore_verification_text(v).1).unwrap_or(false);
+    if let Some(msg) = cli_report::restore_failure(&report, named, readback_failed) {
+        bail!("{msg}");
+    }
+    Ok(())
+}
+
+/// The result of `apply_restore`: a `RestoreApplyError` is a refusal before any write; a report in
+/// hand means the camera may have been written, which `report_in_hand` records for `transplant_exit`.
+fn after_restore_apply<R>(
+    result: Result<R, nikon_fleet::ops::restore_flow::RestoreApplyError>,
+    json: bool,
+    report_in_hand: &mut bool,
+) -> Result<R> {
+    let report = result.map_err(|e| restore_refusal(e, json))?;
+    *report_in_hand = true;
+    Ok(report)
 }
 
 fn restore_run(
@@ -2466,9 +2620,6 @@ fn restore_run(
     no_usb_reset: bool,
     report_in_hand: &mut bool,
 ) -> Result<()> {
-    use nikon_fleet::ops::baseline::GatePolicy;
-    use nikon_fleet::ops::restore_flow::{BodyPolicy, RestoreApplyRequest, RestorePlanInput, apply_restore, build_restore_plan};
-
     let json = args.json;
     let mut json_out = nikon_fleet::json_out::JsonOut::redirect(json)?;
     let snap_path = resolve_snapshot_path(data_dir, &args.snapshot_path);
@@ -2510,69 +2661,33 @@ fn restore_run(
         .with_context(|| format!("loading schema from {}", schema_path.display()))?;
     let name_lookup = schema.name_map_for_model(&target.name);
     let identity = target_identity(&target, &usb_info);
-    // The CLI picked the body by serial above (including the id-N and SDK-id forms the MCP refuses),
-    // so only the model is checked here. A different model is a transplant, not a restore.
-    let input = RestorePlanInput {
-        source: &snap,
+    let snapshots = snapshots_dir(data_dir);
+    let setup = RestoreSetup {
+        snap: &snap,
         source_name: &source_name,
         source_bytes: &source_bytes,
-        target: &identity,
         only: only.as_ref(),
-        body_policy: BodyPolicy::SameModel,
-    };
-    let plan = build_restore_plan(&device, &input).map_err(|r| {
-        anyhow::anyhow!("{r}\nUse `nikon-fleet transplant` to copy settings between models.")
-    })?;
-    let named = only.as_ref().map(|o| o.len());
-
-    if args.dry_run {
-        say(json, &cli_report::render_restore_dry_run(&plan.steps, &plan.counts, only.is_some()));
-        say(json, &format!("Plan: {}\nDigest: {}\n", plan.summary, plan.digest));
-        if json {
-            json_out.emit(&serde_json::to_string_pretty(&plan)?)?;
-        }
-        if let Some(msg) = unrestored_error(named, &plan.unrestorable) {
-            bail!("{msg}");
-        }
-        return Ok(());
-    }
-
-    let snapshots = snapshots_dir(data_dir);
-    let captured_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
-    // Unless the caller presents a plan it approved (--expect-digest, the way the GUI does), the
-    // plan above is this command's own and running it is the consent.
-    let confirmation = restore_confirmation(args, &plan.digest, &plan.summary);
-    let req = RestoreApplyRequest {
-        plan: input,
+        identity: &identity,
         snapshots_dir: &snapshots,
         name_lookup: &name_lookup,
-        expected_digest: confirmation.0,
-        expected_summary: confirmation.1,
-        captured_at,
-        gate_policy: if args.allow_partial { GatePolicy::AllowPartial } else { GatePolicy::Strict },
+        captured_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
     };
-    let report = apply_restore(&device, &req, &mut |_| {}).map_err(|e| restore_refusal(e, json))?;
-    // From here the camera may have been written.
-    *report_in_hand = true;
-
-    for w in cli_report::restore_write_warnings(&report.steps) {
-        eprintln!("{w}");
+    let mut product = RestoreProduct::default();
+    let result = restore_on_port(&device, args, &setup, &mut product, report_in_hand);
+    product.print(json, &mut json_out)?;
+    if args.dry_run {
+        // A plan wrote nothing and there is nothing left to do once it is out: leave without
+        // closing the session, as `check` does (F24: the SDK's DisconnectDevice hangs on about
+        // 1 run in 14). The failure status is the ordinary one (`main` would print the same).
+        match &result {
+            Ok(()) => nikon_fleet::process_exit::exit_now(0),
+            Err(e) => {
+                eprintln!("Error: {e:?}");
+                nikon_fleet::process_exit::exit_now(exit_code_for(e))
+            }
+        }
     }
-    say(json, &cli_report::restore_tally("Restore complete:", &report.counts, only.is_some()));
-    say(json, &cli_report::render_restore_apply(&report));
-    if let Some(v) = &report.verification {
-        let (line, _) = restore_verification_text(v);
-        say(json, &format!("{line}\n"));
-    }
-    if json {
-        json_out.emit(&serde_json::to_string_pretty(&report)?)?;
-    }
-
-    let readback_failed = report.verification.as_ref().map(|v| restore_verification_text(v).1).unwrap_or(false);
-    if let Some(msg) = cli_report::restore_failure(&report, named, readback_failed) {
-        bail!("{msg}");
-    }
-    Ok(())
+    result
 }
 
 /// The one-line read-back report for the CLI, and whether it is a failure.
@@ -2756,7 +2871,9 @@ fn transplant_run(
         if json {
             json_out.emit(&serde_json::to_string_pretty(&plan)?)?;
         }
-        return Ok(());
+        // A plan wrote nothing and the result is out: leave without closing the session, as `check`
+        // does (F24: DisconnectDevice hangs on about 1 run in 14).
+        nikon_fleet::process_exit::exit_now(0);
     }
 
     // The same sequence the MCP's transplant_apply runs: recompute the plan, take a restore point,
@@ -4465,6 +4582,209 @@ mod tests {
         let d = TempDir::new().unwrap();
         let err = cmd_ref(d.path(), &RefCmd::Show { model: "Z 9".into(), serial: "../x".into() }).unwrap_err();
         assert!(err.to_string().contains("not a plain file name"), "{err}");
+    }
+
+    // ── restore, composed with a fake camera (everything but the SDK) ────────────
+
+    mod restore_on_a_fake_camera {
+        use super::*;
+        use clap::Parser;
+        use nikon_fleet::ops::apply::{EXIT_REFUSED_BEFORE_WRITE, EXIT_STALE_PLAN};
+        use nikon_fleet::ops::baseline::baseline_for;
+        use nikon_fleet::ops::port::{FakeCamera, Failure};
+        use nikon_fleet::sdk::{OP_GET, OP_SET};
+        use nikon_fleet::snapshot::Transport;
+
+        const RW: u32 = OP_GET | OP_SET;
+
+        struct World {
+            cam: FakeCamera,
+            names: HashMap<u32, String>,
+            targets: Vec<(String, u32)>,
+            snap: Snapshot,
+            bytes: Vec<u8>,
+            identity: Camera,
+            dir: tempfile::TempDir,
+        }
+
+        /// A Z 9 holding "old" strings and 1 where the stored snapshot says other values.
+        fn world(fail_write: Option<usize>) -> World {
+            let b = baseline_for("Z 9").unwrap();
+            let targets: Vec<(String, u32)> = b.readable.iter().skip(6).take(3).map(|c| (c.name.clone(), c.code)).collect();
+            let identity = Camera { model: "Z 9".into(), serial: "T1".into(), firmware: "5.31".into() };
+            let mut snap = Snapshot::new(identity.clone(), Transport::Usb, "2026-10-27T10:00:00Z".into());
+            let mut cam = FakeCamera::new();
+            let mut names = HashMap::new();
+            for c in &b.readable {
+                let at = targets.iter().position(|(_, code)| *code == c.code);
+                let (live, stored) = match at {
+                    Some(2) => (serde_json::json!(1), serde_json::json!(55)),
+                    Some(i) => (serde_json::json!("old"), serde_json::json!(format!("text {i}"))),
+                    None => (serde_json::json!(1), serde_json::json!(1)),
+                };
+                cam = cam.with(c.code, RW, live);
+                names.insert(c.code, c.name.clone());
+                snap.insert(c.name.clone(), c.code, stored);
+            }
+            if let Some(i) = fail_write {
+                cam = cam.failing_write(targets[i].1, Failure::Call(-125));
+            }
+            let bytes = snap.to_pretty_json().unwrap().into_bytes();
+            World { cam, names, targets, snap, bytes, identity, dir: tempfile::tempdir().unwrap() }
+        }
+
+        fn args(extra: &[&str]) -> RestoreArgs {
+            let mut argv = vec!["nikon-fleet", "restore", "--json"];
+            argv.extend_from_slice(extra);
+            argv.push("snap.json");
+            match Cli::try_parse_from(argv).unwrap().cmd {
+                Cmd::Restore(a) => a,
+                _ => unreachable!(),
+            }
+        }
+
+        /// What `cmd_restore` does after the SDK: the restore on the camera and how it ends.
+        fn run(w: &World, a: &RestoreArgs, only: Option<&std::collections::BTreeSet<String>>) -> (Result<()>, RestoreProduct, bool) {
+            let setup = RestoreSetup {
+                snap: &w.snap,
+                source_name: "snap.json",
+                source_bytes: &w.bytes,
+                only,
+                identity: &w.identity,
+                snapshots_dir: w.dir.path(),
+                name_lookup: &w.names,
+                captured_at: "2026-10-27T17:26:00.688812Z".into(),
+            };
+            let mut product = RestoreProduct::default();
+            let mut in_hand = false;
+            let r = restore_on_port(&w.cam, a, &setup, &mut product, &mut in_hand);
+            (restore_finish(r, a, in_hand), product, in_hand)
+        }
+
+        fn plan_of(w: &World) -> (String, String) {
+            let (r, p, _) = run(w, &args(&["--dry-run"]), None);
+            r.unwrap();
+            let v: serde_json::Value = serde_json::from_str(p.json().expect("a plan")).unwrap();
+            (v["digest"].as_str().unwrap().to_string(), v["summary"].as_str().unwrap().to_string())
+        }
+
+        #[test]
+        fn a_dry_run_prints_the_plan_as_json_and_writes_nothing() {
+            let w = world(None);
+            let (r, p, in_hand) = run(&w, &args(&["--dry-run"]), None);
+            r.unwrap();
+            assert!(!in_hand);
+            let v: serde_json::Value = serde_json::from_str(p.json().unwrap()).unwrap();
+            assert!(v["digest"].as_str().is_some_and(|d| d.len() == 64), "{v}");
+            assert!(w.cam.writes().is_empty());
+            // without --json no document is printed
+            let mut plain = args(&["--dry-run"]);
+            plain.json = false;
+            assert!(run(&w, &plain, None).1.json().is_none());
+        }
+
+        #[test]
+        fn an_apply_is_held_to_the_plan_it_was_given_and_a_report_in_hand_is_recorded_when_it_ran() {
+            let w = world(None);
+            let (digest, summary) = plan_of(&w);
+            let held = args(&["--expect-digest", &digest, "--expect-summary", &summary]);
+            let (r, p, in_hand) = run(&w, &held, None);
+            r.unwrap();
+            assert!(in_hand, "apply_restore returned a report: from here a failure may have followed a write");
+            assert!(!w.cam.writes().is_empty());
+            let report: serde_json::Value = serde_json::from_str(p.json().unwrap()).unwrap();
+            assert_eq!(report["plan_digest"], digest, "the report names the plan it was held to");
+            // with no --expect-* the command applies the plan it has just made itself
+            let w2 = world(None);
+            let (r, _, in_hand) = run(&w2, &args(&[]), None);
+            r.unwrap();
+            assert!(in_hand);
+        }
+
+        #[test]
+        fn a_plan_that_no_longer_matches_writes_nothing_and_ends_with_the_stale_status() {
+            for (what, digest, summary) in [("digest", Some("0".repeat(64)), None), ("summary", None, Some("another summary".to_string()))] {
+                let w = world(None);
+                let (good_digest, good_summary) = plan_of(&w);
+                let a = args(&[
+                    "--expect-digest",
+                    &digest.unwrap_or(good_digest),
+                    "--expect-summary",
+                    &summary.unwrap_or(good_summary),
+                ]);
+                let (r, p, in_hand) = run(&w, &a, None);
+                let e = r.unwrap_err();
+                assert_eq!(exit_code_for(&e), EXIT_STALE_PLAN, "{what}: {e:?}");
+                assert!(!in_hand && w.cam.writes().is_empty() && p.json().is_none(), "{what}");
+            }
+        }
+
+        #[test]
+        fn a_refusal_before_the_writes_ends_with_the_refused_status_and_a_failure_after_them_does_not() {
+            // another model: refused while planning, before anything is read for writing
+            let mut w = world(None);
+            w.identity.model = "Z6_3".into();
+            let (r, _, in_hand) = run(&w, &args(&[]), None);
+            assert_eq!(exit_code_for(&r.unwrap_err()), EXIT_REFUSED_BEFORE_WRITE);
+            assert!(!in_hand && w.cam.writes().is_empty());
+            // the advice to run another command is for a person at a terminal
+            let msg = |json: bool| {
+                let mut a = args(&["--dry-run"]);
+                a.json = json;
+                run(&w, &a, None).0.unwrap_err().to_string()
+            };
+            assert!(msg(false).contains("nikon-fleet transplant") && !msg(true).contains("nikon-fleet transplant"), "{} / {}", msg(false), msg(true));
+            // a write that failed: a report is in hand, the camera may have changed, plain failure
+            let w = world(Some(1));
+            let (r, p, in_hand) = run(&w, &args(&[]), None);
+            let e = r.unwrap_err();
+            assert!(in_hand, "the report came after the writes began");
+            assert_eq!(exit_code_for(&e), 1, "{e:?}");
+            assert!(p.json().is_some(), "the report is printed before the command fails");
+            // an apply that did not even get as far as a stale check: no baseline for the model
+        }
+
+        #[test]
+        fn a_dry_run_that_names_what_cannot_be_restored_prints_its_plan_and_then_fails() {
+            let mut w = world(None);
+            // a name in the snapshot the camera does not have: planned as absent_on_target, named by --only
+            w.snap.insert("kNkMAIDCapability_NotOnThisBody", 999_999, serde_json::json!(1));
+            w.bytes = w.snap.to_pretty_json().unwrap().into_bytes();
+            let only = std::collections::BTreeSet::from(["kNkMAIDCapability_NotOnThisBody".to_string(), w.targets[0].0.clone()]);
+            let (r, p, in_hand) = run(&w, &args(&["--dry-run", "--only", "NotOnThisBody", "--only", &w.targets[0].0]), Some(&only));
+            let e = r.unwrap_err();
+            assert_eq!(exit_code_for(&e), 1, "a dry run keeps the plain failure: {e:?}");
+            assert!(!in_hand);
+            let plan: serde_json::Value = serde_json::from_str(p.json().expect("the plan is printed before the failure")).unwrap();
+            assert_eq!(plan["unrestorable"][0][0], "kNkMAIDCapability_NotOnThisBody", "{plan}");
+            assert!(w.cam.writes().is_empty());
+        }
+
+        #[test]
+        fn the_status_a_run_ends_with_is_chosen_by_whether_a_report_was_in_hand() {
+            let a = args(&[]);
+            let boom = || anyhow::anyhow!("boom");
+            assert_eq!(exit_code_for(&restore_finish(Err(boom()), &a, false).unwrap_err()), EXIT_REFUSED_BEFORE_WRITE);
+            assert_eq!(exit_code_for(&restore_finish(Err(boom()), &a, true).unwrap_err()), 1);
+            let dry = args(&["--dry-run"]);
+            assert_eq!(exit_code_for(&restore_finish(Err(boom()), &dry, false).unwrap_err()), 1);
+            assert!(restore_finish(Ok(()), &a, false).is_ok());
+        }
+
+        #[test]
+        fn restore_help_names_every_status_it_ends_with_and_what_exit_zero_covers() {
+            let mut cmd = <Cli as clap::CommandFactory>::command();
+            let help = cmd.find_subcommand_mut("restore").unwrap().render_long_help().to_string();
+            for code in [0, 1, 2, EXIT_STALE_PLAN, EXIT_REFUSED_BEFORE_WRITE] {
+                assert!(help.contains(&format!("\n  {code}  ")), "status {code} missing from:\n{help}");
+            }
+            for status in ["applied_verified", "applied_unverified"] {
+                assert!(help.contains(status), "exit 0 covers {status}:\n{help}");
+            }
+            let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains("changed between this run's own plan and its apply"), "{flat}");
+            assert!(flat.contains("prints its plan and then exits 1"), "{flat}");
+        }
     }
 
 }

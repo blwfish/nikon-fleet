@@ -23,3 +23,37 @@ pub fn exit_now(code: i32) -> ! {
     #[cfg(not(unix))]
     std::process::exit(code)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHILD_ENV: &str = "NIKON_FLEET_EXIT_NOW_CHILD";
+    const MARKER: &str = "written-before-exit-no-newline";
+
+    /// Runs only as the child of `exit_now_flushes_what_was_written_and_ends_with_the_code`.
+    #[test]
+    fn exit_now_child() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            return;
+        }
+        // No newline: a line-buffered stdout keeps this until it is flushed.
+        print!("{MARKER}");
+        eprint!("{MARKER}-err");
+        exit_now(7)
+    }
+
+    #[test]
+    fn exit_now_flushes_what_was_written_and_ends_with_the_code() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process_exit::tests::exit_now_child", "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run the test binary as a child");
+        assert_eq!(out.status.code(), Some(7), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).contains(MARKER), "stdout was not flushed: {:?}", out.stdout);
+        assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("{MARKER}-err")), "stderr was not flushed");
+        // the process ended at exit_now: the harness never got to print its summary line
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("test result"), "the process kept running past exit_now");
+    }
+}

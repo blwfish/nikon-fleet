@@ -1132,6 +1132,83 @@ mod tests {
         assert_eq!(w.cam.writes().len(), writes);
     }
 
+    // ── every way the apply is refused leaves the body untouched ─────────
+
+    /// `apply_restore` returns `Err` only before its first write (the CLI maps "no report" to exit
+    /// 6, "nothing was written"). The match names every `ApplyError` variant: a new one fails to
+    /// compile here, and its refusal then has to be added to the table below.
+    #[test]
+    fn every_refusal_the_apply_can_return_happens_before_the_first_write() {
+        fn named(e: &RestoreApplyError) -> &'static str {
+            match e {
+                RestoreApplyError::Refused(_) => "refused",
+                RestoreApplyError::Apply(a) => match a {
+                    ApplyError::MissingConfirmation { .. } => "missing_confirmation",
+                    ApplyError::StalePlan { .. } => "stale_plan",
+                    ApplyError::List(_) => "list",
+                    ApplyError::RestorePointCap(_) => "cap",
+                    // Built from constants by the library: no input of a restore can make it fail.
+                    ApplyError::Label(_) => "label",
+                    ApplyError::NoBaseline(_) => "no_baseline",
+                    ApplyError::NothingReadable { .. } => "nothing_readable",
+                    ApplyError::RestorePointIncomplete { .. } => "incomplete",
+                    ApplyError::RestorePointWrite(_) => "write",
+                },
+            }
+        }
+        let seen = std::cell::RefCell::new(BTreeSet::new());
+        let check = |w: &World, e: RestoreApplyError, label: &'static str| {
+            assert_eq!(named(&e), label, "{e:?}");
+            assert!(w.cam.writes().is_empty(), "{label}: the body was written before the refusal");
+            seen.borrow_mut().insert(label);
+        };
+        // refused: another body
+        let w = world();
+        let mut f = fixture(&w);
+        let p = plan_of(&w, &f);
+        f.target.serial = "T2".into();
+        check(&w, run(&w, &f, &p.digest, &p.summary, &mut Vec::new()).unwrap_err(), "refused");
+        // the echo
+        let f = fixture(&w);
+        check(&w, run(&w, &f, "", &p.summary, &mut Vec::new()).unwrap_err(), "missing_confirmation");
+        check(&w, run(&w, &f, "not-the-digest", &p.summary, &mut Vec::new()).unwrap_err(), "stale_plan");
+        check(&w, run(&w, &f, &p.digest, "not the summary", &mut Vec::new()).unwrap_err(), "stale_plan");
+        // the snapshots directory cannot be listed (a file where the directory should be)
+        let not_a_dir = w.dir.path().join("a-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let e = apply_restore(
+            &w.cam,
+            &RestoreApplyRequest {
+                plan: input(&f, Some(&f.only)),
+                snapshots_dir: &not_a_dir,
+                name_lookup: &w.names,
+                expected_digest: &p.digest,
+                expected_summary: &p.summary,
+                captured_at: AT.into(),
+                gate_policy: GatePolicy::Strict,
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(named(&e), "list" | "write"), "{e:?}");
+        assert!(w.cam.writes().is_empty());
+        seen.borrow_mut().insert("list_or_write");
+        // an incomplete body
+        let w = world_with(|c, _| c, 20);
+        check(&w, apply_planned(&w, &fixture(&w)).unwrap_err(), "incomplete");
+        // the cap
+        let w = world();
+        let f = fixture(&w);
+        for i in 0..MAX_RESTORE_POINTS_PER_CAMERA {
+            let mut s = Snapshot::new(f.target.clone(), Transport::Usb, format!("2026-01-01T00:00:00.{i:03}Z"));
+            s.label = Some("mcp-restore-pre-restore-old".into());
+            s.insert("kNkMAIDCapability_A", 1, json!(1));
+            s.save_to_file(w.dir.path().join(format!("rp-{i}.json"))).unwrap();
+        }
+        check(&w, apply_planned(&w, &f).unwrap_err(), "cap");
+        assert_eq!(seen.borrow().len(), 6, "{:?}", seen.borrow());
+    }
+
     // ── the CLI's policies ───────────────────────────────────────────────
 
     fn run_policy(w: &World, f: &Fixture, body: BodyPolicy, gate: GatePolicy) -> Result<RestoreApplyReport, RestoreApplyError> {

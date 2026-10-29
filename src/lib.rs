@@ -25,4 +25,5 @@ pub mod transplant;
 pub(crate) mod value_shape;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod gui_argv;
 pub mod vendor_argv;

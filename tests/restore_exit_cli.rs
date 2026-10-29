@@ -46,51 +46,69 @@ fn err(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// What each case's message proves: it names where the run stopped, so a case cannot pass because
+/// it stopped somewhere else (every apply stopped at the missing SDK exits 6 whatever came first).
+const AT_THE_SDK: &str = "SDK bundle not found";
+
 #[test]
-fn an_apply_stopped_at_the_missing_sdk_exits_six_and_a_dry_run_exits_one() {
+fn an_apply_stopped_at_the_sdk_exits_six_and_a_dry_run_exits_one() {
     let d = tempfile::tempdir().unwrap();
     let snap = write_snapshot(d.path());
     let snap = snap.to_str().unwrap();
     let apply = run(d.path(), &["--json", snap]);
     assert_eq!(code(&apply), EXIT_REFUSED_BEFORE_WRITE, "{}", err(&apply));
-    assert!(err(&apply).contains("SDK bundle not found"), "the message is kept: {}", err(&apply));
+    assert!(err(&apply).contains(AT_THE_SDK), "stopped at the SDK: {}", err(&apply));
     let dry = run(d.path(), &["--json", "--dry-run", snap]);
     assert_eq!(code(&dry), 1, "{}", err(&dry));
+    assert!(err(&dry).contains(AT_THE_SDK), "{}", err(&dry));
 }
 
 #[test]
-fn an_apply_stopped_by_a_bad_selection_or_a_missing_snapshot_exits_six() {
+fn the_snapshot_and_the_selection_are_checked_before_the_sdk_is_opened() {
     let d = tempfile::tempdir().unwrap();
     let snap = write_snapshot(d.path());
     let snap = snap.to_str().unwrap();
+    // each of these stops on its own message: the SDK check, which would also exit 6, is never reached
     let bad_only = run(d.path(), &["--only", "Apertur", snap]);
     assert_eq!(code(&bad_only), EXIT_REFUSED_BEFORE_WRITE, "{}", err(&bad_only));
+    assert!(err(&bad_only).contains("no property by that name") && !err(&bad_only).contains(AT_THE_SDK), "{}", err(&bad_only));
     let missing = run(d.path(), &["--json", "no-such-snapshot.json"]);
     assert_eq!(code(&missing), EXIT_REFUSED_BEFORE_WRITE, "{}", err(&missing));
-    assert_eq!(code(&run(d.path(), &["--dry-run", "no-such-snapshot.json"])), 1);
+    assert!(err(&missing).contains("no-such-snapshot.json") && !err(&missing).contains(AT_THE_SDK), "{}", err(&missing));
+    // a dry run stops at the same places with the plain failure
+    let dry_missing = run(d.path(), &["--dry-run", "no-such-snapshot.json"]);
+    assert_eq!(code(&dry_missing), 1);
+    assert!(!err(&dry_missing).contains(AT_THE_SDK), "{}", err(&dry_missing));
+    // a good selection gets past the check and stops at the SDK
+    let good_only = run(d.path(), &["--only", "Aperture", snap]);
+    assert!(err(&good_only).contains(AT_THE_SDK), "{}", err(&good_only));
 }
 
 #[test]
-fn an_apply_given_a_plan_to_hold_to_exits_six_when_refused_and_two_when_misused() {
+fn the_flags_that_hold_an_apply_to_a_plan_are_checked_by_the_parser_before_anything_runs() {
     let d = tempfile::tempdir().unwrap();
     let snap = write_snapshot(d.path());
     let snap = snap.to_str().unwrap();
-    let held = run(d.path(), &["--expect-digest", "d", "--expect-summary", "s", snap]);
-    assert_eq!(code(&held), EXIT_REFUSED_BEFORE_WRITE, "{}", err(&held));
-    // Misuse is the parser's, before any of this: clap's own status.
+    // Misuse is the parser's, before any of this: clap's own status. (That a held apply exits 5 on a
+    // plan that no longer matches needs a camera behind the SDK: it is pinned in-process, with the
+    // library's fake camera, in `restore_on_a_fake_camera` in src/main.rs.)
     assert_eq!(code(&run(d.path(), &["--expect-digest", "d", snap])), 2);
     assert_eq!(code(&run(d.path(), &["--expect-summary", "s", snap])), 2);
     assert_eq!(code(&run(d.path(), &["--dry-run", "--expect-digest", "d", "--expect-summary", "s", snap])), 2);
     assert_eq!(code(&run(d.path(), &[])), 2);
+    // given both, the run gets as far as the SDK
+    let held = run(d.path(), &["--expect-digest", "d", "--expect-summary", "s", snap]);
+    assert!(err(&held).contains(AT_THE_SDK), "{}", err(&held));
 }
 
 #[test]
 fn the_help_documents_every_status_a_caller_tests() {
     let out = Command::new(BIN).args(["restore", "--help"]).output().expect("run CLI");
     let help = String::from_utf8(out.stdout).unwrap();
-    for status in [EXIT_STALE_PLAN, EXIT_REFUSED_BEFORE_WRITE] {
+    for status in [0, 1, 2, EXIT_STALE_PLAN, EXIT_REFUSED_BEFORE_WRITE] {
         assert!(help.contains(&format!("\n  {status}  ")), "status {status} missing from:\n{help}");
     }
-    assert!(help.contains("may have written"), "{help}");
-    assert!(help.contains("leaves out the advice to pass --allow-partial"), "{help}");
+    for needle in ["may have written", "applied_unverified", "leaves out the advice to pass --allow-partial"] {
+        assert!(help.contains(needle), "{needle:?} missing from:\n{help}");
+    }
 }
