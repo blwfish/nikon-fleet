@@ -154,6 +154,7 @@ enum Cmd {
     /// *different* model, translating enum/range values into the target's
     /// own equivalents instead of assuming the same code/index means the
     /// same thing on both bodies. See src/transplant.rs for the strategy.
+    #[command(after_help = TRANSPLANT_HELP)]
     Transplant(TransplantArgs),
 
     /// Manage the firmware archive.
@@ -411,6 +412,13 @@ Exit status:
 /// from the plain failure (1) a script is allowed to retry blindly: this one needs a look at the
 /// camera first.
 const EXIT_WRITE_INDETERMINATE: i32 = 4;
+
+const TRANSPLANT_HELP: &str = "\
+Exit status:
+  0  done (a dry run, or an apply that wrote and read back what it planned)
+  1  any other error, or an apply that wrote but did not fully take (the JSON report says which)
+  2  command-line usage error
+  5  --expect-digest was given and the plan no longer matches: nothing was written";
 
 const DEVICE_INFO_HELP: &str = "\
 Read-only: sends only the standard GetDeviceInfo (0x1001) inside a PTP session and changes nothing
@@ -670,6 +678,15 @@ struct TransplantArgs {
     /// read-back still compared.
     #[arg(long)]
     allow_partial: bool,
+    /// Apply only the plan that has this digest (from a `--dry-run` of the same snapshot, target
+    /// and opt-ins, e.g. one a person has just reviewed). The plan is recomputed on the camera as
+    /// it is now; if it no longer matches, nothing is written and the command exits 5. Without
+    /// this the command applies the plan it has just computed itself. Needs --expect-summary.
+    #[arg(long, value_name = "DIGEST", requires = "expect_summary", conflicts_with = "dry_run")]
+    expect_digest: Option<String>,
+    /// The plan's summary line, copied from the same dry run as --expect-digest.
+    #[arg(long, value_name = "SUMMARY", requires = "expect_digest", conflicts_with = "dry_run")]
+    expect_summary: Option<String>,
     /// Print the plan (with --dry-run) or the result as JSON on stdout (the same value the MCP
     /// worker's `transplant-plan` / `transplant-apply` return); progress and warnings go to stderr.
     #[arg(long)]
@@ -2547,6 +2564,25 @@ fn restore_verification_text(v: &restore::Verification) -> (String, bool) {
 /// instead of `restore`'s literal same-model copy. See that module's docs
 /// for the translation strategy and why capability *codes* (not menu
 /// position, not per-model renumbering) are the right join key here.
+/// The digest and summary an apply is held to: the plan a person approved and presented
+/// (`--expect-digest`, `--expect-summary`), else the one just computed, whose approval is the
+/// running of the command itself.
+fn transplant_confirmation<'a>(args: &'a TransplantArgs, digest: &'a str, summary: &'a str) -> (&'a str, &'a str) {
+    (args.expect_digest.as_deref().unwrap_or(digest), args.expect_summary.as_deref().unwrap_or(summary))
+}
+
+/// A transplant apply refused before any write: its message with the hint for its tag, and for a stale
+/// plan the status a caller tests (`EXIT_STALE_PLAN`) instead of reading the message.
+fn transplant_refusal(e: nikon_fleet::ops::apply::ApplyError) -> anyhow::Error {
+    use nikon_fleet::ops::apply::{ApplyError, EXIT_STALE_PLAN};
+    let hint = cli_report::refusal_hint(e.tag()).map(|h| format!("\n{h}")).unwrap_or_default();
+    let message = format!("{e}{hint}");
+    match e {
+        ApplyError::StalePlan { .. } => ExitCodeError { code: EXIT_STALE_PLAN, message }.into(),
+        _ => anyhow::anyhow!(message),
+    }
+}
+
 fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &TransplantArgs, no_usb_reset: bool) -> Result<()> {
     use nikon_fleet::ops::apply::{ApplyRequest, apply_transplant};
     use nikon_fleet::ops::baseline::GatePolicy;
@@ -2630,24 +2666,23 @@ fn cmd_transplant(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Tra
     }
 
     // The same sequence the MCP's transplant_apply runs: recompute the plan, take a restore point,
-    // write, read back. The plan above is this command's own, so its digest and summary are what
+    // write, read back. Unless the caller presents a plan it approved (--expect-digest, the way
+    // the GUI does), the plan above is this command's own and its digest and summary are what
     // apply is given: running the command is the consent, the digest only guards the gap between
     // the two reads.
     let snapshots = snapshots_dir(data_dir);
+    let confirmation = transplant_confirmation(args, &plan.digest, &plan.summary);
     let req = ApplyRequest {
         plan: input,
         guard: &guard,
         snapshots_dir: &snapshots,
         name_lookup: &name_lookup,
-        expected_digest: &plan.digest,
-        expected_summary: &plan.summary,
+        expected_digest: confirmation.0,
+        expected_summary: confirmation.1,
         captured_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
         gate_policy: if args.allow_partial { GatePolicy::AllowPartial } else { GatePolicy::Strict },
     };
-    let report = apply_transplant(&device, &req, &mut |_| {}).map_err(|e| {
-        let hint = cli_report::refusal_hint(e.tag()).map(|h| format!("\n{h}")).unwrap_or_default();
-        anyhow::anyhow!("{e}{hint}")
-    })?;
+    let report = apply_transplant(&device, &req, &mut |_| {}).map_err(transplant_refusal)?;
 
     let text = cli_report::render_transplant(&report.outcomes, false);
     for w in &text.warnings {
@@ -2709,7 +2744,7 @@ fn is_already_archived(e: &anyhow::Error) -> bool {
 
 /// The process exit status for a failed run: 3 for "already archived" (`EXIT_ALREADY_ARCHIVED`),
 /// 4 for an indeterminate FTP-profile write (`EXIT_WRITE_INDETERMINATE`), a status an error
-/// carries itself, else 1.
+/// carries itself (5 for a stale transplant plan, `EXIT_STALE_PLAN`), else 1.
 fn exit_code_for(e: &anyhow::Error) -> i32 {
     if let Some(x) = e.downcast_ref::<ExitCodeError>() {
         x.code
@@ -3854,6 +3889,50 @@ mod tests {
         nikon_fleet::ptp_usb::PtpUsbError::FtpWriteIndeterminate {
             cause: Box::new(nikon_fleet::ptp_usb::PtpUsbError::ShortWrite { written: 40, expected: 82 }),
         }
+    }
+
+    #[test]
+    fn a_stale_transplant_plan_exits_five_and_every_other_refusal_exits_one() {
+        use nikon_fleet::ops::apply::{ApplyError, EXIT_STALE_PLAN};
+        let stale = transplant_refusal(ApplyError::StalePlan { what: "digest" });
+        assert_eq!(exit_code_for(&stale), EXIT_STALE_PLAN);
+        assert_eq!(EXIT_STALE_PLAN, 5, "documented in --help; the GUI tests for it");
+        assert!(![1, 2, EXIT_ALREADY_ARCHIVED, EXIT_WRITE_INDETERMINATE].contains(&EXIT_STALE_PLAN));
+        let missing = transplant_refusal(ApplyError::MissingConfirmation { which: "digest" });
+        assert_eq!(exit_code_for(&missing), 1);
+        assert!(stale.to_string().contains("stale"), "the message still says why: {stale}");
+    }
+
+    #[test]
+    fn an_apply_is_held_to_the_plan_it_was_given_and_only_otherwise_to_its_own() {
+        use clap::Parser;
+        let args = |extra: &[&str]| {
+            let mut argv = vec!["nikon-fleet", "transplant", "snap.json"];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).unwrap().cmd {
+                Cmd::Transplant(a) => a,
+                _ => unreachable!(),
+            }
+        };
+        let own = args(&[]);
+        assert_eq!(transplant_confirmation(&own, "fresh-digest", "fresh summary"), ("fresh-digest", "fresh summary"));
+        let given = args(&["--expect-digest", "approved-digest", "--expect-summary", "approved summary"]);
+        assert_eq!(transplant_confirmation(&given, "fresh-digest", "fresh summary"), ("approved-digest", "approved summary"));
+    }
+
+    #[test]
+    fn expect_digest_and_expect_summary_come_together_and_never_with_a_dry_run() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["nikon-fleet", "transplant", "snap.json"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        assert!(parse(&[]).is_ok());
+        assert!(parse(&["--expect-digest", "d", "--expect-summary", "s"]).is_ok());
+        assert!(parse(&["--expect-digest", "d"]).is_err(), "a digest alone is half a confirmation");
+        assert!(parse(&["--expect-summary", "s"]).is_err(), "a summary alone is half a confirmation");
+        assert!(parse(&["--dry-run", "--expect-digest", "d", "--expect-summary", "s"]).is_err(), "a dry run writes nothing, so it has nothing to confirm");
     }
 
     #[test]

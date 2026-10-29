@@ -49,7 +49,13 @@ use crate::snapshot::{PropertyEntry, Snapshot, SnapshotError, Transport};
 use crate::transplant::{CodeNameGuard, Severity, SkipReason, TransplantOutcome, numbers_equal, transplant};
 use crate::value_shape::{is_range_shape, range_values_agree};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Process exit status of `nikon-fleet transplant --expect-digest` when the plan it was given no
+/// longer matches the camera and snapshot as they are now ([`ApplyError::StalePlan`]): nothing was
+/// written, and whoever approved that plan must be shown a new one. The GUI tests the status,
+/// never the message; both read this constant.
+pub const EXIT_STALE_PLAN: i32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyStatus {
     AppliedVerified,

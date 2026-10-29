@@ -317,7 +317,7 @@ pub enum SkipReason {
 /// skips are the tool declining on purpose (and, for opt-in gates, offering a
 /// way to override); warn skips want a person's attention; an error is a write
 /// that failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Routine,
