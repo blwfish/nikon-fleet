@@ -20,7 +20,7 @@
 // restored with `only` set to the apply's `undo_set`, through the same four steps.
 
 use super::*;
-use nikon_fleet::ops::restore::{Verdict, readback_line};
+use nikon_fleet::ops::restore::{RestoreSkip, Verdict, readback_line};
 use nikon_fleet::ops::restore_flow::step_would_change;
 
 /// A plan reads every property it would write (4-20 s a read); the transplant's timeouts, for the
@@ -81,15 +81,36 @@ pub(crate) enum PlanSection {
 }
 
 impl StepTag {
+    /// The library's skip reason this tag names, if it names one.
+    pub(crate) fn skip(self) -> Option<RestoreSkip> {
+        match self {
+            StepTag::NeverCopied => Some(RestoreSkip::NeverCopied),
+            StepTag::AbsentOnTarget => Some(RestoreSkip::Absent),
+            StepTag::ReadOnly => Some(RestoreSkip::ReadOnly),
+            StepTag::RangeScaleDiffers => Some(RestoreSkip::RangeScaleDiffers),
+            StepTag::NotSelected
+            | StepTag::WouldWrite
+            | StepTag::Written
+            | StepTag::UnsupportedWriteType
+            | StepTag::WriteFailed
+            | StepTag::Unknown => None,
+        }
+    }
+
+    /// Whether a skip is routine is the library's call ([`RestoreSkip::is_routine`]); this only
+    /// files it. A skip tag that somehow maps to no skip is listed where it will be seen.
     pub(crate) fn section(self, changes: bool) -> PlanSection {
         match self {
             StepTag::WouldWrite if changes => PlanSection::WriteChange,
             StepTag::WouldWrite => PlanSection::WriteSame,
-            StepTag::NeverCopied | StepTag::AbsentOnTarget | StepTag::ReadOnly => PlanSection::Routine,
-            StepTag::NotSelected => PlanSection::Hidden,
-            StepTag::RangeScaleDiffers | StepTag::Written | StepTag::UnsupportedWriteType | StepTag::WriteFailed | StepTag::Unknown => {
-                PlanSection::Attention
+            StepTag::NeverCopied | StepTag::AbsentOnTarget | StepTag::ReadOnly | StepTag::RangeScaleDiffers => {
+                match self.skip() {
+                    Some(skip) if skip.is_routine() => PlanSection::Routine,
+                    Some(_) | None => PlanSection::Attention,
+                }
             }
+            StepTag::NotSelected => PlanSection::Hidden,
+            StepTag::Written | StepTag::UnsupportedWriteType | StepTag::WriteFailed | StepTag::Unknown => PlanSection::Attention,
         }
     }
 
@@ -1560,6 +1581,25 @@ mod tests {
         assert_eq!((junk.tag, junk.raw_tag.as_str()), (StepTag::Unknown, "a_new_kind_of_step"));
         assert_eq!(StepTag::Unknown.section(false), PlanSection::Attention, "and it is listed where it will be seen");
         assert!(serde_json::from_value::<StepOutcomeJson>(serde_json::json!({"detail": 1})).is_err(), "a step with no tag at all is not a step");
+    }
+
+    #[test]
+    fn a_skip_is_filed_by_the_library_s_severity_and_every_skip_tag_maps_back_to_its_skip() {
+        for skip in RestoreSkip::ALL {
+            let parsed: StepOutcomeJson = serde_json::from_value(serde_json::to_value(StepOutcome::Skipped(skip)).unwrap()).unwrap();
+            assert_eq!(parsed.tag.skip(), Some(skip), "{}: the GUI's tag names the library's skip", skip.tag());
+            let want = if skip.is_routine() { PlanSection::Routine } else { PlanSection::Attention };
+            // `changes` is about writes; a skip is filed the same whatever it carries
+            assert_eq!(parsed.tag.section(false), want, "{}", skip.tag());
+            assert_eq!(parsed.tag.section(true), want, "{}", skip.tag());
+        }
+        // pinned by name too, so a change of the library's table is a visible decision here
+        assert_eq!(StepTag::RangeScaleDiffers.section(false), PlanSection::Attention);
+        assert_eq!(StepTag::ReadOnly.section(false), PlanSection::Routine);
+        // outcomes that are not skips name no skip
+        for t in [StepTag::NotSelected, StepTag::WouldWrite, StepTag::Written, StepTag::UnsupportedWriteType, StepTag::WriteFailed, StepTag::Unknown] {
+            assert_eq!(t.skip(), None, "{t:?}");
+        }
     }
 
     #[test]
