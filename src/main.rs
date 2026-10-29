@@ -2440,7 +2440,7 @@ fn ingest_user_file(data_dir: &Path, source_id: &str, release: &Release, file: &
 /// The digest and summary a restore apply is held to: the plan a person approved and presented
 /// (`--expect-digest`, `--expect-summary`), else the one just computed.
 fn restore_confirmation<'a>(args: &'a RestoreArgs, digest: &'a str, summary: &'a str) -> (&'a str, &'a str) {
-    (args.expect_digest.as_deref().unwrap_or(digest), args.expect_summary.as_deref().unwrap_or(summary))
+    held_to(args.expect_digest.as_deref(), args.expect_summary.as_deref(), digest, summary)
 }
 
 /// A restore apply refused before any write, worded as a transplant's refusal is (the shared
@@ -2737,7 +2737,13 @@ fn restore_verification_text(v: &restore::Verification) -> (String, bool) {
 /// (`--expect-digest`, `--expect-summary`), else the one just computed, whose approval is the
 /// running of the command itself.
 fn transplant_confirmation<'a>(args: &'a TransplantArgs, digest: &'a str, summary: &'a str) -> (&'a str, &'a str) {
-    (args.expect_digest.as_deref().unwrap_or(digest), args.expect_summary.as_deref().unwrap_or(summary))
+    held_to(args.expect_digest.as_deref(), args.expect_summary.as_deref(), digest, summary)
+}
+
+/// The one rule behind `transplant_confirmation` and `restore_confirmation`: what the caller
+/// presented, else what this run computed.
+fn held_to<'a>(expect_digest: Option<&'a str>, expect_summary: Option<&'a str>, digest: &'a str, summary: &'a str) -> (&'a str, &'a str) {
+    (expect_digest.unwrap_or(digest), expect_summary.unwrap_or(summary))
 }
 
 /// A transplant apply refused before any write: its message with the hint for its tag (unless
