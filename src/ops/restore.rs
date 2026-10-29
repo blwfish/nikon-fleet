@@ -56,6 +56,28 @@ impl RestoreSkip {
             RestoreSkip::RangeScaleDiffers => "range_scale_differs",
         }
     }
+
+    /// Every skip reason, for tests and for anything that must name them all.
+    pub const ALL: [RestoreSkip; 4] =
+        [RestoreSkip::NeverCopied, RestoreSkip::Absent, RestoreSkip::ReadOnly, RestoreSkip::RangeScaleDiffers];
+
+    /// The skip a [`tag`](Self::tag) names, or `None` for a string that is not one (a tag from
+    /// another build, an outcome that is not a skip, empty text).
+    pub fn from_tag(tag: &str) -> Option<RestoreSkip> {
+        Self::ALL.into_iter().find(|s| s.tag() == tag)
+    }
+
+    /// Whether the skip is part of how a restore normally goes, so a front end may list it as
+    /// "skipped as a matter of course": the body does not hold or take the setting, and there is
+    /// nothing for the person to do. `RangeScaleDiffers` is not: a setting the person asked to put
+    /// back was deliberately left alone because its meaning moved, and they should see that. The one
+    /// place this is decided; a new reason has to choose here (the match names every variant).
+    pub fn is_routine(&self) -> bool {
+        match self {
+            RestoreSkip::NeverCopied | RestoreSkip::Absent | RestoreSkip::ReadOnly => true,
+            RestoreSkip::RangeScaleDiffers => false,
+        }
+    }
 }
 
 /// Whose settings a restore is carrying: the body's own, or another body's.
@@ -736,6 +758,34 @@ mod tests {
     fn skip_tags_are_distinct_and_closed() {
         let tags = [RestoreSkip::NeverCopied.tag(), RestoreSkip::Absent.tag(), RestoreSkip::ReadOnly.tag()];
         assert_eq!(tags, ["never_copied", "absent_on_target", "read_only"]);
+    }
+
+    #[test]
+    fn every_skip_is_listed_has_a_distinct_tag_that_round_trips_and_has_a_decided_severity() {
+        // This match names every variant: a new one fails to compile here, then `ALL` and the table.
+        fn every(s: RestoreSkip) {
+            match s {
+                RestoreSkip::NeverCopied | RestoreSkip::Absent | RestoreSkip::ReadOnly | RestoreSkip::RangeScaleDiffers => {}
+            }
+        }
+        let expected = [
+            (RestoreSkip::NeverCopied, "never_copied", true),
+            (RestoreSkip::Absent, "absent_on_target", true),
+            (RestoreSkip::ReadOnly, "read_only", true),
+            (RestoreSkip::RangeScaleDiffers, "range_scale_differs", false),
+        ];
+        assert_eq!(RestoreSkip::ALL.len(), expected.len());
+        for (skip, tag, routine) in expected {
+            every(skip);
+            assert!(RestoreSkip::ALL.contains(&skip), "{tag} is in ALL");
+            assert_eq!(skip.tag(), tag);
+            assert_eq!(skip.is_routine(), routine, "{tag}");
+            assert_eq!(RestoreSkip::from_tag(tag), Some(skip), "{tag} round-trips");
+        }
+        // not a skip: another outcome's tag, a tag from another build, empty text, a near miss
+        for not_a_skip in ["would_write", "written", "not_selected", "a_new_kind_of_step", "", "NEVER_COPIED", "never_copied ", "absent"] {
+            assert_eq!(RestoreSkip::from_tag(not_a_skip), None, "{not_a_skip:?}");
+        }
     }
 
     // ── resolve_only ─────────────────────────────────────────────────────
