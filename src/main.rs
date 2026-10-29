@@ -37,6 +37,7 @@ use nikon_fleet::ops::capture::{self as ops_capture, CaptureStats};
 use nikon_fleet::ops::firmware_latest::{LatestReport, ModelSurvey, survey_json, survey_models, watch_models};
 use nikon_fleet::ops::paths::{checked_reference_filename, is_safe_path_component, write_atomic};
 use nikon_fleet::ops::list::{EntryState, Listing, list_dir};
+use nikon_fleet::ops::labels::{self, Labels};
 use nikon_fleet::ops::render;
 use nikon_fleet::ops::restore;
 use nikon_fleet::ops::target::{
@@ -307,8 +308,18 @@ struct LsArgs {
 }
 
 const SHOW_HELP: &str = "\
-Reads one snapshot or reference file and prints each property as `name [0xCODE] = value`, sorted
-by name, with the kNkMAIDCapability_ prefix left off. Nothing touches a camera or the SDK.
+Reads one snapshot or reference file and prints each property as `name = value`, sorted by name,
+with the kNkMAIDCapability_ prefix left off. Nothing touches a camera or the SDK.
+
+Names come from files in sdk-runtime/ (next to --schema): the SDK's display name for a property
+(\"Mode A\" for ModeA), the name of an enumeration's current value (\"Label (3)\" rather than 3) and
+a range's scale (\"612.0 (0..1224, 1225 steps)\"). MaidLayer.config supplies the display names and
+some value names; scripts/extract-maid-labels.py writes maid-labels.json with the base
+capabilities' names (what a cap_0x.. key is called) and the value names the SDK's PDF documents. A value
+that its property's list of names does not have is marked [value_not_in_labels]. Without these
+files the numbers are shown as they are and a note on stderr says what is missing.
+--codes adds the [0xCODE] column (--filter finds codes either way); --no-names drops the display-name
+column; --raw drops every name and scale and prints the numbers with the code column, as before.
 
 SNAPSHOT_FILE is a path, or a bare file name (as `ls` prints it) looked up in snapshots/ and then
 references/ of --data-dir, and failing that in the current directory.
@@ -330,6 +341,18 @@ struct ShowArgs {
     /// Print the result as one JSON document instead of text.
     #[arg(long)]
     json: bool,
+    /// Add the [0xCODE] column.
+    #[arg(long)]
+    codes: bool,
+    /// Show the SDK's display name next to the internal name (the default when the names are available).
+    #[arg(long, conflicts_with_all = ["no_names", "raw"])]
+    names: bool,
+    /// Do not show display names.
+    #[arg(long)]
+    no_names: bool,
+    /// No names, labels or scales: the numbers as stored, with the code column.
+    #[arg(long)]
+    raw: bool,
 }
 
 #[derive(Args, Debug)]
@@ -817,14 +840,26 @@ fn cmd_ls(data_dir: &Path, args: &LsArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_show(data_dir: &Path, args: &ShowArgs) -> Result<()> {
+fn cmd_show(data_dir: &Path, schema_path: &Path, args: &ShowArgs) -> Result<()> {
     let path = render::locate(data_dir, &args.snapshot_file)?;
     let snapshot = render::load(&path)?;
-    let rendered = render::render_snapshot(&snapshot, args.filter.as_deref());
+    // The names live beside MaidLayer.config, wherever --schema puts it.
+    let labels = if args.raw {
+        Labels::none()
+    } else {
+        let firmware = Some(snapshot.camera.firmware.as_str()).filter(|f| !f.is_empty());
+        Labels::load_from(schema_path, &schema_path.with_file_name(labels::LABELS_FILE), &snapshot.camera.model, firmware)
+    };
+    let opts = if args.raw { render::RenderOptions::raw() } else { render::RenderOptions::viewer(&labels) };
+    let rendered = render::render_snapshot_opts(&snapshot, args.filter.as_deref(), &opts);
+    if let Some(note) = &rendered.labels_note {
+        eprintln!("note: {note}");
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&rendered)?);
     } else {
-        print!("{}", rendered.to_text(args.filter.as_deref()));
+        let text = render::TextOptions { codes: args.codes || args.raw, names: !args.raw && !args.no_names };
+        print!("{}", rendered.to_text_with(args.filter.as_deref(), text));
     }
     Ok(())
 }
@@ -2728,7 +2763,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Check(args) => cmd_check(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
         Cmd::Diff(args) => cmd_diff(&cli.data_dir, &cli.schema, args),
         Cmd::Ls(args) => cmd_ls(&cli.data_dir, args),
-        Cmd::Show(args) => cmd_show(&cli.data_dir, args),
+        Cmd::Show(args) => cmd_show(&cli.data_dir, &cli.schema, args),
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
         Cmd::Baseline(sub) => cmd_baseline(sub),

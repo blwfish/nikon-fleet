@@ -8,6 +8,8 @@
 #         (the directory that contains Module/Mac/)
 #
 # Idempotent: re-running rewrites paths to the current sdk-runtime location.
+# Also writes sdk-runtime/maid-labels.json (scripts/extract-maid-labels.py); that step is optional
+# and only warns when pdftotext (poppler) is missing.
 
 set -euo pipefail
 
@@ -61,6 +63,21 @@ echo "Re-signing modified Mach-Os (ad-hoc) so hardened-runtime loaders will acce
 codesign --force --sign - "$BUNDLE_EXE"
 codesign --force --sign - "$DRIVER"
 codesign --force --sign - "$ROYALMILE"
+
+# Names for what a snapshot holds (display names are in MaidLayer.config, staged above; the base
+# capability names and the value names the SDK's PDF documents come from here). Derived from the
+# licensed SDK documents, so it goes into the gitignored sdk-runtime/ and never into the repository.
+# Optional: without it `nikon-fleet show` prints raw numbers and says so; it needs poppler's pdftotext.
+echo "Extracting capability and value names from the SDK documents"
+if command -v python3 >/dev/null 2>&1; then
+  if ! python3 "$PROJ_DIR/scripts/extract-maid-labels.py" "$SDK_ROOT" \
+      --out "$RUNTIME/maid-labels.json" --maid-layer-config "$RUNTIME/MaidLayer.config"; then
+    echo "WARNING: names were not extracted (see above); the runtime works without them." >&2
+    echo "         After installing what is missing: python3 scripts/extract-maid-labels.py $SDK_ROOT" >&2
+  fi
+else
+  echo "WARNING: python3 not found; skipping scripts/extract-maid-labels.py (names stay raw numbers)." >&2
+fi
 
 echo "Copying config files into ~/Library/Preferences/Nikon/NXTether/"
 mkdir -p "$HOME/Library/Preferences/Nikon/NXTether"

@@ -115,7 +115,7 @@ expect `git log` to have history for them.
   top of `snapshot.rs`. Properties are stored in a `BTreeMap` specifically
   so JSON diffs in git show real changes, not key reordering.
 - **What a snapshot holds is shown by one formatter, `ops::render`.**
-  `nikon-fleet show <file-or-name> [--filter TEXT] [--json]` (CLI, read-only,
+  `nikon-fleet show <file-or-name> [--filter TEXT] [--json] [--codes] [--raw]` (CLI, read-only,
   no camera or SDK) and the egui GUI's snapshot window (double-click a row,
   or its View button) both call `ops::render::render_snapshot`; the Python
   GUI's `fmt_cap_value` must agree with it, and
@@ -124,6 +124,23 @@ expect `git log` to have history for them.
   `(malformed: why)` with a closed `kind` and `notes`, never as a default;
   stepped ranges read their position from `value_index` through
   `value_shape`. Change the display rules there, not in a UI.
+- **Names for what a snapshot holds come from files on the machine that has
+  the SDK, never from the repository.** `ops::labels::Labels` reads
+  `sdk-runtime/MaidLayer.config` (display names, and some enumeration value
+  names, for the snapshot's model and firmware generation) and
+  `sdk-runtime/maid-labels.json` (the base capability names from `Maid3.h`,
+  what a `cap_0x..` key is called, and the value names the SDK's PDF documents), which
+  `scripts/extract-maid-labels.py <SDK folder>` writes (needs poppler's
+  `pdftotext`; `scripts/setup-sdk-runtime.sh` calls it). Both are licensed SDK
+  material and gitignored; every part is optional and a missing one is
+  reported, not guessed (`nikon-fleet show` prints the numbers and a note on
+  stderr). `render_snapshot_with` / `render_value_with` use them and also show a
+  range's scale; the plain `render_*` functions never do, which keeps
+  `render_values.json` SDK-independent (`render_labels.json` pins the named forms
+  with invented labels). The PDF parser leaves a capability unnamed rather than
+  complete a list by guessing: see `unparsed` in the generated file for each
+  reason. An enum value its capability's list lacks is shown, with the
+  `value_not_in_labels` note, never hidden.
 - **Cross-model diffing is out of scope.** `diff.rs` only diffs two
   snapshots from the *same* camera model — see the module doc comment for
   why (semantic alignment between bodies needs per-model MaidLayer
@@ -167,7 +184,13 @@ expect `git log` to have history for them.
 cargo build --release          # produces target/release/nikon-fleet
 cargo test --workspace         # Rust unit tests: 108+23 in the nikon-fleet lib/bin, 35+ in gui/ (all offline)
 cd gui && python3 -m pytest    # GUI helper unit tests (test_fleet_lib.py; also offline)
+python3 -m unittest scripts/test_extract_maid_labels.py   # the SDK-document extractor (invented inputs; offline)
 ```
+
+To name what `nikon-fleet show` prints (display names, enumeration value names), run
+`python3 scripts/extract-maid-labels.py /path/to/S-SDKZ-200BF-ALLIN` by hand; it writes
+`sdk-runtime/maid-labels.json` (gitignored) and needs poppler's `pdftotext`
+(`brew install poppler`). `scripts/setup-sdk-runtime.sh` runs it too.
 
 `gui/` is a workspace member (joined 2026-09-03), not a standalone crate — `cargo test`/`cargo llvm-cov` run without `--workspace` from the repo root cover only the root `nikon-fleet` package and silently skip `gui/src/main.rs`'s tests.
 

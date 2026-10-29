@@ -34,6 +34,11 @@ fn data_dir() -> tempfile::TempDir {
 }
 
 fn run_in(cwd: &Path, data: &Path, args: &[&str]) -> Output {
+    // `--raw`: these tests pin the numbers as stored, with the code column. Whether names are
+    // shown depends on the sdk-runtime/ of the machine; followup_labels_show_cli.rs covers that
+    // with files it writes itself.
+    let (cmd, rest) = args.split_first().expect("a subcommand");
+    let raw: &[&str] = if *cmd == "show" { &["--raw"] } else { &[] };
     Command::new(BIN)
         .current_dir(cwd)
         .arg("--data-dir")
@@ -41,7 +46,9 @@ fn run_in(cwd: &Path, data: &Path, args: &[&str]) -> Output {
         // A bundle that does not exist: `show` must not touch the SDK.
         .arg("--sdk-bundle")
         .arg("/nonexistent/sdk")
-        .args(args)
+        .arg(cmd)
+        .args(raw)
+        .args(rest)
         .output()
         .expect("spawn CLI")
 }

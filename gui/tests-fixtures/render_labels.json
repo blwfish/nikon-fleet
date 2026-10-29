@@ -1,0 +1,1031 @@
+{
+ "_comment": "Synthetic: the schema text and the SDK-document labels below are invented for this test (no SDK file is copied here). Each case is rendered for the property (code, property) of model `Test 1`, firmware 2.00; mode: viewer = labels and scale, labels_only = labels without scale, raw = neither.",
+ "model": "Test 1",
+ "firmware": "2.00",
+ "schema_lines": [
+  "<ProfileVersion>1.0</ProfileVersion>",
+  "<model:Test 1>",
+  "\t<version>common</version>",
+  "\t<caplist>",
+  "\t\t<capability:kNkMAIDCapability_ModeA-40001>",
+  "\t\t\t<description>0,11100,\"Mode A\"</description>",
+  "\t\t\t<resourcestringList>",
+  "\t\t\t\t<resourcestring>0,1,\"Alpha\"</resourcestring>",
+  "\t\t\t\t<resourcestring>1,2,\"Beta\"</resourcestring>",
+  "\t\t\t\t<resourcestring>-1,3,\"Unset\"</resourcestring>",
+  "\t\t\t\t<resourcestring>7,4,\"Seven, with a comma\"</resourcestring>",
+  "\t\t\t</resourcestringList>",
+  "\t\t</capability>",
+  "\t\t<capability:kNkMAIDCapability_ModeB-40002>",
+  "\t\t\t<description>0,11100,\"Mode B\"</description>",
+  "\t\t\t<resourcestringList>",
+  "\t\t\t</resourcestringList>",
+  "\t\t</capability>",
+  "\t\t<capability:kNkMAIDCapability_Dup-40003>",
+  "\t\t\t<description>0,11100,\"Dup\"</description>",
+  "\t\t\t<resourcestringList>",
+  "\t\t\t\t<resourcestring>4,1,\"Four\"</resourcestring>",
+  "\t\t\t\t<resourcestring>4,2,\"Four\"</resourcestring>",
+  "\t\t\t\t<resourcestring>5,3,\"Five\"</resourcestring>",
+  "\t\t\t\t<resourcestring>5,4,\"Cinq\"</resourcestring>",
+  "\t\t\t\t<resourcestring>6,5,\"Six\"</resourcestring>",
+  "\t\t\t\t<resourcestring>9,-1,\"Nine\",34105,1</resourcestring>",
+  "\t\t\t</resourcestringList>",
+  "\t\t</capability>",
+  "\t\t<capability:kNkMAIDCapability_Plain-40004>",
+  "\t\t\t<description>0,11100,\"kNkMAIDCapability_Plain\"</description>",
+  "\t\t</capability>",
+  "\t\t<capability:kNkMAIDCapability_Slot-40010>",
+  "\t\t\t<description>0,11100,\"\"</description>",
+  "\t\t</capability>",
+  "\t</caplist>",
+  "</model>",
+  "<model:Other>",
+  "\t<version>common</version>",
+  "\t<caplist>",
+  "\t\t<capability:kNkMAIDCapability_ModeA-40001>",
+  "\t\t\t<description>0,11100,\"Not this model\"</description>",
+  "\t\t\t<resourcestringList>",
+  "\t\t\t\t<resourcestring>1,2,\"WRONG\"</resourcestring>",
+  "\t\t\t</resourcestringList>",
+  "\t\t</capability>",
+  "\t</caplist>",
+  "</model>"
+ ],
+ "doc": {
+  "source": {
+   "sdk_folder": "synthetic",
+   "files": [],
+   "extractor_version": 1,
+   "generated_at": "2026-01-01T00:00:00Z"
+  },
+  "base_capabilities": {
+   "1": "BaseOne",
+   "9": "Base Nine"
+  },
+  "capabilities": {
+   "ModeA": {
+    "enum": "eSynthetic",
+    "values": {
+     "0": "DocAlpha",
+     "2": "DocGamma"
+    },
+    "provenance": "synthetic"
+   },
+   "ModeB": {
+    "enum": "eSynthetic",
+    "values": {
+     "0": "Off",
+     "1": "On"
+    },
+    "provenance": "synthetic"
+   },
+   "Slot": {
+    "enum": "eSynthetic",
+    "values": {
+     "0": "ZeroState",
+     "1": "OneState"
+    },
+    "provenance": "synthetic"
+   }
+  }
+ },
+ "cases": [
+  {
+   "name": "enum labelled from the schema",
+   "mode": "viewer",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": {
+    "elem_type": 2,
+    "value_index": 1,
+    "elem_count": 3,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     0,
+     1,
+     7
+    ]
+   },
+   "display": "Beta (1)",
+   "kind": "enum",
+   "notes": [],
+   "label": "Beta",
+   "label_source": "schema"
+  },
+  {
+   "name": "enum label with a comma",
+   "mode": "viewer",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": {
+    "elem_type": 2,
+    "value_index": 2,
+    "elem_count": 3,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     0,
+     1,
+     7
+    ]
+   },
+   "display": "Seven, with a comma (7)",
+   "kind": "enum",
+   "notes": [],
+   "label": "Seven, with a comma",
+   "label_source": "schema"
+  },
+  {
+   "name": "enum negative value labelled",
+   "mode": "viewer",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": {
+    "elem_type": 1,
+    "value_index": 0,
+    "elem_count": 2,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     -1,
+     0
+    ]
+   },
+   "display": "Unset (-1)",
+   "kind": "enum",
+   "notes": [],
+   "label": "Unset",
+   "label_source": "schema"
+  },
+  {
+   "name": "schema is asked before the document",
+   "mode": "viewer",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": {
+    "elem_type": 2,
+    "value_index": 0,
+    "elem_count": 2,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     0,
+     1
+    ]
+   },
+   "display": "Alpha (0)",
+   "kind": "enum",
+   "notes": [],
+   "label": "Alpha",
+   "label_source": "schema"
+  },
+  {
+   "name": "document names a value the schema list lacks",
+   "mode": "viewer",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": {
+    "elem_type": 2,
+    "value_index": 1,
+    "elem_count": 2,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     0,
+     2
+    ]
+   },
+   "display": "DocGamma (2)",
+   "kind": "enum",
+   "notes": [],
+   "label": "DocGamma",
+   "label_source": "sdk_doc"
+  },
+  {
+   "name": "document only: the schema has no list for it",
+   "mode": "viewer",
+   "code": 40002,
+   "property": "kNkMAIDCapability_ModeB",
+   "value": {
+    "elem_type": 2,
+    "value_index": 1,
+    "elem_count": 2,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     0,
+     1
+    ]
+   },
+   "display": "On (1)",
+   "kind": "enum",
+   "notes": [],
+   "label": "On",
+   "label_source": "sdk_doc"
+  },
+  {
+   "name": "value in neither list",
+   "mode": "viewer",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": {
+    "elem_type": 2,
+    "value_index": 1,
+    "elem_count": 2,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     0,
+     9
+    ]
+   },
+   "display": "9",
+   "kind": "enum",
+   "notes": [
+    "value_not_in_labels"
+   ]
+  },
+  {
+   "name": "no list anywhere",
+   "mode": "viewer",
+   "code": 40004,
+   "property": "kNkMAIDCapability_Plain",
+   "value": {
+    "elem_type": 2,
+    "value_index": 0,
+    "elem_count": 1,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     3
+    ]
+   },
+   "display": "3",
+   "kind": "enum",
+   "notes": [
+    "unlabelled"
+   ]
+  },
+  {
+   "name": "two different names for one value are not a name",
+   "mode": "viewer",
+   "code": 40003,
+   "property": "kNkMAIDCapability_Dup",
+   "value": {
+    "elem_type": 2,
+    "value_index": 0,
+    "elem_count": 1,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     5
+    ]
+   },
+   "display": "5",
+   "kind": "enum",
+   "notes": [
+    "unlabelled"
+   ]
+  },
+  {
+   "name": "a name that depends on another capability is not a name",
+   "mode": "viewer",
+   "code": 40003,
+   "property": "kNkMAIDCapability_Dup",
+   "value": {
+    "elem_type": 2,
+    "value_index": 0,
+    "elem_count": 1,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     9
+    ]
+   },
+   "display": "9",
+   "kind": "enum",
+   "notes": [
+    "unlabelled"
+   ]
+  },
+  {
+   "name": "the same name twice is one name",
+   "mode": "viewer",
+   "code": 40003,
+   "property": "kNkMAIDCapability_Dup",
+   "value": {
+    "elem_type": 2,
+    "value_index": 0,
+    "elem_count": 1,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     4
+    ]
+   },
+   "display": "Four (4)",
+   "kind": "enum",
+   "notes": [],
+   "label": "Four",
+   "label_source": "schema"
+  },
+  {
+   "name": "another value of a list with an ambiguous one is named",
+   "mode": "viewer",
+   "code": 40003,
+   "property": "kNkMAIDCapability_Dup",
+   "value": {
+    "elem_type": 2,
+    "value_index": 0,
+    "elem_count": 1,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     6
+    ]
+   },
+   "display": "Six (6)",
+   "kind": "enum",
+   "notes": [],
+   "label": "Six",
+   "label_source": "schema"
+  },
+  {
+   "name": "the schema finds a code without a name",
+   "mode": "viewer",
+   "code": 40001,
+   "property": null,
+   "value": {
+    "elem_type": 2,
+    "value_index": 0,
+    "elem_count": 1,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     1
+    ]
+   },
+   "display": "Beta (1)",
+   "kind": "enum",
+   "notes": [],
+   "label": "Beta",
+   "label_source": "schema"
+  },
+  {
+   "name": "the document finds a name when the schema lacks the code",
+   "mode": "viewer",
+   "code": 99999,
+   "property": "kNkMAIDCapability_ModeB",
+   "value": {
+    "elem_type": 2,
+    "value_index": 0,
+    "elem_count": 1,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     1
+    ]
+   },
+   "display": "On (1)",
+   "kind": "enum",
+   "notes": [],
+   "label": "On",
+   "label_source": "sdk_doc"
+  },
+  {
+   "name": "a code and name nothing knows is unlabelled",
+   "mode": "viewer",
+   "code": 77777,
+   "property": null,
+   "value": {
+    "elem_type": 2,
+    "value_index": 0,
+    "elem_count": 1,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     3
+    ]
+   },
+   "display": "3",
+   "kind": "enum",
+   "notes": [
+    "unlabelled"
+   ]
+  },
+  {
+   "name": "another model's list is not used",
+   "mode": "viewer",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": {
+    "elem_type": 2,
+    "value_index": 0,
+    "elem_count": 1,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     1
+    ]
+   },
+   "display": "Beta (1)",
+   "kind": "enum",
+   "notes": [],
+   "label": "Beta",
+   "label_source": "schema"
+  },
+  {
+   "name": "enum option beyond i64 cannot be looked up",
+   "mode": "viewer",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": {
+    "elem_type": 2,
+    "value_index": 0,
+    "elem_count": 1,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     18446744073709551615
+    ]
+   },
+   "display": "18446744073709551615",
+   "kind": "enum",
+   "notes": []
+  },
+  {
+   "name": "stride-layout packed string is not labelled",
+   "mode": "viewer",
+   "code": 40004,
+   "property": "kNkMAIDCapability_Plain",
+   "value": {
+    "elem_type": 7,
+    "value_index": 1,
+    "elem_count": 2,
+    "elem_bytes": 12,
+    "default_index": 0,
+    "values": [
+     "Normal",
+     "Cyclic"
+    ]
+   },
+   "display": "Cyclic",
+   "kind": "enum",
+   "notes": []
+  },
+  {
+   "name": "byte-layout packed string: index counts strings",
+   "mode": "viewer",
+   "code": 40004,
+   "property": "kNkMAIDCapability_Plain",
+   "value": {
+    "elem_type": 7,
+    "value_index": 1,
+    "elem_count": 14,
+    "elem_bytes": 1,
+    "default_index": 0,
+    "values": [
+     "N",
+     "o",
+     "r",
+     "m",
+     "a",
+     "l",
+     "",
+     "C",
+     "y",
+     "c",
+     "l",
+     "i",
+     "c",
+     ""
+    ]
+   },
+   "display": "Cyclic",
+   "kind": "enum",
+   "notes": []
+  },
+  {
+   "name": "byte-layout packed string, first string",
+   "mode": "raw",
+   "code": 40004,
+   "property": "kNkMAIDCapability_Plain",
+   "value": {
+    "elem_type": 7,
+    "value_index": 0,
+    "elem_count": 14,
+    "elem_bytes": 1,
+    "default_index": 0,
+    "values": [
+     "N",
+     "o",
+     "r",
+     "m",
+     "a",
+     "l",
+     "",
+     "C",
+     "y",
+     "c",
+     "l",
+     "i",
+     "c",
+     ""
+    ]
+   },
+   "display": "Normal",
+   "kind": "enum",
+   "notes": []
+  },
+  {
+   "name": "byte-layout packed string: index past the strings",
+   "mode": "viewer",
+   "code": 40004,
+   "property": "kNkMAIDCapability_Plain",
+   "value": {
+    "elem_type": 7,
+    "value_index": 2,
+    "elem_count": 14,
+    "elem_bytes": 1,
+    "default_index": 0,
+    "values": [
+     "N",
+     "o",
+     "r",
+     "m",
+     "a",
+     "l",
+     "",
+     "C",
+     "y",
+     "c",
+     "l",
+     "i",
+     "c",
+     ""
+    ]
+   },
+   "display": "(malformed: enum index 2 is past its 2 options)",
+   "kind": "malformed",
+   "notes": [
+    "index_out_of_range"
+   ]
+  },
+  {
+   "name": "byte-layout packed string: a last string with no NUL",
+   "mode": "raw",
+   "code": 40004,
+   "property": "kNkMAIDCapability_Plain",
+   "value": {
+    "elem_type": 7,
+    "value_index": 1,
+    "elem_count": 4,
+    "elem_bytes": 1,
+    "default_index": 0,
+    "values": [
+     "a",
+     "b",
+     "",
+     "c"
+    ]
+   },
+   "display": "c",
+   "kind": "enum",
+   "notes": []
+  },
+  {
+   "name": "byte-layout packed string: empty strings are options",
+   "mode": "raw",
+   "code": 40004,
+   "property": "kNkMAIDCapability_Plain",
+   "value": {
+    "elem_type": 7,
+    "value_index": 1,
+    "elem_count": 5,
+    "elem_bytes": 1,
+    "default_index": 0,
+    "values": [
+     "a",
+     "",
+     "",
+     "b",
+     ""
+    ]
+   },
+   "display": "",
+   "kind": "enum",
+   "notes": []
+  },
+  {
+   "name": "byte layout needs elem_bytes 1",
+   "mode": "raw",
+   "code": 40004,
+   "property": "kNkMAIDCapability_Plain",
+   "value": {
+    "elem_type": 7,
+    "value_index": 1,
+    "elem_count": 2,
+    "elem_bytes": 2,
+    "default_index": 0,
+    "values": [
+     "a",
+     "b"
+    ]
+   },
+   "display": "b",
+   "kind": "enum",
+   "notes": []
+  },
+  {
+   "name": "byte layout needs elem_type 7",
+   "mode": "raw",
+   "code": 40004,
+   "property": "kNkMAIDCapability_Plain",
+   "value": {
+    "elem_type": 2,
+    "value_index": 1,
+    "elem_count": 2,
+    "elem_bytes": 1,
+    "default_index": 0,
+    "values": [
+     "a",
+     "b"
+    ]
+   },
+   "display": "b",
+   "kind": "enum",
+   "notes": []
+  },
+  {
+   "name": "plain integer named by the document",
+   "mode": "viewer",
+   "code": 40010,
+   "property": "kNkMAIDCapability_Slot",
+   "value": 1,
+   "display": "OneState (1)",
+   "kind": "int",
+   "notes": [],
+   "label": "OneState",
+   "label_source": "sdk_doc"
+  },
+  {
+   "name": "plain integer outside the document's list",
+   "mode": "viewer",
+   "code": 40010,
+   "property": "kNkMAIDCapability_Slot",
+   "value": 5,
+   "display": "5",
+   "kind": "int",
+   "notes": [
+    "value_not_in_labels"
+   ]
+  },
+  {
+   "name": "plain integer with no list says nothing",
+   "mode": "viewer",
+   "code": 40004,
+   "property": "kNkMAIDCapability_Plain",
+   "value": 3,
+   "display": "3",
+   "kind": "int",
+   "notes": []
+  },
+  {
+   "name": "a float is never named",
+   "mode": "viewer",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": 1.0,
+   "display": "1.0",
+   "kind": "float",
+   "notes": []
+  },
+  {
+   "name": "a bool is never named",
+   "mode": "viewer",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": true,
+   "display": "Yes",
+   "kind": "bool",
+   "notes": []
+  },
+  {
+   "name": "plain integer beyond i64",
+   "mode": "viewer",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": 18446744073709551615,
+   "display": "18446744073709551615",
+   "kind": "int",
+   "notes": []
+  },
+  {
+   "name": "raw mode names nothing",
+   "mode": "raw",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": {
+    "elem_type": 2,
+    "value_index": 1,
+    "elem_count": 2,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     0,
+     1
+    ]
+   },
+   "display": "1",
+   "kind": "enum",
+   "notes": []
+  },
+  {
+   "name": "raw mode flags nothing",
+   "mode": "raw",
+   "code": 40001,
+   "property": "kNkMAIDCapability_ModeA",
+   "value": {
+    "elem_type": 2,
+    "value_index": 1,
+    "elem_count": 2,
+    "elem_bytes": 4,
+    "default_index": 0,
+    "values": [
+     0,
+     9
+    ]
+   },
+   "display": "9",
+   "kind": "enum",
+   "notes": []
+  },
+  {
+   "name": "stepped range shows its scale",
+   "mode": "viewer",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 0.0,
+    "default": 0.0,
+    "lower": 0.0,
+    "upper": 1224.0,
+    "steps": 1225,
+    "value_index": 612,
+    "default_index": 0
+   },
+   "display": "612.0 (0..1224, 1225 steps)",
+   "kind": "range",
+   "notes": [],
+   "scale": {
+    "lower": 0.0,
+    "upper": 1224.0,
+    "steps": 1225
+   }
+  },
+  {
+   "name": "continuous range shows its scale",
+   "mode": "viewer",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 3.5,
+    "default": 0.0,
+    "lower": 0.0,
+    "upper": 10.0,
+    "steps": 0
+   },
+   "display": "3.5 (0..10)",
+   "kind": "range",
+   "notes": [],
+   "scale": {
+    "lower": 0.0,
+    "upper": 10.0,
+    "steps": 0
+   }
+  },
+  {
+   "name": "continuous range keeps an integer value",
+   "mode": "viewer",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 3,
+    "default": 0.0,
+    "lower": 0.0,
+    "upper": 10.0,
+    "steps": 0
+   },
+   "display": "3 (0..10)",
+   "kind": "range",
+   "notes": [],
+   "scale": {
+    "lower": 0.0,
+    "upper": 10.0,
+    "steps": 0
+   }
+  },
+  {
+   "name": "two steps is stepped",
+   "mode": "viewer",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 0.0,
+    "default": 0.0,
+    "lower": 0.0,
+    "upper": 1.0,
+    "steps": 2,
+    "value_index": 1,
+    "default_index": 0
+   },
+   "display": "1.0 (0..1, 2 steps)",
+   "kind": "range",
+   "notes": [],
+   "scale": {
+    "lower": 0.0,
+    "upper": 1.0,
+    "steps": 2
+   }
+  },
+  {
+   "name": "one step is said in the singular",
+   "mode": "viewer",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 0.25,
+    "default": 0.0,
+    "lower": 0.0,
+    "upper": 1.0,
+    "steps": 1
+   },
+   "display": "0.25 (0..1, 1 step)",
+   "kind": "range",
+   "notes": [],
+   "scale": {
+    "lower": 0.0,
+    "upper": 1.0,
+    "steps": 1
+   }
+  },
+  {
+   "name": "fractional and negative bounds are kept",
+   "mode": "viewer",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 0.0,
+    "default": 0.0,
+    "lower": -2.5,
+    "upper": 2.5,
+    "steps": 0
+   },
+   "display": "0.0 (-2.5..2.5)",
+   "kind": "range",
+   "notes": [],
+   "scale": {
+    "lower": -2.5,
+    "upper": 2.5,
+    "steps": 0
+   }
+  },
+  {
+   "name": "an integral bound below 1e15 is written as an integer",
+   "mode": "viewer",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 1.0,
+    "default": 0.0,
+    "lower": 0.0,
+    "upper": 999999999999999.0,
+    "steps": 0
+   },
+   "display": "1.0 (0..999999999999999)",
+   "kind": "range",
+   "notes": [],
+   "scale": {
+    "lower": 0.0,
+    "upper": 999999999999999.0,
+    "steps": 0
+   }
+  },
+  {
+   "name": "a bound of 1e15 is written as a float",
+   "mode": "viewer",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 1.0,
+    "default": 0.0,
+    "lower": 0.0,
+    "upper": 1000000000000000.0,
+    "steps": 0
+   },
+   "display": "1.0 (0..1000000000000000.0)",
+   "kind": "range",
+   "notes": [],
+   "scale": {
+    "lower": 0.0,
+    "upper": 1000000000000000.0,
+    "steps": 0
+   }
+  },
+  {
+   "name": "no span: the scale is still shown",
+   "mode": "viewer",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 5.0,
+    "default": 0.0,
+    "lower": 5.0,
+    "upper": 5.0,
+    "steps": 0
+   },
+   "display": "5.0 (5..5)",
+   "kind": "range",
+   "notes": [],
+   "scale": {
+    "lower": 5.0,
+    "upper": 5.0,
+    "steps": 0
+   }
+  },
+  {
+   "name": "a stepped range past its steps has no number and no scale",
+   "mode": "viewer",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 0.0,
+    "default": 0.0,
+    "lower": 0.0,
+    "upper": 1224.0,
+    "steps": 1225,
+    "value_index": 1225,
+    "default_index": 0
+   },
+   "display": "(malformed: stepped range position 1225 is past its 1225 steps)",
+   "kind": "malformed",
+   "notes": [
+    "index_out_of_range",
+    "no_number"
+   ]
+  },
+  {
+   "name": "a range with no value has no scale",
+   "mode": "viewer",
+   "code": 1,
+   "property": null,
+   "value": {
+    "lower": 0.0,
+    "upper": 10.0,
+    "steps": 0
+   },
+   "display": "(malformed: range has no value)",
+   "kind": "malformed",
+   "notes": [
+    "missing_value",
+    "no_number"
+   ]
+  },
+  {
+   "name": "scale off leaves the number as it was",
+   "mode": "labels_only",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 0.0,
+    "default": 0.0,
+    "lower": 0.0,
+    "upper": 1224.0,
+    "steps": 1225,
+    "value_index": 612,
+    "default_index": 0
+   },
+   "display": "612.0",
+   "kind": "range",
+   "notes": []
+  },
+  {
+   "name": "raw mode has no scale",
+   "mode": "raw",
+   "code": 1,
+   "property": null,
+   "value": {
+    "value": 3.5,
+    "default": 0.0,
+    "lower": 0.0,
+    "upper": 10.0,
+    "steps": 0
+   },
+   "display": "3.5",
+   "kind": "range",
+   "notes": []
+  }
+ ]
+}

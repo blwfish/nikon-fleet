@@ -12,6 +12,13 @@
 //! The display strings of well-formed values are those of `gui/fleet_lib.py`'s `fmt_cap_value`.
 //! `gui/tests-fixtures/render_values.json` is the table both sides are tested against.
 //! [`render_snapshot`] renders a whole snapshot, sorted by name, optionally filtered.
+//!
+//! The `_with`/`_opts` functions add what only the SDK's own files can say (`ops::labels`): an
+//! enumeration's current value is shown with its name (`Label (3)`), a value its list does
+//! not have is flagged, rows carry a display name, and a range shows its scale
+//! (`612.0 (0..1224, 1225 steps)`). The plain functions show none of that, so their strings are the
+//! ones `render_values.json` pins for the Python GUI too. Without labels the viewer entry points
+//! still work: they show the numbers, and say the names are unavailable.
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +26,7 @@ use serde::Serialize;
 use serde_json::{Number, Value};
 use thiserror::Error;
 
+use crate::ops::labels::{LabelSource, Labels, Lookup};
 use crate::ops::paths::{PathError, resolve_existing};
 use crate::snapshot::{Snapshot, SnapshotError, Transport};
 use crate::transplant::PROPERTY_PREFIX;
@@ -81,10 +89,16 @@ pub enum Note {
     MissingList,
     /// An enum whose `values` is not a list.
     ValuesNotList,
+    /// A numeric enum with labels loaded, none of which names this capability's values (or names
+    /// this one only ambiguously): the number is all there is to show.
+    Unlabelled,
+    /// The capability has a list of value names and this value is not in it: either the list is
+    /// incomplete or the camera reports something undocumented. Shown, never hidden.
+    ValueNotInLabels,
 }
 
 impl Note {
-    pub const ALL: [Note; 10] = [
+    pub const ALL: [Note; 12] = [
         Note::MissingValue,
         Note::NullValue,
         Note::IndexOutOfRange,
@@ -95,7 +109,13 @@ impl Note {
         Note::Truncated,
         Note::MissingList,
         Note::ValuesNotList,
+        Note::Unlabelled,
+        Note::ValueNotInLabels,
     ];
+
+    /// The notes only a labelled rendering can carry (`render_labels.json` pins them; the
+    /// SDK-independent `render_values.json` has none of them).
+    pub const LABEL_NOTES: [Note; 2] = [Note::Unlabelled, Note::ValueNotInLabels];
 
     /// The tag serialised output carries (`serde`'s `snake_case`), for text a UI shows.
     pub fn tag(self) -> &'static str {
@@ -110,11 +130,13 @@ impl Note {
             Note::Truncated => "truncated",
             Note::MissingList => "missing_list",
             Note::ValuesNotList => "values_not_list",
+            Note::Unlabelled => "unlabelled",
+            Note::ValueNotInLabels => "value_not_in_labels",
         }
     }
 
     /// Whether the note means the data is wrong or absent (a UI shows it as a warning), as opposed
-    /// to merely not complete (a placeholder, a cut display).
+    /// to merely not complete (a placeholder, a cut display, a value our lists do not name).
     pub fn is_problem(self) -> bool {
         match self {
             Note::MissingValue
@@ -125,10 +147,29 @@ impl Note {
             | Note::DecodeFailed
             | Note::MissingList
             | Note::ValuesNotList => true,
-            Note::NotCaptured | Note::Truncated => false,
+            Note::NotCaptured | Note::Truncated | Note::Unlabelled | Note::ValueNotInLabels => false,
         }
     }
 }
+
+/// Whether a range's scale is shown after its number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShowScale {
+    #[default]
+    Off,
+    On,
+}
+
+/// A range's `lower`, `upper` and `steps` (0: continuous), as the capture holds them.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Scale {
+    pub lower: f64,
+    pub upper: f64,
+    pub steps: u64,
+}
+
+// The bounds come from JSON numbers, which are never NaN.
+impl Eq for Scale {}
 
 /// One value, ready to show.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -137,6 +178,14 @@ pub struct Rendered {
     pub kind: Kind,
     /// Sorted, without duplicates.
     pub notes: Vec<Note>,
+    /// The name of an enumeration value, when one was found; `display` then reads `name (value)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_source: Option<LabelSource>,
+    /// The scale of a range, when it was asked for and the range has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<Scale>,
 }
 
 impl Rendered {
@@ -144,7 +193,14 @@ impl Rendered {
         let mut notes = notes.to_vec();
         notes.sort();
         notes.dedup();
-        Rendered { display: display.into(), kind, notes }
+        Rendered { display: display.into(), kind, notes, label: None, label_source: None, scale: None }
+    }
+
+    fn with_note(mut self, note: Note) -> Self {
+        self.notes.push(note);
+        self.notes.sort();
+        self.notes.dedup();
+        self
     }
 
     fn malformed(why: impl std::fmt::Display, notes: &[Note]) -> Self {
@@ -235,6 +291,34 @@ fn write_py_json(v: &Value, out: &mut String) {
     }
 }
 
+/// What a rendering may add to the plain strings: names from `ops::labels`, and ranges' scales.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RenderOptions<'a> {
+    pub labels: Option<&'a Labels>,
+    pub scale: ShowScale,
+}
+
+impl<'a> RenderOptions<'a> {
+    /// The plain strings: no names, no scales.
+    pub fn raw() -> Self {
+        RenderOptions::default()
+    }
+
+    /// What the viewers show: names where `labels` has them, and every range's scale.
+    pub fn viewer(labels: &'a Labels) -> Self {
+        RenderOptions { labels: Some(labels), scale: ShowScale::On }
+    }
+}
+
+/// The property a value belongs to, for the lookups that need it.
+#[derive(Clone, Copy)]
+struct Ctx<'a> {
+    opts: &'a RenderOptions<'a>,
+    code: u32,
+    /// The snapshot's property name, when known (`kNkMAIDCapability_ExposureMode`).
+    name: Option<&'a str>,
+}
+
 /// Render a property's value, which may be absent altogether (a raw entry with no `value` key).
 /// Absent is `(missing)`, kind `malformed`, note `missing_value`: not null, not 0, not empty.
 pub fn render_optional(v: Option<&Value>) -> Rendered {
@@ -246,16 +330,48 @@ pub fn render_optional(v: Option<&Value>) -> Rendered {
 
 /// Render the JSON `sdk::decode_value` produced for one property.
 pub fn render_value(v: &Value) -> Rendered {
+    render_in(None, v)
+}
+
+/// [`render_value`] for property `code`, with `labels`' names and every range's scale.
+pub fn render_value_with(labels: &Labels, code: u32, v: &Value) -> Rendered {
+    render_value_opts(&RenderOptions::viewer(labels), code, None, v)
+}
+
+/// [`render_value`] for property `code` (named `name` in the snapshot, if known) as `opts` say.
+pub fn render_value_opts(opts: &RenderOptions<'_>, code: u32, name: Option<&str>, v: &Value) -> Rendered {
+    render_in(Some(Ctx { opts, code, name }), v)
+}
+
+fn render_in(ctx: Option<Ctx<'_>>, v: &Value) -> Rendered {
     match v {
         Value::Null => Rendered::new("null", Kind::Unknown, &[Note::NullValue]),
         Value::Bool(b) => Rendered::new(if *b { "Yes" } else { "No" }, Kind::Bool, &[]),
         Value::Number(n) => {
             let (text, kind) = number_text(n);
-            Rendered::new(text, kind, &[])
+            label_number(ctx, n, Rendered::new(text, kind, &[]), false)
         }
         Value::String(s) => Rendered::new(s.clone(), Kind::String, &[]),
         Value::Array(items) => render_list(items),
-        Value::Object(_) => render_object(v),
+        Value::Object(_) => render_object(ctx, v),
+    }
+}
+
+/// Name a number the property's lists name, or flag it. `is_enum`: an enumeration's current
+/// option, as opposed to a plain integer property (an integer property is flagged only when its
+/// list does not have the value; most have no list and say nothing).
+fn label_number(ctx: Option<Ctx<'_>>, n: &Number, shown: Rendered, is_enum: bool) -> Rendered {
+    let Some(ctx) = ctx else { return shown };
+    let Some(labels) = ctx.opts.labels else { return shown };
+    let Some(value) = n.as_i64() else { return shown };
+    match labels.lookup_value(ctx.code, ctx.name, value) {
+        Lookup::Label { text, source } => {
+            let display = format!("{text} ({})", shown.display);
+            Rendered { display, label: Some(text.to_string()), label_source: Some(source), ..shown }
+        }
+        Lookup::NotInLabels => shown.with_note(Note::ValueNotInLabels),
+        Lookup::Ambiguous | Lookup::NoLabels if is_enum => shown.with_note(Note::Unlabelled),
+        Lookup::Ambiguous | Lookup::NoLabels => shown,
     }
 }
 
@@ -273,7 +389,7 @@ fn render_list(items: &[Value]) -> Rendered {
     Rendered::new(display, Kind::Array, &notes)
 }
 
-fn render_object(v: &Value) -> Rendered {
+fn render_object(ctx: Option<Ctx<'_>>, v: &Value) -> Rendered {
     match v.get("_type").and_then(Value::as_str) {
         Some(kind @ "datetime") => return Rendered::new(format!("({kind}: not captured)"), Kind::Datetime, &[Note::NotCaptured]),
         Some(kind @ "array") => return Rendered::new(format!("({kind}: not captured)"), Kind::Array, &[Note::NotCaptured]),
@@ -283,11 +399,11 @@ fn render_object(v: &Value) -> Rendered {
         return Rendered::new(format!("(unknown capability type {})", py_json(t)), Kind::Unknown, &[Note::NotCaptured]);
     }
     if is_range_shape(v) {
-        return render_range(v);
+        return render_range(ctx, v);
     }
     // `value_index` with no `values` is an enum that lost its list; `is_enum_shape` needs the list.
     if is_enum_shape(v) || (v.get("value_index").is_some() && v.get("lower").is_none()) {
-        return render_enum(v);
+        return render_enum(ctx, v);
     }
     let text = py_json(v);
     if text.chars().count() <= MAX_SHOWN {
@@ -298,10 +414,31 @@ fn render_object(v: &Value) -> Rendered {
     }
 }
 
-fn render_range(v: &Value) -> Rendered {
+/// A range bound as text: `0` for `0.0`, `2500` for `2500.0`, `-3.5` for `-3.5`.
+fn bound_text(x: f64) -> String {
+    if x.fract() == 0.0 && x.abs() < 1e15 { format!("{}", x as i64) } else { py_float(x) }
+}
+
+/// `shown` with the range's scale after its number, when the options ask for it:
+/// `612.0 (0..1224, 1225 steps)`, or `3.5 (0..10)` for a continuous range (0 steps).
+fn with_scale(ctx: Option<Ctx<'_>>, v: &Value, shown: Rendered) -> Rendered {
+    if !ctx.is_some_and(|c| c.opts.scale == ShowScale::On) {
+        return shown;
+    }
+    let Some((lower, upper, steps)) = range_scale(v) else { return shown };
+    let steps_text = match steps {
+        0 => String::new(),
+        1 => ", 1 step".to_string(),
+        n => format!(", {n} steps"),
+    };
+    let display = format!("{} ({}..{}{steps_text})", shown.display, bound_text(lower), bound_text(upper));
+    Rendered { display, scale: Some(Scale { lower, upper, steps }), ..shown }
+}
+
+fn render_range(ctx: Option<Ctx<'_>>, v: &Value) -> Rendered {
     if is_stepped_range(v) {
         if let Some(n) = range_value(v) {
-            return Rendered::new(py_float(n), Kind::Range, &[]);
+            return with_scale(ctx, v, Rendered::new(py_float(n), Kind::Range, &[]));
         }
         // `range_value` gives a stepped range no number when its position is unusable; say which way.
         let steps = range_scale(v).map_or(0, |(_, _, steps)| steps);
@@ -318,12 +455,40 @@ fn render_range(v: &Value) -> Rendered {
     }
     match v.get("value") {
         None => Rendered::malformed("range has no value", &[Note::MissingValue, Note::NoNumber]),
-        Some(Value::Number(n)) => Rendered::new(number_text(n).0, Kind::Range, &[]),
+        Some(Value::Number(n)) => with_scale(ctx, v, Rendered::new(number_text(n).0, Kind::Range, &[])),
         Some(other) => Rendered::malformed(format!("range value is not a number ({})", py_json(other)), &[Note::NoNumber]),
     }
 }
 
-fn render_enum(v: &Value) -> Rendered {
+/// The option strings of a packed-string enum the capture stored one byte per element
+/// (`elem_type` 7, `elem_bytes` 1: `"J","P","E","G","","R","A","W",""`, `""` a NUL), which
+/// `value_index` indexes by string, not by element. `None` for any other layout, whose elements
+/// are the options already. `transplant::packed_string_options` reads the same layout (and
+/// refuses what it cannot read; this shows what it can and leaves the rest as it was).
+fn packed_strings(v: &Value, list: &[Value]) -> Option<Vec<Value>> {
+    if v.get("elem_type").and_then(Value::as_u64) != Some(7) || v.get("elem_bytes").and_then(Value::as_u64) != Some(1) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut open = false;
+    for e in list {
+        let e = e.as_str()?;
+        if e.is_empty() {
+            out.push(Value::String(std::mem::take(&mut cur)));
+            open = false;
+        } else {
+            cur.push_str(e);
+            open = true;
+        }
+    }
+    if open {
+        out.push(Value::String(cur));
+    }
+    Some(out)
+}
+
+fn render_enum(ctx: Option<Ctx<'_>>, v: &Value) -> Rendered {
     let index = v.get("value_index");
     let index_text = index.map_or("absent".to_string(), py_json);
     let Some(values) = v.get("values") else {
@@ -344,6 +509,14 @@ fn render_enum(v: &Value) -> Rendered {
             );
         }
     };
+    let strings;
+    let list: &[Value] = match packed_strings(v, list) {
+        Some(s) => {
+            strings = s;
+            &strings
+        }
+        None => list,
+    };
     let Some(position) = index.and_then(Value::as_u64) else {
         return Rendered::malformed(
             format!("enum index is missing or invalid ({index_text}) of {} options", list.len()),
@@ -359,6 +532,9 @@ fn render_enum(v: &Value) -> Rendered {
     let mut shown = render_value(option);
     if shown.kind != Kind::Malformed {
         shown.kind = Kind::Enum;
+        if let Value::Number(n) = option {
+            shown = label_number(ctx, n, shown, true);
+        }
     }
     shown
 }
@@ -383,6 +559,10 @@ pub struct Row {
     /// The property's full name (`kNkMAIDCapability_Aperture`).
     pub name: String,
     pub code: u32,
+    /// What the SDK calls it for a person (`Mode A` for `ModeA`; a base capability's own name for a `cap_0x..` key),
+    /// when labels are loaded and know the code. `None`: unknown, not empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub value: Rendered,
 }
 
@@ -396,10 +576,18 @@ impl Row {
     pub fn code_hex(&self) -> String {
         format!("{:#06x}", self.code)
     }
+
+    /// The display name when it says something the name does not (`Mode A` for
+    /// `ModeA`; not `Aperture` for `Aperture`, and not the symbol `kNkMAIDCapability_Aperture`
+    /// the schema gives many capabilities as their description).
+    pub fn extra_display_name(&self) -> Option<&str> {
+        self.display_name.as_deref().filter(|d| *d != self.short_name() && *d != self.name)
+    }
 }
 
 /// The one rule for which rows a filter keeps: a case-insensitive substring of the name, of the
-/// displayed value, of the code in hex (`0xd053`, so `d053` too) or of the code in decimal.
+/// display name, of the displayed value, of the code in hex (`0xd053`, so `d053` too) or of the
+/// code in decimal.
 /// Surrounding whitespace is ignored; an empty filter keeps everything.
 pub struct RowFilter {
     needle: String,
@@ -417,6 +605,7 @@ impl RowFilter {
     pub fn matches(&self, row: &Row) -> bool {
         self.is_empty()
             || row.name.to_lowercase().contains(&self.needle)
+            || row.display_name.as_deref().is_some_and(|d| d.to_lowercase().contains(&self.needle))
             || row.value.display.to_lowercase().contains(&self.needle)
             || row.code_hex().contains(&self.needle)
             || row.code.to_string().contains(&self.needle)
@@ -432,19 +621,40 @@ pub struct RenderedSnapshot {
     pub filtered_out: usize,
     /// Some row's display is shorter than its value (a `truncated` note); the file has the rest.
     pub truncated: bool,
+    /// Set when labels were asked for and some part is missing: why the names are not all there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels_note: Option<String>,
+    /// How much of the snapshot the loaded labels name; present when labels were used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<Coverage>,
 }
 
+/// The snapshot as the plain strings show it: no names, no scales.
 pub fn render_snapshot(s: &Snapshot, filter: Option<&str>) -> RenderedSnapshot {
+    render_snapshot_opts(s, filter, &RenderOptions::raw())
+}
+
+/// The snapshot as the viewers show it: `labels`' names and every range's scale.
+pub fn render_snapshot_with(s: &Snapshot, filter: Option<&str>, labels: &Labels) -> RenderedSnapshot {
+    render_snapshot_opts(s, filter, &RenderOptions::viewer(labels))
+}
+
+pub fn render_snapshot_opts(s: &Snapshot, filter: Option<&str>, opts: &RenderOptions<'_>) -> RenderedSnapshot {
     let filter = RowFilter::new(filter.unwrap_or(""));
     let all = s.properties.len();
     // BTreeMap order: by name.
     let rows: Vec<Row> = s
         .properties
         .iter()
-        .map(|(name, entry)| Row { name: name.clone(), code: entry.code, value: render_value(&entry.value) })
+        .map(|(name, entry)| Row {
+            name: name.clone(),
+            code: entry.code,
+            display_name: opts.labels.and_then(|l| l.capability_display_name(entry.code)).map(str::to_string),
+            value: render_value_opts(opts, entry.code, Some(name), &entry.value),
+        })
         .filter(|row| filter.matches(row))
         .collect();
-    RenderedSnapshot {
+    let mut out = RenderedSnapshot {
         header: Header {
             model: s.camera.model.clone(),
             serial: s.camera.serial.clone(),
@@ -457,6 +667,57 @@ pub fn render_snapshot(s: &Snapshot, filter: Option<&str>) -> RenderedSnapshot {
         filtered_out: all - rows.len(),
         truncated: rows.iter().any(|r| r.value.notes.contains(&Note::Truncated)),
         rows,
+        labels_note: opts.labels.and_then(Labels::note),
+        coverage: None,
+    };
+    if opts.labels.is_some() {
+        out.coverage = Some(Coverage::of(&out));
+    }
+    out
+}
+
+/// How much of what a rendered snapshot shows the loaded labels name. Counts are of the rows kept
+/// by the filter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Coverage {
+    pub properties: usize,
+    pub with_display_name: usize,
+    /// Properties no display name is known for, by name.
+    pub no_display_name: Vec<String>,
+    /// Enumerations whose current value is a number (the others are named by the camera itself).
+    pub numeric_enums: usize,
+    pub labelled: usize,
+    pub unlabelled: usize,
+    /// Properties whose current value is not in the list of names the capability has, as
+    /// `Name = value`.
+    pub not_in_labels: Vec<String>,
+}
+
+impl Coverage {
+    pub fn of(r: &RenderedSnapshot) -> Coverage {
+        let has = |row: &Row, note: Note| row.value.notes.contains(&note);
+        let numeric_enum = |row: &Row| row.value.kind == Kind::Enum && (row.value.label.is_some() || has(row, Note::Unlabelled) || has(row, Note::ValueNotInLabels));
+        Coverage {
+            properties: r.rows.len(),
+            with_display_name: r.rows.iter().filter(|row| row.display_name.is_some()).count(),
+            no_display_name: r.rows.iter().filter(|row| row.display_name.is_none()).map(|row| row.name.clone()).collect(),
+            numeric_enums: r.rows.iter().filter(|row| numeric_enum(row)).count(),
+            labelled: r.rows.iter().filter(|row| numeric_enum(row) && row.value.label.is_some()).count(),
+            unlabelled: r.rows.iter().filter(|row| has(row, Note::Unlabelled)).count(),
+            not_in_labels: r
+                .rows
+                .iter()
+                .filter(|row| has(row, Note::ValueNotInLabels))
+                .map(|row| format!("{} = {}", row.short_name(), row.value.display))
+                .collect(),
+        }
+    }
+}
+
+impl Labels {
+    /// How much of `s` these labels name.
+    pub fn coverage(&self, s: &Snapshot) -> Coverage {
+        Coverage::of(&render_snapshot_with(s, None, self))
     }
 }
 
@@ -466,10 +727,26 @@ pub fn printable(text: &str) -> String {
     text.chars().flat_map(|c| if c.is_control() { c.escape_default().collect::<Vec<_>>() } else { vec![c] }).collect()
 }
 
+/// What the text of a rendered snapshot includes beyond name and value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextOptions {
+    /// The `[0xCODE]` column.
+    pub codes: bool,
+    /// The display-name column (for the rows that have a name differing from the short one).
+    pub names: bool,
+}
+
 impl RenderedSnapshot {
-    /// The `show` output: a header line, then `name [0xCODE] = display` per row, aligned.
-    /// `filter` is only echoed in the closing line.
+    /// The `show` output as it was before names: a header line, then `name [0xCODE] = display` per
+    /// row, aligned. `filter` is only echoed in the closing line.
     pub fn to_text(&self, filter: Option<&str>) -> String {
+        self.to_text_with(filter, TextOptions { codes: true, names: false })
+    }
+
+    /// The `show` output: a header line, then per row the name, the display name (if `names` and it
+    /// differs), the `[0xCODE]` (if `codes`) and `= value`, aligned. A value its capability's list
+    /// of names does not have is marked `[value_not_in_labels]`, so it is not mistaken for a named one.
+    pub fn to_text_with(&self, filter: Option<&str>, opts: TextOptions) -> String {
         let h = &self.header;
         let mut out = format!(
             "{} {}  fw {}  label={}  captured {}  ({} properties)\n",
@@ -480,15 +757,25 @@ impl RenderedSnapshot {
             printable(&h.captured_at),
             h.property_count,
         );
-        let codes: Vec<String> = self.rows.iter().map(Row::code_hex).collect();
-        let name_width = self.rows.iter().map(|r| printable(r.short_name()).chars().count()).max().unwrap_or(0);
-        let code_width = codes.iter().map(|c| c.chars().count()).max().unwrap_or(0);
-        for (row, code) in self.rows.iter().zip(&codes) {
-            out.push_str(&format!(
-                "{:<name_width$} [{code:<code_width$}] = {}\n",
-                printable(row.short_name()),
-                printable(&row.value.display)
-            ));
+        let width = |f: &dyn Fn(&Row) -> String| self.rows.iter().map(|r| f(r).chars().count()).max().unwrap_or(0);
+        let name_width = width(&|r| printable(r.short_name()));
+        let code_width = width(&Row::code_hex);
+        let shown_name = |r: &Row| if opts.names { r.extra_display_name().map(printable).unwrap_or_default() } else { String::new() };
+        let display_width = width(&shown_name);
+        for row in &self.rows {
+            let mut line = format!("{:<name_width$}", printable(row.short_name()));
+            if display_width > 0 {
+                line.push_str(&format!("  {:<display_width$}", shown_name(row)));
+            }
+            if opts.codes {
+                line.push_str(&format!(" [{:<code_width$}]", row.code_hex()));
+            }
+            line.push_str(&format!(" = {}", printable(&row.value.display)));
+            if row.value.notes.contains(&Note::ValueNotInLabels) {
+                line.push_str(&format!("  [{}]", Note::ValueNotInLabels.tag()));
+            }
+            out.push_str(&line);
+            out.push('\n');
         }
         let filter = filter.map(str::trim).filter(|f| !f.is_empty());
         match (filter, self.rows.is_empty()) {
@@ -616,9 +903,14 @@ mod tests {
             let tag = serde_json::to_value(kind).unwrap();
             assert!(cases.iter().any(|c| c["kind"] == tag), "no fixture case of kind {tag}");
         }
-        for note in Note::ALL {
+        for note in Note::ALL.into_iter().filter(|n| !Note::LABEL_NOTES.contains(n)) {
             let tag = serde_json::to_value(note).unwrap();
             assert!(cases.iter().any(|c| c["notes"].as_array().is_some_and(|n| n.contains(&tag))), "no fixture case with note {tag}");
+        }
+        // The notes only labels can raise belong to render_labels.json: this table needs no SDK file.
+        for note in Note::LABEL_NOTES {
+            let tag = serde_json::to_value(note).unwrap();
+            assert!(!cases.iter().any(|c| c["notes"].as_array().is_some_and(|n| n.contains(&tag))), "render_values.json has the label note {tag}");
         }
     }
 
@@ -864,7 +1156,8 @@ mod tests {
     #[test]
     fn only_the_data_problems_are_problems() {
         for note in Note::ALL {
-            assert_eq!(note.is_problem(), !matches!(note, Note::NotCaptured | Note::Truncated), "{note:?}");
+            let benign = matches!(note, Note::NotCaptured | Note::Truncated | Note::Unlabelled | Note::ValueNotInLabels);
+            assert_eq!(note.is_problem(), !benign, "{note:?}");
         }
         assert!(!render_value(&json!({"_type": "datetime"})).is_problem(), "a placeholder is not an error");
         assert!(!render_value(&json!([1, 2, 3, 4, 5, 6, 7])).is_problem(), "a cut list is not an error");
@@ -1082,5 +1375,218 @@ mod tests {
         assert_eq!(err.tag(), "io");
         assert!(err.to_string().contains("absent.json"), "the message names the file: {err}");
         assert_eq!(load(d.path()).unwrap_err().tag(), "io", "a directory is not a snapshot");
+    }
+
+    // ── names and scales (render_labels.json) ─────────────────────────
+
+    fn label_fixture() -> Value {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gui/tests-fixtures/render_labels.json"))
+            .expect("the labels fixture");
+        serde_json::from_str(&text).expect("the labels fixture is JSON")
+    }
+
+    fn fixture_labels(fx: &Value) -> Labels {
+        let schema: Vec<&str> = fx["schema_lines"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+        let schema = schema.join("\n");
+        let doc = fx["doc"].to_string();
+        Labels::from_sources(
+            Some(crate::ops::labels::Source { path: "schema", text: &schema }),
+            Some(crate::ops::labels::Source { path: "doc", text: &doc }),
+            fx["model"].as_str().unwrap(),
+            fx["firmware"].as_str(),
+        )
+    }
+
+    #[test]
+    fn every_label_fixture_case_renders_to_the_expected_display_kind_notes_label_and_scale() {
+        let fx = label_fixture();
+        let labels = fixture_labels(&fx);
+        assert_eq!(labels.unavailable(), [], "the fixture's own files load whole");
+        let cases = fx["cases"].as_array().unwrap();
+        assert!(cases.len() > 40, "{} cases", cases.len());
+        for case in cases {
+            let name = case["name"].as_str().expect("every case is named");
+            let opts = match case["mode"].as_str().unwrap() {
+                "viewer" => RenderOptions::viewer(&labels),
+                "labels_only" => RenderOptions { labels: Some(&labels), scale: ShowScale::Off },
+                "raw" => RenderOptions::raw(),
+                other => panic!("{name}: unknown mode {other}"),
+            };
+            let got = render_value_opts(&opts, case["code"].as_u64().unwrap() as u32, case["property"].as_str(), &case["value"]);
+            assert_eq!(got.display, case["display"].as_str().unwrap(), "{name}: display");
+            assert_eq!(serde_json::to_value(got.kind).unwrap(), case["kind"], "{name}: kind");
+            assert_eq!(serde_json::to_value(&got.notes).unwrap(), case["notes"], "{name}: notes");
+            assert_eq!(got.label.as_deref(), case["label"].as_str(), "{name}: label");
+            assert_eq!(got.label_source.map(|s| serde_json::to_value(s).unwrap()), case.get("label_source").cloned(), "{name}: label_source");
+            assert_eq!(got.scale.map(|s| serde_json::to_value(s).unwrap()), case.get("scale").cloned(), "{name}: scale");
+        }
+    }
+
+    #[test]
+    fn the_label_fixture_exercises_every_label_note_source_and_mode() {
+        let fx = label_fixture();
+        let cases = fx["cases"].as_array().unwrap();
+        for note in Note::LABEL_NOTES {
+            let tag = serde_json::to_value(note).unwrap();
+            assert!(cases.iter().any(|c| c["notes"].as_array().unwrap().contains(&tag)), "no case with {tag}");
+        }
+        for source in ["schema", "sdk_doc"] {
+            assert!(cases.iter().any(|c| c.get("label_source") == Some(&json!(source))), "no case labelled from {source}");
+        }
+        for mode in ["viewer", "labels_only", "raw"] {
+            assert!(cases.iter().any(|c| c["mode"] == mode), "no {mode} case");
+        }
+        let mut names: Vec<&str> = cases.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        names.sort();
+        let n = names.len();
+        names.dedup();
+        assert_eq!(names.len(), n, "duplicate case names");
+    }
+
+    #[test]
+    fn render_value_with_is_the_viewer_rendering_by_code_alone() {
+        let fx = label_fixture();
+        let labels = fixture_labels(&fx);
+        let v = enum_of(json!(1), json!([0, 1, 7]));
+        let r = render_value_with(&labels, 40001, &v);
+        assert_eq!((r.display.as_str(), r.label.as_deref()), ("Beta (1)", Some("Beta")));
+        // No name given: the schema finds the capability by its code; a code it lacks has nothing to find.
+        assert_eq!(render_value_with(&labels, 99999, &enum_of(json!(0), json!([1]))).notes, vec![Note::Unlabelled]);
+        let wb = render_value_with(&labels, 1, &wb_tune(json!(612)));
+        assert_eq!(wb.display, "612.0 (0..1224, 1225 steps)");
+    }
+
+    #[test]
+    fn the_plain_functions_never_name_or_scale_anything() {
+        let r = render_value(&wb_tune(json!(612)));
+        assert_eq!((r.display.as_str(), r.scale, r.label.clone()), ("612.0", None, None));
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("scale").is_none() && v.get("label").is_none() && v.get("label_source").is_none(), "{v}");
+        let fx = label_fixture();
+        let labels = fixture_labels(&fx);
+        let snap = labelled_snap();
+        let plain = serde_json::to_value(render_snapshot(&snap, None)).unwrap();
+        assert!(plain.get("labels_note").is_none() && plain.get("coverage").is_none(), "{plain}");
+        assert!(plain["rows"].as_array().unwrap().iter().all(|r| r.get("display_name").is_none()), "{plain}");
+        let with = serde_json::to_value(render_snapshot_with(&snap, None, &labels)).unwrap();
+        assert!(with.get("coverage").is_some() && with["rows"][0].get("display_name").is_some(), "{with}");
+    }
+
+    fn labelled_snap() -> Snapshot {
+        let mut s = Snapshot::new(
+            Camera { model: "Test 1".into(), serial: "1".into(), firmware: "2.00".into() },
+            Transport::Usb,
+            "2026-10-27T12:00:00Z".into(),
+        );
+        s.insert("kNkMAIDCapability_ModeA", 40001, enum_of(json!(1), json!([0, 1, 7])));
+        s.insert("kNkMAIDCapability_ModeB", 40002, enum_of(json!(1), json!([0, 1])));
+        s.insert("kNkMAIDCapability_Plain", 40004, enum_of(json!(0), json!([3])));
+        s.insert("kNkMAIDCapability_Odd", 40005, enum_of(json!(0), json!([8])));
+        s.insert("kNkMAIDCapability_Slot", 40010, json!(5));
+        s.insert("cap_0x9", 9, json!("Z 9"));
+        s.insert("kNkMAIDCapability_Quality", 40020, enum_of(json!(1), json!(["Basic", "Fine"])));
+        s
+    }
+
+    #[test]
+    fn rows_carry_the_display_name_and_none_when_it_is_unknown() {
+        let fx = label_fixture();
+        let labels = fixture_labels(&fx);
+        let r = render_snapshot_with(&labelled_snap(), None, &labels);
+        let by_name = |n: &str| r.rows.iter().find(|row| row.name == n).unwrap();
+        assert_eq!(by_name("kNkMAIDCapability_ModeA").display_name.as_deref(), Some("Mode A"));
+        assert_eq!(by_name("cap_0x9").display_name.as_deref(), Some("Base Nine"), "a base capability by its number");
+        assert_eq!(by_name("kNkMAIDCapability_Odd").display_name, None, "the schema does not know code 40005");
+        assert_eq!(by_name("kNkMAIDCapability_Slot").display_name, None, "an empty description is not a name");
+        // And with no labels at all, none.
+        assert!(render_snapshot(&labelled_snap(), None).rows.iter().all(|row| row.display_name.is_none()));
+    }
+
+    #[test]
+    fn the_filter_finds_a_row_by_its_display_name() {
+        let fx = label_fixture();
+        let labels = fixture_labels(&fx);
+        let hit = |f: &str| -> Vec<String> { render_snapshot_with(&labelled_snap(), Some(f), &labels).rows.iter().map(|r| r.short_name().to_string()).collect() };
+        assert_eq!(hit("mode a"), ["ModeA"], "the display name has a space the name does not");
+        assert_eq!(hit("beta"), ["ModeA"], "the label is part of the display");
+        assert_eq!(hit("base nine"), ["cap_0x9"], "a base capability is found by its SDK name, which its key lacks");
+        // Without labels the display name is not there to match.
+        assert!(render_snapshot(&labelled_snap(), Some("mode a")).rows.is_empty());
+    }
+
+    #[test]
+    fn coverage_counts_what_the_labels_name_and_lists_what_they_do_not() {
+        let fx = label_fixture();
+        let labels = fixture_labels(&fx);
+        let c = labels.coverage(&labelled_snap());
+        assert_eq!(c.properties, 7);
+        assert_eq!(c.with_display_name, 4, "ModeA, ModeB, Plain (its description is its symbol: still a name) and cap_0x9");
+        let mut none = c.no_display_name.clone();
+        none.sort();
+        assert_eq!(none, ["kNkMAIDCapability_Odd", "kNkMAIDCapability_Quality", "kNkMAIDCapability_Slot"]);
+        // Numeric enums: ModeA Beta(1), ModeB On(1), Plain unlabelled, Odd unlabelled. Quality is named by the camera.
+        assert_eq!((c.numeric_enums, c.labelled, c.unlabelled), (4, 2, 2));
+        assert_eq!(c.not_in_labels, ["Slot = 5"]);
+    }
+
+    #[test]
+    fn the_text_hides_codes_by_default_and_shows_display_names_when_they_say_something() {
+        let fx = label_fixture();
+        let labels = fixture_labels(&fx);
+        let r = render_snapshot_with(&labelled_snap(), None, &labels);
+        let text = r.to_text_with(None, TextOptions { codes: false, names: true });
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("Test 1 1  fw 2.00"), "{}", lines[0]);
+        assert!(!text.contains("[0x"), "no code column: {text}");
+        let mode_a = lines.iter().find(|l| l.starts_with("ModeA")).unwrap();
+        assert!(mode_a.contains("Mode A") && mode_a.ends_with("= Beta (1)"), "{mode_a}");
+        let plain = lines.iter().find(|l| l.starts_with("Plain")).unwrap();
+        assert_eq!(plain.split_whitespace().collect::<Vec<_>>(), ["Plain", "=", "3"], "its display name is its symbol: nothing extra {plain}");
+        let slot = lines.iter().find(|l| l.starts_with("Slot")).unwrap();
+        assert!(slot.ends_with("= 5  [value_not_in_labels]"), "{slot}");
+        let with_codes = r.to_text_with(None, TextOptions { codes: true, names: true });
+        assert!(with_codes.contains("[0x9c41]"), "40001 is 0x9c41: {with_codes}");
+        let no_names = r.to_text_with(None, TextOptions { codes: false, names: false });
+        assert!(!no_names.contains("Mode A"), "{no_names}");
+    }
+
+    #[test]
+    fn to_text_is_the_text_as_it_was_before_names() {
+        let r = render_snapshot(&snap(), None);
+        assert_eq!(r.to_text(None), r.to_text_with(None, TextOptions { codes: true, names: false }));
+        assert_eq!(r.to_text(None).lines().nth(1), Some("Alpha [0x000c] = On"));
+        // The same rows, names asked for but none known: the same text.
+        assert_eq!(r.to_text(None), r.to_text_with(None, TextOptions { codes: true, names: true }));
+    }
+
+    #[test]
+    fn a_rendering_with_labels_that_are_partly_missing_says_so() {
+        let fx = label_fixture();
+        let schema: Vec<&str> = fx["schema_lines"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+        let schema = schema.join("\n");
+        let labels = Labels::from_sources(Some(crate::ops::labels::Source { path: "schema", text: &schema }), None, "Test 1", None);
+        assert!(labels.note().is_none(), "from_sources has no file to miss; load_from reports those");
+        let none = Labels::load_from(Path::new("/nonexistent/MaidLayer.config"), Path::new("/nonexistent/maid-labels.json"), "Z 9", None);
+        let r = render_snapshot_with(&snap(), None, &none);
+        let note = r.labels_note.expect("labels unavailable are said so");
+        assert!(note.contains("MaidLayer.config") && note.contains("maid-labels.json"), "{note}");
+        assert_eq!(r.rows[0].value.display, "On", "the numbers are shown as they were");
+        assert_eq!(r.coverage.as_ref().map(|c| c.with_display_name), Some(0));
+        assert!(render_snapshot(&snap(), None).labels_note.is_none(), "raw rendering is a choice, not a gap");
+    }
+
+    #[test]
+    fn extra_display_name_is_only_a_name_that_differs_from_the_symbol_and_the_short_name() {
+        let row = |name: &str, display: Option<&str>| Row {
+            name: name.into(),
+            code: 1,
+            display_name: display.map(Into::into),
+            value: render_value(&json!(1)),
+        };
+        assert_eq!(row("kNkMAIDCapability_Aperture", Some("Aperture")).extra_display_name(), None);
+        assert_eq!(row("kNkMAIDCapability_Aperture", Some("kNkMAIDCapability_Aperture")).extra_display_name(), None);
+        assert_eq!(row("kNkMAIDCapability_Aperture", Some("Aperture ")).extra_display_name(), Some("Aperture "), "a differing name is shown as it is");
+        assert_eq!(row("cap_0x9", Some("Base Nine")).extra_display_name(), Some("Base Nine"));
+        assert_eq!(row("cap_0x9", None).extra_display_name(), None);
     }
 }

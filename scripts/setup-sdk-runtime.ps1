@@ -47,6 +47,26 @@ foreach ($cfg in $configs) {
     }
 }
 
+# Names for what a snapshot holds: the base capability names (Maid3.h) and the value names the
+# SDK's PDF documents. Derived from the licensed SDK documents, so it goes into the gitignored
+# sdk-runtime\ and never into the repository. Optional: without it `nikon-fleet show` prints raw
+# numbers and says so. Needs python3 and poppler's pdftotext.
+Write-Host ""
+Write-Host "Extracting capability and value names from the SDK documents"
+$python = Get-Command python3 -ErrorAction SilentlyContinue
+if (-not $python) { $python = Get-Command python -ErrorAction SilentlyContinue }
+if ($python) {
+    & $python.Source (Join-Path $PSScriptRoot "extract-maid-labels.py") $SdkRoot `
+        --out (Join-Path $Runtime "maid-labels.json") `
+        --maid-layer-config (Join-Path $Runtime "MaidLayer.config")
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "names were not extracted (see above); the runtime works without them."
+        Write-Warning "After installing what is missing: python3 scripts\extract-maid-labels.py $SdkRoot"
+    }
+} else {
+    Write-Warning "python not found; skipping scripts\extract-maid-labels.py (names stay raw numbers)."
+}
+
 Write-Host ""
 Write-Host "Done. Build and run:"
 Write-Host "  cargo build"
