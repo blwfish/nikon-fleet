@@ -13,6 +13,7 @@ use nikon_fleet::firmware::{
 use nikon_fleet::ops::cameras::{AmbiguousPairing, CameraList, duplicate_models, list_cameras};
 use nikon_fleet::ops::list::{EntryState, list_dir};
 use nikon_fleet::ops::paths::{checked_reference_filename, is_safe_path_component, write_atomic};
+use nikon_fleet::ops::labels::Labels;
 use nikon_fleet::ops::render::{self, Row, RowFilter};
 use nikon_fleet::ops::target::storable_serial;
 use nikon_fleet::ptp_usb::{self, FtpField, FtpProfile};
@@ -303,6 +304,11 @@ struct SnapshotViewer {
     /// Every property, sorted by name; [`SnapshotViewer::visible_rows`] applies the filter.
     rows: Vec<Row>,
     filter: String,
+    /// Show the `0x8254` code column. Off by default: the name says what a row is; the code is for
+    /// finding it in the SDK's documents (the filter matches codes either way).
+    show_codes: bool,
+    /// Why some names are missing (no `sdk-runtime/`, an unreadable labels file), when they are.
+    labels_note: Option<String>,
 }
 
 impl SnapshotViewer {
@@ -315,6 +321,8 @@ impl SnapshotViewer {
             header: None,
             rows: Vec::new(),
             filter: String::new(),
+            show_codes: false,
+            labels_note: None,
         }
     }
 
@@ -326,11 +334,13 @@ impl SnapshotViewer {
                 self.error = None;
                 self.header = Some(r.header);
                 self.rows = r.rows;
+                self.labels_note = r.labels_note;
             }
             Err(e) => {
                 self.error = Some(e);
                 self.header = None;
                 self.rows.clear();
+                self.labels_note = None;
             }
         }
     }
@@ -406,6 +416,19 @@ impl SnapshotViewers {
         self.open.len() != before
     }
 
+    /// Close the windows whose close was asked for this frame, given each open window's file and
+    /// whether its close button was pressed. Returns the files that were closed, so a request for
+    /// a window that is no longer open (or a window not asking) changes nothing.
+    fn close_requested(&mut self, requests: impl IntoIterator<Item = (String, bool)>) -> Vec<String> {
+        let mut closed = Vec::new();
+        for (file, requested) in requests {
+            if requested && self.close(&file) {
+                closed.push(file);
+            }
+        }
+        closed
+    }
+
     /// Keep each window's reference mark current with the listing (a reference set while the
     /// window is open).
     fn sync_reference(&mut self, listing: &SnapListing) {
@@ -425,15 +448,27 @@ struct ViewLoad {
 
 /// Find, read, validate and render `snapshots/<file>` by the library's rules, so the window shows
 /// what `nikon-fleet show` prints. Reads a file: call it off the UI thread.
-fn load_for_view(data_dir: &Path, file: &str) -> Result<render::RenderedSnapshot, String> {
+fn load_for_view(data_dir: &Path, sdk_runtime: &Path, file: &str) -> Result<render::RenderedSnapshot, String> {
     let path = render::find_named(&[&data_dir.join("snapshots")], file).map_err(|e| e.to_string())?;
     let snapshot = render::load(&path).map_err(|e| e.to_string())?;
-    Ok(render::render_snapshot(&snapshot, None))
+    let firmware = Some(snapshot.camera.firmware.as_str()).filter(|f| !f.is_empty());
+    let labels = Labels::load_for(sdk_runtime, &snapshot.camera.model, firmware);
+    Ok(render::render_snapshot_with(&snapshot, None, &labels))
+}
+
+/// Where the SDK's names are: `$NIKON_FLEET_SDK_RUNTIME` if set, else the project's `sdk-runtime/`
+/// (where `scripts/setup-sdk-runtime.sh` puts it, and where the CLI's `--schema` default points).
+fn resolve_sdk_runtime(env_override: Option<OsString>) -> PathBuf {
+    match env_override {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../sdk-runtime")),
+    }
 }
 
 fn spawn_view_load(data_dir: PathBuf, file: String, tx: mpsc::Sender<ViewLoad>, ctx: egui::Context) -> std::io::Result<()> {
     std::thread::Builder::new().name("snapshot-view".into()).spawn(move || {
-        let result = load_for_view(&data_dir, &file);
+        let sdk_runtime = resolve_sdk_runtime(std::env::var_os("NIKON_FLEET_SDK_RUNTIME"));
+        let result = load_for_view(&data_dir, &sdk_runtime, &file);
         // The receiver is gone only when the window closed; there is no one to tell.
         let _ = tx.send(ViewLoad { file, result });
         ctx.request_repaint();
@@ -1167,29 +1202,53 @@ impl FleetApp {
         }
     }
 
-    /// One resizable window per open snapshot: a filter box, a count line and the rows in a
-    /// scrollable monospace grid. Problems are orange, placeholders and cut values dim.
+    /// One window per open snapshot: a filter box, a count line and the rows in a scrollable
+    /// monospace grid. Problems are orange, placeholders and cut values dim. Each is its own native
+    /// OS window (movable outside the main one, onto another monitor); where the integration cannot
+    /// make native windows it is a resizable egui window inside the main one.
     fn ui_snapshot_viewers(&mut self, ctx: &egui::Context) {
         if let Some(listing) = &self.listing {
             self.viewers.sync_reference(listing);
         }
-        let mut closed = Vec::new();
+        let embedded = ctx.embed_viewports();
+        let mut requests = Vec::new();
         for viewer in &mut self.viewers.open {
-            let mut open = true;
-            egui::Window::new(viewer.title())
-                .id(egui::Id::new(("snapshot_viewer", &viewer.file)))
-                .open(&mut open)
-                .resizable(true)
-                .default_size([720.0, 480.0])
-                .show(ctx, |ui| draw_snapshot_viewer(ui, viewer));
-            if !open {
-                closed.push(viewer.file.clone());
-            }
+            let requested = if embedded {
+                let mut open = true;
+                egui::Window::new(viewer.title())
+                    .id(egui::Id::new(("snapshot_viewer", &viewer.file)))
+                    .open(&mut open)
+                    .resizable(true)
+                    .default_size([720.0, 480.0])
+                    .show(ctx, |ui| draw_snapshot_viewer(ui, viewer));
+                !open
+            } else {
+                let builder = egui::ViewportBuilder::default()
+                    .with_title(viewer.title())
+                    .with_inner_size([760.0, 600.0])
+                    .with_min_inner_size([420.0, 240.0]);
+                ctx.show_viewport_immediate(viewer_viewport_id(&viewer.file), builder, |ui, class| {
+                    if class == egui::ViewportClass::EmbeddedWindow {
+                        // Not reachable under eframe (`embed_viewports` was false above); draw the
+                        // contents rather than nothing.
+                        draw_snapshot_viewer(ui, viewer);
+                        false
+                    } else {
+                        egui::CentralPanel::default().show_inside(ui, |ui| draw_snapshot_viewer(ui, viewer));
+                        ui.ctx().input(|i| i.viewport().close_requested())
+                    }
+                })
+            };
+            requests.push((viewer.file.clone(), requested));
         }
-        for file in closed {
-            self.viewers.close(&file);
-        }
+        self.viewers.close_requested(requests);
     }
+}
+
+/// The native window's identity: stable for a file, so a viewer keeps its window (and its place on
+/// screen) from frame to frame, and different for each file.
+fn viewer_viewport_id(file: &str) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("snapshot_viewer", file))
 }
 
 fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) {
@@ -1207,17 +1266,25 @@ fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) {
         if ui.small_button("Clear").clicked() {
             viewer.filter.clear();
         }
+        ui.checkbox(&mut viewer.show_codes, "Show codes");
     });
     if let Some(line) = viewer.count_line() {
         ui.label(egui::RichText::new(line).weak());
     }
+    if let Some(note) = &viewer.labels_note {
+        ui.label(egui::RichText::new(format!("Names: {note}")).small().color(egui::Color32::from_rgb(200, 120, 0)));
+    }
     ui.separator();
     let warn = egui::Color32::from_rgb(200, 120, 0);
+    let show_codes = viewer.show_codes;
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new(("snapshot_rows", &viewer.file)).striped(true).num_columns(3).show(ui, |ui| {
+        egui::Grid::new(("snapshot_rows", &viewer.file)).striped(true).show(ui, |ui| {
             for row in viewer.visible_rows() {
                 ui.label(egui::RichText::new(row.short_name()).monospace());
-                ui.label(egui::RichText::new(row.code_hex()).monospace().weak());
+                ui.label(egui::RichText::new(row.extra_display_name().unwrap_or("")));
+                if show_codes {
+                    ui.label(egui::RichText::new(row.code_hex()).monospace().weak());
+                }
                 let text = egui::RichText::new(&row.value.display).monospace();
                 let text = if row.value.is_problem() {
                     text.color(warn)
@@ -1295,12 +1362,14 @@ const CAMERA_CLI_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Where to find the CLI binary: `$NIKON_FLEET_CLI` if set, else
 /// `nikon-fleet` next to this executable (a `cargo build --workspace` puts
-/// both in the same target directory). An override that points nowhere is an
+/// both in the same target directory; on Windows the file is `nikon-fleet.exe`, so `exe_suffix` is
+/// `std::env::consts::EXE_SUFFIX`). An override that points nowhere is an
 /// error — it is not silently ignored in favour of the sibling, which would
 /// hide a typo'd path.
 fn resolve_cli(
     env_override: Option<OsString>,
     current_exe: Option<&Path>,
+    exe_suffix: &str,
     is_file: impl Fn(&Path) -> bool,
 ) -> Result<PathBuf, String> {
     if let Some(v) = env_override {
@@ -1314,7 +1383,7 @@ fn resolve_cli(
     let exe = current_exe.ok_or_else(|| {
         format!("could not determine fleet-gui's own location to find the {CLI_NAME} CLI; set {CLI_ENV}")
     })?;
-    let sibling = exe.with_file_name(CLI_NAME);
+    let sibling = exe.with_file_name(format!("{CLI_NAME}{exe_suffix}"));
     if is_file(&sibling) {
         Ok(sibling)
     } else {
@@ -1328,7 +1397,7 @@ fn resolve_cli(
 }
 
 fn locate_cli() -> Result<PathBuf, String> {
-    resolve_cli(std::env::var_os(CLI_ENV), std::env::current_exe().ok().as_deref(), Path::is_file)
+    resolve_cli(std::env::var_os(CLI_ENV), std::env::current_exe().ok().as_deref(), std::env::consts::EXE_SUFFIX, Path::is_file)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3475,14 +3544,14 @@ mod tests {
 
     #[test]
     fn resolve_cli_prefers_a_valid_env_override() {
-        let got = resolve_cli(Some("/opt/x/nikon-fleet".into()), Some(Path::new("/t/fleet-gui")), |_| true);
+        let got = resolve_cli(Some("/opt/x/nikon-fleet".into()), Some(Path::new("/t/fleet-gui")), "", |_| true);
         assert_eq!(got, Ok(PathBuf::from("/opt/x/nikon-fleet")));
     }
 
     #[test]
     fn resolve_cli_bad_env_override_does_not_fall_back_to_the_sibling() {
         // A typo'd override must fail loudly even though the sibling exists.
-        let got = resolve_cli(Some("/typo/nikon-fleet".into()), Some(Path::new("/t/fleet-gui")), |p| {
+        let got = resolve_cli(Some("/typo/nikon-fleet".into()), Some(Path::new("/t/fleet-gui")), "", |p| {
             p == Path::new("/t/nikon-fleet")
         });
         let e = got.unwrap_err();
@@ -3491,19 +3560,28 @@ mod tests {
 
     #[test]
     fn resolve_cli_finds_the_sibling_of_the_gui_executable() {
-        let got = resolve_cli(None, Some(Path::new("/t/debug/fleet-gui")), |p| p == Path::new("/t/debug/nikon-fleet"));
+        let got = resolve_cli(None, Some(Path::new("/t/debug/fleet-gui")), "", |p| p == Path::new("/t/debug/nikon-fleet"));
         assert_eq!(got, Ok(PathBuf::from("/t/debug/nikon-fleet")));
     }
 
     #[test]
+    fn resolve_cli_looks_for_nikon_fleet_exe_on_windows_and_says_so_when_it_is_missing() {
+        let found = resolve_cli(None, Some(Path::new("C:/t/debug/fleet-gui.exe")), ".exe", |p| p == Path::new("C:/t/debug/nikon-fleet.exe"));
+        assert_eq!(found, Ok(PathBuf::from("C:/t/debug/nikon-fleet.exe")));
+        // The suffix-less name is not the CLI there, even if a file by that name exists.
+        let e = resolve_cli(None, Some(Path::new("C:/t/debug/fleet-gui.exe")), ".exe", |p| p == Path::new("C:/t/debug/nikon-fleet")).unwrap_err();
+        assert!(e.contains("nikon-fleet.exe"), "{e}");
+    }
+
+    #[test]
     fn resolve_cli_missing_sibling_says_how_to_build_it() {
-        let e = resolve_cli(None, Some(Path::new("/t/debug/fleet-gui")), |_| false).unwrap_err();
+        let e = resolve_cli(None, Some(Path::new("/t/debug/fleet-gui")), "", |_| false).unwrap_err();
         assert!(e.contains("/t/debug/nikon-fleet") && e.contains("cargo build --workspace") && e.contains(CLI_ENV), "{e}");
     }
 
     #[test]
     fn resolve_cli_without_a_known_exe_path_asks_for_the_override() {
-        let e = resolve_cli(None, None, |_| true).unwrap_err();
+        let e = resolve_cli(None, None, "", |_| true).unwrap_err();
         assert!(e.contains(CLI_ENV), "{e}");
     }
 
@@ -4728,6 +4806,32 @@ mod tests {
     }
 
     #[test]
+    fn a_close_request_closes_only_the_window_that_asked() {
+        let mut vs = SnapshotViewers::default();
+        for f in ["a.json", "b.json", "c.json"] {
+            vs.open(f, false);
+        }
+        let req = |a, b, c| vec![("a.json".to_string(), a), ("b.json".to_string(), b), ("c.json".to_string(), c)];
+        assert!(vs.close_requested(req(false, false, false)).is_empty(), "no one asked: nothing closes");
+        assert_eq!(vs.open.len(), 3);
+        assert_eq!(vs.close_requested(req(false, true, false)), ["b.json"]);
+        assert_eq!(vs.open.iter().map(|v| v.file.as_str()).collect::<Vec<_>>(), ["a.json", "c.json"]);
+        // A stale request for a window that is already gone changes nothing and is not reported.
+        assert!(vs.close_requested([("b.json".to_string(), true)]).is_empty());
+        assert_eq!(vs.close_requested(req(true, false, true)).len(), 2, "several windows may close in one frame");
+        assert!(vs.open.is_empty());
+        assert!(vs.close_requested(Vec::new()).is_empty(), "no windows, no requests");
+    }
+
+    #[test]
+    fn each_snapshot_has_its_own_stable_native_window_id() {
+        assert_eq!(viewer_viewport_id("a.json"), viewer_viewport_id("a.json"), "the same file keeps its window");
+        assert_ne!(viewer_viewport_id("a.json"), viewer_viewport_id("b.json"));
+        assert_ne!(viewer_viewport_id("a.json"), egui::ViewportId::ROOT, "never the main window");
+        assert_ne!(viewer_viewport_id(""), egui::ViewportId::ROOT);
+    }
+
+    #[test]
     fn a_window_that_failed_is_reloaded_when_opened_again() {
         let mut vs = SnapshotViewers::default();
         vs.open("a.json", false);
@@ -4789,7 +4893,7 @@ mod tests {
         fs::create_dir_all(dir.path().join("snapshots")).unwrap();
         fs::write(dir.path().join("snapshots/broken.json"), "{ nope").unwrap();
         let mut v = SnapshotViewer::loading("broken.json", false);
-        v.finish(load_for_view(dir.path(), "broken.json"));
+        v.finish(load_for_view(dir.path(), dir.path(), "broken.json"));
         assert!(!v.loading);
         assert!(v.error.as_deref().is_some_and(|e| e.contains("broken.json") && e.contains("JSON")), "{:?}", v.error);
         assert!(v.rows.is_empty() && v.header.is_none());
@@ -4844,24 +4948,104 @@ mod tests {
         assert_eq!(marks, [true, false, true], "a is now the reference, b no longer is, a file not in the listing keeps its mark");
     }
 
+    /// A `sdk-runtime/` holding the synthetic schema and documentation of the shared render fixture:
+    /// model "Test 1", firmware 2.00, `ModeA` (40001) named "Mode A" with the values Alpha, Beta, Unset, Seven.
+    fn fixture_sdk_runtime() -> (TempDir, Snapshot) {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests-fixtures/render_labels.json")).unwrap();
+        let lines: Vec<&str> = fixture["schema_lines"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+        let rt = TempDir::new().unwrap();
+        fs::write(rt.path().join("MaidLayer.config"), lines.join("\n")).unwrap();
+        fs::write(rt.path().join("maid-labels.json"), fixture["doc"].to_string()).unwrap();
+        let mut s = Snapshot::new(
+            Camera { model: "Test 1".into(), serial: "1".into(), firmware: "2.00".into() },
+            Transport::Usb,
+            "2026-10-27T12:34:56Z".into(),
+        );
+        s.insert(
+            "kNkMAIDCapability_ModeA",
+            40001,
+            serde_json::json!({"elem_type": 2, "value_index": 1, "elem_count": 3, "elem_bytes": 4, "default_index": 0, "values": [0, 1, 7]}),
+        );
+        s.insert("kNkMAIDCapability_Range", 40009, serde_json::json!({"lower": 0.0, "upper": 10.0, "steps": 11, "value": 4.0, "value_index": 4}));
+        (rt, s)
+    }
+
+    #[test]
+    fn the_viewer_shows_the_sdks_names_labels_and_range_scales_when_sdk_runtime_has_them() {
+        let (rt, snap) = fixture_sdk_runtime();
+        let data = TempDir::new().unwrap();
+        fs::create_dir_all(data.path().join("snapshots")).unwrap();
+        snap.save_to_file(data.path().join("snapshots/t.json")).unwrap();
+        let mut v = SnapshotViewer::loading("t.json", false);
+        v.finish(load_for_view(data.path(), rt.path(), "t.json"));
+        let mode = v.rows.iter().find(|r| r.short_name() == "ModeA").unwrap();
+        assert_eq!(mode.extra_display_name(), Some("Mode A"));
+        assert_eq!(mode.value.display, "Beta (1)");
+        let range = v.rows.iter().find(|r| r.short_name() == "Range").unwrap();
+        assert!(range.value.display.ends_with("(0..10, 11 steps)"), "{}", range.value.display);
+        assert_eq!(v.labels_note, None);
+        assert!(!v.show_codes, "the code column starts hidden");
+    }
+
+    #[test]
+    fn the_viewer_without_sdk_runtime_shows_the_numbers_and_says_why_the_names_are_missing() {
+        let (_rt, snap) = fixture_sdk_runtime();
+        let empty = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        fs::create_dir_all(data.path().join("snapshots")).unwrap();
+        snap.save_to_file(data.path().join("snapshots/t.json")).unwrap();
+        let mut v = SnapshotViewer::loading("t.json", false);
+        v.finish(load_for_view(data.path(), empty.path(), "t.json"));
+        let mode = v.rows.iter().find(|r| r.short_name() == "ModeA").unwrap();
+        assert_eq!((mode.extra_display_name(), mode.value.display.as_str()), (None, "1"));
+        assert!(v.labels_note.as_deref().is_some_and(|n| n.contains("MaidLayer.config")), "{:?}", v.labels_note);
+        v.finish(Err("gone".into()));
+        assert_eq!(v.labels_note, None, "a note about an earlier load does not stay under an error");
+    }
+
+    #[test]
+    fn the_filter_still_finds_a_row_by_its_display_name_and_by_its_code_while_codes_are_hidden() {
+        let (rt, snap) = fixture_sdk_runtime();
+        let data = TempDir::new().unwrap();
+        fs::create_dir_all(data.path().join("snapshots")).unwrap();
+        snap.save_to_file(data.path().join("snapshots/t.json")).unwrap();
+        let mut v = SnapshotViewer::loading("t.json", false);
+        v.finish(load_for_view(data.path(), rt.path(), "t.json"));
+        for text in ["mode a", "9c41", "beta"] {
+            v.filter = text.into();
+            assert_eq!(visible(&v), ["ModeA"], "{text}");
+        }
+    }
+
+    #[test]
+    fn the_sdk_runtime_directory_is_the_override_or_the_projects() {
+        assert_eq!(resolve_sdk_runtime(Some(OsString::from("/x/rt"))), PathBuf::from("/x/rt"));
+        for none in [None, Some(OsString::new())] {
+            let p = resolve_sdk_runtime(none);
+            assert!(p.ends_with("sdk-runtime"), "{p:?}");
+            assert!(p.starts_with(env!("CARGO_MANIFEST_DIR")), "{p:?}");
+        }
+    }
+
     #[test]
     fn load_for_view_reads_a_snapshot_from_snapshots_and_nowhere_else() {
         let dir = TempDir::new().unwrap();
+        let no_names = TempDir::new().unwrap();
         let snapshots = dir.path().join("snapshots");
         fs::create_dir_all(&snapshots).unwrap();
         fs::create_dir_all(dir.path().join("references")).unwrap();
         viewer_snapshot().save_to_file(snapshots.join("ok.json")).unwrap();
         viewer_snapshot().save_to_file(dir.path().join("references/ref.json")).unwrap();
-        let r = load_for_view(dir.path(), "ok.json").unwrap();
+        let r = load_for_view(dir.path(), no_names.path(), "ok.json").unwrap();
         assert_eq!((r.header.property_count, r.rows.len(), r.filtered_out), (3, 3, 0));
-        assert!(load_for_view(dir.path(), "ref.json").unwrap_err().contains("ref.json"), "a listing row is a snapshots/ file");
-        assert!(load_for_view(dir.path(), "missing.json").unwrap_err().contains("missing.json"));
+        assert!(load_for_view(dir.path(), no_names.path(), "ref.json").unwrap_err().contains("ref.json"), "a listing row is a snapshots/ file");
+        assert!(load_for_view(dir.path(), no_names.path(), "missing.json").unwrap_err().contains("missing.json"));
         for hostile in ["../references/ref.json", "..", "", "a/b.json"] {
-            assert!(load_for_view(dir.path(), hostile).is_err(), "{hostile:?}");
+            assert!(load_for_view(dir.path(), no_names.path(), hostile).is_err(), "{hostile:?}");
         }
         let old = viewer_snapshot().to_pretty_json().unwrap().replace("\"format_version\": 1", "\"format_version\": 7");
         fs::write(snapshots.join("old.json"), old).unwrap();
-        assert!(load_for_view(dir.path(), "old.json").unwrap_err().contains("unsupported format_version 7"));
+        assert!(load_for_view(dir.path(), no_names.path(), "old.json").unwrap_err().contains("unsupported format_version 7"));
     }
 
     #[test]
