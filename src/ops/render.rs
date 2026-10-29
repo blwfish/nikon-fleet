@@ -1350,6 +1350,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_out_of_the_data_directory_is_refused() {
         let d = data_dir();
