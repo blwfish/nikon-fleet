@@ -105,3 +105,15 @@ Behaviour changes that also affect transplant (all with tests): a write is refus
 Re-verified by the orchestrating session after the fixes: `cargo test --workspace --no-fail-fast` with the SDK runtime present: 1847 passed, 0 failed, tree clean; every test using `recording_cli` is `#[cfg(unix)]`-gated.
 
 Unverified: **the Windows CI job** (local cross-check could not build libusb; the job on the next push is the verification of #17); **#12** (`exit_now` for dry runs is hardware-unverified: the F24 fix was verified on real bodies, this application of it was not; a wrong call would show as a plan that never exits and the 150 s timeout would catch it); **exit 5 through the real binary** (needs a camera; pinned in-process with the library's fake camera); the firmware pre-flight added to transplant has no real-camera check. One survivor accepted: "firmware compared across bodies" in `firmware_moved`, because the same-model ambiguity refusal fires first (redundant defensive code). #27 stays deferred (needs a library severity on restore skip tags); #34 is mostly done (an SDK-runtime env literal is still retyped in a few places). No deferred finding is High or Critical, so no GitHub issue was filed.
+
+### Hardware and CI verification (2026-10-29, ledger `nikon-fleet-remediate-20261029-h7a2`)
+
+Run on a real Z 5 (firmware 1.43) and Z 9 (5.31) after PR 8 merged (e344af6). No code changed; every disposition above stands.
+
+- **#17 (Windows):** verified. The `windows` job on PR 8 passed on the push of 557e86b, before the merge.
+- **#12 (`exit_now` for dry runs):** 10 `restore --dry-run` and 10 `transplant --dry-run` runs (Z 9 onto Z 5, Z 5 onto Z 9) all exited 0 in 6-8 s with identical output; none reached the 150 s timeout. The plan digest was identical across all five restore runs on each body. This is evidence, not proof: at the ~7% F24 rate, 20 clean runs happen by chance about a quarter of the time.
+- **Exit 5 through the real binary:** verified on the Z 5 only. `restore` (a real apply) with an all-zero `--expect-digest` and the correct `--expect-summary` exited 5 after 11 s ("the plan is stale ..."), printed no report and wrote no restore point. A fresh dry run gave the same digest as before (0 properties would change) and a fresh capture diffed as "no differences" against the one taken before. The comparison covers readable settings only.
+- **Exit 2 / exit 1:** a bad flag exits 2; `--only` naming a property not in the snapshot exits 1 with a clear message.
+- **#39 (firmware pre-flight):** only the string format is verified: `discover`, the plan's target and the snapshot's source report identical firmware strings on both bodies, so the comparison cannot refuse a write on a format mismatch. The firmware-changed-between-plan-and-apply case is unit-test only (it needs a flash).
+- **Still unverified on hardware:** exit 6 through the real binary; a firmware change between plan and apply.
+- **Noticed, not investigated:** `discover` reports `baseline: false` for the Z 5 and `true` for the Z 9; the Z 5 capture still succeeded.
