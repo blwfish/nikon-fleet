@@ -3000,6 +3000,7 @@ mod tests {
     use nikon_fleet::snapshot::{Camera, Transport};
     use std::collections::HashMap;
     use std::io::Cursor;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
@@ -3007,6 +3008,7 @@ mod tests {
 
     // ── helpers ────────────────────────────────────────────────────────────
 
+    #[cfg(unix)]
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -3014,6 +3016,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     /// A stand-in for the CLI: records its argv (one per line) and stdin next to it, then runs `tail`.
     fn recording_cli(dir: &Path, tail: &str) -> PathBuf {
         script(
@@ -3339,6 +3342,7 @@ mod tests {
         assert!(l.problems().iter().any(|p| p.contains("not valid UTF-8")), "{:?}", l.problems());
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_reference_file_is_counted_not_hidden() {
         let d = TempDir::new().unwrap();
@@ -3429,16 +3433,19 @@ mod tests {
 
     // ── running the CLI ─────────────────────────────────────────────────────
 
+    #[cfg(unix)]
     fn sh(script: &str) -> (PathBuf, Vec<String>) {
         (PathBuf::from("/bin/sh"), vec!["-c".to_string(), script.to_string()])
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_cli_returns_trimmed_stdout_on_success() {
         let (p, a) = sh("echo '  hello  '");
         assert_eq!(run_cli(&p, &a, None, T).unwrap().stdout, "hello");
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_cli_pipes_stdin_exactly_and_closes_it() {
         // `wc -c` only finishes once stdin hits EOF, so this also proves the
@@ -3447,6 +3454,7 @@ mod tests {
         assert_eq!(run_cli(&p, &a, Some("pa ss--wd"), T).unwrap().stdout, "9");
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_cli_non_zero_exit_returns_stderr_as_a_typed_exit_failure() {
         let (p, a) = sh("echo 'boom: no camera' >&2; exit 3");
@@ -3455,6 +3463,7 @@ mod tests {
         assert!(!e.outcome_unknown());
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_cli_non_zero_exit_with_empty_stderr_reports_the_status() {
         let (p, a) = sh("exit 3");
@@ -3462,6 +3471,7 @@ mod tests {
         assert!(e.message.contains("exited with") && e.message.contains('3'), "{}", e.message);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_cli_child_killed_by_signal_is_an_error_not_a_gui_crash() {
         // The point of #12: if the USB churn takes the child down, the GUI
@@ -3471,6 +3481,7 @@ mod tests {
         assert!(e.message.contains("signal"), "{}", e.message);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_cli_stderr_on_success_reaches_the_caller() {
         let (p, a) = sh("echo 'warning: unconfirmed model' >&2; echo ok");
@@ -3478,6 +3489,7 @@ mod tests {
         assert_eq!((out.stdout.as_str(), out.stderr.as_str()), ("ok", "warning: unconfirmed model"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_cli_child_that_exits_without_reading_stdin_reports_its_own_error() {
         // The stdin write fails (EPIPE) — a non-zero child's stderr must still win.
@@ -3486,6 +3498,7 @@ mod tests {
         assert_eq!((e.kind, e.message.as_str()), (CliFailure::Exit, "rejected: bad args"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_cli_a_failed_stdin_write_fails_the_call_even_when_the_child_exits_zero() {
         // G41: a truncated password must not be reported as a success.
@@ -3509,6 +3522,7 @@ mod tests {
         Command::new("kill").args(["-0", pid]).stderr(Stdio::null()).status().unwrap().success()
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_cli_kills_a_child_that_outlives_the_timeout_and_keeps_what_it_printed() {
         // G33: a hung CLI must not wedge the worker. `exec` so the killed process is the sleeper.
@@ -3525,6 +3539,7 @@ mod tests {
         assert!(!alive(pid.trim()), "the child was killed and reaped");
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_cli_timeout_boundary_a_child_inside_the_limit_succeeds() {
         let (p, a) = sh("sleep 0.2; echo done");
@@ -3533,6 +3548,7 @@ mod tests {
         assert_eq!(run_cli(&p, &a, None, Duration::from_millis(300)).unwrap_err().kind, CliFailure::TimedOut);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_cli_a_child_that_never_reads_its_input_still_times_out() {
         let (p, a) = sh("exec sleep 30");
@@ -3649,6 +3665,7 @@ mod tests {
         assert!(discover_notices(&[row("Z 9", "AAA", 1)], &scan_of(vec![usb("Z 9", "AAA")])).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn discover_via_runs_the_cli_shows_its_stderr_and_adds_the_bus_notes() {
         let d = TempDir::new().unwrap();
@@ -3661,6 +3678,7 @@ mod tests {
         assert!(found.notices.iter().any(|n| n.contains("enumeration order")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn discover_that_prints_its_result_and_then_hangs_is_taken_with_a_note() {
         // F24: the SDK's close hangs after the result is out.
@@ -3671,6 +3689,7 @@ mod tests {
         assert!(found.notices.iter().any(|n| n.contains("did not exit")), "{:?}", found.notices);
     }
 
+    #[cfg(unix)]
     #[test]
     fn discover_that_hangs_without_a_result_or_fails_is_an_error() {
         let d = TempDir::new().unwrap();
@@ -3792,6 +3811,7 @@ mod tests {
         assert!(done.notices.iter().any(|n| n.contains("2 capabilities were not found in the schema")), "{:?}", done.notices);
     }
 
+    #[cfg(unix)]
     #[test]
     fn snapshot_via_runs_the_cli_with_the_serial_and_shows_its_verdict() {
         let d = TempDir::new().unwrap();
@@ -3806,6 +3826,7 @@ mod tests {
         assert!(done.status.text.starts_with("Saved Z_9_30012345_x.json") && done.cli_log == "note: x");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_refused_snapshot_never_starts_the_cli() {
         let d = TempDir::new().unwrap();
@@ -3816,6 +3837,7 @@ mod tests {
         assert!(!d.path().join("argv.txt").exists(), "the CLI was not run");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_capture_shows_the_cli_message_and_refreshes_the_list() {
         let d = TempDir::new().unwrap();
@@ -3827,6 +3849,7 @@ mod tests {
         assert!(done.refresh_listing);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_hung_capture_is_stopped_and_says_the_file_may_exist() {
         let d = TempDir::new().unwrap();
@@ -3858,6 +3881,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn vendor_write_sends_the_password_on_stdin_and_never_in_argv() {
         let dir = TempDir::new().unwrap();
@@ -3871,6 +3895,7 @@ mod tests {
         assert_eq!(argv, vendor_write_ftp_argv(&p, Some("SER1")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn vendor_stderr_from_a_successful_run_is_kept_and_shown_next_to_the_result() {
         // H27: the unconfirmed-model warning and a reply that did not match its command.
@@ -3885,6 +3910,7 @@ mod tests {
         assert_eq!(with_stderr("x", "  \n"), "x", "an empty stderr adds nothing");
     }
 
+    #[cfg(unix)]
     #[test]
     fn vendor_write_failure_is_an_error_and_no_success_message() {
         let dir = TempDir::new().unwrap();
@@ -3892,6 +3918,7 @@ mod tests {
         assert_eq!(vendor_write_via(&cli, &sample_profile(), None, T).unwrap_err(), "Error: could not claim the PTP USB interface");
     }
 
+    #[cfg(unix)]
     #[test]
     fn vendor_read_failure_is_an_error() {
         let dir = TempDir::new().unwrap();
@@ -3899,6 +3926,7 @@ mod tests {
         assert_eq!(vendor_read_via(&cli, 0xD053, None, T).unwrap_err(), "Error: no Nikon USB camera found");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_write_that_was_cut_off_or_took_a_truncated_password_says_the_camera_may_have_changed() {
         let dir = TempDir::new().unwrap();
@@ -3914,6 +3942,7 @@ mod tests {
         assert!(e.contains("could not be given its input") && e.contains("MAY have taken"), "{e}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn exit_status_4_from_the_write_command_means_the_camera_may_have_changed() {
         let dir = TempDir::new().unwrap();
@@ -3935,6 +3964,7 @@ mod tests {
         assert_eq!(run_cli(&p, &a, None, T).unwrap_err().code, Some(4));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_write_child_that_dies_or_panics_may_have_changed_the_camera() {
         let dir = TempDir::new().unwrap();
@@ -4671,6 +4701,7 @@ mod tests {
         SnapListing { dir: dst.join("snapshots").display().to_string(), ..list_all(src) }
     }
 
+    #[cfg(unix)]
     #[test]
     fn export_counts_and_names_everything_it_leaves_out() {
         let d = full_data_dir();
@@ -4702,6 +4733,7 @@ mod tests {
         assert_eq!(done.notices.len(), 6);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_directory_is_counted_not_dropped() {
         let d = full_data_dir();
