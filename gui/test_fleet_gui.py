@@ -103,6 +103,10 @@ def tk_root():
         import tkinter as tk
     except ImportError as e:
         skip_or_fail(f"tkinter is not available: {e}", "REQUIRE_DISPLAY")
+    # Tk 8.6 is unsupported: these tests hang inside Tk's `update` there (AGENT-README.md,
+    # "Supported GUI environment"). Refuse it up front instead of hanging a test run.
+    if tk.TkVersion < 9.0:
+        skip_or_fail(f"Tk {tk.TkVersion} is not supported (needs Tk 9.0; see AGENT-README.md)", "REQUIRE_DISPLAY")
     try:
         root = tk.Tk()
     except tk.TclError as e:
@@ -226,6 +230,34 @@ class TestStartup:
         settle(tk_root, app)
         assert "not a single JSON document" in dialogs.shown[0][2]
         assert app.cameras == []
+
+
+class TestUnsupportedTk:
+    """Tk 8.6 is refused by the `tk_root` fixture, not run: these tests hang inside Tk's `update`
+    there (AGENT-README.md, "Supported GUI environment")."""
+
+    @pytest.mark.parametrize("version", [8.6, 8.9])
+    def test_tk_below_9_is_skipped_by_default(self, request, monkeypatch, version):
+        import tkinter
+        monkeypatch.setattr(tkinter, "TkVersion", version)
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("REQUIRE_DISPLAY", raising=False)
+        with pytest.raises(pytest.skip.Exception, match="not supported"):
+            request.getfixturevalue("tk_root")
+
+    @pytest.mark.parametrize("switch", ["CI", "REQUIRE_DISPLAY"])
+    def test_tk_below_9_fails_when_the_environment_must_be_supported(self, request, monkeypatch, switch):
+        import tkinter
+        monkeypatch.setattr(tkinter, "TkVersion", 8.6)
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("REQUIRE_DISPLAY", raising=False)
+        monkeypatch.setenv(switch, "1")
+        with pytest.raises(pytest.fail.Exception, match="not supported"):
+            request.getfixturevalue("tk_root")
+
+    def test_tk_9_is_not_refused(self, tk_root):
+        import tkinter
+        assert tkinter.TkVersion >= 9.0     # the fixture handed out a real root, so 9.0 is accepted
 
 
 class TestNoCli:

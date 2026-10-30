@@ -74,18 +74,9 @@ jobs:
   gui-python:
     runs-on: macos-latest
     timeout-minutes: 20
-    # Python 3.12.10 on the runner (the last 3.12 with a prebuilt macOS binary, April 2025) ships Tk
-    # 8.6.16, and there test_fleet_gui.py::TestStartup::test_a_settings_error_is_shown_and_nothing_is_guessed
-    # hangs inside Tk's `update` (pytest-timeout fails it after 2 minutes with a stack dump). Python 3.14.9
-    # ships Tk 9.0.4 and passes all 656 tests in about 85 s, as does a local Tk 9.0. So 3.14 gates the
-    # PR. The 3.13 leg is a non-blocking canary for Tk 8.6, the more relevant older version (still
-    # supported; found 2026-10-30, hang not yet diagnosed). The step below prints each leg's Tk
-    # version; if 3.13 turns out to ship Tk 9, move the canary back to 3.12.
-    continue-on-error: ${{ matrix.python-version == '3.13' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.13", "3.14"]
+    # The Python/tk GUI is supported on Python 3.14 with Tk 9.0 only (see AGENT-README.md,
+    # "Supported GUI environment"): on Tk 8.6 (python.org Python 3.13 and older) the GUI tests hang
+    # inside Tk's `update`. Found 2026-10-30 on 3.12 (Tk 8.6.16) and 3.13 (Tk 8.6.18); not diagnosed.
     steps:
       - uses: actions/checkout@v4
       - run: rustup update stable
@@ -102,7 +93,7 @@ jobs:
       # setup-python's interpreters ship tkinter, which the GUI tests need.
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.14"
       - run: python -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.TkVersion, tkinter.Tcl().eval('info patchlevel'))"
       - run: python -m pip install pytest pytest-timeout
       # CI=true is left on here on purpose: gui/conftest.py then makes a missing binary, tkinter or

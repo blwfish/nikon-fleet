@@ -192,6 +192,18 @@ To name what `nikon-fleet show` prints (display names, enumeration value names),
 `sdk-runtime/maid-labels.json` (gitignored) and needs poppler's `pdftotext`
 (`brew install poppler`). `scripts/setup-sdk-runtime.sh` runs it too.
 
+### Supported GUI environment
+
+The Python/tkinter GUI (`gui/fleet_gui.py`) and its tests are supported on **Python 3.14 with Tk 9.0.x**
+(Homebrew's `python@3.14` and python.org's 3.14 installer; CI runs 3.14.8/Tk 9.0.4). **Tk 8.6 is not
+supported** — that is what python.org's Python 3.13 and older ship (3.13.16 has Tk 8.6.18, 3.12.10 has
+8.6.16). On Tk 8.6 the GUI tests hang: `test_fleet_gui.py::TestStartup::test_a_settings_error_is_shown_and_nothing_is_guessed`
+never returns from Tk's `update` on the macOS runner (found 2026-10-30; cause not diagnosed, and the
+tests after it were never reached, so there may be more). The test fixture `tk_root` therefore refuses
+Tk older than 9.0 (skips, or fails when `CI`/`REQUIRE_DISPLAY` is set) rather than hanging. The CLI,
+the MCP server and the egui GUI do not use Tk. Check yours with
+`python3 -c "import tkinter; print(tkinter.TkVersion)"`.
+
 `gui/` is a workspace member (joined 2026-09-03), not a standalone crate — `cargo test`/`cargo llvm-cov` run without `--workspace` from the repo root cover only the root `nikon-fleet` package and silently skip `gui/src/main.rs`'s tests.
 
 Running the CLI/GUI against real hardware requires:
