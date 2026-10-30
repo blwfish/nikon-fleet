@@ -1,0 +1,95 @@
+# Does the macOS build work, and do its tests pass? macOS is where the CLI, the MCP server and both
+# GUIs are used day to day, and until this job existed the only CI was windows.yml. No camera, Nikon
+# SDK or Nikon account is involved: sdk-runtime/ is gitignored (not redistributable), so everything
+# here must pass without it.
+#
+# Three jobs, so a failure in one does not hide the others:
+#   rust       the library, the CLI, the egui GUI and the MCP server's unit tests
+#   mcp-stdio  fleet-mcp's stdio integration tests, non-blocking until they are SDK-free (see below)
+#   gui-python the Python/tk GUI's tests (gui/test_*.py), against the CLI built here
+name: macos
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The crates are edition 2024: needs Rust 1.85 or newer.
+      - run: rustup update stable
+      - run: rustc --version && cargo --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-cargo-
+      - run: cargo build --workspace
+      # GitHub sets CI=true, which makes the tests that need the Nikon SDK's files (sdk-runtime/)
+      # fail instead of skip; this job has none, so it is turned off here, same as windows.yml.
+      # fleet-mcp's stdio integration tests are in their own job; its unit tests run here.
+      - run: cargo test --workspace --exclude fleet-mcp --no-fail-fast
+        env:
+          CI: "0"
+      - run: cargo test -p fleet-mcp --lib --bins --no-fail-fast
+        env:
+          CI: "0"
+
+  # mcp/tests/stdio.rs spawns the real server. Two of its tests fail on a machine with no
+  # sdk-runtime/ (found 2026-10-30 by moving it aside and running `CI=0 cargo test --workspace`:
+  # `snapshots_are_listed_read_and_diffed_by_name` at stdio.rs:354, and a server-did-not-exit
+  # timeout at stdio.rs:202 in a different test each run), and neither is gated the way the
+  # baseline and labels tests are. Until they are, this job reports but does not block. Remove
+  # `continue-on-error` once it passes here.
+  mcp-stdio:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-cargo-
+      - run: cargo test -p fleet-mcp --test stdio --no-fail-fast
+        env:
+          CI: "0"
+
+  gui-python:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-cargo-
+      # The tests that run the real binary on camera-free commands look for target/debug/nikon-fleet.
+      - run: cargo build -p nikon-fleet
+      # setup-python's interpreters ship tkinter, which the GUI tests need.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest
+      # CI=true is left on here on purpose: gui/conftest.py then makes a missing binary, tkinter or
+      # display a failure instead of a silent skip, so this job cannot pass by skipping everything.
+      - run: python -m pytest -q
+        working-directory: gui
