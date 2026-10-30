@@ -350,11 +350,46 @@ fn snapshots_are_listed_read_and_diffed_by_name() {
     assert_eq!(structured(&r)["properties"][0]["value"], json!(100));
     assert_eq!(structured(&r)["page"]["truncated"], json!(false));
 
+    // `diff_snapshots` names properties from the SDK's `sdk-runtime/MaidLayer.config`, which is
+    // gitignored (not redistributable): without it the server answers `schema_unreadable`, which
+    // is the server working, not a diff to assert on. Where the file must exist (a machine set up
+    // with scripts/setup-sdk-runtime.sh, or REQUIRE_SDK_RUNTIME / CI set) its absence fails; on a
+    // bare runner the diff half is skipped, loudly, and the list/get half above still ran.
+    let schema = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk-runtime/MaidLayer.config");
+    if !schema.exists() {
+        assert!(
+            !sdk_runtime_required(|n| std::env::var_os(n)),
+            "REQUIRE_SDK_RUNTIME or CI is set but {schema:?} does not exist (run scripts/setup-sdk-runtime.sh)"
+        );
+        eprintln!("skipping the diff_snapshots half: {schema:?} does not exist");
+        return;
+    }
     let r = s.call("diff_snapshots", json!({"a": "a.json", "b": "b.json"}));
     assert!(!is_error(&r), "{r}");
     let diff = &structured(&r)["diff"];
     assert_eq!(diff["counts"]["changed"], json!(1));
     assert_eq!(diff["entries"][0]["name"], json!("kNkMAIDCapability_Artist"));
+}
+
+/// Whether this run must have the gitignored `sdk-runtime/`: the repo's own switch
+/// (`REQUIRE_SDK_RUNTIME`, as in `src/ops/baseline.rs` and `transplant.rs`) or a CI run. Set to
+/// anything but empty, `0` or `false`.
+fn sdk_runtime_required(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["REQUIRE_SDK_RUNTIME", "CI"].iter().any(|name| var(name).is_some_and(|v| !v.is_empty() && v != "0" && v != "false"))
+}
+
+#[test]
+fn the_sdk_runtime_requirement_is_decided_by_both_switches() {
+    fn env<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |name| set.iter().find(|(k, _)| *k == name).map(|(_, v)| std::ffi::OsString::from(*v))
+    }
+    assert!(!sdk_runtime_required(env(&[])));
+    assert!(sdk_runtime_required(env(&[("REQUIRE_SDK_RUNTIME", "1")])));
+    assert!(sdk_runtime_required(env(&[("CI", "true")])), "CI alone requires it");
+    for off in ["", "0", "false"] {
+        assert!(!sdk_runtime_required(env(&[("CI", off), ("REQUIRE_SDK_RUNTIME", off)])), "{off:?}");
+    }
+    assert!(sdk_runtime_required(env(&[("CI", "0"), ("REQUIRE_SDK_RUNTIME", "1")])));
 }
 
 #[test]

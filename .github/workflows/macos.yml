@@ -46,12 +46,12 @@ jobs:
         env:
           CI: "0"
 
-  # mcp/tests/stdio.rs spawns the real server. Two of its tests fail on a machine with no
-  # sdk-runtime/ (found 2026-10-30 by moving it aside and running `CI=0 cargo test --workspace`:
-  # `snapshots_are_listed_read_and_diffed_by_name` at stdio.rs:354, and a server-did-not-exit
-  # timeout at stdio.rs:202 in a different test each run), and neither is gated the way the
-  # baseline and labels tests are. Until they are, this job reports but does not block. Remove
-  # `continue-on-error` once it passes here.
+  # mcp/tests/stdio.rs spawns the real server. The first CI run showed the one failure here was
+  # `snapshots_are_listed_read_and_diffed_by_name`: `diff_snapshots` needs the gitignored
+  # sdk-runtime/MaidLayer.config, and the test is now gated on it like the baseline and labels tests.
+  # Locally, a second test (a "server did not exit" timeout at stdio.rs:202, a different test each run)
+  # also failed once under load; it did not fail on the runner. `continue-on-error` stays until this
+  # job has been green on a few runs, then remove it.
   mcp-stdio:
     runs-on: macos-latest
     timeout-minutes: 20
@@ -74,6 +74,14 @@ jobs:
   gui-python:
     runs-on: macos-latest
     timeout-minutes: 20
+    # 3.12 hung in test_fleet_gui.py::TestStartup::test_a_settings_error_is_shown_and_nothing_is_guessed
+    # (Tk's `update` never returned; the same suite passes locally on Tk 9.0 in about a minute).
+    # Running 3.12 and 3.14 side by side, with the Tk version printed, shows whether it follows the
+    # Python/Tk build. Drop whichever leg is not needed once that is known.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - run: rustup update stable
@@ -90,7 +98,8 @@ jobs:
       # setup-python's interpreters ship tkinter, which the GUI tests need.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
+      - run: python -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.TkVersion, tkinter.Tcl().eval('info patchlevel'))"
       - run: python -m pip install pytest pytest-timeout
       # CI=true is left on here on purpose: gui/conftest.py then makes a missing binary, tkinter or
       # display a failure instead of a silent skip, so this job cannot pass by skipping everything.
