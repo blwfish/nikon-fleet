@@ -204,6 +204,13 @@ Tk older than 9.0 (skips, or fails when `CI`/`REQUIRE_DISPLAY` is set) rather th
 the MCP server and the egui GUI do not use Tk. Check yours with
 `python3 -c "import tkinter; print(tkinter.TkVersion)"`.
 
+The GUI tests share **one `Tk()` root for the whole run** (`_shared_tk_root` in `gui/test_fleet_gui.py`),
+reset between tests. Creating and destroying a root per test crashed intermittently on the macOS runner
+on Tk 9.0 (exit 139/138 mid-suite, and a CoreFoundation "process has forked" message in captured stderr):
+3 of 6 runs of the per-test-root tests crashed in an A/B on 2026-10-30 against 0 of 6 with the shared
+root, and about 5 of 13 per-test-root runs overall against 0 of 8. Tk's macOS port wraps a single
+`NSApplication`, which is the likely reason; that part is a hypothesis. Keep it one root.
+
 `gui/` is a workspace member (joined 2026-09-03), not a standalone crate — `cargo test`/`cargo llvm-cov` run without `--workspace` from the repo root cover only the root `nikon-fleet` package and silently skip `gui/src/main.rs`'s tests.
 
 Running the CLI/GUI against real hardware requires:

@@ -97,8 +97,9 @@ def fake_cli(tmp_path, monkeypatch):
     return Fake()
 
 
-@pytest.fixture
-def tk_root():
+def _tk_unsupported_or_missing():
+    """The `tkinter` module, after refusing what cannot run these tests (skip, or fail when
+    CI/REQUIRE_DISPLAY is set). Called by every test, so it also holds for a root that already exists."""
     try:
         import tkinter as tk
     except ImportError as e:
@@ -107,6 +108,15 @@ def tk_root():
     # "Supported GUI environment"). Refuse it up front instead of hanging a test run.
     if tk.TkVersion < 9.0:
         skip_or_fail(f"Tk {tk.TkVersion} is not supported (needs Tk 9.0; see AGENT-README.md)", "REQUIRE_DISPLAY")
+    return tk
+
+
+@pytest.fixture(scope="session")
+def _shared_tk_root():
+    """ONE Tk root for the whole run. Tk's macOS port wraps a single NSApplication, and creating and
+    destroying a root per test was intermittently crashing (a segfault in AppKit's menu code) or
+    stalling inside `update` on the macOS runner. Tests get it through `tk_root`, which resets it."""
+    tk = _tk_unsupported_or_missing()
     try:
         root = tk.Tk()
     except tk.TclError as e:
@@ -114,9 +124,34 @@ def tk_root():
     root.withdraw()
     yield root
     root.destroy()
-    # Free the dead app's Tk variables here, on the main thread: left to the
-    # cyclic collector they can be finalised on a worker thread, which Tk refuses.
     gc.collect()
+
+
+def _reset_tk_root(root):
+    """Return the shared root to a blank state: no pending `after` callbacks, no child widgets, the
+    app's per-instance overrides and window settings gone. What one test's FleetApp leaves behind
+    must not run during the next."""
+    for ident in root.tk.splitlist(root.tk.call("after", "info")):
+        root.after_cancel(ident)
+    for child in root.winfo_children():
+        child.destroy()
+    root.__dict__.pop("report_callback_exception", None)   # FleetApp assigns its own on the instance
+    root.title("tk")
+    root.geometry("")
+    root.withdraw()
+    root.update_idletasks()
+    # Free the dead app's Tk variables here, on the main thread: left to the cyclic collector
+    # they can be finalised on a worker thread, which Tk refuses.
+    gc.collect()
+
+
+@pytest.fixture
+def tk_root(request):
+    _tk_unsupported_or_missing()
+    root = request.getfixturevalue("_shared_tk_root")
+    _reset_tk_root(root)
+    yield root
+    _reset_tk_root(root)
 
 
 @pytest.fixture
