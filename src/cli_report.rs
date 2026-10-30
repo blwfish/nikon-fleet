@@ -3,7 +3,7 @@
 //! counting are testable without a camera; `main.rs` decides where each part is printed.
 
 use nikon_fleet::ops::apply::{ApplyReport, ApplyStatus, Readback};
-use nikon_fleet::ops::restore::{Counts, StepOutcome, StepResult, undo_command};
+use nikon_fleet::ops::restore::{Counts, PlanCaveat, PlanCaveatKind, StepOutcome, StepResult, undo_command};
 use nikon_fleet::ops::restore_flow::{PlanStep, RestoreApplyReport};
 use nikon_fleet::transplant::{Severity, SkipReason, Strategy, TransplantOutcome};
 
@@ -127,6 +127,19 @@ pub fn render_restore_dry_run(steps: &[PlanStep], counts: &Counts, only_selected
     }
     s.push_str(&restore_tally("Dry run:", counts, only_selected));
     s
+}
+
+/// One warning line per plan caveat, for stdout (a dry run) or stderr (a real restore).
+pub fn restore_caveat_lines(caveats: &[PlanCaveat]) -> Vec<String> {
+    caveats
+        .iter()
+        .map(|c| match c.kind {
+            PlanCaveatKind::ReadbackCannotConfirm => format!(
+                "  warn: {} [{:#x}]: the stored position ({}) reads back the same for two different settings on this body (for max shots per burst on a Z6III, infinity and 1 shot), so the snapshot cannot say which it held and the read-back cannot confirm the restore; check the setting on the camera afterwards",
+                c.name, c.code, c.value_index
+            ),
+        })
+        .collect()
 }
 
 /// The tally line shared by a dry run and a real restore.
@@ -421,6 +434,16 @@ mod tests {
         let s = render_restore_dry_run(&steps, &Counts { written: 2, ..Counts::default() }, false);
         assert_eq!(s.lines().filter(|l| l.contains("would write")).count(), 2);
         assert!(s.contains("  would write  A [0x10]") && !s.contains("B ["));
+    }
+
+    #[test]
+    fn a_plan_caveat_is_one_warning_line_naming_the_property_and_the_ambiguity() {
+        let c = PlanCaveat { kind: PlanCaveatKind::ReadbackCannotConfirm, name: "kNkMAIDCapability_ShootingLimit".into(), code: 33086, value_index: 1 };
+        let lines = restore_caveat_lines(&[c.clone(), c]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("  warn: kNkMAIDCapability_ShootingLimit [0x813e]"), "{}", lines[0]);
+        assert!(lines[0].contains("cannot confirm") && lines[0].contains("infinity"), "{}", lines[0]);
+        assert!(restore_caveat_lines(&[]).is_empty());
     }
 
     #[test]

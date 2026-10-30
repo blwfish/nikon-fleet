@@ -32,7 +32,8 @@ use crate::ops::plan::NotTransferable;
 use crate::ops::port::CameraPort;
 use crate::ops::readback::{SideEffects, side_effects};
 use crate::ops::restore::{
-    Counts, RestoreRun, Source, StepOutcome, StepResult, Verdict, Verification, coherent_for_write, execute_from, undo_set, verify_with,
+    Counts, PlanCaveat, RestoreRun, Source, StepOutcome, StepResult, Verdict, Verification, coherent_for_write, execute_from, readback_caveat, undo_set,
+    verify_with,
 };
 use crate::ops::worker::{PHASE_PLAN_VERIFIED, PHASE_READ_BACK, PHASE_RESTORE_POINT_WRITTEN, PHASE_WRITING};
 use crate::ops::retention::RestoreOp;
@@ -139,7 +140,21 @@ pub struct RestorePlanReport {
     pub steps: Vec<PlanStep>,
     /// Named by `only` but not writable: they would not be restored.
     pub unrestorable: Vec<(String, &'static str)>,
+    /// Properties this plan would write whose read-back cannot confirm the write (typed, see
+    /// [`PlanCaveat`]): the snapshot cannot tell the two states the value stands for apart, so the
+    /// plan names the case. Empty for almost every plan.
+    pub caveats: Vec<PlanCaveat>,
     pub cannot_read: &'static [NotTransferable],
+}
+
+/// The caveats on `steps` (a plan's, in step order): each step that would be written whose stored
+/// value is one the target model's read-back cannot confirm. Not-written steps carry none.
+pub fn plan_caveats(steps: &[PlanStep], source: &Snapshot, target_model: &str) -> Vec<PlanCaveat> {
+    steps
+        .iter()
+        .filter(|s| s.outcome == StepOutcome::WouldWrite)
+        .filter_map(|s| readback_caveat(target_model, &s.name, s.code, &source.properties.get(&s.name)?.value))
+        .collect()
 }
 
 fn changes_for(port: &(impl CameraPort + ?Sized), code: u32, stored: &Value) -> Option<bool> {
@@ -233,6 +248,7 @@ pub fn build_restore_plan<P: CameraPort + ?Sized>(
         counts: run.counts(),
         would_change,
         unrestorable: if input.only.is_some() { run.unrestored() } else { Vec::new() },
+        caveats: plan_caveats(&steps, input.source, &input.target.model),
         steps,
         cannot_read: NOT_TRANSFERABLE,
     })
@@ -564,6 +580,138 @@ mod tests {
             std::fs::read_dir(w.dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         v.sort();
         v
+    }
+
+    // ── a write whose read-back cannot confirm it (F25, Z6III max shots per burst) ──
+
+    const SHOOTING_LIMIT: u32 = 33086;
+    const SHOOTING_LIMIT_NAME: &str = "kNkMAIDCapability_ShootingLimit";
+
+    /// The Z6III's scale for max shots per burst: 0 to 200, 201 steps, the index equal to the number.
+    fn burst(index: u64) -> Value {
+        json!({"value": 0.0, "default": 0.0, "value_index": index, "default_index": 200,
+               "lower": 0.0, "upper": 200.0, "steps": 201})
+    }
+
+    /// A plan of a one-property snapshot (`ShootingLimit` at `stored`) onto a body of `model` that
+    /// holds `live`, by the real planner. `serial_of_snapshot` and `policy` choose whose snapshot it is.
+    fn burst_plan(
+        model: &str,
+        stored: Value,
+        live: Value,
+        only: Option<&BTreeSet<String>>,
+        serial_of_snapshot: &str,
+        policy: BodyPolicy,
+    ) -> RestorePlanReport {
+        let target = Camera { model: model.into(), serial: "SER".into(), firmware: "2.00".into() };
+        let mut source = Snapshot::new(Camera { serial: serial_of_snapshot.into(), ..target.clone() }, Transport::Usb, "2026-10-28T10:00:00Z".into());
+        source.insert(SHOOTING_LIMIT_NAME, SHOOTING_LIMIT, stored);
+        let bytes = source.to_pretty_json().unwrap().into_bytes();
+        let cam = FakeCamera::new().with(SHOOTING_LIMIT, RW, live).with_sdk_range_quirk();
+        let input = RestorePlanInput { source: &source, source_name: "z6iii.json", source_bytes: &bytes, target: &target, only, body_policy: policy };
+        build_restore_plan(&cam, &input).unwrap()
+    }
+
+    fn plain_burst_plan(model: &str, stored_index: u64) -> RestorePlanReport {
+        burst_plan(model, burst(stored_index), burst(17), None, "SER", BodyPolicy::SameBody)
+    }
+
+    #[test]
+    fn writing_index_one_of_max_shots_per_burst_onto_a_z6iii_is_named_in_the_plan() {
+        let p = plain_burst_plan("Z6_3", 1);
+        assert_eq!(p.counts.written, 1, "the write is planned: {:?}", p.steps);
+        assert_eq!(
+            p.caveats,
+            vec![PlanCaveat { kind: crate::ops::restore::PlanCaveatKind::ReadbackCannotConfirm, name: SHOOTING_LIMIT_NAME.into(), code: SHOOTING_LIMIT, value_index: 1 }]
+        );
+        // And in the JSON a client reads, with the closed tag, not a sentence.
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["caveats"][0]["kind"], "readback_cannot_confirm");
+        assert_eq!(v["caveats"][0]["code"], SHOOTING_LIMIT);
+        assert_eq!(v["caveats"][0]["value_index"], 1);
+    }
+
+    #[test]
+    fn the_values_either_side_of_the_ambiguous_one_carry_no_caveat() {
+        for index in [0, 2, 17, 199, 200] {
+            let p = plain_burst_plan("Z6_3", index);
+            assert_eq!(p.counts.written, 1, "index {index} is still written");
+            assert!(p.caveats.is_empty(), "index {index}: {:?}", p.caveats);
+        }
+    }
+
+    #[test]
+    fn the_same_value_on_another_model_carries_no_caveat() {
+        // Z 9: infinity is index 0 and index 1 is 1 shot, unambiguous. Z 5: no infinity at all.
+        for model in ["Z 9", "Z 5", "Z6_2", ""] {
+            let p = plain_burst_plan(model, 1);
+            assert_eq!(p.counts.written, 1, "{model}");
+            assert!(p.caveats.is_empty(), "{model:?}: {:?}", p.caveats);
+        }
+    }
+
+    #[test]
+    fn a_body_already_at_index_one_still_gets_the_caveat() {
+        // The plan says nothing changes (the body reads 1 now), which is exactly when it cannot tell
+        // infinity from 1 shot: the snapshot may have been taken at infinity.
+        let p = burst_plan("Z6_3", burst(1), burst(1), None, "SER", BodyPolicy::SameBody);
+        assert_eq!(p.would_change, 0);
+        assert_eq!(p.caveats.len(), 1);
+    }
+
+    #[test]
+    fn a_step_that_is_not_written_carries_no_caveat() {
+        // Left out by --only.
+        let other = BTreeSet::from(["kNkMAIDCapability_SomethingElse".to_string()]);
+        let mut source_with_other = Snapshot::new(Camera { model: "Z6_3".into(), serial: "SER".into(), firmware: "2.00".into() }, Transport::Usb, "t".into());
+        source_with_other.insert(SHOOTING_LIMIT_NAME, SHOOTING_LIMIT, burst(1));
+        source_with_other.insert("kNkMAIDCapability_SomethingElse", 12345, json!(1));
+        let bytes = source_with_other.to_pretty_json().unwrap().into_bytes();
+        let target = Camera { model: "Z6_3".into(), serial: "SER".into(), firmware: "2.00".into() };
+        let cam = FakeCamera::new().with(SHOOTING_LIMIT, RW, burst(17)).with(12345, RW, json!(0)).with_sdk_range_quirk();
+        let input = RestorePlanInput { source: &source_with_other, source_name: "s.json", source_bytes: &bytes, target: &target, only: Some(&other), body_policy: BodyPolicy::SameBody };
+        let p = build_restore_plan(&cam, &input).unwrap();
+        assert_eq!(p.counts.not_selected, 1);
+        assert!(p.caveats.is_empty(), "{:?}", p.caveats);
+        // Another body's snapshot: ShootingLimit is never written (it reads as a different position
+        // per body), so there is nothing to caveat.
+        let p = burst_plan("Z6_3", burst(1), burst(17), None, "OTHER", BodyPolicy::SameModel);
+        assert_eq!(p.counts.skipped_never, 1);
+        assert!(p.caveats.is_empty(), "{:?}", p.caveats);
+        // The body's scale is not the one the snapshot was read on: skipped, not written.
+        let rescaled = json!({"value": 0.0, "default": 0.0, "value_index": 17, "default_index": 99, "lower": 1.0, "upper": 100.0, "steps": 100});
+        let p = burst_plan("Z6_3", burst(1), rescaled, None, "SER", BodyPolicy::SameBody);
+        assert_eq!(p.counts.skipped_scale, 1);
+        assert!(p.caveats.is_empty(), "{:?}", p.caveats);
+    }
+
+    #[test]
+    fn only_a_stepped_range_at_the_listed_property_qualifies() {
+        // The same index on a different property of a Z6III.
+        let target = Camera { model: "Z6_3".into(), serial: "SER".into(), firmware: "2.00".into() };
+        let mut source = Snapshot::new(target.clone(), Transport::Usb, "t".into());
+        source.insert("kNkMAIDCapability_WBTuneAuto", 33049, stepped(1));
+        let bytes = source.to_pretty_json().unwrap().into_bytes();
+        let cam = FakeCamera::new().with(33049, RW, stepped(5)).with_sdk_range_quirk();
+        let input = RestorePlanInput { source: &source, source_name: "s.json", source_bytes: &bytes, target: &target, only: None, body_policy: BodyPolicy::SameBody };
+        let p = build_restore_plan(&cam, &input).unwrap();
+        assert_eq!(p.counts.written, 1);
+        assert!(p.caveats.is_empty(), "{:?}", p.caveats);
+        // The listed property holding something that is not a stepped range (a plain number 1).
+        let p = burst_plan("Z6_3", json!(1), json!(2), None, "SER", BodyPolicy::SameBody);
+        assert!(p.caveats.is_empty(), "{:?}", p.caveats);
+        // A stepped range with no usable index.
+        let no_index = json!({"value": 0.0, "default": 0.0, "default_index": 200, "lower": 0.0, "upper": 200.0, "steps": 201});
+        let p = burst_plan("Z6_3", no_index, burst(17), None, "SER", BodyPolicy::SameBody);
+        assert!(p.caveats.is_empty(), "{:?}", p.caveats);
+    }
+
+    #[test]
+    fn a_plan_without_the_case_has_an_empty_list_not_a_missing_field() {
+        let w = world();
+        let f = fixture(&w);
+        let v = serde_json::to_value(plan_of(&w, &f)).unwrap();
+        assert_eq!(v["caveats"], json!([]));
     }
 
     // ── the plan ─────────────────────────────────────────────────────────
