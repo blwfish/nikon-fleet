@@ -4,11 +4,15 @@
 # creating and destroying a Tk root per test? Same suite, same Python/Tk, many independent runner VMs:
 #   control  = master's tests (a Tk root per test)
 #   shared   = this branch's tests (one Tk root for the whole session, reset between tests)
-# Not triggered by push or pull_request on purpose: control failures are the thing being measured.
+# Control failures are the thing being measured, so this only runs when this file changes (or by hand).
 # Delete this file once the numbers are in.
 name: gui-flake-check
 
 on:
+  # A workflow that exists only on a branch cannot be dispatched until it has run once; this path-filtered
+  # pull_request trigger runs it when the PR touches this file (and so on each push that edits it).
+  pull_request:
+    paths: ['.github/workflows/gui-flake-check.yml']
   workflow_dispatch:
 
 jobs:
@@ -24,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.variant == 'control' && 'master' || github.sha }}
+          ref: ${{ matrix.variant == 'control' && 'master' || github.event.pull_request.head.sha || github.sha }}
       - run: rustup update stable
       - uses: actions/cache@v4
         with:
