@@ -226,6 +226,10 @@ pub(crate) struct RestorePlanJson {
     pub(crate) steps: Vec<RestoreStepJson>,
     /// Named by `only` but not writable: they would not be restored.
     pub(crate) unrestorable: Vec<(String, String)>,
+    /// Writes this plan would make whose read-back cannot confirm them (the library's own typed
+    /// caveat). Absent from a plan made by a build that predates the field.
+    #[serde(default)]
+    pub(crate) caveats: Vec<nikon_fleet::ops::restore::PlanCaveat>,
     pub(crate) cannot_read: Vec<NotTransferableJson>,
 }
 
@@ -964,6 +968,20 @@ fn draw_restore_plan(ui: &mut egui::Ui, p: &PlannedRestore, can_edit: bool, acti
     ));
     if let Some(note) = &p.source.note {
         ui.label(egui::RichText::new(format!("Names and values: {note}")).small().color(WARN_COLOR));
+    }
+    for c in &plan.caveats {
+        match c.kind {
+            nikon_fleet::ops::restore::PlanCaveatKind::ReadbackCannotConfirm => {
+                ui.colored_label(
+                    WARN_COLOR,
+                    format!(
+                        "{}: the stored position ({}) reads back the same for two different settings on this body (for max shots per burst on a Z6III, infinity and 1 shot), so the read-back cannot confirm this restore. Check it on the camera afterwards.",
+                        short_name(&c.name),
+                        c.value_index
+                    ),
+                );
+            }
+        }
     }
     if let Some(only) = &plan.only {
         ui.horizontal_wrapped(|ui| {
@@ -1720,6 +1738,23 @@ mod tests {
         assert_eq!(plan, plan_of(&world()));
         assert_eq!(log, "a warning");
         assert!(argv_of(dir.path()).contains(&"--dry-run".to_string()));
+    }
+
+    #[test]
+    fn a_plan_caveat_the_library_wrote_is_read_and_a_plan_from_before_the_field_has_none() {
+        use nikon_fleet::ops::restore::{PlanCaveat, PlanCaveatKind};
+        let w = world();
+        assert!(plan_of(&w).caveats.is_empty(), "an ordinary plan names no caveat");
+        // The library's own serialisation of a caveat (the CLI's JSON) reads back as the same typed value.
+        let caveat = PlanCaveat { kind: PlanCaveatKind::ReadbackCannotConfirm, name: "kNkMAIDCapability_ShootingLimit".into(), code: 33086, value_index: 1 };
+        let mut v: serde_json::Value = serde_json::from_str(&plan_text(&w, None)).unwrap();
+        v["caveats"] = serde_json::json!([caveat]);
+        let plan: RestorePlanJson = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(plan.caveats, [caveat]);
+        // A plan printed by a CLI that predates the field has no key at all.
+        v.as_object_mut().unwrap().remove("caveats");
+        let old: RestorePlanJson = serde_json::from_value(v).unwrap();
+        assert!(old.caveats.is_empty());
     }
 
     #[cfg(unix)]

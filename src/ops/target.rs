@@ -34,6 +34,11 @@ pub enum TargetError {
     /// (raw-USB commands) An `id-N` was given, but those commands see only the
     /// USB bus and cannot tell which attached body that SDK id is.
     FallbackUnresolvable { requested: String, attached: usize },
+    /// (`restore` aiming at the serial its own snapshot carries) The snapshot's serial is not a USB
+    /// serial but an SDK id of the session that took it (`id-N`, or a bare number), several attached
+    /// bodies share the snapshot's model, and an SDK id says nothing about which of them it was.
+    /// Resolving it would pick whichever body happens to hold that id in this session.
+    SnapshotSerialAmbiguous { requested: String, model: String, count: usize },
 }
 
 impl TargetError {
@@ -45,6 +50,7 @@ impl TargetError {
             TargetError::DuplicateSerial { .. } => "duplicate_serial",
             TargetError::AmbiguousSerial { .. } => "ambiguous_serial",
             TargetError::FallbackUnresolvable { .. } => "fallback_unresolvable",
+            TargetError::SnapshotSerialAmbiguous { .. } => "snapshot_serial_ambiguous",
         }
     }
 }
@@ -75,6 +81,13 @@ impl std::fmt::Display for TargetError {
                  tell which of the {attached} attached camera(s) that is. Name the body by its real USB \
                  serial, or (when exactly one Nikon camera is attached and it has no readable USB serial) \
                  leave --serial out"
+            ),
+            TargetError::SnapshotSerialAmbiguous { requested, model, count } => write!(
+                f,
+                "the snapshot names its camera {requested:?}, which is an SDK id from the session that took it and \
+                 not a USB serial, and {count} {model:?} bodies are attached, so it does not say which one is meant; \
+                 attach only one {model:?} body, or pass --serial with the real USB serial of the body to restore \
+                 (see `discover`)"
             ),
         }
     }
@@ -185,6 +198,39 @@ pub fn select_by_cli_serial(
         _ => return Err(TargetError::AmbiguousSerial { requested: serial.to_string() }),
     };
     Ok(enriched.into_iter().nth(chosen).expect("index came from this list"))
+}
+
+/// The CLI's rule for the target of a `restore` that was given no `--serial`, so it aims at the
+/// serial its own snapshot carries (`snapshot_serial`, of a body of `snapshot_model`): the CLI's rule
+/// ([`select_by_cli_serial`]) with one refusal added.
+///
+/// A snapshot stamped with a real USB serial names its body. One stamped with an SDK id (`id-N` for a
+/// body whose USB serial was unreadable, or the bare number older output used) names whichever body
+/// holds that id in the session now running, which is a different session from the one that took the
+/// snapshot, and with two bodies of the snapshot's model nothing says which one the snapshot was of.
+/// A restore writes to the camera, so it refuses: [`TargetError::SnapshotSerialAmbiguous`] when the
+/// body was found by SDK id (not by USB serial) and more than one attached body has the snapshot's
+/// model. With one body of that model, or a body found by its USB serial, nothing changes. Every
+/// refusal [`select_by_cli_serial`] makes still comes first.
+///
+/// How the body was found is read from the match itself (its USB serial equals the request or it
+/// does not), so this holds no copy of the `id-N` shape check.
+pub fn select_for_snapshot_serial(
+    enriched: Vec<(DeviceInfo, Option<UsbCameraInfo>)>,
+    snapshot_serial: &str,
+    snapshot_model: &str,
+) -> Result<(DeviceInfo, Option<UsbCameraInfo>), TargetError> {
+    let same_model = crate::ops::cameras::require_unambiguous(&enriched, snapshot_model);
+    let (dev, usb) = select_by_cli_serial(enriched, snapshot_serial)?;
+    let found_by_usb_serial = usb.as_ref().is_some_and(|u| u.serial == snapshot_serial);
+    match same_model {
+        Err(a) if !found_by_usb_serial => Err(TargetError::SnapshotSerialAmbiguous {
+            requested: snapshot_serial.to_string(),
+            model: a.model,
+            count: a.count,
+        }),
+        _ => Ok((dev, usb)),
+    }
 }
 
 /// What to hand the raw-USB commands (`vendor-read`, `vendor-write-ftp`) as
@@ -349,10 +395,18 @@ mod tests {
             TargetError::DuplicateSerial { requested: String::new(), count: 2 }.tag(),
             TargetError::AmbiguousSerial { requested: String::new() }.tag(),
             TargetError::FallbackUnresolvable { requested: String::new(), attached: 0 }.tag(),
+            TargetError::SnapshotSerialAmbiguous { requested: String::new(), model: String::new(), count: 2 }.tag(),
         ];
         assert_eq!(
             tags,
-            ["no_usb_serial", "not_found", "duplicate_serial", "ambiguous_serial", "fallback_unresolvable"]
+            [
+                "no_usb_serial",
+                "not_found",
+                "duplicate_serial",
+                "ambiguous_serial",
+                "fallback_unresolvable",
+                "snapshot_serial_ambiguous"
+            ]
         );
     }
 
@@ -420,6 +474,98 @@ mod tests {
         // SDK ids are unique per session; if that ever failed, the CLI must not take the first.
         let e = vec![(dev(1), None), (dev(1), None)];
         assert_eq!(cli(e, "id-1"), Err(TargetError::DuplicateSerial { requested: "id-1".into(), count: 2 }));
+    }
+
+    // ── a restore aimed at its snapshot's own serial (R17) ───────────────
+
+    fn named(id: u32, model: &str) -> DeviceInfo {
+        DeviceInfo { name: model.into(), ..dev(id) }
+    }
+
+    /// Two Z 9 bodies: SDK ids 1 and 2, neither with a readable USB serial (the case that stamps `id-N`).
+    fn two_serialless_z9() -> Enriched {
+        vec![(named(1, "Z 9"), Some(usb(""))), (named(2, "Z 9"), None)]
+    }
+
+    fn for_snapshot(e: Enriched, serial: &str, model: &str) -> Result<u32, TargetError> {
+        select_for_snapshot_serial(e, serial, model).map(|(d, _)| d.id)
+    }
+
+    fn ambiguous(requested: &str, model: &str, count: usize) -> TargetError {
+        TargetError::SnapshotSerialAmbiguous { requested: requested.into(), model: model.into(), count }
+    }
+
+    #[test]
+    fn an_id_n_snapshot_serial_is_refused_when_two_bodies_of_its_model_are_attached() {
+        assert_eq!(for_snapshot(two_serialless_z9(), "id-1", "Z 9"), Err(ambiguous("id-1", "Z 9", 2)));
+        assert_eq!(for_snapshot(two_serialless_z9(), "id-2", "Z 9"), Err(ambiguous("id-2", "Z 9", 2)));
+        // Three bodies: the count in the error is the real count, not a flag.
+        let three = vec![(named(1, "Z 9"), None), (named(2, "Z 9"), None), (named(3, "Z 9"), None)];
+        assert_eq!(for_snapshot(three, "id-3", "Z 9"), Err(ambiguous("id-3", "Z 9", 3)));
+    }
+
+    #[test]
+    fn a_bare_sdk_id_snapshot_serial_is_refused_the_same_way() {
+        // What older `discover` output stamped for a body with no readable USB serial.
+        assert_eq!(for_snapshot(two_serialless_z9(), "2", "Z 9"), Err(ambiguous("2", "Z 9", 2)));
+    }
+
+    #[test]
+    fn with_exactly_one_body_of_the_model_an_sdk_id_snapshot_serial_still_resolves() {
+        for serial in ["id-1", "1"] {
+            let one = vec![(named(1, "Z 9"), None)];
+            assert_eq!(for_snapshot(one, serial, "Z 9"), Ok(1), "{serial}");
+        }
+        // And agrees with the CLI's own rule, so the new function changes nothing for this case.
+        let one = || vec![(named(1, "Z 9"), None)];
+        assert_eq!(for_snapshot(one(), "id-1", "Z 9"), cli(one(), "id-1"));
+    }
+
+    #[test]
+    fn a_second_body_of_another_model_is_not_a_reason_to_refuse() {
+        let mixed = || vec![(named(1, "Z 9"), None), (named(2, "Z6_3"), None)];
+        assert_eq!(for_snapshot(mixed(), "id-1", "Z 9"), Ok(1));
+        assert_eq!(for_snapshot(mixed(), "id-2", "Z6_3"), Ok(2));
+        // Two Z6_3 and one Z 9: the Z 9 snapshot is unambiguous, the Z6_3 one is not.
+        let three = || vec![(named(1, "Z 9"), None), (named(2, "Z6_3"), None), (named(3, "Z6_3"), None)];
+        assert_eq!(for_snapshot(three(), "id-1", "Z 9"), Ok(1));
+        assert_eq!(for_snapshot(three(), "id-2", "Z6_3"), Err(ambiguous("id-2", "Z6_3", 2)));
+    }
+
+    #[test]
+    fn a_real_usb_serial_is_unaffected_by_other_same_model_bodies() {
+        let e = || vec![(named(1, "Z 9"), Some(usb("AAA"))), (named(2, "Z 9"), Some(usb("BBB")))];
+        assert_eq!(for_snapshot(e(), "AAA", "Z 9"), Ok(1));
+        assert_eq!(for_snapshot(e(), "BBB", "Z 9"), Ok(2));
+    }
+
+    #[test]
+    fn a_numeric_usb_serial_is_a_real_serial_not_an_sdk_id() {
+        // Serial "7" belongs to the body with SDK id 5. Found by its USB serial, so no ambiguity.
+        let e = vec![(named(5, "Z 9"), Some(usb("7"))), (named(6, "Z 9"), Some(usb("AAA")))];
+        assert_eq!(for_snapshot(e, "7", "Z 9"), Ok(5));
+        // The same digits as an SDK id (no body has that USB serial) are refused with two bodies.
+        let e = vec![(named(7, "Z 9"), Some(usb("AAA"))), (named(8, "Z 9"), Some(usb("BBB")))];
+        assert_eq!(for_snapshot(e, "7", "Z 9"), Err(ambiguous("7", "Z 9", 2)));
+    }
+
+    #[test]
+    fn the_clis_own_refusals_still_come_first() {
+        // Not found: an SDK id nobody holds, or a serial nobody has, with two same-model bodies.
+        assert_eq!(for_snapshot(two_serialless_z9(), "id-9", "Z 9"), Err(TargetError::NotFound { requested: "id-9".into() }));
+        assert_eq!(for_snapshot(two_serialless_z9(), "NOPE", "Z 9"), Err(TargetError::NotFound { requested: "NOPE".into() }));
+        // A serial that is one body's USB serial and another's SDK id.
+        let e = vec![(named(1, "Z 9"), Some(usb("AAA"))), (named(2, "Z 9"), Some(usb("1")))];
+        assert_eq!(for_snapshot(e, "1", "Z 9"), Err(TargetError::AmbiguousSerial { requested: "1".into() }));
+        // Empty.
+        assert_eq!(for_snapshot(two_serialless_z9(), "", "Z 9"), Err(TargetError::NoUsbSerial { requested: String::new() }));
+    }
+
+    #[test]
+    fn the_refusal_says_how_to_proceed() {
+        let s = ambiguous("id-1", "Z 9", 2).to_string();
+        assert!(s.contains("id-1") && s.contains("2") && s.contains("Z 9"), "{s}");
+        assert!(s.contains("attach only one") && s.contains("--serial") && s.contains("USB serial"), "{s}");
     }
 
     // ── identity recorded for a body ─────────────────────────────────────

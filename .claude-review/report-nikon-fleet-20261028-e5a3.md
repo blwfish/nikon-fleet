@@ -168,3 +168,7 @@ Verified: Rust 1419 tests and Python 652 tests pass (`make test` now runs both);
 - R18, R19: two Low items in the vendor path (bus touched before the lock; a failed descriptor read reported as "not found").
 
 **Behaviour changes worth a look:** `discover --json`'s `serial` is now the stored identity (`id-N` when there is no USB serial), not the bare SDK id; `vendor-write-ftp` rejects SSIDs over 32 bytes and control characters; `make test` needs pytest; the CLI's `--data-dir` default stays `.` on purpose (see `nikon-fleet settings show`).
+
+## Remediation (2026-10-30, `nikon-fleet-remediate-20261030-3afc`)
+
+Remediated the deferred Mediums of nikon-fleet with the High (#04) left alone at the owner's direction (it depends on the snooping system and protocol reverse engineering). Of the Mediums touching this report: **#36** stays deferred (needs hardware: the second Z 9 and captures per model and state). **R17** stays deferred with a narrower reason: commit `c2f9d59` makes a restore with no `--serial` refuse (`TargetError::SnapshotSerialAmbiguous`, exit 6) when its `id-N` / bare-SDK-id snapshot serial could mean any of several same-model bodies. Still open: the GUI always passes an explicit `--serial` from its listing, and an explicit `--serial id-N` on the CLI is not refused. Closing it means refusing that too, or a stable identity for serial-less bodies. Unverified: the real-restore stderr warning path was tested only as far as the warning, because the apply fails on the fake body.

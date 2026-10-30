@@ -399,6 +399,61 @@ impl RestoreRun {
     }
 }
 
+/// A restore step whose read-back cannot confirm it: the body reads two different states as the
+/// same value, so a read-back that agrees with the snapshot does not show the restore did what the
+/// snapshot meant. Typed (a closed vocabulary), so a front end branches on [`tag`](Self::tag) and
+/// never on the wording of a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanCaveatKind {
+    /// The value written reads back identically for two different settings, so a read-back of it is
+    /// no confirmation of either. See [`AMBIGUOUS_READBACKS`].
+    ReadbackCannotConfirm,
+}
+
+impl PlanCaveatKind {
+    /// Closed machine-readable tag. Exhaustive match.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            PlanCaveatKind::ReadbackCannotConfirm => "readback_cannot_confirm",
+        }
+    }
+}
+
+/// One caveat on a restore plan: the property it is about and the value that makes it ambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanCaveat {
+    pub kind: PlanCaveatKind,
+    pub name: String,
+    pub code: u32,
+    /// The stored position that is written and cannot be confirmed.
+    pub value_index: u64,
+}
+
+/// Values a body reads back identically for two different settings, so writing one of them cannot
+/// be confirmed by reading it back. `(capability code, camera.model, stepped-range position)`.
+///
+/// `ShootingLimit` (33086, max shots per burst, Custom Setting d2) on a Z6III (`Z6_3`): the range
+/// runs 0 to 200 with the index equal to the number, and infinity reads index 1, the same as
+/// 1 shot (docs/mcp-hardware-findings.md F25: 1 reads 1, 17 reads 17, 200 reads 200, infinity reads
+/// 1; confirmed at the camera's display). A snapshot cannot tell which of the two it holds, so a
+/// restore of index 1 may leave 1 shot per burst where the body was at infinity, and the read-back
+/// says `verified` either way. The Z 9 (infinity is index 0) and the Z5 (no infinity) do not have
+/// this ambiguity, and no other value on the Z6III does.
+pub const AMBIGUOUS_READBACKS: &[(u32, &str, u64)] = &[(33086, "Z6_3", 1)];
+
+/// The caveat for writing `stored` to property `code` on a body of `model`, if that write is one
+/// whose read-back cannot confirm it. Only a stepped range at exactly the listed position qualifies.
+pub fn readback_caveat(model: &str, name: &str, code: u32, stored: &Value) -> Option<PlanCaveat> {
+    let index = if is_stepped_range(stored) { stored.get("value_index")?.as_u64()? } else { return None };
+    AMBIGUOUS_READBACKS.iter().any(|&(c, m, i)| c == code && m == model && i == index).then(|| PlanCaveat {
+        kind: PlanCaveatKind::ReadbackCannotConfirm,
+        name: name.to_string(),
+        code,
+        value_index: index,
+    })
+}
+
 /// The struct to hand to the SDK for `stored`. A stepped range's `value` field is
 /// `0.0` in every snapshot (F18), so writing it back as stored would send a
 /// position of `value_index` and a number of 0; which of the two the camera honours
@@ -752,6 +807,18 @@ mod tests {
         let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(7, &ro)]);
         assert_eq!(restore_precheck(&caps, 7).err(), Some(RestoreSkip::ReadOnly));
         assert_eq!(restore_precheck(&caps, 8).err(), Some(RestoreSkip::Absent));
+    }
+
+    #[test]
+    fn every_ambiguous_readback_is_a_property_a_restore_of_the_same_body_writes() {
+        // The caveat table must name a property the other tables know under the same code and name,
+        // or it describes nothing: ShootingLimit is on NEVER_TRANSLATED (restored only onto its own body).
+        for &(code, _, _) in AMBIGUOUS_READBACKS {
+            let (c, name, _) = transplant::NEVER_TRANSLATED.iter().find(|(c, _, _)| *c == code).expect("listed code is a known property");
+            assert_eq!((*c, *name), (33086, "kNkMAIDCapability_ShootingLimit"));
+        }
+        assert_eq!(AMBIGUOUS_READBACKS, &[(33086, "Z6_3", 1)]);
+        assert_eq!(PlanCaveatKind::ReadbackCannotConfirm.tag(), "readback_cannot_confirm");
     }
 
     #[test]

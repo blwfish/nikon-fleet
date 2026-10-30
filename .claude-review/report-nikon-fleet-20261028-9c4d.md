@@ -150,3 +150,7 @@ What changed that a reader of the earlier findings should know:
 - **Test double**: `sdk::prepare_write` is the one place that decides what is writable; `FakeCamera` uses it and keeps the body's own scale on a write.
 
 Not done, with reasons: #28 (capture-first with replayed reads), #30, #31 and #24 are larger redesigns; the deferred Lows are listed in the ledger. A string or boolean is still written without a read, so a transplant retry that copies only strings is not a no-op (a plan's digest deliberately does not depend on such properties' current values). One supervisor timing test failed once under load during the run and did not reproduce in five further full runs.
+
+## Remediation (2026-10-30, `nikon-fleet-remediate-20261030-3afc`)
+
+**#24** and **#31** reviewed and left deferred: both are redesigns in `src/transplant.rs` (a single per-code policy record; a model registry), a file that protocol work from the snooping system is about to change. Nothing changed in code for them. Fixed the related light-review finding 1f6c#04 in `c2f9d59`.
