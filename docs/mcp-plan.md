@@ -327,7 +327,7 @@ restore should bring it back. It is on a second table, `NEVER_TRANSLATED`, read 
 *another* body, by `restore` (a restore of the body's own snapshot does not read it): the SDK reads the same menu setting as a different index on each body (infinity is index 0 on a Z 9, index 1 on a
 Z6III where it is indistinguishable from 1 shot, and the Z5 has no infinity; F25), which only matters when a value is carried from
 one body to another. Decided 2026-10-28 (the user): a restore returns a body to what the same body stored, so there is nothing to
-interpret. Caveat, not tested: a Z6III snapshot taken at infinity stores index 1, so its restore may leave 1 shot per burst.
+interpret. Caveat, not tested: a Z6III snapshot taken at infinity stores index 1, so its restore may leave 1 shot per burst. The restore plan now names the case (2026-10-30): a plan that would write `ShootingLimit` at index 1 onto a `Z6_3` carries a typed `caveats` entry (`readback_cannot_confirm`, `restore::AMBIGUOUS_READBACKS`), because the snapshot cannot tell infinity from 1 shot and the read-back says `verified` either way.
 
 ### 5.3a Ranges: default-deny between models (2026-10-28)
 

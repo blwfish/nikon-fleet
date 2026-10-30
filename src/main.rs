@@ -44,7 +44,7 @@ use nikon_fleet::ops::labels::{self, Labels};
 use nikon_fleet::ops::render;
 use nikon_fleet::ops::restore;
 use nikon_fleet::ops::target::{
-    TargetError, body_firmware, raw_usb_serial_arg, select_by_cli_serial, storable_serial,
+    TargetError, body_firmware, raw_usb_serial_arg, select_by_cli_serial, select_for_snapshot_serial, storable_serial,
 };
 use nikon_fleet::sdk::{Device, DeviceInfo, Sdk, UsbCameraInfo, pair_devices, usb_camera_list};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
@@ -638,7 +638,10 @@ struct VendorWriteFtpArgs {
 struct RestoreArgs {
     /// Snapshot to restore from. Resolved relative to snapshots/ if not absolute.
     snapshot_path: PathBuf,
-    /// Target camera serial. Defaults to the serial recorded in the snapshot.
+    /// Target camera serial. Defaults to the serial recorded in the snapshot. A snapshot recorded
+    /// with an SDK id instead of a USB serial (`id-N`, or a bare number) names whichever body holds
+    /// that id now, so with more than one body of the snapshot's model attached the restore
+    /// refuses; attach only one body of that model, or pass --serial with the real USB serial.
     #[arg(long)]
     serial: Option<String>,
     /// Print what would be written without sending anything to the camera.
@@ -2553,6 +2556,9 @@ fn restore_on_port<P: nikon_fleet::ops::port::CameraPort + ?Sized>(
 
     if args.dry_run {
         product.say(cli_report::render_restore_dry_run(&plan.steps, &plan.counts, setup.only.is_some()));
+        for line in cli_report::restore_caveat_lines(&plan.caveats) {
+            product.say(format!("{line}\n"));
+        }
         product.say(format!("Plan: {}\nDigest: {}\n", plan.summary, plan.digest));
         if json {
             product.out.push(RestoreOut::Json(serde_json::to_string_pretty(&plan)?));
@@ -2564,6 +2570,12 @@ fn restore_on_port<P: nikon_fleet::ops::port::CameraPort + ?Sized>(
             bail!("{msg}");
         }
         return Ok(());
+    }
+
+    // A value the read-back cannot confirm is said before anything is written, not after a
+    // "verified" verdict.
+    for line in cli_report::restore_caveat_lines(&plan.caveats) {
+        product.out.push(RestoreOut::Warn(line));
     }
 
     // Unless the caller presents a plan it approved (--expect-digest, the way the GUI does), the
@@ -2612,6 +2624,30 @@ fn after_restore_apply<R>(
     Ok(report)
 }
 
+/// The body a restore writes to: the one `--serial` names, else the one the snapshot's own serial
+/// names. A serial given with `--serial` is the person's say; the snapshot's own is trusted only
+/// when it is a USB serial or no second body of its model could be mistaken for it
+/// (`select_for_snapshot_serial`). A refusal here is an error before any write, so a real restore
+/// ends with `EXIT_REFUSED_BEFORE_WRITE` (`restore_finish`) like every other target refusal.
+fn restore_target(
+    enriched: Vec<(DeviceInfo, Option<UsbCameraInfo>)>,
+    serial_arg: Option<&str>,
+    snap: &Snapshot,
+) -> Result<(DeviceInfo, Option<UsbCameraInfo>)> {
+    let target_serial = serial_arg.unwrap_or(&snap.camera.serial);
+    let selected = match serial_arg {
+        Some(s) => select_by_cli_serial(enriched, s),
+        None => select_for_snapshot_serial(enriched, &snap.camera.serial, &snap.camera.model),
+    };
+    selected.map_err(|e| match e {
+        TargetError::NotFound { .. } => anyhow::anyhow!(
+            "no connected camera with serial {}  (snapshot is for {} {})",
+            target_serial, snap.camera.model, snap.camera.serial
+        ),
+        other => anyhow::anyhow!("{other}"),
+    })
+}
+
 fn restore_run(
     data_dir: &Path,
     bundle: &Path,
@@ -2643,15 +2679,7 @@ fn restore_run(
     }
     let enriched = enrich_devices(devices);
 
-    // Match by --serial override, or by the serial embedded in the snapshot.
-    let target_serial = args.serial.as_deref().unwrap_or(&snap.camera.serial);
-    let (target, usb_info) = select_by_cli_serial(enriched, target_serial).map_err(|e| match e {
-        TargetError::NotFound { .. } => anyhow::anyhow!(
-            "no connected camera with serial {}  (snapshot is for {} {})",
-            target_serial, snap.camera.model, snap.camera.serial
-        ),
-        other => anyhow::anyhow!("{other}"),
-    })?;
+    let (target, usb_info) = restore_target(enriched, args.serial.as_deref(), &snap)?;
 
     say(json, &format!("Connecting to {:?} (id={})…\n", target.name, target.id));
     let device = sdk.connect(target.id)?;
@@ -4739,6 +4767,119 @@ mod tests {
             let dry = args(&["--dry-run"]);
             assert_eq!(exit_code_for(&restore_finish(Err(boom()), &dry, false).unwrap_err()), 1);
             assert!(restore_finish(Ok(()), &a, false).is_ok());
+        }
+
+        // ── a restore that cannot be confirmed by its read-back (F25) ───────────
+
+        /// A Z6III holding 17 shots per burst, and a snapshot of it that stores `stored_index`.
+        fn burst_restore(stored_index: u64, model: &str, a: &RestoreArgs) -> RestoreProduct {
+            let range = |i: u64| serde_json::json!({"value": 0.0, "default": 0.0, "value_index": i, "default_index": 200, "lower": 0.0, "upper": 200.0, "steps": 201});
+            let identity = Camera { model: model.into(), serial: "T1".into(), firmware: "2.00".into() };
+            let mut snap = Snapshot::new(identity.clone(), Transport::Usb, "2026-10-28T10:00:00Z".into());
+            snap.insert("kNkMAIDCapability_ShootingLimit", 33086, range(stored_index));
+            let bytes = snap.to_pretty_json().unwrap().into_bytes();
+            let cam = FakeCamera::new().with(33086, RW, range(17)).with_sdk_range_quirk();
+            let names = HashMap::from([(33086, "kNkMAIDCapability_ShootingLimit".to_string())]);
+            let dir = tempfile::tempdir().unwrap();
+            let setup = RestoreSetup {
+                snap: &snap,
+                source_name: "z6iii.json",
+                source_bytes: &bytes,
+                only: None,
+                identity: &identity,
+                snapshots_dir: dir.path(),
+                name_lookup: &names,
+                captured_at: "2026-10-28T17:26:00Z".into(),
+            };
+            let mut product = RestoreProduct::default();
+            let mut in_hand = false;
+            let _ = restore_on_port(&cam, a, &setup, &mut product, &mut in_hand);
+            product
+        }
+
+        fn caveat_lines(p: &RestoreProduct) -> Vec<&RestoreOut> {
+            p.out.iter().filter(|o| matches!(o, RestoreOut::Say(t) | RestoreOut::Warn(t) if t.contains("cannot confirm"))).collect()
+        }
+
+        #[test]
+        fn a_restore_that_would_write_the_ambiguous_burst_value_says_so_in_the_plan_and_before_the_write() {
+            // Dry run: the caveat is in the printed plan (text) and in the JSON document.
+            let dry = burst_restore(1, "Z6_3", &args(&["--dry-run"]));
+            let lines = caveat_lines(&dry);
+            assert_eq!(lines.len(), 1, "{:?}", dry.out);
+            assert!(matches!(lines[0], RestoreOut::Say(t) if t.contains("kNkMAIDCapability_ShootingLimit")), "{:?}", lines[0]);
+            let plan: serde_json::Value = serde_json::from_str(dry.json().unwrap()).unwrap();
+            assert_eq!(plan["caveats"][0]["kind"], "readback_cannot_confirm", "{plan}");
+            // A real restore: a warning on stderr, pushed before the apply runs (whatever the apply then does).
+            let real = burst_restore(1, "Z6_3", &args(&["--allow-partial"]));
+            assert!(matches!(caveat_lines(&real).as_slice(), [RestoreOut::Warn(_)]), "{:?}", real.out);
+        }
+
+        #[test]
+        fn neighbouring_values_and_other_models_print_no_caveat() {
+            for (index, model) in [(0, "Z6_3"), (2, "Z6_3"), (1, "Z 9"), (1, "Z 5")] {
+                let dry = burst_restore(index, model, &args(&["--dry-run"]));
+                assert!(caveat_lines(&dry).is_empty(), "{model} index {index}: {:?}", dry.out);
+                let plan: serde_json::Value = serde_json::from_str(dry.json().unwrap()).unwrap();
+                assert_eq!(plan["caveats"], serde_json::json!([]), "{model} index {index}");
+            }
+        }
+
+        // ── which body a restore writes to (R17) ─────────────────────────────────
+
+        fn z9(id: u32, usb_serial: Option<&str>) -> (DeviceInfo, Option<UsbCameraInfo>) {
+            (dev(id), usb_serial.map(usb))
+        }
+
+        fn snapshot_of_serial(serial: &str, model: &str) -> Snapshot {
+            Snapshot::new(Camera { model: model.into(), serial: serial.into(), firmware: "5.31".into() }, Transport::Usb, "2026-10-27T10:00:00Z".into())
+        }
+
+        #[test]
+        fn a_snapshot_stamped_with_an_sdk_id_is_not_restored_onto_one_of_two_same_model_bodies() {
+            let two = || vec![z9(1, None), z9(2, None)];
+            for serial in ["id-1", "id-2", "1", "2"] {
+                let err = restore_target(two(), None, &snapshot_of_serial(serial, "Z 9")).unwrap_err();
+                let typed = err.to_string();
+                assert!(typed.contains("attach only one") && typed.contains("--serial"), "{serial}: {typed}");
+            }
+            // Exactly the typed refusal, not NotFound or a pick.
+            assert_eq!(
+                select_for_snapshot_serial(two(), "id-1", "Z 9").unwrap_err(),
+                TargetError::SnapshotSerialAmbiguous { requested: "id-1".into(), model: "Z 9".into(), count: 2 }
+            );
+        }
+
+        #[test]
+        fn with_one_body_of_the_model_a_snapshot_sdk_id_still_picks_it_and_a_second_model_does_not_count() {
+            let one = restore_target(vec![z9(1, None)], None, &snapshot_of_serial("id-1", "Z 9")).unwrap();
+            assert_eq!(one.0.id, 1);
+            let other_model = (DeviceInfo { name: "Z6_3".into(), ..dev(2) }, None);
+            let mixed = restore_target(vec![z9(1, None), other_model], None, &snapshot_of_serial("id-1", "Z 9")).unwrap();
+            assert_eq!(mixed.0.id, 1);
+        }
+
+        #[test]
+        fn a_real_usb_serial_in_the_snapshot_and_an_explicit_serial_are_not_second_guessed() {
+            let two = || vec![z9(1, Some("AAA")), z9(2, Some("BBB"))];
+            assert_eq!(restore_target(two(), None, &snapshot_of_serial("BBB", "Z 9")).unwrap().0.id, 2);
+            // The person named the body with --serial, even as an id-N: their say, as before.
+            let serialless = || vec![z9(1, None), z9(2, None)];
+            assert_eq!(restore_target(serialless(), Some("id-2"), &snapshot_of_serial("id-1", "Z 9")).unwrap().0.id, 2);
+            // And a --serial that finds nobody keeps the old message naming the snapshot.
+            let missing = restore_target(two(), Some("NOPE"), &snapshot_of_serial("AAA", "Z 9")).unwrap_err().to_string();
+            assert!(missing.contains("no connected camera with serial NOPE") && missing.contains("snapshot is for Z 9 AAA"), "{missing}");
+        }
+
+        #[test]
+        fn the_ambiguous_target_refusal_ends_a_real_restore_with_the_refused_before_write_status() {
+            let err = restore_target(vec![z9(1, None), z9(2, None)], None, &snapshot_of_serial("id-1", "Z 9")).unwrap_err();
+            // Same path every other refusal before a report takes: nothing was written, and says so.
+            let real = restore_finish(Err(err), &args(&[]), false).unwrap_err();
+            assert_eq!(exit_code_for(&real), EXIT_REFUSED_BEFORE_WRITE, "{real:?}");
+            let err = restore_target(vec![z9(1, None), z9(2, None)], None, &snapshot_of_serial("id-1", "Z 9")).unwrap_err();
+            let dry = restore_finish(Err(err), &args(&["--dry-run"]), false).unwrap_err();
+            assert_eq!(exit_code_for(&dry), 1, "a dry run keeps the plain failure");
         }
 
         #[test]
