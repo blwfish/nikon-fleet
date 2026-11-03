@@ -3042,7 +3042,7 @@ fn run(cli: Cli) -> Result<()> {
 fn main() {
     let cli = Cli::parse();
     // Test hook, not an option: with this variable set the command line is parsed and nothing runs.
-    // tests/gui_cli_argv_parity.rs feeds it every argv the Python GUI builds. An environment
+    // tests/gui_argv_cli.rs feeds it every argv the GUI builds. An environment
     // variable rather than a flag, so no wrapper script can turn a real command into a silent
     // exit 0 by adding an argument.
     if std::env::var_os("NIKON_FLEET_PARSE_ONLY").is_some_and(|v| v == "1") {
@@ -3105,7 +3105,7 @@ mod tests {
     // ── firmware latest --json shape ─────────────────────────────────────
 
     // ── reference_filename parity ────────────────────────────────────────
-    // Python GUI uses: f"{model.replace(' ', '_')}_{serial}.json"
+    // The GUI uses: format!("{model with ' ' as '_'}_{serial}.json")
     // This test pins that contract so CLI and GUI produce identical paths.
     // A mismatch breaks `fleet check` because the reference file cannot be found.
 

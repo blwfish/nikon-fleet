@@ -114,7 +114,7 @@ fn write_synced(file: &mut fs::File, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// `errno`s that mean "this filesystem has no hard links" (macOS FAT/exFAT/SMB give `EPERM`), as
-/// opposed to a real failure. The same set `gui/fleet_archive.py` falls back on.
+/// opposed to a real failure.
 fn hard_links_unsupported(e: &std::io::Error) -> bool {
     matches!(
         e.raw_os_error(),

@@ -2336,7 +2336,7 @@ fn do_vendor_read(propcode: u16, serial: Option<&str>) -> Result<VendorOut, Stri
 /// Metal surface and segfaulted the GUI), and whether this path triggers it
 /// was never verified. A subprocess takes the question away: the churn
 /// happens outside this process, and if the child dies it comes back as an
-/// error string. (`gui/fleet_gui.py` has always worked this way.)
+/// error string.
 fn vendor_read_via(cli: &Path, propcode: u16, serial: Option<&str>, timeout: Duration) -> Result<VendorOut, String> {
     let out = run_cli(cli, &vendor_read_argv(propcode, serial), None, timeout).map_err(|e| e.message)?;
     Ok(VendorOut { text: out.stdout, stderr: out.stderr })
@@ -3877,8 +3877,7 @@ fn describe_reference(r: &ReferenceReport) -> OpDone {
 
 // ── Pack / unpack ─────────────────────────────────────────────────────────
 
-/// Archive layout, one table for export and import (the Python GUI's `accept_zip_entry` follows
-/// the same rule; the cases are in `gui/tests-fixtures/zip_entry_names.json`):
+/// Archive layout, one table for export and import (the cases are in `gui/tests-fixtures/zip_entry_names.json`):
 ///
 /// ```text
 ///   snapshots/<file>.json
@@ -4981,7 +4980,7 @@ mod tests {
 
     #[test]
     fn listing_matches_the_shared_reference_parity_fixture() {
-        // Same directory and expectations as ops::list's test and gui/test_fleet_lib.py.
+        // Same directory and expectations as ops::list's test.
         let fx = fixtures().join("reference_parity");
         let expected: HashMap<String, HashMap<String, bool>> =
             serde_json::from_str(&fs::read_to_string(fx.join("expected.json")).unwrap()).unwrap();

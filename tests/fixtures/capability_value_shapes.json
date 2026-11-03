@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared fixture closing the gap where gui/fleet_lib.py's fmt_cap_value() hand-matched src/sdk.rs's decode_value()/decode_enum_values() output shapes with nothing to catch drift. src/sdk.rs's tests assert these are exactly what Rust produces (see decode_string_ptr / decode_integer_by_value / decode_range_ptr / enum_values_unsigned4 / enum_values_packed_string); gui/test_fleet_lib.py asserts fmt_cap_value handles every one without raising. Edit both test files together with this fixture.",
+  "_comment": "Shared fixture of the value shapes src/sdk.rs's decode_value()/decode_enum_values() produce. src/sdk.rs's tests assert these are exactly what Rust produces (see decode_string_ptr / decode_integer_by_value / decode_range_ptr / enum_values_unsigned4 / enum_values_packed_string).",
   "unsigned_scalar": 100,
   "integer_scalar": -5,
   "float_scalar": 5.6,

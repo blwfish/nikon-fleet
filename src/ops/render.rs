@@ -1,5 +1,5 @@
 //! What a snapshot holds, as text a person can read: the one formatter the CLI (`show`), the
-//! egui GUI's snapshot window and (by parity fixture) the Python GUI's detail window share.
+//! egui GUI's snapshot window share.
 //!
 //! [`render_value`] takes the JSON `sdk::decode_value` produced for one property and returns a
 //! [`Rendered`]: the text to show, a closed [`Kind`] saying what shape it was, and closed [`Note`]s
@@ -9,15 +9,15 @@
 //! (a stepped range keeps its position in `value_index` and leaves `value` at junk 0.0), not
 //! re-derived here.
 //!
-//! The display strings of well-formed values are those of `gui/fleet_lib.py`'s `fmt_cap_value`.
-//! `gui/tests-fixtures/render_values.json` is the table both sides are tested against.
+//! `gui/tests-fixtures/render_values.json` is the table of display strings of well-formed values
+//! this module is tested against.
 //! [`render_snapshot`] renders a whole snapshot, sorted by name, optionally filtered.
 //!
 //! The `_with`/`_opts` functions add what only the SDK's own files can say (`ops::labels`): an
 //! enumeration's current value is shown with its name (`Label (3)`), a value its list does
 //! not have is flagged, rows carry a display name, and a range shows its scale
 //! (`612.0 (0..1224, 1225 steps)`). The plain functions show none of that, so their strings are the
-//! ones `render_values.json` pins for the Python GUI too. Without labels the viewer entry points
+//! ones `render_values.json` pins. Without labels the viewer entry points
 //! still work: they show the numbers, and say the names are unavailable.
 
 use std::path::{Path, PathBuf};
