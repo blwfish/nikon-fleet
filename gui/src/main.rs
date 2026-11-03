@@ -21,6 +21,11 @@ use nikon_fleet::ops::render::{self, Row, RowFilter};
 use nikon_fleet::ops::target::{is_id_fallback, storable_serial};
 use nikon_fleet::ptp_usb::{self, FtpField, FtpProfile};
 use nikon_fleet::settings::{self, Settings};
+
+use crate::menu::{Entry, MenuAction, menus};
+
+/// macOS gets a native menu bar and "Settings…"; elsewhere the menus are drawn in the window.
+const MACOS: bool = cfg!(target_os = "macos");
 use nikon_fleet::snapshot::Snapshot;
 use nikon_fleet::transplant::{PROPERTY_PREFIX, Severity};
 use nikon_fleet::vendor_argv::{vendor_read_argv, vendor_write_ftp_argv};
@@ -30,6 +35,7 @@ use zip::{ZipArchive, ZipWriter};
 
 mod check;
 mod guarded;
+mod menu;
 mod firmware_win;
 mod restore;
 
@@ -668,6 +674,10 @@ struct FleetApp {
     settings: SettingsState,
     prefs_open: bool,
     prefs_data_dir: String,
+    about_open: bool,
+    /// The native macOS menu bar; `None` elsewhere, or if it could not be installed (the window draws its own).
+    #[cfg(target_os = "macos")]
+    native_menu: Option<menu::native::NativeMenu>,
     // Vendor ops (raw USB PTP — see docs/nx-field-session-2026-07-09.md)
     vendor_ops_open: bool,
     vendor_propcode: String,
@@ -695,6 +705,11 @@ impl FleetApp {
         let initial = settings.data_dir_or_err();
         std::thread::spawn(move || worker(cmd_rx, evt_tx, ctx, initial));
 
+        #[cfg(target_os = "macos")]
+        let (native_menu, menu_error) = match menu::native::NativeMenu::install(&cc.egui_ctx) {
+            Ok(m) => (Some(m), None),
+            Err(e) => (None, Some(format!("The macOS menu bar could not be installed ({e}); the menus are in the window instead."))),
+        };
         let mut app = Self {
             cmd_tx,
             evt_rx,
@@ -715,6 +730,9 @@ impl FleetApp {
             settings,
             prefs_open: false,
             prefs_data_dir,
+            about_open: false,
+            #[cfg(target_os = "macos")]
+            native_menu,
             vendor_ops_open: false,
             vendor_propcode: "0xD053".to_string(),
             vendor_read_result: String::new(),
@@ -726,6 +744,10 @@ impl FleetApp {
             check: CheckUi::default(),
             firmware: FwUi::default(),
         };
+        #[cfg(target_os = "macos")]
+        if let Some(m) = menu_error {
+            app.notices.push(m);
+        }
         app.refresh_listing();
         app
     }
@@ -955,9 +977,12 @@ impl eframe::App for FleetApp {
         self.restore.sync(&self.cameras);
         self.check.sync(&self.cameras);
         self.poll_firmware(ctx);
+        self.handle_native_menu(ctx);
+        self.ui_menu_bar(ctx);
         self.ui_toolbar(ctx);
         self.ui_notices(ctx);
         self.ui_preferences(ctx);
+        self.ui_about(ctx);
         self.ui_vendor_ops(ctx);
         self.ui_transplant(ctx);
         self.ui_restore(ctx);
@@ -978,24 +1003,6 @@ impl FleetApp {
                         self.send(Cmd::Discover);
                     }
                 });
-                if ui.button("⚙ Preferences").clicked() {
-                    self.prefs_open = !self.prefs_open;
-                }
-                if ui.button("🔧 Vendor Ops").clicked() {
-                    self.vendor_ops_open = !self.vendor_ops_open;
-                }
-                if ui.button("⇄ Transplant").clicked() {
-                    self.transplant.open = !self.transplant.open;
-                }
-                if ui.button("↺ Restore").clicked() {
-                    self.restore.open = !self.restore.open;
-                }
-                if ui.button("✓ Check").clicked() {
-                    self.check.open = !self.check.open;
-                }
-                if ui.button("⬆ Firmware").clicked() {
-                    self.firmware.open = !self.firmware.open;
-                }
                 ui.separator();
                 if let Some(since) = self.busy_since {
                     // No animated spinner: it repaints every frame. A once-a-second
@@ -1047,12 +1054,8 @@ impl FleetApp {
         let mut save_prefs = false;
         let mut reload_prefs = false;
         let mut cancel_prefs = false;
-        let mut export_trigger = false;
-        let mut import_trigger = false;
-        let busy = self.busy();
-        let data_ready = self.settings.data_dir.is_some();
 
-        egui::Window::new("Preferences")
+        egui::Window::new(MenuAction::Preferences.label(MACOS).trim_end_matches('…'))
             .open(&mut prefs_open)
             .resizable(false)
             .collapsible(false)
@@ -1088,33 +1091,6 @@ impl FleetApp {
                 if let Some(dir) = &self.settings.data_dir {
                     ui.label(egui::RichText::new(format!("In use: {}", dir.display())).small().weak());
                 }
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-
-                ui.label("Move data to another machine:");
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!busy && data_ready, |ui| {
-                        if ui
-                            .button("↑  Export all…")
-                            .on_hover_text("Pack snapshots, references and the firmware archive into a zip archive")
-                            .clicked()
-                        {
-                            export_trigger = true;
-                        }
-                        if ui
-                            .button("↓  Import archive…")
-                            .on_hover_text(
-                                "Add the archive's files to the current data directory. Files that already exist are kept, never replaced.",
-                            )
-                            .clicked()
-                        {
-                            import_trigger = true;
-                        }
-                    });
-                });
 
                 ui.add_space(8.0);
                 ui.separator();
@@ -1157,23 +1133,129 @@ impl FleetApp {
             prefs_open = false;
         }
         self.prefs_open = prefs_open;
+    }
 
-        // File dialogs for export/import — open native dialogs, then dispatch
-        // to the worker so the UI shows progress during the zip operation.
-        if export_trigger {
-            if let Some(dest) = rfd::FileDialog::new()
-                .set_file_name("fleet-export.zip")
-                .add_filter("Zip archive", &["zip"])
-                .save_file()
-            {
-                self.send(Cmd::Export { dest });
-            }
+    // ── Menu bar ────────────────────────────────────────────────────────
+
+    fn menu_enabled(&self, action: MenuAction) -> bool {
+        match action {
+            MenuAction::Discover => !self.busy(),
+            MenuAction::Export | MenuAction::Import => !self.busy() && self.settings.data_dir.is_some(),
+            MenuAction::Quit
+            | MenuAction::Preferences
+            | MenuAction::Transplant
+            | MenuAction::Restore
+            | MenuAction::Check
+            | MenuAction::VendorOps
+            | MenuAction::Firmware
+            | MenuAction::About => true,
         }
-        if import_trigger {
-            if let Some(src) = rfd::FileDialog::new().add_filter("Zip archive", &["zip"]).pick_file() {
-                self.send(Cmd::Import { src });
-            }
+    }
+
+    /// Do what a menu item says. A disabled item is refused here too, not only greyed out, so a
+    /// shortcut or a click that raced a state change cannot start a second operation.
+    fn do_menu_action(&mut self, ctx: &egui::Context, action: MenuAction) {
+        if !self.menu_enabled(action) {
+            return;
         }
+        match action {
+            MenuAction::Export => self.start_export(),
+            MenuAction::Import => self.start_import(),
+            MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            MenuAction::Preferences => self.prefs_open = true,
+            MenuAction::Discover => {
+                // A dead worker says so in the status line (see `send`).
+                self.send(Cmd::Discover);
+            }
+            MenuAction::Transplant => self.transplant.open = true,
+            MenuAction::Restore => self.restore.open = true,
+            MenuAction::Check => self.check.open = true,
+            MenuAction::VendorOps => self.vendor_ops_open = true,
+            MenuAction::Firmware => self.firmware.open = true,
+            MenuAction::About => self.about_open = true,
+        }
+    }
+
+    /// Clicks on the native macOS menu bar; also keeps its items' enabled state current.
+    #[cfg(target_os = "macos")]
+    fn handle_native_menu(&mut self, ctx: &egui::Context) {
+        let Some(nm) = &self.native_menu else { return };
+        nm.set_enabled(|a| self.menu_enabled(a));
+        for action in nm.clicked() {
+            self.do_menu_action(ctx, action);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn handle_native_menu(&mut self, _ctx: &egui::Context) {}
+
+    fn has_native_menu(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.native_menu.is_some();
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
+    /// The in-window menu bar, for platforms (and a macOS failure) without a native one.
+    fn ui_menu_bar(&mut self, ctx: &egui::Context) {
+        if self.has_native_menu() {
+            return;
+        }
+        let mut chosen = None;
+        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                for m in menus(MACOS) {
+                    ui.menu_button(m.title, |ui| {
+                        for entry in &m.entries {
+                            match entry {
+                                Entry::Item(a) => {
+                                    let button = egui::Button::new(a.label(MACOS));
+                                    if ui.add_enabled(self.menu_enabled(*a), button).clicked() {
+                                        chosen = Some(*a);
+                                        ui.close();
+                                    }
+                                }
+                                Entry::Separator => {
+                                    ui.separator();
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        if let Some(a) = chosen {
+            self.do_menu_action(ctx, a);
+        }
+    }
+
+    fn start_export(&mut self) {
+        if let Some(dest) = rfd::FileDialog::new()
+            .set_file_name("fleet-export.zip")
+            .add_filter("Zip archive", &["zip"])
+            .save_file()
+        {
+            self.send(Cmd::Export { dest });
+        }
+    }
+
+    fn start_import(&mut self) {
+        if let Some(src) = rfd::FileDialog::new().add_filter("Zip archive", &["zip"]).pick_file() {
+            self.send(Cmd::Import { src });
+        }
+    }
+
+    fn ui_about(&mut self, ctx: &egui::Context) {
+        let mut open = self.about_open;
+        egui::Window::new(MenuAction::About.label(MACOS))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.heading("Fleet — Nikon Camera Manager");
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+            });
+        self.about_open = open;
     }
 
     fn ui_vendor_ops(&mut self, ctx: &egui::Context) {
@@ -2254,7 +2336,7 @@ fn do_vendor_read(propcode: u16, serial: Option<&str>) -> Result<VendorOut, Stri
 /// Metal surface and segfaulted the GUI), and whether this path triggers it
 /// was never verified. A subprocess takes the question away: the churn
 /// happens outside this process, and if the child dies it comes back as an
-/// error string. (`gui/fleet_gui.py` has always worked this way.)
+/// error string.
 fn vendor_read_via(cli: &Path, propcode: u16, serial: Option<&str>, timeout: Duration) -> Result<VendorOut, String> {
     let out = run_cli(cli, &vendor_read_argv(propcode, serial), None, timeout).map_err(|e| e.message)?;
     Ok(VendorOut { text: out.stdout, stderr: out.stderr })
@@ -3795,8 +3877,7 @@ fn describe_reference(r: &ReferenceReport) -> OpDone {
 
 // ── Pack / unpack ─────────────────────────────────────────────────────────
 
-/// Archive layout, one table for export and import (the Python GUI's `accept_zip_entry` follows
-/// the same rule; the cases are in `gui/tests-fixtures/zip_entry_names.json`):
+/// Archive layout, one table for export and import (the cases are in `gui/tests-fixtures/zip_entry_names.json`):
 ///
 /// ```text
 ///   snapshots/<file>.json
@@ -4899,7 +4980,7 @@ mod tests {
 
     #[test]
     fn listing_matches_the_shared_reference_parity_fixture() {
-        // Same directory and expectations as ops::list's test and gui/test_fleet_lib.py.
+        // Same directory and expectations as ops::list's test.
         let fx = fixtures().join("reference_parity");
         let expected: HashMap<String, HashMap<String, bool>> =
             serde_json::from_str(&fs::read_to_string(fx.join("expected.json")).unwrap()).unwrap();
@@ -7782,6 +7863,9 @@ mod tests {
             settings,
             prefs_open: false,
             prefs_data_dir: String::new(),
+            about_open: false,
+            #[cfg(target_os = "macos")]
+            native_menu: None,
             vendor_ops_open: false,
             vendor_propcode: String::new(),
             vendor_read_result: String::new(),
@@ -7794,6 +7878,61 @@ mod tests {
             firmware: FwUi::default(),
         };
         (app, cmd_rx, evt_tx, dir)
+    }
+
+    #[test]
+    fn menu_items_that_start_work_are_off_while_busy_or_without_a_data_dir_and_refused_then_too() {
+        let (mut app, rx, _evt, _dir) = test_app();
+        let ctx = egui::Context::default();
+        let needs_data_dir = [MenuAction::Export, MenuAction::Import];
+        let needs_idle = [MenuAction::Discover, MenuAction::Export, MenuAction::Import];
+
+        // Idle, data dir set: everything is on.
+        for a in MenuAction::ALL {
+            assert!(app.menu_enabled(a), "{a:?} idle");
+        }
+        // One command in flight (the smallest busy): exactly the idle-only items go off.
+        app.pending = 1;
+        for a in MenuAction::ALL {
+            assert_eq!(app.menu_enabled(a), !needs_idle.contains(&a), "{a:?} busy");
+        }
+        // The CLI is done again: back on.
+        app.pending = 0;
+        assert!(app.menu_enabled(MenuAction::Discover));
+        // No data dir: only the data-dir items go off.
+        app.settings.data_dir = None;
+        for a in MenuAction::ALL {
+            assert_eq!(app.menu_enabled(a), !needs_data_dir.contains(&a), "{a:?} no data dir");
+        }
+        app.settings.data_dir = Some(_dir.path().to_path_buf());
+
+        // A refused action sends nothing; an allowed one sends exactly one command.
+        app.pending = 1;
+        app.do_menu_action(&ctx, MenuAction::Discover);
+        assert_eq!(app.pending, 1);
+        assert!(rx.try_recv().is_err());
+        app.pending = 0;
+        app.do_menu_action(&ctx, MenuAction::Discover);
+        assert_eq!(app.pending, 1);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Discover)));
+    }
+
+    #[test]
+    fn window_menu_items_open_their_windows_and_keep_them_open_when_chosen_again() {
+        let (mut app, _rx, _evt, _dir) = test_app();
+        let ctx = egui::Context::default();
+        app.transplant.open = false;
+        for _ in 0..2 {
+            app.do_menu_action(&ctx, MenuAction::Preferences);
+            app.do_menu_action(&ctx, MenuAction::Transplant);
+            app.do_menu_action(&ctx, MenuAction::Restore);
+            app.do_menu_action(&ctx, MenuAction::Check);
+            app.do_menu_action(&ctx, MenuAction::VendorOps);
+            app.do_menu_action(&ctx, MenuAction::Firmware);
+            app.do_menu_action(&ctx, MenuAction::About);
+            assert!(app.prefs_open && app.transplant.open && app.restore.open && app.check.open);
+            assert!(app.vendor_ops_open && app.firmware.open && app.about_open);
+        }
     }
 
     #[test]

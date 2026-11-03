@@ -714,8 +714,7 @@ impl Drop for Sdk {
         // sidesteps this entirely.
         //
         // KNOWN GAP: both mitigations above assume a short-lived process —
-        // true for the CLI (one process per invocation) and the Python GUI
-        // (shells out to a fresh `fleet` subprocess per action), but NOT for
+        // true for the CLI (one process per invocation), but NOT for
         // the Rust egui GUI: `do_discover`/`do_snapshot` open and drop a
         // fresh `Sdk` on every button click via `initialize_no_usb_reset()`
         // (never resets) within one long-running process that never exits
@@ -1730,12 +1729,11 @@ mod tests {
     }
 
     // ── capability_value_shapes.json cross-check ─────────────────────────
-    // tests/fixtures/capability_value_shapes.json is the shared fixture
-    // gui/test_fleet_lib.py's TestFmtCapValue also loads. This test proves
-    // each entry is exactly what decode_value/decode_enum_values produce
-    // for the corresponding eNkMAIDDataType/array-type branch — a mismatch
-    // here means the fixture (and therefore the Python side's coverage) no
-    // longer represents real Rust output.
+    // tests/fixtures/capability_value_shapes.json holds the value shapes a consumer
+    // has to handle. This test proves each entry is exactly what
+    // decode_value/decode_enum_values produce for the corresponding
+    // eNkMAIDDataType/array-type branch — a mismatch here means the fixture
+    // no longer represents real Rust output.
 
     fn load_fixture() -> serde_json::Map<String, Value> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/capability_value_shapes.json");

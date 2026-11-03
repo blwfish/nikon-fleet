@@ -28,7 +28,7 @@ pub fn camera_filename_matches(name: &str, filter: &str) -> bool {
 }
 
 /// File name of the reference for a camera: `{model_slug}_{serial}.json`.
-/// The CLI's `ref set`, the Rust GUI and the Python GUI all write this name.
+/// The CLI's `ref set` and the Rust GUI both write this name.
 /// For a model and serial read from a data file, use
 /// `ops::paths::checked_reference_filename`, which refuses a non-plain value.
 pub fn reference_filename(model: &str, serial: &str) -> String {
@@ -359,9 +359,8 @@ mod tests {
         }
     }
 
-    /// Parity: the Rust GUI (`gui/src/main.rs`) and the Python GUI
-    /// (`gui/test_fleet_lib.py`) check the same expectations against the same
-    /// directory. If this test and one of those disagree, the rule has drifted.
+    /// Parity: the Rust GUI (`gui/src/main.rs`) checks the same expectations against the same
+    /// directory. If this test and that one disagree, the rule has drifted.
     #[test]
     fn reference_rule_matches_the_shared_parity_fixture() {
         let fx = fixture_dir();

@@ -6,8 +6,7 @@ file is byte-identical to `references/{model_slug}_{serial}.json`, with model
 and serial taken from the snapshot itself):
 
 - `nikon_fleet::ops::list::list_dir` (the CLI and, later, the MCP),
-- the Rust GUI's `list_snapshots` (`gui/src/main.rs`),
-- the Python GUI's `snapshot_rows` (`gui/fleet_lib.py`).
+- the Rust GUI's `list_snapshots` (`gui/src/main.rs`).
 
 `expected.json` maps a serial to `{snapshot file: is_reference}` for every
 snapshot that serial owns. `broken.json` is not a snapshot: the GUIs skip it

@@ -3,7 +3,7 @@
 # a Windows user needs and runs their tests. No camera, SDK or display is involved.
 #
 # Left out on purpose: fleet-mcp (it uses tokio's unix signal pipe; the MCP server is macOS/Linux only,
-# docs/mcp-plan.md) and the Python/tk GUI (gui/*.py).
+# docs/mcp-plan.md).
 name: windows
 
 on:

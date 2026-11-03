@@ -2150,9 +2150,7 @@ pub fn hex_bytes(data: &[u8]) -> String {
 /// construct an actual [`FtpProfile`]. Which fields are trimmed first, and
 /// what each is called, come from [`FTP_PROFILE_FIELDS`] (the password is
 /// checked as typed). Centralizes this list so the egui GUI doesn't
-/// hand-copy it; `gui/fleet_gui.py`'s independent Python reimplementation
-/// still has to hand-copy this list itself — same cross-language limitation
-/// as `parse_propcode`, since Python can't call into this crate directly.
+/// hand-copy it.
 pub fn ftp_profile_missing_fields<'a>(
     profile_name: &str,
     ssid_24ghz: &str,
@@ -3047,7 +3045,7 @@ mod tests {
 
     #[test]
     fn parse_propcode_bare_digits_are_decimal_even_when_they_look_like_hex() {
-        // Finding #85, kept as documented behaviour (the Python GUI agrees):
+        // Finding #85, kept as documented behaviour:
         // "5010" is 5010, i.e. 0x1392, never 0x5010.
         assert_eq!(parse_propcode("5010"), Ok(0x1392));
         assert_eq!(parse_propcode("0x5010"), Ok(0x5010));
@@ -3073,10 +3071,9 @@ mod tests {
         assert!(parse_propcode("0x10000").is_err());
     }
 
-    // Regression tests for two confirmed cross-language divergences from
-    // gui/fleet_lib.py's independent Python re-implementation (which relied
-    // on Python's int(), tolerant of both forms below) — pinned here on the
-    // Rust side too so a future edit can't silently reopen either gap.
+    // Regression tests for two divergences found against a since-removed Python
+    // re-implementation (which relied on Python's int(), tolerant of both forms
+    // below) — pinned so a future edit can't silently reopen either gap.
 
     #[test]
     fn parse_propcode_rejects_internal_whitespace_after_hex_prefix() {

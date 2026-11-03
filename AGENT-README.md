@@ -6,7 +6,7 @@ exploration passes to reconstruct.
 
 ## What this project is
 
-`nikon-fleet` is a Rust CLI (`fleet`) + Python/tkinter GUI for managing
+`nikon-fleet` is a Rust CLI (`fleet`) + egui GUI for managing
 settings and firmware across a small personal fleet of Nikon Z-series
 cameras (Z 5, Z 6III, two Z 9 bodies). It talks to cameras over USB via the
 Nikon Remote SDK v2 (a vendored CFBundle/DLL, not distributed with this
@@ -50,10 +50,8 @@ src/            Rust library + CLI (the `nikon-fleet` crate; binary name `fleet`
   snapshot.rs     Snapshot data model (BTreeMap<String, serde_json::Value>, JSON on disk)
   diff.rs         Same-model snapshot diffing
   firmware.rs     Firmware archive: storage layout, metadata, rollback bundle generation
-gui/            Python/tkinter GUI — a frontend that shells out to the `fleet` binary
-  fleet_gui.py    tkinter app
-  fleet_lib.py    Pure-function helpers (parsing/formatting), unit-tested in isolation
-  test_fleet_lib.py
+gui/            egui GUI (`fleet-gui`, a workspace member) — shells out to the `fleet` binary
+  tests-fixtures/ Tables the GUI's and `ops::render`'s tests share
 examples/       Standalone probes for exercising the SDK/parsers without the full CLI
 scripts/        setup-sdk-runtime.{sh,ps1} — stage the vendor SDK into sdk-runtime/
 docs/
@@ -117,10 +115,8 @@ expect `git log` to have history for them.
 - **What a snapshot holds is shown by one formatter, `ops::render`.**
   `nikon-fleet show <file-or-name> [--filter TEXT] [--json] [--codes] [--raw]` (CLI, read-only,
   no camera or SDK) and the egui GUI's snapshot window (double-click a row,
-  or its View button) both call `ops::render::render_snapshot`; the Python
-  GUI's `fmt_cap_value` must agree with it, and
-  `gui/tests-fixtures/render_values.json` is the table both sides are tested
-  against. A value that is missing or unusable is shown as `(missing)` or
+  or its View button) both call `ops::render::render_snapshot`;
+  `gui/tests-fixtures/render_values.json` is the table its tests check. A value that is missing or unusable is shown as `(missing)` or
   `(malformed: why)` with a closed `kind` and `notes`, never as a default;
   stepped ranges read their position from `value_index` through
   `value_shape`. Change the display rules there, not in a UI.
@@ -153,12 +149,12 @@ expect `git log` to have history for them.
   a human-readable settings table plus step-by-step instructions rather
   than attempting to push settings automatically as part of rollback.
 - **The GUI is a thin subprocess frontend, not a reimplementation.**
-  `fleet_gui.py` shells out to the compiled `fleet` binary
+  `gui/src/main.rs` shells out to the compiled `fleet` binary
   (`target/release/nikon-fleet`, falling back to `target/debug`) and
   parses its `--json` output. Business logic belongs in the Rust
-  library/CLI, not in the GUI. `fleet_lib.py` holds the GUI's own pure
-  helper functions (string parsing/formatting) and is unit-tested
-  independently in `test_fleet_lib.py`.
+  library/CLI, not in the GUI. The GUI's menus are described once, in
+  `gui/src/menu.rs`; macOS gets a native bar (Settings… in the Apple menu),
+  other platforms an in-window one.
 
 ## Before making a change
 
@@ -183,7 +179,6 @@ expect `git log` to have history for them.
 ```bash
 cargo build --release          # produces target/release/nikon-fleet
 cargo test --workspace         # Rust unit tests: 108+23 in the nikon-fleet lib/bin, 35+ in gui/ (all offline)
-cd gui && python3 -m pytest    # GUI helper unit tests (test_fleet_lib.py; also offline)
 python3 -m unittest scripts/test_extract_maid_labels.py   # the SDK-document extractor (invented inputs; offline)
 ```
 
@@ -191,25 +186,6 @@ To name what `nikon-fleet show` prints (display names, enumeration value names),
 `python3 scripts/extract-maid-labels.py /path/to/S-SDKZ-200BF-ALLIN` by hand; it writes
 `sdk-runtime/maid-labels.json` (gitignored) and needs poppler's `pdftotext`
 (`brew install poppler`). `scripts/setup-sdk-runtime.sh` runs it too.
-
-### Supported GUI environment
-
-The Python/tkinter GUI (`gui/fleet_gui.py`) and its tests are supported on **Python 3.14 with Tk 9.0.x**
-(Homebrew's `python@3.14` and python.org's 3.14 installer; CI runs 3.14.8/Tk 9.0.4). **Tk 8.6 is not
-supported** — that is what python.org's Python 3.13 and older ship (3.13.16 has Tk 8.6.18, 3.12.10 has
-8.6.16). On Tk 8.6 the GUI tests hang: `test_fleet_gui.py::TestStartup::test_a_settings_error_is_shown_and_nothing_is_guessed`
-never returns from Tk's `update` on the macOS runner (found 2026-10-30; cause not diagnosed, and the
-tests after it were never reached, so there may be more). The test fixture `tk_root` therefore refuses
-Tk older than 9.0 (skips, or fails when `CI`/`REQUIRE_DISPLAY` is set) rather than hanging. The CLI,
-the MCP server and the egui GUI do not use Tk. Check yours with
-`python3 -c "import tkinter; print(tkinter.TkVersion)"`.
-
-The GUI tests share **one `Tk()` root for the whole run** (`_shared_tk_root` in `gui/test_fleet_gui.py`),
-reset between tests. Creating and destroying a root per test crashed intermittently on the macOS runner
-on Tk 9.0 (exit 139/138 mid-suite, and a CoreFoundation "process has forked" message in captured stderr):
-3 of 6 runs of the per-test-root tests crashed in an A/B on 2026-10-30 against 0 of 6 with the shared
-root, and about 5 of 13 per-test-root runs overall against 0 of 8. Tk's macOS port wraps a single
-`NSApplication`, which is the likely reason; that part is a hypothesis. Keep it one root.
 
 `gui/` is a workspace member (joined 2026-09-03), not a standalone crate — `cargo test`/`cargo llvm-cov` run without `--workspace` from the repo root cover only the root `nikon-fleet` package and silently skip `gui/src/main.rs`'s tests.
 

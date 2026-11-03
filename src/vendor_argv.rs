@@ -7,8 +7,8 @@
 //! (`ptp_usb::claim_with_retry`). Run in-process from the egui GUI's worker
 //! thread, that is the same shape as the USB-reset crash fixed in commit
 //! 48704d5 (USB device events reaching the AppKit run loop mid-frame), and
-//! whether it triggers the same crash was never verified. The Python GUI
-//! already shells out to the CLI for these; the egui GUI now does too, so
+//! whether it triggers the same crash was never verified. The egui GUI
+//! shells out to the CLI for these, so
 //! the churn happens in a separate process that cannot corrupt the GUI's
 //! drawing surface, and a crash there surfaces as an error message.
 //!

@@ -1,5 +1,5 @@
 {
-  "_about": "Zip entry names the archive layout accepts (gui/src/main.rs classify_zip_entry; the Python GUI's accept_zip_entry must agree). Rule: split the RAW name on '/'; every component must be non-empty, not '.', not '..', and contain no backslash or NUL; then the parts must be exactly [snapshots|references, <x>.json] or [firmware, <slug>, <version>, firmware.bin|source-page.html|metadata.json]. Case-sensitive.",
+  "_about": "Zip entry names the archive layout accepts (gui/src/main.rs classify_zip_entry). Rule: split the RAW name on '/'; every component must be non-empty, not '.', not '..', and contain no backslash or NUL; then the parts must be exactly [snapshots|references, <x>.json] or [firmware, <slug>, <version>, firmware.bin|source-page.html|metadata.json]. Case-sensitive.",
   "cases": [
     {
       "name": "snapshots/foo.json",
