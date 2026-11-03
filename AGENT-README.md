@@ -150,7 +150,7 @@ expect `git log` to have history for them.
   than attempting to push settings automatically as part of rollback.
 - **The GUI is a thin subprocess frontend, not a reimplementation.**
   `gui/src/main.rs` shells out to the compiled `fleet` binary
-  (`target/release/nikon-fleet`, falling back to `target/debug`) and
+  (the `nikon-fleet` next to its own executable, or `$NIKON_FLEET_CLI`) and
   parses its `--json` output. Business logic belongs in the Rust
   library/CLI, not in the GUI. The GUI's menus are described once, in
   `gui/src/menu.rs`; macOS gets a native bar (Settings… in the Apple menu),
@@ -177,7 +177,8 @@ expect `git log` to have history for them.
 ## Building and testing
 
 ```bash
-cargo build --release          # produces target/release/nikon-fleet
+cargo build --workspace         # debug build: target/debug/nikon-fleet and fleet-gui (the day-to-day build)
+# cargo build --release          # release build: only at a release point, not day to day
 cargo test --workspace         # Rust unit tests: 108+23 in the nikon-fleet lib/bin, 35+ in gui/ (all offline)
 python3 -m unittest scripts/test_extract_maid_labels.py   # the SDK-document extractor (invented inputs; offline)
 ```
