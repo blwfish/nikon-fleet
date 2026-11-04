@@ -30,7 +30,7 @@ id, not by id alone.
 | 0x500C | FlashMode | fires as a side effect of ExposureProgramMode changes |
 | 0x500D | ExposureTime | |
 | 0x500E | ExposureProgramMode | 1=M, 3=A, 4=S (matches PTP 1.1 spec table) |
-| 0x500F | ExposureIndex (ISO) | **never seen as a SetDevicePropValue request** — only as an event; ISO commit likely goes through a vendor op, not 0x1016 |
+| 0x500F | ExposureIndex (ISO) | **never seen as a SetDevicePropValue request** — only as an event; ISO commit goes through vendor property `0xD0B4`, confirmed on the Z6III (see the Z6III section below) |
 | 0x5010 | ExposureBiasCompensation | milli-EV units |
 | 0x5011 | DateTime | PTP String: 1-byte char-count prefix (incl. null) + UTF-16LE |
 | 0x5018 | BurstNumber | |
@@ -94,10 +94,11 @@ effects, it will miss things once the initial burst passes.
   in the same numeric family (`0x10xx`–`0x1F80` range, `0x80` high bit set). Best read: a generic "current
   picker/list selection index" UI-state property, not a photographic setting itself.
 - **`0xD0B4`** — scrolls through round numbers (100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600,
-  51200, 102400) during ISO-adjacent interactions — ISO-shaped but not confirmed as *the* ISO commit path.
+  51200, 102400) during ISO-adjacent interactions — ISO-shaped; **confirmed on the Z6III as the ISO commit path** (see the Z6III section below).
 - **`0xD100`** — heavy scrolling-picker traffic (10–15 SetDevicePropValue calls per single logical UI
   action) with values that decompose into two uint16 halves that look like shutter-speed numerator/
-  denominator pairs. Not confirmed.
+  denominator pairs. **On the Z6III this is the current shutter speed (denominator in the low half,
+  numerator in the high half), not a settable value** (see the Z6III section below).
 - **`0xD1AC`/`0xD1BC`/`0xD1A6`** — always fire together as a trio.
 - **`0xD010`** — cycles 4→3→2→1 once at connection time only; not seen again after.
 - **`0xD0B3`** — fires exactly once per capture, precisely when viewing the FTP status screen (via the
@@ -348,6 +349,80 @@ device version `"V2.00"`, no trailing bytes; PTP serial `"0000000000000000000000
 `"0000003014527"`: zero-padded to 32 characters. Three bodies of three models agree. The PTP `model` string
 is also the SDK's model name on all three (`Z 9`, `Z 5`, `Z6_3`). Still not checked: the second Z 9, and a
 body whose USB descriptor is empty.
+
+## Z6III over NX Field — properties decoded (2026-11-04 session; Pi clock showed 2026-07-09)
+
+A second capture series, on a Z6III this time, with NX Field on an iPhone. The Raspberry Pi access point
+from the July setup was used again (camera and phone joined as stations; `tcpdump` on the Pi's `wlan0`,
+filtered to the camera). Each setting was changed one at a time while the changes were logged against the
+capture clock. Every value below was cross-checked against what the camera displayed, except where noted.
+The camera's response code to each write was decoded only for the exposure-mode, Auto ISO and metering
+writes; the others were seen to take effect on the camera.
+
+**Write pattern:** NX Field usually sends each `SetDevicePropValue` (`0x1016`) twice, about 0.1 s apart. The
+camera then sends `0x4006` DevicePropChanged events for the affected property, and for the shutter-speed
+property when the exposure changed.
+
+### Properties
+
+| Property | Meaning | Value format | Notes |
+|---|---|---|---|
+| `0x5007` | Aperture | uint16, f-number × 100 | 400 = f/4.0 (same as the Z9) |
+| `0x5010` | Exposure compensation | int16, thousandths of an EV | +1666 shown as +1.7; −2000; 0 |
+| `0x5011` | DateTime | PTP string | written at session start, not user-driven |
+| `0x500B` | Metering mode | uint16 | see below |
+| `0x500E` | Exposure program | uint16 | NX Field writes 1 (M); camera answers `0x200F` Access Denied. Mode is set by the body dial; the phone learns it from events |
+| `0xD053` | Attach copyright | 1 byte, 0/1 | |
+| `0xD054` | Auto ISO | 1 byte, 0/1 | camera answered OK to both |
+| `0xD060` | Active IPTC profile | 1 byte | 1 = profile 1 (changed from "unregistered"; the unregistered value was not captured) |
+| `0xD072` | Artist | PTP string, 36 chars | space-padded |
+| `0xD073` | Copyright | PTP string, 54 chars | space-padded |
+| `0xD090` | Image comment text | PTP string, 36 chars | space-padded |
+| `0xD091` | Attach image comment | 1 byte, 0/1 | |
+| `0xD0B4` | ISO | uint32, the ISO number | 2000 and 100 captured |
+| `0xD100` | Shutter speed (current) | uint32: low 16 bits = denominator, high 16 = numerator | written by NX Field after the camera's change events. 1/20 s at ISO 2000, 1 s at ISO 100, about 3 s at +1.7 EV, 1/4 s at −2 EV, 4 s in manual. Inferred from these points, not confirmed on the camera display |
+
+Metering mode `0x500B`, confirmed against the camera display for all four:
+`0x0002` center-weighted, `0x0003` matrix, `0x0004` spot, `0x8010` highlight-weighted.
+
+PTP string format used by the artist, copyright and comment properties: one length byte counting the null
+terminator, then UTF-16LE characters, then a null. Text is padded with spaces to the field's full length.
+
+### What NX Field would not let us change
+
+- **Exposure mode:** the write is sent and refused (`0x200F`); the dial on the body controls it.
+- **Shutter speed in manual mode:** NX Field sent nothing. This is a limit in the app, not a camera refusal.
+- **Auto ISO limits (maximum sensitivity, minimum shutter speed):** the app has no controls for them.
+
+### Connection behavior worth knowing when snooping
+
+- **Camera mode:** NX Field connected only while the camera was in "Connect to other cameras" → remote
+  camera mode, where TCP port 15740 was open. In FTP-test mode, master camera mode and the SnapBridge /
+  NX MobileAir screen the port was closed and the camera reset the connection attempts. Whether another
+  mode would also work was not tested.
+- **Keepalive:** the camera sends a PTP/IP probe request (type `0x0d`) about every 10 s and expects a probe
+  response (`0x0e`). When the phone auto-locked and NX Field was suspended, the camera closed both channels
+  after one missed probe, and NX Field reported the camera as off. Set Auto-Lock to Never while testing.
+- **No-internet Wi-Fi:** iOS leaves a network that fails its connectivity check. The Pi answered the
+  `captive.apple.com` check locally (a dnsmasq address entry and a tiny web server returning Apple's
+  "Success" page) so the phone stayed joined.
+- **Local Network permission** must be enabled for NX Field on iOS.
+- **Saved cameras:** NX Field also probed four saved addresses on `192.168.8.x` (a previous network) before
+  finding the camera on the new one.
+- **FTP:** the camera's FTP connection test logged in, listed the directory and sent `QUIT` on its own; it is
+  a one-shot test, not a held connection. Whether the FTP link and NX Field's remote mode can be up at the
+  same time was not established. The camera was in a different mode for each.
+- **Not investigated:** vendor opcodes new to this repo that NX Field sends at connect: `0x9201`, `0x9202`,
+  `0x90C2`, `0x90C8`, `0x936C`, `0x941C`, `0x9447`, `0x944B`. NX Field's FTP profile edit was rejected by
+  the app ("no active profile in camera") before anything was sent, so no `0x90EE` write was captured on the
+  Z6III. The pre-release and post-release capture settings were not tested.
+
+### Method note
+
+`tshark`'s `ptpip` dissector was only used for counts. Operations and values were decoded by walking the
+PTP/IP packets in each TCP segment by hand (a segment can carry several packets), pairing each
+`0x1016` request with its data phase, and reading the camera's response and event packets from the other
+direction.
 
 ## Open items for next session
 
