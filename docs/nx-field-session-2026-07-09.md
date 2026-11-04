@@ -375,6 +375,8 @@ property when the exposure changed.
 | `0xD053` | Attach copyright | 1 byte, 0/1 | |
 | `0xD054` | Auto ISO | 1 byte, 0/1 | camera answered OK to both |
 | `0xD060` | Active IPTC profile | 1 byte | 1 = profile 1 (changed from "unregistered"; the unregistered value was not captured) |
+| `0xD068` | CL continuous-low frame rate | 1 byte, fps | 7 and 5 captured (NX Field writes it); the original 3 fps was not captured |
+| `0x5013` | Release mode (still capture mode) | uint16 | read-only from the phone; values below |
 | `0xD072` | Artist | PTP string, 36 chars | space-padded |
 | `0xD073` | Copyright | PTP string, 54 chars | space-padded |
 | `0xD090` | Image comment text | PTP string, 36 chars | space-padded |
@@ -388,8 +390,37 @@ Metering mode `0x500B`, confirmed against the camera display for all four:
 PTP string format used by the artist, copyright and comment properties: one length byte counting the null
 terminator, then UTF-16LE characters, then a null. Text is padded with spaces to the field's full length.
 
+### Release mode (`0x5013`) and CL speed (`0xD068`)
+
+The release mode was changed on the camera body, because NX Field would not switch between modes (see
+below). Each change produced a `0x4006` event for `0x5013`, and NX Field then read the new value. Every
+value was matched to what the camera displayed:
+
+| Mode | `0x5013` |
+|---|---|
+| Single frame | `0x0001` |
+| CH | `0x0002` |
+| CL | `0x8010` |
+| Self-timer (10 s) | `0x8011` |
+| CH extended (no fixed rate) | `0x8019` |
+| C15 | `0x810F` |
+| C30 | `0x811E` |
+| C60 | `0x813C` |
+| C120 | `0x8178` |
+
+The extended continuous-high rates are `0x81` in the high byte and the frame rate in hex in the low byte.
+The self-timer duration is not carried in this value, and where it lives was not tested. CL's frame rate
+is the separate property `0xD068` (above). CH shows no frame rate on the camera and none was read.
+
+Moving into or out of the extended modes made the camera send a `0x400C` (capture-complete) event followed
+by change events for image size (`0x5003`), image quality (`0x5004`), flash (`0x500C`), shutter (`0x500D`)
+and `0x5013`. The shutter had not been released. This looks like a state refresh rather than an exposure;
+that explanation is a guess and was not tested.
+
 ### What NX Field would not let us change
 
+- **Release mode:** selecting CH while on CL, in NX Field, sent nothing. This is a limit in the app. Only the
+  CL speed (`0xD068`) was settable.
 - **Exposure mode:** the write is sent and refused (`0x200F`); the dial on the body controls it.
 - **Shutter speed in manual mode:** NX Field sent nothing. This is a limit in the app, not a camera refusal.
 - **Auto ISO limits (maximum sensitivity, minimum shutter speed):** the app has no controls for them.
