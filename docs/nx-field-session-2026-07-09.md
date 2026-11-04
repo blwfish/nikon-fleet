@@ -43,6 +43,27 @@ id, not by id alone.
   City, State, Country, Category, Supplemental Categories, Authors Position, Caption Writer, Credit,
   Source (14 total, count-matches exiftool's XMP output on the resulting JPEG). Exact position of Title
   vs Creator not yet confirmed (both were empty in our test) — need a follow-up test with those two filled.
+  **Superseded for the Z6III — see the correction below. Positions 1–11 of the order above are wrong
+  for that camera; positions 12–14 (Writer, Credit, Source) agree.**
+  - **Correction, Z6III capture (NX Field on iPhone, 2026-07-09 23:52–23:54 Pi clock, session
+    `session-20260709-235137-nxfield-ops.pcap`).** The user typed each field's own name into that field
+    (label for label; the camera's IPTC menu was not checked afterwards), saved, and NX Field sent one
+    `0x9413` followed by `0x9412` reads. The data phase is two leading entries, an empty string and `"1"`
+    (meaning unknown), then 14 values in this wire order:
+    1 Caption, 2 Event ID, 3 Headline, 4 Object name, 5 City, 6 State, 7 Country, 8 Category,
+    9 Supplemental categories, 10 Byline, 11 Byline title, 12 Writer/editor, 13 Credit, 14 Source.
+    This is Nikon's classic IPTC field list. The typed strings were `Captions, Id, Headline,
+    Object name, City, State, Country, Category, Supplemental, Byline, Byline title, Writer, Credit,
+    Source`. The camera's read-back (`0x9412`, slot 1) returned the same values, so the write was accepted.
+    Corroboration: before this edit the same slot held `Caption`, `I’d` (iOS autocorrect of "Id"),
+    `Head`, ten empty fields and `Lastly one`, an earlier test using shortened field names in the same
+    positions. Both sets agree on positions 1–3 and 14.
+  - **Request params:** in this capture the `0x9413` request carries one parameter, the slot (1). The
+    `0x14, 0x09` that follow it on the wire are the header of the next PTP/IP packet (Start Data: length
+    20, type 9), so the `[slot, 0x14, 0x9]` params above may be a misreading; not re-checked against the
+    July Z9 pcaps.
+  - Related reads: `0x9412` with params `0` and `1` (screen open, then slot read) and again after the
+    write. `0x1016` set of property `0xD060` right when the IPTC screen opened (purpose unknown).
 - **`0x90E8`** → **`0x90EE`** — FTP profile write. `0x90E8` is a shared setup/status step (also seen alone
   during read-only status checks); `0x90EE` carries the actual profile data phase. Mixed-encoding blob:
   SSID/network name fields in plain ASCII (`nikon-snoop`, `nikon5ghz`), host IP and profile name in
