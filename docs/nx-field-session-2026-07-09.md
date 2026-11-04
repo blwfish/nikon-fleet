@@ -97,8 +97,9 @@ effects, it will miss things once the initial burst passes.
   51200, 102400) during ISO-adjacent interactions — ISO-shaped; **confirmed on the Z6III as the ISO commit path** (see the Z6III section below).
 - **`0xD100`** — heavy scrolling-picker traffic (10–15 SetDevicePropValue calls per single logical UI
   action) with values that decompose into two uint16 halves that look like shutter-speed numerator/
-  denominator pairs. **On the Z6III this is the current shutter speed (denominator in the low half,
-  numerator in the high half), not a settable value** (see the Z6III section below).
+  denominator pairs. **On the Z6III this is the shutter speed (denominator in the low half, numerator in the
+  high half). NX Field writes it automatically; the camera accepts the write in manual mode and refuses it
+  in aperture priority** (see the Z6III section below).
 - **`0xD1AC`/`0xD1BC`/`0xD1A6`** — always fire together as a trio.
 - **`0xD010`** — cycles 4→3→2→1 once at connection time only; not seen again after.
 - **`0xD0B3`** — fires exactly once per capture, precisely when viewing the FTP status screen (via the
@@ -356,8 +357,8 @@ A second capture series, on a Z6III this time, with NX Field on an iPhone. The R
 from the July setup was used again (camera and phone joined as stations; `tcpdump` on the Pi's `wlan0`,
 filtered to the camera). Each setting was changed one at a time while the changes were logged against the
 capture clock. Every value below was cross-checked against what the camera displayed, except where noted.
-The camera's response code to each write was decoded only for the exposure-mode, Auto ISO and metering
-writes; the others were seen to take effect on the camera.
+The camera's response code to every `0x1016` write in the capture was audited at the end (table below), and
+each deliberate change was also seen to take effect on the camera.
 
 **Write pattern:** NX Field usually sends each `SetDevicePropValue` (`0x1016`) twice, about 0.1 s apart. The
 camera then sends `0x4006` DevicePropChanged events for the affected property, and for the shutter-speed
@@ -382,7 +383,8 @@ property when the exposure changed.
 | `0xD090` | Image comment text | PTP string, 36 chars | space-padded |
 | `0xD091` | Attach image comment | 1 byte, 0/1 | |
 | `0xD0B4` | ISO | uint32, the ISO number | 2000 and 100 captured |
-| `0xD100` | Shutter speed (current) | uint32: low 16 bits = denominator, high 16 = numerator | written by NX Field after the camera's change events. 1/20 s at ISO 2000, 1 s at ISO 100, about 3 s at +1.7 EV, 1/4 s at −2 EV, 4 s in manual. Inferred from these points, not confirmed on the camera display |
+| `0xD100` | Shutter speed | uint32: low 16 bits = denominator, high 16 = numerator | NX Field writes it by itself after the camera's change events, not from a user control. Accepted by the camera in manual mode (3 of 3), refused with `0x200F` Access Denied in aperture priority (11 of 11; the mode at each write is inferred from the dial events and the session log, not read from the camera). Values seen: 1/20 s at ISO 2000, 1 s at ISO 100, about 3 s at +1.7 EV, 1/4 s at −2 EV, 4 s, 1/60, 1/125, and the Nikon fractions 10/13 (1/1.3 s) and 10/16 (1/1.6 s), which confirm the numerator/denominator order |
+| `0xD148` | Secondary slot function | 1 byte | 0 = Overflow, 1 = Backup, 2 = RAW primary / JPEG secondary, 4 = JPEG primary / JPEG secondary; 3 not seen |
 
 Metering mode `0x500B`, confirmed against the camera display for all four:
 `0x0002` center-weighted, `0x0003` matrix, `0x0004` spot, `0x8010` highlight-weighted.
@@ -417,13 +419,52 @@ by change events for image size (`0x5003`), image quality (`0x5004`), flash (`0x
 and `0x5013`. The shutter had not been released. This looks like a state refresh rather than an exposure;
 that explanation is a guess and was not tested.
 
+### Pre-release burst (vendor op `0x943C`)
+
+Not a `0x1016` property write. NX Field sent operation **`0x943C`** with the single parameter `0x0001D025`
+and a one-byte data phase, then read the value back with `0x943B` on the same parameter. The value is in
+tenths of a second: `0x0A` for 1 s and `0x03` for 0.3 s; the camera answered OK both times. `0x943B` is the
+generic read already seen polling parameter `0x0001D03D`, so `0x943C` looks like its write counterpart, with
+the parameter being `0x1D000` plus a low byte that names the setting (`0x25` here). That pairing is inferred
+from the numbering and the read-back, not documented. Other values (0.5 s, off) and the post-release setting
+were not tried.
+
+### Secondary slot function (`0xD148`)
+
+| Option | Value |
+|---|---|
+| Overflow | `0x00` |
+| Backup | `0x01` |
+| RAW primary / JPEG secondary | `0x02` |
+| (not seen) | `0x03` |
+| JPEG primary / JPEG secondary | `0x04` |
+
+All four writes were answered OK. The Backup write was sent before the second card was inserted, and the
+camera still answered OK; whether it applied the setting with the slot empty was not checked on the camera.
+Inserting the card produced a `0x4004` (store added) event, after which NX Field asked for the storage list
+(`0x1004`). A `0x400C` event followed some of the writes, as it did around the extended release modes.
+
+### Camera response codes for `0x1016` writes (whole capture)
+
+One response counted per write pair. Everything changed on purpose was accepted except the exposure program.
+
+| Result | Properties |
+|---|---|
+| OK | `0x5007`, `0x500B`, `0x5010`, `0x5011`, `0x5018`, `0xD053`, `0xD054`, `0xD060`, `0xD068`, `0xD072`, `0xD073`, `0xD090`, `0xD091`, `0xD0B4`, `0xD148`, `0xD1AC` |
+| `0x200F` Access Denied | `0x500E` (3), `0xD1A6` (2), `0xD100` (11, aperture priority only; 3 more were OK in manual) |
+| `0x200A` Property Not Supported | `0xD07F` (2), `0xD1F0` (2): connect-time writes the Z9 accepted in July |
+
 ### What NX Field would not let us change
 
 - **Release mode:** selecting CH while on CL, in NX Field, sent nothing. This is a limit in the app. Only the
   CL speed (`0xD068`) was settable.
 - **Exposure mode:** the write is sent and refused (`0x200F`); the dial on the body controls it.
-- **Shutter speed in manual mode:** NX Field sent nothing. This is a limit in the app, not a camera refusal.
+- **Shutter speed in manual mode:** the app has no control for it, and sent nothing when we tried. This is a
+  limit in the app. The camera does accept `0xD100` writes in manual mode (NX Field sends them itself), so a
+  client that wrote the property directly might be accepted; that was not tried.
 - **Auto ISO limits (maximum sensitivity, minimum shutter speed):** the app has no controls for them.
+- **Self-timer duration:** the app has no control for it, and no property or event changed when it was
+  changed on the body.
 
 ### Connection behavior worth knowing when snooping
 
@@ -446,7 +487,7 @@ that explanation is a guess and was not tested.
 - **Not investigated:** vendor opcodes new to this repo that NX Field sends at connect: `0x9201`, `0x9202`,
   `0x90C2`, `0x90C8`, `0x936C`, `0x941C`, `0x9447`, `0x944B`. NX Field's FTP profile edit was rejected by
   the app ("no active profile in camera") before anything was sent, so no `0x90EE` write was captured on the
-  Z6III. The pre-release and post-release capture settings were not tested.
+  Z6III. The post-release capture setting was not tested.
 
 ### Method note
 
