@@ -339,6 +339,11 @@ pub enum PtpUsbError {
     DeviceInfoMalformed { field: &'static str, offset: usize, fault: DeviceInfoFault },
     #[error("FTP profile data is not in a layout this decoder knows: {what} at byte offset {offset}: {detail}")]
     FtpBlobMalformed { what: &'static str, offset: usize, detail: String },
+    #[error(
+        "FTP profile slot {slot} is outside the {count} stored profile(s) (slots 0..{count}); a read past the end \
+         stalls the USB pipe, so it was not sent"
+    )]
+    FtpSlotOutOfRange { slot: u32, count: u32 },
     #[error("FTP profile field {field} is {len} {unit}, exceeds the {max}-{unit} limit")]
     FtpFieldTooLong { field: &'static str, len: usize, max: usize, unit: &'static str },
     #[error("FTP profile field {field} contains non-ASCII characters, which this encoding does not support")]
@@ -1433,7 +1438,22 @@ pub struct DecodedFtpProfile {
     /// (192.168.66.87/24 in every capture; the capture rig's Z 9).
     pub camera_network: FtpCameraNetwork,
     pub ssid_24ghz: String,
+    /// The third byte of the four-byte tag before [`Self::ssid_24ghz`]
+    /// (`03 00 xx 00`): `01` in most profiles, `0x30` in one with no stored
+    /// camera address. Meaning unknown. The encoder writes `01`.
+    pub ssid24_kind: u8,
+    /// The string the encoder calls the 5 GHz SSID. **Probably the Wi-Fi
+    /// password, not an SSID**: in the July blob it is `nikon5ghz`, the
+    /// passphrase of the capture rig's access point, and in the profiles read
+    /// on 2026-11-05 it looked like a passphrase too. Treated as a secret by
+    /// [`Self::with_secrets_masked`] and the CLI. (Unconfirmed against the
+    /// camera's menu.)
     pub ssid_5ghz: String,
+    /// The first byte of the two-byte tag before [`Self::ssid_5ghz`]: `04` in
+    /// the July blobs and a NETSOL profile, `06` in a phone-hotspot profile
+    /// (the second byte is `04` in all). Meaning unknown; possibly a security
+    /// type. The encoder writes `04`.
+    pub ssid5_kind: u8,
     pub host: String,
     /// A PTP string between host and username. Empty in two of three
     /// captures; `"Claude"` in the third, a profile typed in through NX
@@ -1453,8 +1473,9 @@ pub struct DecodedFtpProfile {
     /// profile read over USB. Unknown meaning; probably option bits
     /// (protocol, passive mode, ...).
     pub option_flags: u16,
-    /// The u16 after the option flags: 8080 in every blob seen. 8080 is the
-    /// usual default proxy port, so this is probably the proxy-server port.
+    /// The u16 after the option flags: 8080 in most blobs seen, 0 in one
+    /// (a hotspot profile with no stored camera address). 8080 is the usual
+    /// default proxy port, so this is probably the proxy-server port.
     /// **The encoder's `FtpProfile.port` is written here**, not into
     /// [`Self::ftp_port`].
     pub second_port: u16,
@@ -1467,11 +1488,13 @@ impl DecodedFtpProfile {
     /// The [`FtpProfile`] the encoder would need to write this profile back,
     /// when it can: not possible if [`Self::folder`] is non-empty, or
     /// [`Self::option_flags`] is not the encoder's `0x0005`, or
-    /// [`Self::ftp_port`] is not the 21 it hard-codes, since the encoder has
+    /// [`Self::ftp_port`] is not the 21 it hard-codes, or [`Self::ssid5_kind`]
+    /// is not `04`, or [`Self::ssid24_kind`] is not `01`, since the encoder has
     /// no way to carry any of them. `FtpProfile.port` receives
     /// [`Self::second_port`] (where the encoder writes it).
     pub fn as_encodable(&self) -> Option<FtpProfile> {
-        (self.folder.is_empty() && self.option_flags == 0x0005 && self.ftp_port == 21).then(|| FtpProfile {
+        (self.folder.is_empty() && self.option_flags == 0x0005 && self.ftp_port == 21 && self.ssid5_kind == FTP_TAG_SSID_5GHZ[0] && self.ssid24_kind == FTP_TAG_SSID_24GHZ[2])
+            .then(|| FtpProfile {
             profile_name: self.profile_name.clone(),
             ssid_24ghz: self.ssid_24ghz.clone(),
             ssid_5ghz: self.ssid_5ghz.clone(),
@@ -1482,10 +1505,15 @@ impl DecodedFtpProfile {
         })
     }
 
-    /// This profile with the password replaced by asterisks (same length),
-    /// for display.
-    pub fn with_password_masked(&self) -> Self {
-        DecodedFtpProfile { password: "*".repeat(self.password.len()), ..self.clone() }
+    /// This profile with the password and the string the encoder calls the
+    /// 5 GHz SSID (probably a Wi-Fi password) replaced by asterisks of the
+    /// same length, for display.
+    pub fn with_secrets_masked(&self) -> Self {
+        DecodedFtpProfile {
+            password: "*".repeat(self.password.len()),
+            ssid_5ghz: "*".repeat(self.ssid_5ghz.len()),
+            ..self.clone()
+        }
     }
 }
 
@@ -1502,9 +1530,21 @@ pub fn decode_ftp_profile(blob: &[u8]) -> Result<DecodedFtpProfile, PtpUsbError>
     let prefix_len = r.u8("camera prefix length")?;
     r.expect("network padding", &FTP_TEMPLATE_NETWORK_PAD)?;
     let camera_network = FtpCameraNetwork { ipv4: [addr[3], addr[2], addr[1], addr[0]], prefix_len };
-    r.expect("2.4 GHz SSID tag", &FTP_TAG_SSID_24GHZ)?;
+    let tag_at = r.pos;
+    let tag24 = r.take("2.4 GHz SSID tag", 4)?;
+    if tag24[0] != FTP_TAG_SSID_24GHZ[0] || tag24[1] != FTP_TAG_SSID_24GHZ[1] || tag24[3] != FTP_TAG_SSID_24GHZ[3] {
+        r.pos = tag_at;
+        return Err(r.bad("2.4 GHz SSID tag", format!("expected 03 00 xx 00, found {}", hex_bytes(tag24))));
+    }
+    let ssid24_kind = tag24[2];
     let ssid_24ghz = r.ascii_u32_len("2.4 GHz SSID")?;
-    r.expect("5 GHz SSID tag", &FTP_TAG_SSID_5GHZ)?;
+    let tag_at = r.pos;
+    let tag5 = r.take("5 GHz SSID tag", 2)?;
+    if tag5[1] != FTP_TAG_SSID_5GHZ[1] {
+        r.pos = tag_at;
+        return Err(r.bad("5 GHz SSID tag", format!("expected xx {:02x}, found {}", FTP_TAG_SSID_5GHZ[1], hex_bytes(tag5))));
+    }
+    let ssid5_kind = tag5[0];
     let ssid_5ghz = r.ascii_u32_len("5 GHz SSID")?;
     r.expect("host tag", &[FTP_TAG_HOST])?;
     let host = r.ptp_string("host")?.text;
@@ -1531,7 +1571,9 @@ pub fn decode_ftp_profile(blob: &[u8]) -> Result<DecodedFtpProfile, PtpUsbError>
         timestamps,
         camera_network,
         ssid_24ghz,
+        ssid24_kind,
         ssid_5ghz,
+        ssid5_kind,
         host,
         folder,
         username,
@@ -2407,6 +2449,19 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// not recognise is still returned (raw bytes plus the decode error),
     /// since the bytes are the finding.
     pub fn read_ftp_profile(&mut self) -> Result<FtpProfileReadout, PtpUsbError> {
+        self.read_ftp_profile_slot(None)
+    }
+
+    /// [`Self::read_ftp_profile`] reading `slot` instead of the active one
+    /// (`None` = the active one). `0x90ED(n)` is a read: the camera answers
+    /// `0x201F` (TransactionCancelled) for a slot it holds nothing in, which
+    /// comes back as [`PtpUsbError::OperationFailed`] (not seen over USB). A slot at or above the
+    /// stored `count` `0x90EB` reports is refused before `0x90ED` is sent: on
+    /// a Z 9 with count 3, `0x90ED(3)` stalled the USB pipe (clear_halt
+    /// recovered it) instead of answering `0x201F`. Slots `0..count` are the
+    /// stored profiles, in an order that is not the menu's active one (the
+    /// slot `0x90EB` reports stayed `0` across two different active profiles).
+    pub fn read_ftp_profile_slot(&mut self, slot: Option<u32>) -> Result<FtpProfileReadout, PtpUsbError> {
         let mut warnings = Vec::new();
         if sdk_model_name(self.model()).is_none() {
             warnings.push(format!(
@@ -2426,8 +2481,13 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         let info = parse_ftp_profile_info(&info_reply.data)?;
         let mut matched = setup.deviations.is_empty() && info_reply.deviations.is_empty();
 
-        let profile = if info.has_active_profile() {
-            let reply = self.transact(OP_FTP_PROFILE_READ, &[info.slot], None, TxidCheck::Unchecked)?;
+        let wanted = match slot {
+            Some(n) if n >= info.count => return Err(PtpUsbError::FtpSlotOutOfRange { slot: n, count: info.count }),
+            Some(n) => Some(n),
+            None => info.has_active_profile().then_some(info.slot),
+        };
+        let profile = if let Some(wanted) = wanted {
+            let reply = self.transact(OP_FTP_PROFILE_READ, &[wanted], None, TxidCheck::Unchecked)?;
             Self::require_ok(OP_FTP_PROFILE_READ, reply.code)?;
             if reply.data_containers == 0 {
                 return Err(PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_READ });
@@ -2522,9 +2582,13 @@ pub fn write_ftp_profile_locked(
 
 /// [`PtpUsbSession::read_ftp_profile`] for a caller already holding the
 /// [`CameraLock`]; see [`PtpUsbSession::open_locked`]. Read-only.
-pub fn read_ftp_profile_locked(lock: CameraLock, serial: Option<&str>) -> Result<FtpProfileReadout, PtpUsbError> {
+pub fn read_ftp_profile_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    slot: Option<u32>,
+) -> Result<FtpProfileReadout, PtpUsbError> {
     let mut session = PtpUsbSession::open_locked(lock, serial)?;
-    session.read_ftp_profile()
+    session.read_ftp_profile_slot(slot)
 }
 
 /// Format `data` as lowercase space-separated hex byte pairs, e.g.
@@ -5338,6 +5402,60 @@ mod tests {
         )
     }
 
+    /// A phone-hotspot style profile (rebuilt with placeholders): 5 GHz-field
+    /// tag `06 04`, empty username and password (anonymous login?), FTP port
+    /// 2221, option flags 0x07, a 10.x /24 camera network.
+    fn ftp_blob_anonymous_hex() -> &'static str {
+        concat!(
+            "f4010a500052004f00460049004c0045002d004300000010300030003000300030003000300030",
+            "005400300030003000300030003000000010300030003000300030003000300030005400300030",
+            "0030003000300030000000020303fb00000a180000000000000000030001000400000061702d61",
+            "06040400000070772d62010b310030002e0030002e0030002e00310030003700000000ad080000",
+            "0000000000000700901f000000000027000000303030303a303030303a303030303a303030303a",
+            "303030303a303030303a303030303a303030304027000000303030303a303030303a303030303a",
+            "303030303a303030303a303030303a303030303a3030303027000000303030303a303030303a30",
+            "3030303a303030303a303030303a303030303a303030303a3030303081",
+        )
+    }
+
+    /// A hotspot profile with no stored camera address (network block all
+    /// zero): 2.4 GHz tag `03 00 30 00`, 5 GHz tag `06 04`, empty login,
+    /// second port 0. Rebuilt with placeholders from a Z 9 profile read on
+    /// 2026-11-05.
+    fn ftp_blob_no_address_hex() -> &'static str {
+        concat!(
+            "f4010a500052004f00460049004c0045002d004400000010300030003000300030003000300030",
+            "005400300030003000300030003000000010300030003000300030003000300030005400300030",
+            "003000300030003000000002030300000000000000000000000000030030000400000061702d64",
+            "06040400000070772d64010c3100390032002e0030002e0032002e00320034003300000000ad08",
+            "000000000000000007000000000000000027000000303030303a303030303a303030303a303030",
+            "303a303030303a303030303a303030303a303030304027000000303030303a303030303a303030",
+            "303a303030303a303030303a303030303a303030303a3030303027000000303030303a30303030",
+            "3a303030303a303030303a303030303a303030303a303030303a3030303081",
+        )
+    }
+
+    #[test]
+    fn decode_a_profile_with_no_camera_address_and_a_different_2_4ghz_tag() {
+        let d = decode_ftp_profile(&hex::decode_hex(ftp_blob_no_address_hex())).unwrap();
+        assert_eq!(d.profile_name, "PROFILE-D");
+        assert_eq!(d.camera_network, FtpCameraNetwork { ipv4: [0, 0, 0, 0], prefix_len: 0 });
+        assert_eq!((d.ssid24_kind, d.ssid5_kind), (0x30, 0x06));
+        assert_eq!((d.ftp_port, d.option_flags, d.second_port), (2221, 0x0007, 0));
+        assert!(d.as_encodable().is_none());
+    }
+
+    #[test]
+    fn decode_a_profile_with_a_different_5ghz_tag_and_an_empty_login() {
+        let d = decode_ftp_profile(&hex::decode_hex(ftp_blob_anonymous_hex())).unwrap();
+        assert_eq!(d.profile_name, "PROFILE-C");
+        assert_eq!(d.camera_network, FtpCameraNetwork { ipv4: [10, 0, 0, 251], prefix_len: 24 });
+        assert_eq!((d.ssid5_kind, d.ssid_5ghz.as_str()), (0x06, "pw-b"));
+        assert_eq!((d.username.as_str(), d.password.as_str()), ("", ""));
+        assert_eq!((d.ftp_port, d.option_flags, d.second_port), (2221, 0x0007, 8080));
+        assert!(d.as_encodable().is_none());
+    }
+
     #[test]
     fn decode_a_profile_with_a_non_default_ftp_port_and_option_flags() {
         let blob = hex::decode_hex(ftp_blob_port22_hex());
@@ -5399,10 +5517,11 @@ mod tests {
     }
 
     #[test]
-    fn password_masking_keeps_the_length_and_hides_the_text() {
+    fn secret_masking_keeps_the_lengths_and_hides_the_text() {
         let d = decode_ftp_profile(&hex::decode_hex(reference_ftp_blob_hex())).unwrap();
-        assert_eq!(d.with_password_masked().password, "********");
-        assert_eq!(d.password, "12345678", "masking returns a copy");
+        let m = d.with_secrets_masked();
+        assert_eq!((m.password.as_str(), m.ssid_5ghz.as_str()), ("********", "*********"));
+        assert_eq!((d.password.as_str(), d.ssid_5ghz.as_str()), ("12345678", "nikon5ghz"), "masking returns a copy");
     }
 
     #[test]
@@ -5475,6 +5594,37 @@ mod tests {
         );
         s.read_ftp_profile().unwrap();
         assert_eq!(t.sent().last().unwrap(), &(CONTAINER_COMMAND, OP_FTP_PROFILE_READ, 2, le(4)));
+    }
+
+    #[test]
+    fn read_ftp_profile_slot_reads_the_asked_slot_even_when_none_is_active() {
+        let blob = hex::decode_hex(ftp_blob_317_hex());
+        let (mut s, t) = session(
+            vec![
+                resp(RESP_OK),
+                data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(3, 0xff, "Z_9_0000000")),
+                resp(RESP_OK),
+                data_c(OP_FTP_PROFILE_READ, &blob),
+                resp(RESP_OK),
+            ],
+            "Z 9",
+        );
+        let out = s.read_ftp_profile_slot(Some(2)).unwrap();
+        assert!(out.profile.is_some() && !out.info.has_active_profile());
+        assert_eq!(t.sent().last().unwrap(), &(CONTAINER_COMMAND, OP_FTP_PROFILE_READ, 2, le(2)));
+    }
+
+    #[test]
+    fn read_ftp_profile_slot_refuses_a_slot_at_or_above_the_stored_count_before_sending_it() {
+        let (mut s, t) = session(
+            vec![resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(3, 0, "Z_9_0000000")), resp(RESP_OK)],
+            "Z 9",
+        );
+        assert!(matches!(
+            s.read_ftp_profile_slot(Some(3)).unwrap_err(),
+            PtpUsbError::FtpSlotOutOfRange { slot: 3, count: 3 }
+        ));
+        assert!(t.sent().iter().all(|(_, op, _, _)| *op != OP_FTP_PROFILE_READ));
     }
 
     #[test]

@@ -352,7 +352,31 @@ from a Z9 over USB, so **the read works on hardware**. Layout corrections found 
 Not yet matched against the camera's menu: the profile's server type (FTP/FTPS/SFTP), port, passive mode, proxy and
 folder. That comparison would settle the port, flags and folder meanings.
 
-Slot semantics: the slot is the **active** profile (0xff = none selected), not a count of stored ones.
+Slot semantics (superseded just below): the `0x90EB` slot looked like the active profile.
 
 Process note: the first run printed the raw hex of a blob the decoder rejected, which included that profile's password
 in clear. `vendor-read-ftp --raw` now withholds the dump when it cannot locate the password, unless `--show-password`.
+
+### All stored profiles read over USB (2026-11-05, Z9 with 3 profiles)
+
+The owner then said the Z9 holds several profiles, and approved `vendor-read-ftp --slot N` (read-only; `0x90ED(N)`).
+
+- **`0x90EB` `count` is the number of stored FTP profiles** (3 here), and `0x90ED(N)` for `N` in `0..count` returns
+  profile `N`: slot 0 = `PHONE FTP`, slot 1 = `NETSOL`, slot 2 = `PHONE_DIREC8`. The `0x90EB` "slot" field stayed `0` when
+  the active profile changed from NETSOL to PHONE FTP, so it is **not** the active profile; `0xff` there is unexplained
+  (it is what every body reported before a profile was selected/created, and 0 once one was). The earlier readings of
+  "no profile" for the Z6III (`count` 3) and the other Z9 (`count` 1) were wrong: they hold 3 and 1 stored profiles. The
+  tool now reads them with `--slot`.
+- **`0x90ED(count)` stalls the USB pipe** (`Pipe error`; the session clears the halt and the camera answered the next
+  run normally). NX Field, over PTP/IP, got `0x201F` for `0x90ED(0xff)`. `--slot` refuses `N >= count` before sending.
+- New layout facts (rebuilds every blob seen, 325/331/354/319/329 B): the 2.4 GHz tag is `03 00 xx 00` with `xx` = `01`
+  normally and `0x30` for a profile with no stored camera address; the 5 GHz-field tag is `xx 04` with `xx` = `04` or
+  `06` (both seen on hotspot-style profiles); the camera-address block can be all zero; the "second port" is 0, not 8080,
+  in `PHONE_DIREC8`; usernames and passwords can be empty (the two phone-hotspot profiles have no login, FTP port 2221,
+  option flags `0x0007`). Option flags seen: `0x0001`, `0x0005`, `0x0007`, `0x000d`.
+- **The "5 GHz SSID" field is very probably the Wi-Fi password** (July: `nikon5ghz` = the rig AP's passphrase; the
+  phone-hotspot profiles carry a hotspot-style value). The CLI masks it, with the FTP password, unless `--show-password`.
+  Two earlier outputs in the working session showed such values in clear before this masking existed.
+- Still unconfirmed against the camera's menu: what the option flags, the `ssid24_kind`/`ssid5_kind` tags and the
+  "folder" string mean. A per-profile comparison with the menu (protocol, passive, anonymous, proxy, security type) would
+  settle them.

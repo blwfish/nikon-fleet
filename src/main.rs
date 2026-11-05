@@ -586,7 +586,14 @@ struct VendorReadFtpArgs {
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
     serial: Option<String>,
-    /// Print the FTP password in clear text instead of asterisks. Without
+    /// Read this stored profile instead of the active one: slots 0 to count-1
+    /// (`count` is on the first output line). Read-only: `0x90ED(N)`. A slot
+    /// past the end is refused before sending, because on a Z 9 it stalled the
+    /// USB pipe.
+    #[arg(long)]
+    slot: Option<u32>,
+    /// Print the FTP password and the "5 GHz" field (probably a Wi-Fi
+    /// password) in clear text instead of asterisks. Without
     /// --raw the hex dump below also contains it, so --raw masks it too
     /// unless this is given.
     #[arg(long)]
@@ -1479,7 +1486,7 @@ fn cmd_vendor_read(args: &VendorReadArgs) -> Result<()> {
 fn cmd_vendor_read_ftp(args: &VendorReadFtpArgs) -> Result<()> {
     let readout = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
         .and_then(|(lock, serial)| {
-            nikon_fleet::ptp_usb::read_ftp_profile_locked(lock, serial.as_deref()).map_err(anyhow::Error::new)
+            nikon_fleet::ptp_usb::read_ftp_profile_locked(lock, serial.as_deref(), args.slot).map_err(anyhow::Error::new)
         })
         .context("reading the FTP profile over USB PTP")?;
     for w in &readout.warnings {
@@ -1489,8 +1496,9 @@ fn cmd_vendor_read_ftp(args: &VendorReadFtpArgs) -> Result<()> {
     Ok(())
 }
 
-/// What `vendor-read-ftp` prints. The password is masked, in the decoded
-/// fields and in the hex dump, unless `show_password`.
+/// What `vendor-read-ftp` prints. The password and the 5 GHz field (probably a
+/// Wi-Fi password) are masked, in the decoded fields and in the hex dump,
+/// unless `show_password`.
 fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: bool, raw: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1511,18 +1519,18 @@ fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: 
     };
     match &p.decoded {
         Ok(d) => {
-            let shown = if show_password { d.clone() } else { d.with_password_masked() };
+            let shown = if show_password { d.clone() } else { d.with_secrets_masked() };
             let n = d.camera_network;
             let _ = writeln!(out, "profile name:   {}", shown.profile_name);
             let _ = writeln!(out, "SSID 2.4 GHz:   {}", shown.ssid_24ghz);
-            let _ = writeln!(out, "SSID 5 GHz:     {}", shown.ssid_5ghz);
+            let _ = writeln!(out, "5 GHz field:    {}  (probably the Wi-Fi password; tag 0x{:02x}04)", shown.ssid_5ghz, d.ssid5_kind);
             let _ = writeln!(out, "host:           {}", shown.host);
             let _ = writeln!(out, "FTP port:       {}", shown.ftp_port);
             let _ = writeln!(out, "folder (?):     {}", shown.folder);
             let _ = writeln!(out, "username:       {}", shown.username);
             let _ = writeln!(out, "password:       {}", shown.password);
             let _ = writeln!(out, "option flags:   0x{:04x}", shown.option_flags);
-            let _ = writeln!(out, "second port:    {}  (8080 in every blob seen; probably the proxy port)", shown.second_port);
+            let _ = writeln!(out, "second port:    {}  (8080 in most blobs; probably the proxy port)", shown.second_port);
             let _ = write!(
                 out,
                 "camera address: {}.{}.{}.{}/{}",
@@ -1540,8 +1548,10 @@ fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: 
             (Ok(d), false) => {
                 // Zero the password bytes in the dump: they sit right after
                 // the username, found by searching for the plaintext.
-                if let Some(at) = find_subslice(&bytes, d.password.as_bytes()) {
-                    bytes[at..at + d.password.len()].fill(0);
+                for secret in [&d.password, &d.ssid_5ghz] {
+                    if let Some(at) = find_subslice(&bytes, secret.as_bytes()) {
+                        bytes[at..at + secret.len()].fill(0);
+                    }
                 }
             }
             (Err(_), false) => {
@@ -4444,12 +4454,16 @@ mod tests {
         let r = ftp_readout_with_profile();
         let masked = ftp_readout_text(&r, false, true);
         assert!(masked.contains("password:       ********"), "{masked}");
-        assert!(!masked.contains("s3cretpw"), "{masked}");
+        assert!(!masked.contains("s3cretpw") && !masked.contains("nikon5ghz"), "{masked}");
+        assert!(
+            !masked.contains(&nikon_fleet::ptp_usb::hex_bytes(b"nikon5ghz")),
+            "the 5 GHz field (probably a Wi-Fi password) is zeroed in the dump too: {masked}"
+        );
         let hex_of_pw = nikon_fleet::ptp_usb::hex_bytes(b"s3cretpw");
         assert!(!masked.contains(&hex_of_pw), "the dump must not carry the password bytes: {masked}");
         assert!(masked.contains("profile name:   CLAUDE") && masked.contains("FTP port:       21") && masked.contains("second port:    8080"), "{masked}");
         let shown = ftp_readout_text(&r, true, true);
-        assert!(shown.contains("s3cretpw") && shown.contains(&hex_of_pw), "{shown}");
+        assert!(shown.contains("s3cretpw") && shown.contains("nikon5ghz") && shown.contains(&hex_of_pw), "{shown}");
     }
 
     #[test]
