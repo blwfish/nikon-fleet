@@ -403,7 +403,7 @@ The owner then said the Z9 holds several profiles, and approved `vendor-read-ftp
 
 ### Z5 and the second Z9 (2026-11-05)
 
-**Z5 (V1.43): not tested; DeviceInfo says nothing either way.** Its DeviceInfo lists 89 operations, 70 in the vendor range
+**Z5 (V1.43): DeviceInfo says nothing either way (see the Z5 test below: it does not answer `0x90E8`).** Its DeviceInfo lists 89 operations, 70 in the vendor range
 (`0x90C0`–`0x90CF`, `0x9201`–`0x920F`, `0x9400`–`0x9535`), without `0x90E8`/`0x90EB`/`0x90ED`/`0x90EE` or `0x943B`/`0x943C`.
 **That does not show the Z5 lacks the FTP operations**: a Z9 (146 operations) does not list `0x90E8`–`0x90EE` either, yet
 answers all four, so they are hidden from DeviceInfo. (An earlier version of this note said the Z5 "says it does not support
@@ -456,7 +456,14 @@ With the owner's permission (the only stored profile there was a non-functional 
 `vendor-read-ftp` on the Z5 (V1.43) failed with `USB error: Operation timed out`. OpenSession had succeeded and a
 DeviceInfo read right afterwards worked, so the first FTP operation (`0x90E8`, with its 3-byte data phase) got no reply at
 all, rather than the clean `0x2005` OperationNotSupported. The session was poisoned as designed and the camera was fine.
-So the Z5 does not implement the FTP profile operations under these codes (consistent with its having no FTP profile
-feature; its menu was not checked). The error does not say which operation timed out; that is inferred from the session
-opening normally. This supersedes the "not tested" paragraph for the Z5 above; the point there that DeviceInfo says nothing
+So the Z5 does not implement these particular operations. **It does have FTP** (the owner knows it from use: the transfer
+is very slow, about 15 or 150 Mbit/s). The Z5 is an Expeed 6 body and the Z6III/Z9 are Expeed 7, with a quite different
+firmware set; on the Z5 the equivalents of FTP profiles live under **Connect to PC** in the menu, not under a
+"Connect to FTP server" profile list. (An earlier version of this paragraph said the timeout was consistent with the Z5
+having no FTP feature; that was wrong.) The Z5's operations for those settings are therefore unknown, and are probably not
+`0x90E8`–`0x90EE`. The mechanism for reading or writing them over USB has to be found separately, for example by capturing
+the traffic of Nikon's Wireless Transmitter Utility (the app the cameras kept asking for earlier in this work) while it
+sets up a connection, or by comparing the Z5's vendor operation list with older bodies. Neither has been done. The error
+does not say which operation timed out; that is inferred from the session opening normally.
+This supersedes the "not tested" paragraph for the Z5 above; the point there that DeviceInfo says nothing
 about the hidden `0x90E_` operations still stands.
