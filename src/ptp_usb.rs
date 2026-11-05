@@ -362,6 +362,8 @@ pub enum PtpUsbError {
          control); it was not sent"
     )]
     FtpProbeOpNotAllowed { op: u16 },
+    #[error("the FTP probe's data-out is limited to 32 bytes; {len} was not sent")]
+    FtpProbeDataTooLong { len: usize },
     #[error(
         "the FTP probe takes at most 2 parameters and refuses 0xFFFFFFFF (an out-of-range slot value that \
          hung a camera's network stack); {params:?} was not sent"
@@ -2659,6 +2661,8 @@ pub struct FtpListState {
 pub struct FtpOpProbe {
     pub op: u16,
     pub params: Vec<u32>,
+    /// Data-out sent with the op, if any.
+    pub data: Option<Vec<u8>>,
     pub setup_first: bool,
     pub before: FtpListState,
     pub reply: Result<FtpProbeReply, String>,
@@ -2703,12 +2707,17 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// `0x90E8` setup that the profile ops need, and report the profile list before and after.
     /// EXPERIMENTAL: what these ops do is unknown, so the list is read first and again afterwards
     /// and both are returned. The refused-op check happens before any I/O.
-    pub fn probe_ftp_op(&mut self, op: u16, setup_first: bool, params: &[u32]) -> Result<FtpOpProbe, PtpUsbError> {
+    pub fn probe_ftp_op(&mut self, op: u16, setup_first: bool, params: &[u32], data: Option<&[u8]>) -> Result<FtpOpProbe, PtpUsbError> {
         if !FTP_PROBE_OPS.contains(&op) {
             return Err(PtpUsbError::FtpProbeOpNotAllowed { op });
         }
         if params.len() > 2 || params.contains(&u32::MAX) {
             return Err(PtpUsbError::FtpProbeBadParams { params: params.to_vec() });
+        }
+        if let Some(d) = data {
+            if d.len() > 32 {
+                return Err(PtpUsbError::FtpProbeDataTooLong { len: d.len() });
+            }
         }
         let mut warnings = Vec::new();
         if sdk_model_name(self.model()).is_none() {
@@ -2724,14 +2733,14 @@ impl<T: BulkTransport> PtpUsbSession<T> {
                 let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
                 Self::require_ok(OP_FTP_SETUP, setup.code)?;
             }
-            self.transact(op, params, None, TxidCheck::Unchecked)
+            self.transact(op, params, data, TxidCheck::Unchecked)
         })();
         let reply = match sent {
             Ok(r) => Ok(FtpProbeReply { response_code: r.code, data: r.data, data_containers: r.data_containers }),
             Err(e) => Err(e.to_string()),
         };
         let after = self.ftp_list_state().map_err(|e| e.to_string());
-        Ok(FtpOpProbe { op, params: params.to_vec(), setup_first, before, reply, after, warnings })
+        Ok(FtpOpProbe { op, params: params.to_vec(), data: data.map(<[u8]>::to_vec), setup_first, before, reply, after, warnings })
     }
 }
 
@@ -2743,6 +2752,7 @@ pub fn probe_ftp_op_locked(
     op: u16,
     setup_first: bool,
     params: &[u32],
+    data: Option<&[u8]>,
 ) -> Result<FtpOpProbe, PtpUsbError> {
     if !FTP_PROBE_OPS.contains(&op) {
         return Err(PtpUsbError::FtpProbeOpNotAllowed { op });
@@ -2750,8 +2760,11 @@ pub fn probe_ftp_op_locked(
     if params.len() > 2 || params.contains(&u32::MAX) {
         return Err(PtpUsbError::FtpProbeBadParams { params: params.to_vec() });
     }
+    if data.is_some_and(|d| d.len() > 32) {
+        return Err(PtpUsbError::FtpProbeDataTooLong { len: data.map_or(0, <[u8]>::len) });
+    }
     let mut session = PtpUsbSession::open_locked(lock, serial)?;
-    session.probe_ftp_op(op, setup_first, params)
+    session.probe_ftp_op(op, setup_first, params, data)
 }
 
 impl<T: BulkTransport> Drop for PtpUsbSession<T> {
@@ -6046,11 +6059,11 @@ mod tests {
     fn probe_ftp_op_refuses_an_op_off_the_list_before_any_io() {
         let (mut s, t) = session(vec![], "Z 9");
         assert!(matches!(
-            s.probe_ftp_op(0x90EE, false, &[]).unwrap_err(),
+            s.probe_ftp_op(0x90EE, false, &[], None).unwrap_err(),
             PtpUsbError::FtpProbeOpNotAllowed { op: 0x90EE }
         ));
         assert!(matches!(
-            s.probe_ftp_op(0x90ED, true, &[]).unwrap_err(),
+            s.probe_ftp_op(0x90ED, true, &[], None).unwrap_err(),
             PtpUsbError::FtpProbeOpNotAllowed { op: 0x90ED }
         ));
         assert!(t.sent().iter().all(|(_, op, _, _)| *op != 0x90EE && *op != 0x90ED && *op != OP_FTP_SETUP));
@@ -6063,7 +6076,7 @@ mod tests {
         replies.push(resp(0x2005)); // OperationNotSupported
         replies.extend(list_state_replies(&blob, 0));
         let (mut s, t) = session(replies, "Z 9");
-        let p = s.probe_ftp_op(0x9FFF, false, &[]).unwrap();
+        let p = s.probe_ftp_op(0x9FFF, false, &[], None).unwrap();
         assert_eq!(p.reply.as_ref().unwrap().response_code, 0x2005);
         assert_eq!(p.before, p.after.clone().unwrap());
         assert_eq!(p.before.count, 1);
@@ -6084,7 +6097,7 @@ mod tests {
         replies.push(resp(0x2005)); // the op
         replies.extend(list_state_replies(&blob, 0));
         let (mut s, t) = session(replies, "Z 9");
-        let p = s.probe_ftp_op(0x90E9, true, &[]).unwrap();
+        let p = s.probe_ftp_op(0x90E9, true, &[], None).unwrap();
         assert!(p.setup_first);
         assert_eq!(p.reply.unwrap().response_code, 0x2005);
         let ops: Vec<u16> = t.sent().iter().map(|(_, op, _, _)| *op).collect();
@@ -6096,7 +6109,7 @@ mod tests {
     fn probe_ftp_op_sends_the_given_parameters_and_refuses_too_many_or_the_hang_value() {
         let (mut s, t) = session(vec![], "Z 9");
         for bad in [&[1u32, 2, 3][..], &[u32::MAX][..], &[0, u32::MAX][..]] {
-            assert!(matches!(s.probe_ftp_op(0x90EF, false, bad).unwrap_err(), PtpUsbError::FtpProbeBadParams { .. }));
+            assert!(matches!(s.probe_ftp_op(0x90EF, false, bad, None).unwrap_err(), PtpUsbError::FtpProbeBadParams { .. }));
         }
         assert!(t.sent().iter().all(|(_, op, _, _)| *op != 0x90EF && *op != OP_FTP_SETUP));
 
@@ -6105,11 +6118,34 @@ mod tests {
         replies.push(resp(RESP_OK));
         replies.extend(list_state_replies(&blob, 0));
         let (mut s, t) = session(replies, "Z 9");
-        let p = s.probe_ftp_op(0x90EF, false, &[1]).unwrap();
+        let p = s.probe_ftp_op(0x90EF, false, &[1], None).unwrap();
         assert_eq!(p.params, vec![1]);
         let sent = t.sent();
         let (_, _, _, payload) = sent.iter().find(|(_, op, _, _)| *op == 0x90EF).expect("op sent");
         assert_eq!(payload, &1u32.to_le_bytes().to_vec(), "the parameter reached the wire");
+    }
+
+    #[test]
+    fn probe_ftp_op_sends_data_out_under_the_same_transaction_and_caps_its_length() {
+        let (mut s, t) = session(vec![], "Z 9");
+        assert!(matches!(
+            s.probe_ftp_op(0x90EC, false, &[], Some(&[0u8; 33])).unwrap_err(),
+            PtpUsbError::FtpProbeDataTooLong { len: 33 }
+        ));
+        assert!(t.sent().iter().all(|(_, op, _, _)| *op != 0x90EC && *op != OP_FTP_SETUP));
+
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(RESP_OK));
+        replies.extend(list_state_replies(&blob, 0));
+        let (mut s, t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90EC, false, &[1], Some(&[0xAA, 0xBB])).unwrap();
+        assert_eq!(p.data.as_deref(), Some(&[0xAA, 0xBB][..]));
+        let sent = t.sent();
+        let frames: Vec<_> = sent.iter().filter(|(_, op, _, _)| *op == 0x90EC).collect();
+        assert_eq!(frames.len(), 2, "a command container and a data container");
+        assert_eq!(frames[0].2, frames[1].2, "same transaction id");
+        assert_eq!(frames[1].3, vec![0xAA, 0xBB]);
     }
 
     #[test]
@@ -6121,7 +6157,7 @@ mod tests {
         // becomes selected 5), so the two states differ.
         replies.extend(list_state_replies(&blob, 5));
         let (mut s, _t) = session(replies, "Z 9");
-        let p = s.probe_ftp_op(0x90EC, false, &[]).unwrap();
+        let p = s.probe_ftp_op(0x90EC, false, &[], None).unwrap();
         assert_ne!(p.before, p.after.unwrap());
     }
 

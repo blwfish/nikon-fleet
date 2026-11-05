@@ -618,6 +618,15 @@ struct VendorOpSupportArgs {
     serial: Option<String>,
 }
 
+/// Hex digits (optional spaces) to bytes, for the probe's `--data`.
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
+    let t: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if t.is_empty() || t.len() % 2 != 0 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("{s:?} is not an even number of hex digits"));
+    }
+    Ok((0..t.len()).step_by(2).map(|i| u8::from_str_radix(&t[i..i + 2], 16).expect("hex digits checked")).collect())
+}
+
 /// A `u32` given in decimal or `0x` hex (for the probe's `--param`).
 fn parse_u32_any(s: &str) -> Result<u32, String> {
     let t = s.trim();
@@ -638,6 +647,10 @@ struct VendorProbeOpArgs {
     /// stack when used as a slot number.
     #[arg(long = "param", value_parser = parse_u32_any)]
     params: Vec<u32>,
+    /// Data-out to send with the op, as hex digits (at most 32 bytes), e.g.
+    /// "01000000". Without it the op is sent with no data phase at all.
+    #[arg(long)]
+    data: Option<String>,
     /// Send the 0x90E8 setup (data-out 01 00 00) immediately before the op,
     /// as the profile ops need. Without it the op is sent bare in a fresh
     /// session.
@@ -1646,9 +1659,10 @@ fn cmd_vendor_op_support(args: &VendorOpSupportArgs) -> Result<()> {
 
 /// Send one bare op from the fixed probe list and print the list before and after.
 fn cmd_vendor_probe_op(args: &VendorProbeOpArgs) -> Result<()> {
+    let data = args.data.as_deref().map(parse_hex_bytes).transpose().map_err(|e| anyhow::anyhow!("--data: {e}"))?;
     let probe = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
         .and_then(|(lock, serial)| {
-            nikon_fleet::ptp_usb::probe_ftp_op_locked(lock, serial.as_deref(), args.op, args.setup, &args.params).map_err(anyhow::Error::new)
+            nikon_fleet::ptp_usb::probe_ftp_op_locked(lock, serial.as_deref(), args.op, args.setup, &args.params, data.as_deref()).map_err(anyhow::Error::new)
         })
         .with_context(|| format!("probing operation 0x{:04x} over USB PTP", args.op))?;
     for w in &probe.warnings {
@@ -1670,16 +1684,19 @@ fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
             .collect();
         format!("{} profile(s): {}", s.count, items.join(", "))
     }
-    let args = if p.params.is_empty() {
+    let mut args = if p.params.is_empty() {
         String::new()
     } else {
         format!("({})", p.params.iter().map(|v| format!("0x{v:x}")).collect::<Vec<_>>().join(", "))
     };
+    if let Some(d) = &p.data {
+        args.push_str(&format!(" + data {}", hex_bytes(d)));
+    }
     let mut out = format!(
         "0x{:04x}{}{}: ",
         p.op,
         args,
-        if p.setup_first { " after the 0x90E8 setup" } else if p.params.is_empty() { " bare" } else { "" }
+        if p.setup_first { " after the 0x90E8 setup" } else if p.params.is_empty() && p.data.is_none() { " bare" } else { "" }
     );
     match &p.reply {
         Ok(r) => {
@@ -1776,6 +1793,12 @@ fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: 
         i.limit,
         if i.has_active_profile() { i.slot.to_string() } else { "none (0xff)".to_string() }
     );
+    out.push_str(&format!(
+        "info GUID:      {}  (device name {:?}, trailer 0x{:04x})\n",
+        nikon_fleet::ptp_usb::hex_bytes(&i.guid),
+        i.device_name.text,
+        i.trailer
+    ));
     let Some(p) = &r.profile else {
         out.push_str(
             "the camera reports no active FTP profile (slot 0xff; 0x90ED not sent). Profiles may still be stored on it: this does not say there are none.",

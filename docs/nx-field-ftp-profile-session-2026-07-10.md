@@ -225,7 +225,8 @@ new profile (`UsbPi`) at the front. The tool already allowed `slot == count`; it
 
 ### Probing the unused ops in the range
 
-`vendor-probe-op OP [--param N]... [--setup]` sends one op with no data from a fixed list (`0x90E9`,
+`vendor-probe-op OP [--param N]... [--data HEX] [--setup]` sends one op (with optional data-out of up to
+32 bytes) from a fixed list (`0x90E9`,
 `0x90EA`, `0x90EC`, `0x90EF`, and `0x9FFF` as a control that should not exist), at most two parameters
 and never `0xFFFFFFFF`. It reads the profile list and the selected index before and after. If the op gets
 no reply the session is unusable, so the "after" listing is then unavailable and `vendor-read-ftp` is run
@@ -237,18 +238,30 @@ again. Results, Z9:
 | **`0x90EA`, bare** | `0x2001` OK. **All profiles deleted**: count 4 → 0, selected index `0xFF`. |
 | **`0x90EF(1)`** | `0x2001` OK. **The profile at index 1 was deleted** (count 4 → 3, the others kept their order). |
 | `0x90EF`, bare | USB pipe stall (`Pipe error`). Camera fine afterwards. The same way a bad slot number was refused over USB. |
-| `0x90EC`, bare | no reply, USB timeout. Camera answered again immediately in a new session. |
+| `0x90EC`, bare, or `0x90EC(1)` with no data | no reply, USB timeout. Camera answered again immediately in a new session. |
+| **`0x90EC` with data-out `01`, `01 00 00 00` or `01 00 00`** (no parameters) | `0x2001` OK each time; profile list and selection unchanged. **Afterwards the `0x90EB` device-name string was empty** (see below). |
+| `0x90EC(1)` with data-out `01` | USB pipe stall. Camera fine afterwards. |
+| `0x90EC` with data-out `0c 5a 00 5f 00 39 00 5f 00 33 00 30 00 32 00 33 00 36 00 36 00 38 00 00 00` (the original name as a PTP string), then `02 41 00 00` and `02 41 00 00 00` (`"A"`) | `0x2001` OK each time; the name stayed empty. |
 | `0x90E9`, bare, after the setup, over Wi-Fi | no reply within 8 s, and then the camera answered nothing on Wi-Fi (port 15740 closed) or on USB (every transaction timed out) until the owner power-cycled it. |
 
 - **`0x90EA` and `0x90EF(n)` are the delete operations** (all, and one). They are destructive and run
   with no confirmation. The four profiles were restored from saved raw blobs: re-added in reverse order
   (each add goes to the front) and compared byte-for-byte with the originals.
-- `0x90E9` and `0x90EC` exist (they do not answer `0x2005`) but sent bare they get no reply. A guess is
-  that they expect a data phase or parameters. Neither has been sent anything else. `0x90E9` left the
-  camera's PTP engine stuck on both transports; the stuck state was probably the unanswered transaction
-  (unverified).
-- None of the probed ops changed the selection. Only `0x90E9` and `0x90EC` are candidates for a "select"
-  operation.
+- `0x90E9` and `0x90EC` exist (they do not answer `0x2005`) but sent bare they get no reply. `0x90E9` has
+  not been sent anything else; it left the camera's PTP engine stuck on both transports (probably the
+  unanswered transaction, unverified). `0x90EC` takes data-out and no parameters.
+- **An unintended change.** The `0x90EB` reply is `c8 00`, count, limit, selected index, a 16-byte GUID, a
+  PTP string, `f4 01`. The string was `Z_9_3023668` (model and serial) before the three `0x90EC` data runs
+  and is `01 00 00` (an empty string) after them; the GUID did not change. It stayed empty through a power
+  cycle and after the later restore attempts, so it is stored. Which of the three payloads blanked it is
+  not known (the list was not re-read between them), and what `0x90EC` really sets is not known: it did not
+  accept a well-formed name. The camera still joined the access point, logged in over SFTP and uploaded a
+  JPEG (`_BLW9415.JPG`, 978,248 bytes) afterwards, and NX Field's port was open, so the empty name has not
+  been seen to matter. The original value is recorded here in case it does.
+- **No op that selects a profile was found.** NX Field sends none of `0x90E9`, `0x90EA`, `0x90EC`,
+  `0x90EF` in any capture (July sessions, or the 186 MB one here), and the SDK's capability list
+  (`MaidLayer.config`, the TypeCommon module's strings) has nothing for FTP profiles. Selection may be
+  menu-only.
 
 ### Operation map (Z9, this evening)
 
@@ -261,14 +274,18 @@ again. Results, Z9:
 | `0x90EE(count, 1)` | add a profile at the front |
 | `0x90EF(n)` | delete profile n |
 | `0x90EA` | delete all profiles |
-| `0x90E9`, `0x90EC` | exist; purpose unknown |
+| `0x90EC` + data | accepted with 1, 3 or 4 bytes; blanked the `0x90EB` device-name string (cause unclear); stalls if given a parameter |
+| `0x90E9` | exists; purpose unknown; sent bare it wedged the camera until a power cycle |
 
 ## 7. Open questions
 
 - Which camera models accept this client and the probes. Only the Z9 above was tried. The Z6III answered
   the read ops over USB earlier but has not been probed.
-- How to select a profile over the wire. `0x90E9` and `0x90EC` with a parameter or data are untried;
-  either could hang the camera until a power cycle.
+- How to select a profile over the wire, if it can be done at all. `0x90E9` has only been sent bare;
+  `0x90EC` takes data of an unknown format. Either could hang the camera until a power cycle, or change a
+  stored value (`0x90EC` did).
+- What the `0x90EB` device-name string is for, why it blanked, and how to set it back to
+  `Z_9_3023668`.
 - What the second parameter of `0x90EE` means beyond 0 (replace) and 1 (add), and what the `0x90E8`
   setup byte (always `01 00 00`) selects. Neither was varied.
 - What the `00` / `03` byte in the 2.4 GHz tag means.
