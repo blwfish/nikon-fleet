@@ -195,6 +195,23 @@ against the installed version):
   pairing/handshake that gphoto2 doesn't. If it connects, identical code can read the same property over both
   transports, which is the closest thing to a like-for-like comparison.
 
+**What gphoto2 reaches that MAID doesn't, and what neither does** (source-checked 2026-11-05 against libgphoto2
+`ptp.h`/`config.c`/`ptp.c`, plus the July Z6III baseline; nothing run against a camera today):
+- **Artist / copyright: yes over USB.** `config.c` has `artist` (`0xD072`) and `copyright` (`0xD073`) settings for
+  Nikon, both using the string setter `_put_STR`. The baseline lists Artist Name, Copyright Information, Image
+  Comment (`0xD090`) and the flags `0xD053`/`0xD091` as rw, and todo.md records the fields working on all four
+  bodies. `0xD053` has no named setting but is reachable as `other/d053`. MAID has no capability for any of these.
+  Not checked: what `_put_STR` does with the fixed-length, space-padded fields (36/54 chars). Write a value, read it
+  back, and check before relying on it.
+- **FTP profile: no.** libgphoto2 has FTP-profile support only for Canon (`SetWftProfile`/`GetWftProfile`) and Sony
+  (FTP-setting properties). Nothing for Nikon `0x90E8`/`0x90EE`. `ptp_usb.rs` is the only working write path, and
+  the profile still has no read-back.
+- **IPTC contents: no.** Only the preset selector `0xD060` is named (baseline: rw, range 0–13). `0x9412`/`0x9413`
+  are absent; reading or writing the IPTC fields remains `ptp_usb.rs` work.
+- **`0x943B` / `0x943C`: no.** Neither op is in libgphoto2's op list. gphoto2 reaches properties through standard
+  `GetDevicePropDesc`/`Get`/`SetDevicePropValue`, so properties only served via the vendor ops (e.g. `0xD025`, the
+  pre-release burst; see A2 note 3) are out of its reach.
+
 What MAID gives that gphoto2 doesn't: labeled enums/ranges/steps, capability dependencies, snapshot/restore/verify,
 and (probably) Nikon's vendor ops like `0x943B`/`0x9413` as named features.
 
