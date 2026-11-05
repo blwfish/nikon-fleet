@@ -502,3 +502,51 @@ Ways forward, none done:
 2. A read-only `device-info` on a Z6II (another Expeed 6 body, available through a friend) and on the Z8: if the Z6II's
    list looks like the Z5's (about 89 operations, no `0x943B`/`0x943C`) and the Z8's like the Z6III's (about 146), the
    generation split gets a second data point on each side.
+
+### `0x944C` probed on the Z9 (`Z_9_3023668`, 2026-11-05): it does not say whether an op exists
+
+New read-only command `vendor-op-support <op>` sends `0x944C(<op>, 0)` and prints the response code and bytes verbatim (it
+sends nothing else). Results, one query per run:
+
+| op | response | data |
+|---|---|---|
+| `0x90ED` (what NX Field sends) | OK | 32 bytes: `01 01 01`, then zeros (matches the capture) |
+| `0x90EE` | OK | the same 32 bytes |
+| `0x90E8`, `0x90EB`, `0x943B`, `0x9413` (all known to work) | InvalidParameter `0x201d` | none |
+| `0x90E9`, `0x90EA`, `0x90EC`, `0x90EF` | InvalidParameter | none |
+| `0x9FFF` (control, should not exist) | InvalidParameter | none |
+
+- The guess that `0x944C` reports whether the camera implements an op is **wrong**: four ops known to work get the same
+  answer as one that does not exist. It answered OK for exactly the FTP read/write pair, with identical bytes for both.
+  What `01 01 01` means is unknown. The second parameter has only ever been 0.
+- It therefore cannot enumerate the hidden `0x90E_` range, and nothing new was found there. The `0x944C` guess in the
+  other sections of this document is superseded by this table.
+
+### Read-modify-write on the Z9's slot 0 works (2026-11-05)
+
+On the leftover test profile (`txid-edit`, host 192.0.2.2). `vendor-read-ftp --save-blob <file>` now saves the true raw
+bytes (mode 0600, refuses to overwrite). Using only `0x90ED(0)` to read and `0x90EE(0, 0)` to write back
+(`vendor-write-ftp-blob`):
+
+1. Writing the 323 bytes read, unchanged: the read-back was byte-identical.
+2. Patching only the profile name at the byte level (`txid-edit` to `rmw-test`, so the blob became 321 bytes): the
+   read-back was byte-identical to what was written. So the blob has no hidden length or offset fields that a length change
+   breaks.
+3. Writing the original back: byte-identical to the original (SHA-256 `dfb79e87…`).
+
+Option flags (the `u16` after the password; `0x0005` in the original), each written then read back, then the original
+restored:
+
+| flags written | read-back |
+|---|---|
+| `0x04` (clear `0x01`), `0x07` (set `0x02`), `0x15` (set `0x10`, never seen before) | identical to what was written |
+| `0x01` (clear `0x04`), `0x00` (clear all) | **2 bytes longer** (325 vs 323), flags as written |
+
+- The camera stores unknown flag bits as given (`0x10` came back), so a writer that preserves unknown bytes is safe on
+  this point.
+- With bit `0x04` clear, the camera re-serialises the empty **folder** field: the single `00` (string length 0) comes back
+  as `01 00 00` (a length-1 string holding only a terminator), and everything after it shifts by 2. Nothing else changed.
+  A writer must not assume the blob length is fixed or that read-back equals what was sent; the existing decoder reads
+  both forms. That bit `0x04` means something like "a folder is specified" is a guess.
+- Not checked: what bits `0x01`, `0x02`, `0x04`, `0x10` do in the camera's menu or in an actual FTP transfer, adding a
+  profile, deleting one, slots 1 and up (the Z9 holds only slot 0).
