@@ -403,11 +403,14 @@ The owner then said the Z9 holds several profiles, and approved `vendor-read-ftp
 
 ### Z5 and the second Z9 (2026-11-05)
 
-**Z5 (V1.43): no FTP profile operations.** Its DeviceInfo lists 89 operations, 70 in the vendor range (`0x90C0`–`0x90CF`,
-`0x9201`–`0x920F`, `0x9400`–`0x9535`), and none of `0x90E8`, `0x90EB`, `0x90ED`, `0x90EE`, `0x943B`, `0x943C`. Nothing was
-sent to it: it says it does not support them, so `vendor-read-ftp` would at best get `0x2005`. This also settles C4 above on
-the evidence of the operation list alone: `vendor-read` (`0x943B`) on a Z5 should answer OperationNotSupported, which is what
-the `ptp_usb.rs` comment that mentions that reply says. (Not run: the list is the evidence.)
+**Z5 (V1.43): not tested; DeviceInfo says nothing either way.** Its DeviceInfo lists 89 operations, 70 in the vendor range
+(`0x90C0`–`0x90CF`, `0x9201`–`0x920F`, `0x9400`–`0x9535`), without `0x90E8`/`0x90EB`/`0x90ED`/`0x90EE` or `0x943B`/`0x943C`.
+**That does not show the Z5 lacks the FTP operations**: a Z9 (146 operations) does not list `0x90E8`–`0x90EE` either, yet
+answers all four, so they are hidden from DeviceInfo. (An earlier version of this note said the Z5 "says it does not support
+them"; that was wrong.) `0x943B`/`0x943C` are different: the Z9 and Z6III do list them, so their absence on the Z5 is
+likely meaningful and `vendor-read` there should answer OperationNotSupported (C4), but that is untested. Whether a Z5 has
+FTP profiles at all, and whether it answers `0x90EB`, is unknown; a read-only `vendor-read-ftp` would find out (it could
+answer `0x2005` or stall the pipe, as `0x90ED` past the end did on a Z9).
 
 **Second Z9 (`Z_9_3023668`): `count` 1, one profile, left over from our own write tests.**
 
@@ -429,3 +432,21 @@ So `--port` has never set the FTP port on any body.
 | Z5 | n/a | no FTP profile operations |
 
 The two test profiles (`txid-test`, and `CLAUDE` on the Z6III) can be deleted from the cameras' menus.
+
+### Write experiment on the first Z9 (`Z_9_3023668`, 2026-11-05)
+
+With the owner's permission (the only stored profile there was a non-functional test one):
+
+1. `vendor-write-ftp` with new field values (name `txid-edit`, host 192.0.2.2, `--port 8080`, ...) was accepted, and
+   `vendor-read-ftp --slot 0` returned exactly what was sent (the first read-back of any write). `count` stayed 1:
+   **`0x90EE(0, 0)` replaces slot 0**.
+2. A new `vendor-write-ftp-blob` (writes a decodable blob unchanged, with chosen parameters; refuses a slot past the stored
+   count) sent a throwaway profile with **`0x90EE(1, 0)`**, i.e. one past the end. Result: the data phase was sent, then
+   `USB error: Pipe error` (a stall; the session cleared the halt). Afterwards `count` was still 1, slot 0 unchanged, and
+   the camera answered normally. **No profile was added.**
+3. So `0x90EE`'s first parameter is not simply "slot, with N == count adding a new one", at least not this way. NX Field
+   only ever sent `[0, 0]` (replacing the one it edits). Untested alternatives: `[0, 1]`; other values in the `0x90E8`
+   setup data (`01 00 00` in every capture); an operation in the hidden `0x90E_` range that creates a profile. Each
+   untested value risks a stall (harmless so far) and none should be sent without the owner's say-so.
+4. Copying profiles between bodies is therefore possible only as "replace slot 0" for now; adding to a camera that holds
+   other profiles is unsolved. Reading, and replacing the single slot-0 profile, are solid.

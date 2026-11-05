@@ -2430,11 +2430,16 @@ impl<T: BulkTransport> PtpUsbSession<T> {
             return Err(PtpUsbError::UnconfirmedModel(self.model.clone()));
         }
         let blob = encode_ftp_profile_with(profile, network)?;
+        self.send_ftp_blob(FTP_PROFILE_WRITE_PARAMS, &blob)
+    }
 
+    /// `0x90E8` setup, then `0x90EE(params)` with `blob` as its data-out
+    /// phase. Shared by the encoder-built write and the raw-blob write.
+    fn send_ftp_blob(&mut self, params: [u32; 2], blob: &[u8]) -> Result<FtpWriteReceipt, PtpUsbError> {
         let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
         Self::require_ok(OP_FTP_SETUP, setup.code)?;
 
-        let reply = match self.transact(OP_FTP_PROFILE_WRITE, &FTP_PROFILE_WRITE_PARAMS, Some(&blob), TxidCheck::Unchecked) {
+        let reply = match self.transact(OP_FTP_PROFILE_WRITE, &params, Some(blob), TxidCheck::Unchecked) {
             Ok(reply) => reply,
             Err(e) if self.data_phase_started => return Err(PtpUsbError::FtpWriteIndeterminate { cause: Box::new(e) }),
             Err(e) => return Err(e),
@@ -2442,6 +2447,27 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         Self::require_ok(OP_FTP_PROFILE_WRITE, reply.code)?;
         let reply_matched_command = setup.deviations.is_empty() && reply.deviations.is_empty();
         Ok(FtpWriteReceipt { response_params: reply.params, reply_matched_command })
+    }
+
+    /// Write `blob` (a profile in the `0x90ED`/`0x90EE` layout, for instance
+    /// one read from another camera) with `0x90EE(slot, param2)`, unchanged.
+    /// The blob must decode ([`decode_ftp_profile`]), so a garbled one never
+    /// reaches the camera. **What the two parameters mean is partly unknown**:
+    /// every capture used `[0, 0]`, and on a Z 9 `[0, 0]` replaced the only
+    /// stored profile (slot 0) instead of adding one. Same model gate as
+    /// [`Self::write_ftp_profile_with`].
+    pub fn write_ftp_profile_blob(
+        &mut self,
+        slot: u32,
+        param2: u32,
+        blob: &[u8],
+        force_unconfirmed_model: bool,
+    ) -> Result<FtpWriteReceipt, PtpUsbError> {
+        if !force_unconfirmed_model && !ftp_write_confirmed(&self.model) {
+            return Err(PtpUsbError::UnconfirmedModel(self.model.clone()));
+        }
+        decode_ftp_profile(blob)?;
+        self.send_ftp_blob([slot, param2], blob)
     }
 
     /// Read the camera's FTP profile: `0x90E8` (the same fixed 3-byte setup
@@ -2585,6 +2611,20 @@ pub fn write_ftp_profile_locked(
 ) -> Result<FtpWriteReceipt, PtpUsbError> {
     let mut session = PtpUsbSession::open_locked(lock, serial)?;
     session.write_ftp_profile(profile, force_unconfirmed_model)
+}
+
+/// [`PtpUsbSession::write_ftp_profile_blob`] for a caller already holding the
+/// [`CameraLock`].
+pub fn write_ftp_profile_blob_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    slot: u32,
+    param2: u32,
+    blob: &[u8],
+    force_unconfirmed_model: bool,
+) -> Result<FtpWriteReceipt, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.write_ftp_profile_blob(slot, param2, blob, force_unconfirmed_model)
 }
 
 /// [`PtpUsbSession::read_ftp_profile`] for a caller already holding the
@@ -5610,6 +5650,34 @@ mod tests {
         );
         s.read_ftp_profile().unwrap();
         assert_eq!(t.sent().last().unwrap(), &(CONTAINER_COMMAND, OP_FTP_PROFILE_READ, 2, le(4)));
+    }
+
+    #[test]
+    fn write_ftp_profile_blob_sends_the_bytes_unchanged_under_the_given_params() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        let (mut s, t) = session(vec![resp(RESP_OK), resp(RESP_OK)], "Z 9");
+        s.write_ftp_profile_blob(1, 0, &blob, false).unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![
+                (CONTAINER_COMMAND, OP_FTP_SETUP, 0, vec![]),
+                (CONTAINER_DATA, OP_FTP_SETUP, 0, FTP_SETUP_DATA.to_vec()),
+                (CONTAINER_COMMAND, OP_FTP_PROFILE_WRITE, 1, [le(1), le(0)].concat()),
+                (CONTAINER_DATA, OP_FTP_PROFILE_WRITE, 1, blob),
+            ]
+        );
+    }
+
+    #[test]
+    fn write_ftp_profile_blob_refuses_an_undecodable_blob_and_an_unconfirmed_model_before_any_io() {
+        let mut bad = hex::decode_hex(ftp_blob_port22_hex());
+        bad[0] = 0;
+        let (mut s, t) = session(vec![], "Z 9");
+        assert!(matches!(s.write_ftp_profile_blob(0, 0, &bad, false), Err(PtpUsbError::FtpBlobMalformed { .. })));
+        let good = hex::decode_hex(ftp_blob_port22_hex());
+        let (mut s2, t2) = session(vec![], "Z 5");
+        assert!(matches!(s2.write_ftp_profile_blob(0, 0, &good, false), Err(PtpUsbError::UnconfirmedModel(_))));
+        assert!(t.sent().is_empty() && t2.sent().is_empty());
     }
 
     #[test]

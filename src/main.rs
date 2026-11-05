@@ -188,6 +188,14 @@ enum Cmd {
     /// treat the first run as the test. The password is masked unless
     /// --show-password is given.
     VendorReadFtp(VendorReadFtpArgs),
+
+    /// EXPERIMENTAL. Write a profile blob read from a camera (or built to the
+    /// same layout) with 0x90EE(slot, param2), byte for byte. It changes the
+    /// camera: slot N < count replaces that stored profile, slot == count
+    /// tries to add one (untested until the 2026-11-05 experiment; see the
+    /// handoff doc). The blob must decode, the slot may not pass the stored
+    /// count, and the camera is read first so the plan can be printed.
+    VendorWriteFtpBlob(VendorWriteFtpBlobArgs),
 }
 
 #[derive(Args, Debug)]
@@ -602,6 +610,28 @@ struct VendorReadFtpArgs {
     /// --show-password).
     #[arg(long)]
     raw: bool,
+}
+
+#[derive(Args, Debug)]
+struct VendorWriteFtpBlobArgs {
+    /// File holding the profile blob (raw bytes) to write.
+    #[arg(long)]
+    file: PathBuf,
+    /// First 0x90EE parameter (slot). Must be <= the stored profile count.
+    #[arg(long, default_value_t = 0)]
+    slot: u32,
+    /// Second 0x90EE parameter; 0 in every capture.
+    #[arg(long, default_value_t = 0)]
+    param2: u32,
+    /// Camera serial to target; same rules as vendor-read's --serial.
+    #[arg(long)]
+    serial: Option<String>,
+    /// Write even if the model is not in ptp_usb's confirmed list.
+    #[arg(long)]
+    force_unconfirmed_model: bool,
+    /// Print the plan and exit without writing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1478,6 +1508,60 @@ fn cmd_vendor_read(args: &VendorReadArgs) -> Result<()> {
         eprintln!("{w}");
     }
     println!("{stdout}");
+    Ok(())
+}
+
+/// Write a profile blob byte for byte via `0x90EE(slot, param2)`. EXPERIMENTAL.
+fn cmd_vendor_write_ftp_blob(args: &VendorWriteFtpBlobArgs) -> Result<()> {
+    let blob = std::fs::read(&args.file).with_context(|| format!("reading {}", args.file.display()))?;
+    let decoded = nikon_fleet::ptp_usb::decode_ftp_profile(&blob).context("the blob does not decode; refusing to send it")?;
+    // The camera is read first (its own lock acquisition, released before the write) so a slot
+    // past the stored count is refused client-side and the plan names the body.
+    let before = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
+        .and_then(|(lock, serial)| {
+            nikon_fleet::ptp_usb::read_ftp_profile_locked(lock, serial.as_deref(), None).map_err(anyhow::Error::new)
+        })
+        .context("reading the camera's FTP profile count before writing")?;
+    let count = before.info.count;
+    if args.slot > count {
+        bail!("slot {} is past the {count} stored profile(s); the highest slot this will write is {count} (adding one)", args.slot);
+    }
+    let action = if args.slot == count { "ADD a new profile (untested)" } else { "REPLACE the stored profile in that slot" };
+    println!(
+        "{}: {count} stored profile(s). Would {action}: 0x90EE({}, {}) with {} byte(s), profile {:?} ({}:{}, folder {:?}{}).",
+        before.info.device_name.text,
+        args.slot,
+        args.param2,
+        blob.len(),
+        decoded.profile_name,
+        decoded.host,
+        decoded.ftp_port,
+        decoded.folder,
+        if decoded.is_sftp() { ", SFTP" } else { "" }
+    );
+    if args.dry_run {
+        return Ok(());
+    }
+    let receipt = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
+        .and_then(|(lock, serial)| {
+            nikon_fleet::ptp_usb::write_ftp_profile_blob_locked(
+                lock,
+                serial.as_deref(),
+                args.slot,
+                args.param2,
+                &blob,
+                args.force_unconfirmed_model,
+            )
+            .map_err(anyhow::Error::new)
+        })
+        .map_err(|e| match e.downcast::<nikon_fleet::ptp_usb::PtpUsbError>() {
+            Ok(e) => vendor_write_error(e),
+            Err(other) => other,
+        })?;
+    println!("Wrote. Read it back with: vendor-read-ftp --slot {}", args.slot);
+    if let Some(note) = ftp_receipt_note(&receipt) {
+        eprintln!("{note}");
+    }
     Ok(())
 }
 
@@ -3160,6 +3244,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::DeviceInfo(args) => cmd_device_info(args),
         Cmd::VendorWriteFtp(args) => cmd_vendor_write_ftp(args),
         Cmd::VendorReadFtp(args) => cmd_vendor_read_ftp(args),
+        Cmd::VendorWriteFtpBlob(args) => cmd_vendor_write_ftp_blob(args),
         Cmd::Firmware(sub) => match sub {
             FirmwareCmd::Add(args) => cmd_firmware_add(&cli.data_dir, args),
             FirmwareCmd::Ls(args) => cmd_firmware_ls(&cli.data_dir, args),
