@@ -204,6 +204,19 @@ enum Cmd {
     /// guess, which this command exists to test. It sends nothing else (no
     /// setup, no data-out) and one query per run. Never run over USB before.
     VendorOpSupport(VendorOpSupportArgs),
+    /// EXPERIMENTAL, read-only. Read one device property with the standard PTP `GetDevicePropValue`
+    /// (0x1015), or its descriptor with `GetDevicePropDesc` (0x1014) via --desc, and print the
+    /// bytes. A value is also decoded as a PTP string when it is one. This is a different path from
+    /// `vendor-read` (0x943B), which on a Z 9 answers DevicePropNotSupported for the artist and
+    /// image-comment strings. Sends nothing else.
+    VendorGetProp(VendorGetPropArgs),
+    /// EXPERIMENTAL. Write one string property (0xD072 Artist, 0xD073 Copyright, 0xD090 Image
+    /// comment) with the standard PTP `SetDevicePropValue` (0x1016), then read it back and say whether
+    /// the camera holds what was sent. In one session it reads the property's descriptor (refusing a
+    /// property that is not a read-write string right now) and its current value, which it prints so
+    /// the change can be undone. `--dry-run` shows the current value and sends nothing. No other
+    /// property can be written with this. Never run over USB on a Z6III; on a Z 9 see the handoff doc.
+    VendorSetString(VendorSetStringArgs),
     /// EXPERIMENTAL. Send ONE bare operation (no parameters, no data) from a
     /// short fixed list (0x90E9, 0x90EA, 0x90EC, 0x90EF in the FTP-profile
     /// range, and 0x9FFF as a control that should not exist) and print the
@@ -659,6 +672,43 @@ struct VendorProbeOpArgs {
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
     serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct VendorGetPropArgs {
+    /// Property code, e.g. "0xD072" (Artist), "0xD073" (Copyright), "0xD090" (Image comment). Hex
+    /// needs the 0x prefix; a bare number is decimal.
+    #[arg(value_parser = nikon_fleet::ptp_usb::parse_propcode)]
+    prop: u16,
+    /// Read the property's descriptor (0x1014: type, get/set flag, default, current value, form)
+    /// instead of its value.
+    #[arg(long)]
+    desc: bool,
+    /// Camera serial to target; same rules as vendor-read's --serial.
+    #[arg(long)]
+    serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct VendorSetStringArgs {
+    /// Property code: 0xD072 (Artist), 0xD073 (Copyright) or 0xD090 (Image comment). Hex needs the
+    /// 0x prefix; a bare number is decimal. Any other code is refused before anything is sent.
+    #[arg(value_parser = nikon_fleet::ptp_usb::parse_propcode)]
+    prop: u16,
+    /// The new text. Use "" to clear it. Latin-1 only (U+0000..U+00FF): on a Z 9 the camera keeps
+    /// just the low byte of each character, so anything beyond is refused rather than corrupted.
+    /// Control characters (newline, tab, NUL) are refused. The camera itself refuses a value over its
+    /// limit (a Z 9 took 36 characters for the image comment and refused 37).
+    text: String,
+    /// Camera serial to target; same rules as vendor-read's --serial.
+    #[arg(long)]
+    serial: Option<String>,
+    /// Write to a model outside the confirmed list (Z 9, Z6III).
+    #[arg(long)]
+    force_unconfirmed_model: bool,
+    /// Read and print the current value and what would change, then stop. Sends no write.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1716,6 +1766,95 @@ fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
             out.push_str(if *a == p.before { "\nthe profile list is unchanged" } else { "\n*** the profile list CHANGED ***" });
         }
         Err(e) => out.push_str(&format!("\nafter:  could not be read in this session ({e}); run vendor-read-ftp to see the list")),
+    }
+    out
+}
+
+/// `vendor-get-prop`: one standard-PTP property read, printed as bytes (and as a string when the
+/// bytes are one). Read-only.
+fn cmd_vendor_get_prop(args: &VendorGetPropArgs) -> Result<()> {
+    let read = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
+        .and_then(|(lock, serial)| {
+            nikon_fleet::ptp_usb::get_device_prop_locked(lock, serial.as_deref(), args.prop, args.desc).map_err(anyhow::Error::new)
+        })
+        .with_context(|| {
+            format!(
+                "reading property 0x{:04x} with {} over USB PTP",
+                args.prop,
+                if args.desc { "GetDevicePropDesc (0x1014)" } else { "GetDevicePropValue (0x1015)" }
+            )
+        })?;
+    for w in &read.warnings {
+        eprintln!("warning: {w}");
+    }
+    println!("{}", vendor_get_prop_text(args.prop, args.desc, &read.data));
+    Ok(())
+}
+
+/// `vendor-set-string`: write one string property and say whether the camera holds it.
+fn cmd_vendor_set_string(args: &VendorSetStringArgs) -> Result<()> {
+    use nikon_fleet::ptp_usb::{decode_ptp_string_value, get_device_prop_locked, set_string_property_locked, PtpUsbError, STRING_PROPS};
+    let name = STRING_PROPS.iter().find(|(c, _)| *c == args.prop).map(|(_, n)| *n);
+    if args.dry_run {
+        // Refuse a code the write would refuse, even for a dry run: it must not suggest a change that
+        // cannot be made.
+        let Some(name) = name else {
+            let allowed = STRING_PROPS.iter().map(|(c, n)| format!("{c:#06x} {n}")).collect::<Vec<_>>().join(", ");
+            bail!("property {:#06x} is not one of the string properties this writes ({allowed}); nothing was sent", args.prop);
+        };
+        let read = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
+            .and_then(|(lock, serial)| {
+                get_device_prop_locked(lock, serial.as_deref(), args.prop, false).map_err(anyhow::Error::new)
+            })
+            .context("reading the current value over USB PTP")?;
+        let current = decode_ptp_string_value(&read.data).map_err(|e| anyhow::anyhow!("the current value does not decode ({e})"))?;
+        println!("{name} ({:#06x}): currently {current:?}. Would write {:?}. Nothing was sent.", args.prop, args.text);
+        return Ok(());
+    }
+    let receipt = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
+        .and_then(|(lock, serial)| {
+            set_string_property_locked(lock, serial.as_deref(), args.prop, &args.text, args.force_unconfirmed_model)
+                .map_err(anyhow::Error::new)
+        })
+        .map_err(|e| match e.downcast::<PtpUsbError>() {
+            Ok(e @ PtpUsbError::PropWriteIndeterminate { .. }) => anyhow::Error::new(e)
+                .context("the camera may have changed: the value was sent before this failed; read it with vendor-get-prop before deciding whether to repeat the write"),
+            Ok(other) => anyhow::Error::new(other).context("writing the string property over USB PTP"),
+            Err(other) => other,
+        })?;
+    for w in &receipt.warnings {
+        eprintln!("warning: {w}");
+    }
+    println!("{}", vendor_set_string_text(&receipt));
+    if !receipt.verified {
+        bail!("the camera did not confirm holding the value that was sent; the previous value was {:?}", receipt.previous);
+    }
+    Ok(())
+}
+
+/// What `vendor-set-string` prints for a write the camera accepted. The previous value is always
+/// on the first line: it is what to write back to undo this.
+fn vendor_set_string_text(r: &nikon_fleet::ptp_usb::PropWriteReceipt) -> String {
+    use nikon_fleet::ptp_usb::STRING_PROPS;
+    let name = STRING_PROPS.iter().find(|(c, _)| *c == r.propcode).map(|(_, n)| *n).unwrap_or("?");
+    let head = format!("{name} ({:#06x}): previous {:?}, sent {:?}.", r.propcode, r.previous, r.written);
+    match (&r.read_back, r.verified) {
+        (Ok(v), true) => format!("{head}\nRead back {v:?}: the camera holds what was sent."),
+        (Ok(v), false) => format!("{head}\nRead back {v:?}: NOT what was sent."),
+        (Err(why), _) => format!("{head}\nNot confirmed: {why}."),
+    }
+}
+
+/// What `vendor-get-prop` prints. A value that does not decode as a PTP string is reported as such
+/// next to its bytes, never dropped: a property that is not a string is a normal case here.
+fn vendor_get_prop_text(prop: u16, desc: bool, data: &[u8]) -> String {
+    let what = if desc { "descriptor" } else { "value" };
+    let mut out = format!("0x{prop:04x} {what}: {} byte(s): {}", data.len(), nikon_fleet::ptp_usb::hex_bytes(data));
+    if !desc {
+        match nikon_fleet::ptp_usb::decode_ptp_string_value(data) {
+            Ok(text) => out.push_str(&format!("\nas a PTP string ({} char(s)): {text:?}", text.chars().count())),
+            Err(why) => out.push_str(&format!("\nnot a PTP string: {why}")),
+        }
     }
     out
 }
@@ -3385,7 +3524,10 @@ fn exit_code_for(e: &anyhow::Error) -> i32 {
         EXIT_ALREADY_ARCHIVED
     } else if matches!(
         e.downcast_ref::<nikon_fleet::ptp_usb::PtpUsbError>(),
-        Some(nikon_fleet::ptp_usb::PtpUsbError::FtpWriteIndeterminate { .. })
+        Some(
+            nikon_fleet::ptp_usb::PtpUsbError::FtpWriteIndeterminate { .. }
+                | nikon_fleet::ptp_usb::PtpUsbError::PropWriteIndeterminate { .. }
+        )
     ) {
         EXIT_WRITE_INDETERMINATE
     } else {
@@ -3453,6 +3595,8 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::VendorReadFtp(args) => cmd_vendor_read_ftp(args),
         Cmd::VendorWriteFtpBlob(args) => cmd_vendor_write_ftp_blob(args),
         Cmd::VendorOpSupport(args) => cmd_vendor_op_support(args),
+        Cmd::VendorGetProp(args) => cmd_vendor_get_prop(args),
+        Cmd::VendorSetString(args) => cmd_vendor_set_string(args),
         Cmd::VendorProbeOp(args) => cmd_vendor_probe_op(args),
         Cmd::Firmware(sub) => match sub {
             FirmwareCmd::Add(args) => cmd_firmware_add(&cli.data_dir, args),
@@ -4799,6 +4943,43 @@ mod tests {
         );
         assert_eq!(warned.0, "0x5001: 0 byte(s): ");
         assert_eq!(warned.1, ["warning: model \"Z 8\" is not surveyed", "warning: second"], "one line per warning, none dropped");
+    }
+
+    #[test]
+    fn vendor_set_string_text_always_leads_with_the_previous_value() {
+        use nikon_fleet::ptp_usb::PropWriteReceipt;
+        let mut r = PropWriteReceipt {
+            propcode: 0xD090,
+            previous: "old".into(),
+            written: "new".into(),
+            read_back: Ok("new".into()),
+            verified: true,
+            warnings: vec![],
+        };
+        let t = vendor_set_string_text(&r);
+        assert!(t.starts_with("Image comment (0xd090): previous \"old\", sent \"new\"."), "{t}");
+        assert!(t.ends_with("the camera holds what was sent."), "{t}");
+        r.read_back = Ok("ne".into());
+        r.verified = false;
+        assert!(vendor_set_string_text(&r).ends_with("Read back \"ne\": NOT what was sent."));
+        r.read_back = Err("boom".into());
+        let t = vendor_set_string_text(&r);
+        assert!(t.contains("previous \"old\"") && t.ends_with("Not confirmed: boom."), "{t}");
+    }
+
+    #[test]
+    fn vendor_get_prop_text_decodes_strings_and_reports_what_is_not_one() {
+        // "ab" as a PTP string, then padded with a trailing space, then the empty string.
+        let t = vendor_get_prop_text(0xD072, false, &[3, b'a', 0, b'b', 0, 0, 0]);
+        assert_eq!(t, "0xd072 value: 7 byte(s): 03 61 00 62 00 00 00\nas a PTP string (2 char(s)): \"ab\"");
+        assert!(vendor_get_prop_text(0xD072, false, &[3, b'a', 0, b' ', 0, 0, 0]).ends_with("\"a \""));
+        assert!(vendor_get_prop_text(0xD072, false, &[0]).ends_with("(0 char(s)): \"\""));
+        // Not a string (the four zero bytes 0x943B gave for 0xD073): reported with the reason, not dropped.
+        let t = vendor_get_prop_text(0xD073, false, &[0, 0, 0, 0]);
+        assert!(t.starts_with("0xd073 value: 4 byte(s): 00 00 00 00\nnot a PTP string: "), "{t}");
+        // A descriptor is never string-decoded.
+        let t = vendor_get_prop_text(0xD072, true, &[0x72, 0xD0, 0xFF, 0xFF, 1]);
+        assert_eq!(t, "0xd072 descriptor: 5 byte(s): 72 d0 ff ff 01");
     }
 
     #[test]

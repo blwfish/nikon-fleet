@@ -81,6 +81,15 @@ const OP_CLOSE_SESSION: u16 = 0x1003;
 
 /// `0x943B` — generic vendor-property read wrapper. Param is
 /// `0x10000 | propcode`; response data is the property's raw bytes.
+/// Standard PTP `GetDevicePropDesc` (ISO 15740 §10.5.3): one param, the property code; the data
+/// phase is the property's descriptor (type, get/set flag, default, current value, form).
+const OP_GET_DEVICE_PROP_DESC: u16 = 0x1014;
+/// Standard PTP `GetDevicePropValue`: one param, the property code; the data phase is the value
+/// alone, encoded per the property's data type (a string is `[u8 count incl. NUL][UTF-16LE]`).
+const OP_GET_DEVICE_PROP_VALUE: u16 = 0x1015;
+/// Standard PTP `SetDevicePropValue`: one param (the property code) and a data-out phase holding the
+/// value. Used here only for the three string properties in [`STRING_PROPS`].
+const OP_SET_DEVICE_PROP_VALUE: u16 = 0x1016;
 const OP_VENDOR_PROP_READ: u16 = 0x943B;
 
 /// `0x90E8` — FTP setup/status step. Not preceded by a distinct params list;
@@ -126,6 +135,16 @@ const OP_FTP_PROFILE_READ: u16 = 0x90ED;
 /// fire another operation.
 const OP_VENDOR_OP_QUERY: u16 = 0x944C;
 const VENDOR_OP_QUERY_PARAM2: u32 = 0;
+
+/// The string properties [`PtpUsbSession::set_string_property`] will write: Artist, Copyright and
+/// Image comment. The names are libgphoto2's; the codes were read as read-write strings on a Z 9
+/// (2026-11-05). A closed list: any other code is refused, never passed through.
+pub const STRING_PROPS: [(u16, &str); 3] = [(0xD072, "Artist"), (0xD073, "Copyright"), (0xD090, "Image comment")];
+
+/// Models [`PtpUsbSession::set_string_property`] accepts without `force_unconfirmed_model`. The Z 9's
+/// descriptors say read-write and a Z6III took these over Wi-Fi from NX Field; a USB write has been
+/// confirmed on neither until the first hardware run is recorded.
+pub const STRING_PROP_WRITE_MODELS: &[&str] = &["Z 9", "Z6_3"];
 
 /// The slot `0x90EB` reports when the camera has no *active* FTP profile.
 /// **Not** "no profile stored": on 2026-11-05 a Z9 that the owner says holds
@@ -383,6 +402,20 @@ pub enum PtpUsbError {
     FtpWriteIndeterminate { cause: Box<PtpUsbError> },
     #[error("camera model {0:?} is not in this module's confirmed-safe list for vendor writes; wire format may not match")]
     UnconfirmedModel(String),
+    #[error("property {propcode:#06x} is not one of the string properties this writes ({allowed}); nothing was sent")]
+    PropWriteUnsupported { propcode: u16, allowed: String },
+    #[error(
+        "property {propcode:#06x} is read-only on this camera right now (descriptor get/set flag {get_set:#04x}); \
+         the camera makes some properties writable only in some states. Nothing was written"
+    )]
+    PropNotWritable { propcode: u16, get_set: u8 },
+    #[error("property {propcode:#06x}: {why}; nothing was written")]
+    PropValueBad { propcode: u16, why: String },
+    #[error(
+        "property {propcode:#06x} write may or may not have taken effect: the value had already been sent when \
+         this failed ({cause}). Read it back with `vendor-get-prop`; repeating the write is idempotent"
+    )]
+    PropWriteIndeterminate { propcode: u16, cause: Box<PtpUsbError> },
 }
 
 impl PtpUsbError {
@@ -1694,6 +1727,23 @@ pub struct FtpProfileReadout {
     pub reply_matched_command: bool,
 }
 
+/// What [`PtpUsbSession::set_string_property`] did. `Ok` means the camera answered OK; whether the
+/// value took is `verified`, from reading it back with `GetDevicePropValue`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropWriteReceipt {
+    pub propcode: u16,
+    /// The value before the write, as the camera reported it: what to write back to undo this.
+    pub previous: String,
+    /// What was sent.
+    pub written: String,
+    /// The value read back afterwards, or why it could not be read or decoded.
+    pub read_back: Result<String, String>,
+    /// `read_back == Ok(written)`. False with an `Ok` read-back means the camera stored something
+    /// else (truncated, normalised); that is a finding, not a failure to hide.
+    pub verified: bool,
+    pub warnings: Vec<String>,
+}
+
 /// What a vendor-property read returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VendorRead {
@@ -2442,6 +2492,109 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         Ok(VendorRead { data: reply.data, warnings })
     }
 
+    /// Standard `GetDevicePropValue` (`0x1015`): the property's value bytes, undecoded. Read-only.
+    /// This is the generic PTP path, distinct from the `0x943B` wrapper ([`Self::read_vendor_property`]):
+    /// on a Z 9 `0x943B` answers `DevicePropNotSupported` for the artist and image-comment strings, so
+    /// which of the two reaches which property is a per-property fact to be found out.
+    /// An OK answer with no data container is [`PtpUsbError::NoDataPhase`], distinct from empty data.
+    pub fn get_device_prop_value(&mut self, propcode: u16) -> Result<VendorRead, PtpUsbError> {
+        self.get_device_prop(OP_GET_DEVICE_PROP_VALUE, propcode)
+    }
+
+    /// Standard `GetDevicePropDesc` (`0x1014`): the property's descriptor bytes, undecoded. Read-only.
+    /// Its get/set flag says whether the camera will accept a write *now* (it is state-dependent).
+    pub fn get_device_prop_desc(&mut self, propcode: u16) -> Result<VendorRead, PtpUsbError> {
+        self.get_device_prop(OP_GET_DEVICE_PROP_DESC, propcode)
+    }
+
+    fn get_device_prop(&mut self, op: u16, propcode: u16) -> Result<VendorRead, PtpUsbError> {
+        let mut warnings = Vec::new();
+        if sdk_model_name(self.model()).is_none() {
+            warnings.push(format!(
+                "camera model {:?} is not one of the surveyed models ({:?}); property semantics may differ",
+                self.model(),
+                KNOWN_MODELS
+            ));
+        }
+        let reply = self.transact(op, &[u32::from(propcode)], None, TxidCheck::Enforce)?;
+        Self::require_ok(op, reply.code)?;
+        if reply.data_containers == 0 {
+            return Err(PtpUsbError::NoDataPhase { op });
+        }
+        Ok(VendorRead { data: reply.data, warnings })
+    }
+
+    /// Write one of the [`STRING_PROPS`] with `SetDevicePropValue` (`0x1016`), in one session:
+    /// descriptor (`0x1014`, must be a read-write string), current value (`0x1015`, kept as
+    /// [`PropWriteReceipt::previous`]), the write, then a read-back of the value. A refusal before the
+    /// write leaves the camera untouched. A failure after the value went out is
+    /// [`PtpUsbError::PropWriteIndeterminate`]; a camera that *answers* non-OK is a definite refusal.
+    /// The camera's length limit for each property is not known here: nothing is truncated by this
+    /// code, and a camera that truncates shows up as `verified == false` with the read-back text.
+    /// Models outside [`STRING_PROP_WRITE_MODELS`] are refused unless `force_unconfirmed_model`.
+    pub fn set_string_property(
+        &mut self,
+        propcode: u16,
+        text: &str,
+        force_unconfirmed_model: bool,
+    ) -> Result<PropWriteReceipt, PtpUsbError> {
+        if !STRING_PROPS.iter().any(|(c, _)| *c == propcode) {
+            let allowed = STRING_PROPS.iter().map(|(c, n)| format!("{c:#06x} {n}")).collect::<Vec<_>>().join(", ");
+            return Err(PtpUsbError::PropWriteUnsupported { propcode, allowed });
+        }
+        if !force_unconfirmed_model && !STRING_PROP_WRITE_MODELS.contains(&self.model()) {
+            return Err(PtpUsbError::UnconfirmedModel(self.model().to_string()));
+        }
+        let bad = |why: String| PtpUsbError::PropValueBad { propcode, why };
+        // Observed on a Z 9 (2026-11-05): the camera keeps only the LOW BYTE of each UTF-16 unit of
+        // these strings, so Latin-1 (U+0000..U+00FF) survives and anything above is stored as
+        // something else ("日本" came back as "å,", an emoji as "=÷"). Refuse it rather than send
+        // text the camera will quietly corrupt.
+        if let Some(c) = text.chars().find(|c| u32::from(*c) > 0xFF) {
+            return Err(bad(format!(
+                "{c:?} (U+{:04X}) is outside Latin-1; the camera stores only the low byte of each character in this \
+                 property, so it would hold something else",
+                u32::from(c)
+            )));
+        }
+        let data = encode_ptp_string_value(text).map_err(&bad)?;
+
+        let desc = self.get_device_prop_desc(propcode)?;
+        // PropCode u16, DataType u16 (0xFFFF = string), GetSet u8: 5 bytes before anything variable.
+        if desc.data.len() < 5 {
+            return Err(bad(format!("descriptor is {} byte(s), too short to hold the get/set flag", desc.data.len())));
+        }
+        let data_type = u16::from_le_bytes([desc.data[2], desc.data[3]]);
+        if data_type != 0xFFFF {
+            return Err(bad(format!("descriptor data type is {data_type:#06x}, not the string type 0xffff")));
+        }
+        if desc.data[4] != 0x01 {
+            return Err(PtpUsbError::PropNotWritable { propcode, get_set: desc.data[4] });
+        }
+        let before = self.get_device_prop_value(propcode)?;
+        let previous = decode_ptp_string_value(&before.data).map_err(|e| bad(format!("the current value does not decode ({e})")))?;
+        let mut warnings = desc.warnings;
+
+        let reply = match self.transact(OP_SET_DEVICE_PROP_VALUE, &[u32::from(propcode)], Some(&data), TxidCheck::Enforce) {
+            Ok(reply) => reply,
+            Err(e) if self.data_phase_started => {
+                return Err(PtpUsbError::PropWriteIndeterminate { propcode, cause: Box::new(e) })
+            }
+            Err(e) => return Err(e),
+        };
+        Self::require_ok(OP_SET_DEVICE_PROP_VALUE, reply.code)?;
+
+        let read_back = match self.get_device_prop_value(propcode) {
+            Ok(r) => decode_ptp_string_value(&r.data).map_err(|e| format!("the value read back does not decode ({e})")),
+            Err(e) => Err(format!("reading it back failed: {e}")),
+        };
+        if let Err(why) = &read_back {
+            warnings.push(format!("the write was accepted but could not be confirmed: {why}"));
+        }
+        let verified = read_back.as_deref().ok() == Some(text);
+        Ok(PropWriteReceipt { propcode, previous, written: text.to_string(), read_back, verified, warnings })
+    }
+
     /// Send `0x944C(target_op, 0)` and report the answer as it came; see
     /// [`OP_VENDOR_OP_QUERY`] for what is and is not known about it. **Not yet
     /// run over USB on any camera**: this module has never sent `0x944C`, so
@@ -2804,6 +2957,79 @@ pub fn read_vendor_property_report_locked(
 ) -> Result<VendorRead, PtpUsbError> {
     let mut session = PtpUsbSession::open_locked(lock, serial)?;
     session.read_vendor_property_report(propcode)
+}
+
+/// Decode a PTP-string property value (`[u8 count incl. NUL][UTF-16LE units]`; count 0 is the
+/// empty string). Strict: the byte length must be exactly `1 + 2 * count`, a non-empty string must
+/// end in the NUL, and surrogates must pair. The text is returned as the camera holds it, so
+/// trailing spaces from a fixed-width field are kept, not trimmed. The error says what was wrong.
+pub fn decode_ptp_string_value(bytes: &[u8]) -> Result<String, String> {
+    let Some((&count, rest)) = bytes.split_first() else {
+        return Err("no bytes (a PTP string needs at least the count byte)".to_string());
+    };
+    let count = usize::from(count);
+    if rest.len() != count * 2 {
+        return Err(format!("count byte says {count} unit(s) = {} byte(s), but {} byte(s) follow it", count * 2, rest.len()));
+    }
+    let mut units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    if !units.is_empty() {
+        if units.pop() != Some(0) {
+            return Err("a non-empty string must end in a NUL unit".to_string());
+        }
+    }
+    if units.contains(&0) {
+        return Err("an embedded NUL unit before the end".to_string());
+    }
+    String::from_utf16(&units).map_err(|_| "an unpaired UTF-16 surrogate".to_string())
+}
+
+/// Encode `text` as a PTP string value: `[u8 count incl. NUL][UTF-16LE units][NUL]`. The empty
+/// string is `01 00 00` (count 1, just the NUL), the form the camera itself reports for an empty
+/// property. Refuses control characters and anything over 255 units including the NUL.
+pub fn encode_ptp_string_value(text: &str) -> Result<Vec<u8>, String> {
+    if text.chars().any(char::is_control) {
+        return Err("the text contains a control character (NUL, newline, tab, ...)".to_string());
+    }
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units.push(0);
+    if units.len() > 255 {
+        return Err(format!("the text is {} UTF-16 unit(s) with its terminator; a PTP string holds at most 255", units.len()));
+    }
+    let mut out = Vec::with_capacity(1 + units.len() * 2);
+    out.push(units.len() as u8);
+    for u in units {
+        out.extend_from_slice(&u.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// [`PtpUsbSession::get_device_prop_value`] (`desc == false`) or
+/// [`PtpUsbSession::get_device_prop_desc`] (`desc == true`) for a caller already holding the
+/// [`CameraLock`]; see [`PtpUsbSession::open_locked`]. Read-only.
+pub fn get_device_prop_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    propcode: u16,
+    desc: bool,
+) -> Result<VendorRead, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    if desc {
+        session.get_device_prop_desc(propcode)
+    } else {
+        session.get_device_prop_value(propcode)
+    }
+}
+
+/// [`PtpUsbSession::set_string_property`] for a caller already holding the [`CameraLock`].
+pub fn set_string_property_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    propcode: u16,
+    text: &str,
+    force_unconfirmed_model: bool,
+) -> Result<PropWriteReceipt, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.set_string_property(propcode, text, force_unconfirmed_model)
 }
 
 /// Open a session, read the DeviceInfo dataset (`0x1001`), close it. Takes the [`CameraLock`]
@@ -5080,6 +5306,259 @@ mod tests {
         let (mut s, t) = session(vec![data_c(OP_VENDOR_PROP_READ, &[0xAA, 0xBB]), resp(RESP_OK)], "Z 9");
         assert_eq!(s.read_vendor_property(0xD053).unwrap(), vec![0xAA, 0xBB]);
         assert_eq!(t.sent(), vec![(CONTAINER_COMMAND, OP_VENDOR_PROP_READ, 0, le(0x1D053))]);
+    }
+
+    // ── GetDevicePropValue / GetDevicePropDesc ───────────────────────────
+
+    #[test]
+    fn get_device_prop_value_sends_one_param_the_bare_propcode_and_returns_data() {
+        let (mut s, t) = session(vec![data_c(OP_GET_DEVICE_PROP_VALUE, &[1, 0x41, 0]), resp(RESP_OK)], "Z 9");
+        assert_eq!(s.get_device_prop_value(0xD072).unwrap().data, vec![1, 0x41, 0]);
+        // No 0x10000 flag (that is the 0x943B wrapper's), no data-out.
+        assert_eq!(t.sent(), vec![(CONTAINER_COMMAND, OP_GET_DEVICE_PROP_VALUE, 0, le(0xD072))]);
+    }
+
+    #[test]
+    fn get_device_prop_desc_uses_op_0x1014_and_zero_extends_the_propcode() {
+        for code in [0x0000u16, 0x7FFF, 0x8000, 0xD072, 0xFFFF] {
+            let (mut s, t) = session(vec![data_c(OP_GET_DEVICE_PROP_DESC, &[9]), resp(RESP_OK)], "Z 9");
+            s.get_device_prop_desc(code).unwrap();
+            assert_eq!(t.sent(), vec![(CONTAINER_COMMAND, OP_GET_DEVICE_PROP_DESC, 0, le(u32::from(code)))], "{code:#x}");
+        }
+    }
+
+    #[test]
+    fn get_device_prop_non_ok_is_operation_failed_and_ok_without_data_is_no_data_phase() {
+        let (mut s, _t) = session(vec![resp(0x200A)], "Z 9");
+        let err = s.get_device_prop_value(0xD072).unwrap_err();
+        assert!(
+            matches!(err, PtpUsbError::OperationFailed { op: OP_GET_DEVICE_PROP_VALUE, code: PtpResponseCode(0x200A) }),
+            "{err:?}"
+        );
+        let (mut s, _t) = session(vec![resp(RESP_OK)], "Z 9");
+        let err = s.get_device_prop_desc(0xD072).unwrap_err();
+        assert!(matches!(err, PtpUsbError::NoDataPhase { op: OP_GET_DEVICE_PROP_DESC }), "{err:?}");
+        // An empty data phase is a value, not an absence.
+        let (mut s, _t) = session(vec![data_c(OP_GET_DEVICE_PROP_VALUE, &[]), resp(RESP_OK)], "Z 9");
+        assert_eq!(s.get_device_prop_value(0xD072).unwrap().data, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn decode_ptp_string_value_boundaries() {
+        // count 0 is the empty string with nothing after it; count 1 is only the NUL: also empty.
+        assert_eq!(decode_ptp_string_value(&[0]).unwrap(), "");
+        assert_eq!(decode_ptp_string_value(&[1, 0, 0]).unwrap(), "");
+        assert_eq!(decode_ptp_string_value(&[3, b'a', 0, b'b', 0, 0, 0]).unwrap(), "ab");
+        // Fixed-width padding is data: kept.
+        assert_eq!(decode_ptp_string_value(&[3, b'a', 0, b' ', 0, 0, 0]).unwrap(), "a ");
+        // Non-BMP pair (U+1F4F7) decodes.
+        assert_eq!(decode_ptp_string_value(&[3, 0x3D, 0xD8, 0xF7, 0xDC, 0, 0]).unwrap(), "\u{1F4F7}");
+        // Empty input, a count that disagrees with the length (short and long), a missing NUL, an
+        // embedded NUL, a lone surrogate: each is refused, not guessed at.
+        assert!(decode_ptp_string_value(&[]).is_err());
+        assert!(decode_ptp_string_value(&[2, b'a', 0]).is_err());
+        assert!(decode_ptp_string_value(&[1, 0, 0, 0]).is_err());
+        assert!(decode_ptp_string_value(&[1, b'a', 0]).is_err());
+        assert!(decode_ptp_string_value(&[3, b'a', 0, 0, 0, b'b', 0]).is_err());
+        assert!(decode_ptp_string_value(&[2, 0x3D, 0xD8, 0, 0]).is_err());
+    }
+
+    // ── set_string_property (0x1016) ─────────────────────────────────────
+    // Reply bytes are SYNTHETIC but shaped like the Z 9's real ones (read 2026-11-05): a descriptor is
+    // PropCode, DataType 0xFFFF, GetSet, default string, current string, form flag.
+
+    fn prop_desc(propcode: u16, data_type: u16, get_set: u8) -> Vec<u8> {
+        let mut d = propcode.to_le_bytes().to_vec();
+        d.extend_from_slice(&data_type.to_le_bytes());
+        d.push(get_set);
+        d.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0]); // default "", current "", form flag
+        d
+    }
+    fn prop_str(text: &str) -> Vec<u8> {
+        encode_ptp_string_value(text).unwrap()
+    }
+    /// The container kinds/ops/payloads a session sent, without transaction ids.
+    fn sent_ops(t: &ScriptedTransport) -> Vec<(u16, u16, Vec<u8>)> {
+        t.sent().into_iter().map(|(c, op, _id, payload)| (c, op, payload)).collect()
+    }
+    /// descriptor, current value, set, read-back.
+    fn set_script(get_set: u8, previous: &str, set_reply: u16, read_back: &str) -> Vec<Step> {
+        vec![
+            data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(0xD090, 0xFFFF, get_set)),
+            resp(RESP_OK),
+            data_c(OP_GET_DEVICE_PROP_VALUE, &prop_str(previous)),
+            resp(RESP_OK),
+            resp(set_reply),
+            data_c(OP_GET_DEVICE_PROP_VALUE, &prop_str(read_back)),
+            resp(RESP_OK),
+        ]
+    }
+
+    #[test]
+    fn set_string_property_reads_desc_and_value_then_writes_then_reads_back() {
+        let (mut s, t) = session(set_script(1, "old", RESP_OK, "new"), "Z 9");
+        let r = s.set_string_property(0xD090, "new", false).unwrap();
+        assert_eq!((r.previous.as_str(), r.written.as_str()), ("old", "new"));
+        assert_eq!(r.read_back, Ok("new".to_string()));
+        assert!(r.verified);
+        assert_eq!(
+            sent_ops(&t),
+            vec![
+                (CONTAINER_COMMAND, OP_GET_DEVICE_PROP_DESC, le(0xD090)),
+                (CONTAINER_COMMAND, OP_GET_DEVICE_PROP_VALUE, le(0xD090)),
+                (CONTAINER_COMMAND, OP_SET_DEVICE_PROP_VALUE, le(0xD090)),
+                (CONTAINER_DATA, OP_SET_DEVICE_PROP_VALUE, prop_str("new")),
+                (CONTAINER_COMMAND, OP_GET_DEVICE_PROP_VALUE, le(0xD090)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_read_only_descriptor_is_refused_before_any_write() {
+        // GetSet 0 = read-only; anything but exactly 1 is refused (pins 0x02 too, which is not "rw").
+        for get_set in [0x00u8, 0x02, 0xFF] {
+            let (mut s, t) = session(set_script(get_set, "old", RESP_OK, "new"), "Z 9");
+            let err = s.set_string_property(0xD090, "new", false).unwrap_err();
+            assert!(matches!(err, PtpUsbError::PropNotWritable { propcode: 0xD090, get_set: g } if g == get_set), "{err:?}");
+            assert_eq!(t.sent().len(), 1, "only the descriptor read went out");
+        }
+    }
+
+    #[test]
+    fn a_non_string_descriptor_or_a_short_one_is_refused() {
+        let (mut s, t) = session(vec![data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(0xD090, 0x0002, 1)), resp(RESP_OK)], "Z 9");
+        assert!(matches!(s.set_string_property(0xD090, "x", false), Err(PtpUsbError::PropValueBad { .. })));
+        assert_eq!(t.sent().len(), 1);
+        let (mut s, _t) = session(vec![data_c(OP_GET_DEVICE_PROP_DESC, &[0x90, 0xD0, 0xFF, 0xFF]), resp(RESP_OK)], "Z 9");
+        assert!(matches!(s.set_string_property(0xD090, "x", false), Err(PtpUsbError::PropValueBad { .. })));
+    }
+
+    #[test]
+    fn only_the_three_string_props_are_written_and_nothing_is_sent_for_others() {
+        for code in [0xD053u16, 0xD091, 0xD0B4, 0x0000, 0xD071, 0xD074, 0xD08F, 0xD091] {
+            let (mut s, t) = session(vec![], "Z 9");
+            let err = s.set_string_property(code, "x", false).unwrap_err();
+            assert!(matches!(err, PtpUsbError::PropWriteUnsupported { propcode, .. } if propcode == code), "{code:#x}: {err:?}");
+            assert!(t.sent().is_empty(), "{code:#x}: nothing may be sent");
+        }
+        // Each allowed code is accepted, and the write command carries exactly that code.
+        for (code, _) in STRING_PROPS {
+            let (mut s, t) = session(set_script(1, "", RESP_OK, "x"), "Z 9");
+            assert!(s.set_string_property(code, "x", false).unwrap().verified, "{code:#x}");
+            assert_eq!(sent_ops(&t)[2], (CONTAINER_COMMAND, OP_SET_DEVICE_PROP_VALUE, le(u32::from(code))), "{code:#x}");
+        }
+    }
+
+    #[test]
+    fn a_model_outside_the_confirmed_list_is_refused_unless_forced() {
+        let (mut s, t) = session(set_script(1, "a", RESP_OK, "b"), "Z 5");
+        assert!(matches!(s.set_string_property(0xD090, "b", false), Err(PtpUsbError::UnconfirmedModel(_))));
+        assert!(t.sent().is_empty());
+        let (mut s, _t) = session(set_script(1, "a", RESP_OK, "b"), "Z 5");
+        assert!(s.set_string_property(0xD090, "b", true).unwrap().verified);
+        for m in STRING_PROP_WRITE_MODELS {
+            let (mut s, _t) = session(set_script(1, "a", RESP_OK, "b"), m);
+            assert!(s.set_string_property(0xD090, "b", false).is_ok(), "{m}");
+        }
+    }
+
+    #[test]
+    fn a_camera_that_answers_non_ok_is_a_definite_refusal_not_indeterminate() {
+        let (mut s, _t) = session(
+            vec![
+                data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(0xD090, 0xFFFF, 1)),
+                resp(RESP_OK),
+                data_c(OP_GET_DEVICE_PROP_VALUE, &prop_str("old")),
+                resp(RESP_OK),
+                resp(0x200F),
+            ],
+            "Z 9",
+        );
+        let err = s.set_string_property(0xD090, "new", false).unwrap_err();
+        assert!(
+            matches!(err, PtpUsbError::OperationFailed { op: OP_SET_DEVICE_PROP_VALUE, code: PtpResponseCode(0x200F) }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_failure_after_the_value_went_out_is_indeterminate() {
+        let (mut s, t) = session(
+            vec![
+                data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(0xD090, 0xFFFF, 1)),
+                resp(RESP_OK),
+                data_c(OP_GET_DEVICE_PROP_VALUE, &prop_str("old")),
+                resp(RESP_OK),
+                Step::Err(rusb::Error::Timeout),
+            ],
+            "Z 9",
+        );
+        let err = s.set_string_property(0xD090, "new", false).unwrap_err();
+        assert!(matches!(err, PtpUsbError::PropWriteIndeterminate { propcode: 0xD090, .. }), "{err:?}");
+        assert!(t.sent().iter().any(|(c, op, _, _)| *c == CONTAINER_DATA && *op == OP_SET_DEVICE_PROP_VALUE), "the value did go out");
+        assert!(err.to_string().contains("may or may not have taken effect"));
+    }
+
+    #[test]
+    fn a_camera_that_stores_something_else_is_reported_unverified_with_what_it_stored() {
+        let (mut s, _t) = session(set_script(1, "old", RESP_OK, "ne"), "Z 9");
+        let r = s.set_string_property(0xD090, "new", false).unwrap();
+        assert!(!r.verified);
+        assert_eq!(r.read_back, Ok("ne".to_string()));
+        assert_eq!(r.previous, "old");
+    }
+
+    #[test]
+    fn a_failed_read_back_is_unverified_with_a_warning_not_an_error() {
+        let (mut s, _t) = session(
+            vec![
+                data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(0xD090, 0xFFFF, 1)),
+                resp(RESP_OK),
+                data_c(OP_GET_DEVICE_PROP_VALUE, &prop_str("old")),
+                resp(RESP_OK),
+                resp(RESP_OK),
+                resp(0x2002),
+            ],
+            "Z 9",
+        );
+        let r = s.set_string_property(0xD090, "new", false).unwrap();
+        assert!(!r.verified);
+        assert!(r.read_back.is_err());
+        assert!(r.warnings.iter().any(|w| w.contains("could not be confirmed")), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn text_outside_latin1_is_refused_before_anything_is_sent_and_the_boundary_is_u00ff() {
+        for bad in ["\u{100}", "ü\u{65E5}", "\u{1F4F7}", "a\u{FFFF}"] {
+            let (mut s, t) = session(vec![], "Z 9");
+            let err = s.set_string_property(0xD090, bad, false).unwrap_err();
+            assert!(matches!(err, PtpUsbError::PropValueBad { .. }), "{bad:?}: {err:?}");
+            assert!(t.sent().is_empty(), "{bad:?}: nothing may be sent");
+        }
+        // U+00FF is the last character the camera keeps; U+00A9 (c) and U+00E9 (e acute) are in range.
+        for ok in ["\u{FF}", "\u{A9} caf\u{E9}", ""] {
+            let (mut s, _t) = session(set_script(1, "", RESP_OK, ok), "Z 9");
+            assert!(s.set_string_property(0xD090, ok, false).unwrap().verified, "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn encode_ptp_string_value_boundaries() {
+        assert_eq!(encode_ptp_string_value("").unwrap(), vec![1, 0, 0]);
+        assert_eq!(encode_ptp_string_value("a").unwrap(), vec![2, b'a', 0, 0, 0]);
+        // 254 characters + NUL = 255 units: the most the count byte holds. 255 is refused.
+        assert_eq!(encode_ptp_string_value(&"a".repeat(254)).unwrap()[0], 255);
+        assert!(encode_ptp_string_value(&"a".repeat(255)).is_err());
+        // A non-BMP character is two units: 127 of them = 254 + NUL fits, 128 does not.
+        assert_eq!(encode_ptp_string_value(&"\u{1F4F7}".repeat(127)).unwrap()[0], 255);
+        assert!(encode_ptp_string_value(&"\u{1F4F7}".repeat(128)).is_err());
+        for bad in ["a\0b", "a\nb", "tab\there"] {
+            assert!(encode_ptp_string_value(bad).is_err(), "{bad:?}");
+        }
+        // Round trip, including a space-padded value and a non-ASCII one.
+        for t in ["", "Brian L Wong", "(c)Brian L Wong 2026", "trail ", "caf\u{e9}", "\u{1F4F7}"] {
+            assert_eq!(decode_ptp_string_value(&encode_ptp_string_value(t).unwrap()).unwrap(), t);
+        }
     }
 
     // ── 0x944C query ─────────────────────────────────────────────────────

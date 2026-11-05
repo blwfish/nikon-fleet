@@ -567,3 +567,37 @@ restored:
   both forms. That bit `0x04` means something like "a folder is specified" is a guess.
 - Not checked: what bits `0x01`, `0x02`, `0x04`, `0x10` do in the camera's menu or in an actual FTP transfer, adding a
   profile, deleting one, slots 1 and up (the Z9 holds only slot 0).
+
+### Artist, copyright and image comment over USB on the Z9 (`Z_9_3023668`, 2026-11-05)
+
+Two new commands. `vendor-get-prop <code> [--desc]` is read-only: the standard PTP `GetDevicePropValue` (`0x1015`) or
+`GetDevicePropDesc` (`0x1014`), with a string decode when the bytes are a PTP string. `vendor-set-string <code> <text>`
+writes `0xD072` Artist, `0xD073` Copyright or `0xD090` Image comment with `SetDevicePropValue` (`0x1016`), in one session:
+descriptor (must be a read-write string), current value (kept as the undo value), the write, a read-back. Any other code
+is refused before anything is sent; a failure after the value went out exits 4 (may or may not have landed); a read-back
+that differs exits 1.
+
+What the Z9 showed:
+
+- **`0x1015` reads all five properties; `0x943B` does not.** `0xD072` Artist `"Brian L Wong"`, `0xD073` Copyright
+  `"(c)Brian L Wong 2026"`, `0xD090` Image comment `""`. `vendor-read` (`0x943B`) answered `DevicePropNotSupported` for
+  `0xD072`, `0xD090` and `0xD091` and four zero bytes for `0xD073`, so `0x943B` is not the way to these. For `0xD053` the
+  two paths disagree (`0x943B`: `04`; `0x1015`: `01`), so `0x943B` returns something other than the property's value there.
+- **Descriptors:** all three strings are type `0xFFFF`, get/set `01` (read-write). `0xD053` and `0xD091` are `uint8`,
+  read-write, range 0 to 1 (values `01` and `00` here); what they switch is unconfirmed (libgphoto2's names suggest
+  "attach copyright" and "attach comment").
+- **Strings come back unpadded** (not the space-padded fixed width the earlier notes suggested).
+- **A write works and reads back.** Image comment `""` to `"fleet-test"`: read back identical in the same session and in a
+  separate one; restored to `""`, and it is empty now. (Only the image comment was written. Artist and copyright were not.)
+- **Length limit:** the image comment took 36 characters and refused 37 and 60 with `InvalidDevicePropFormat` (`0x201B`),
+  leaving the value unchanged. No truncation. The limits for the other two (the notes say 54 for copyright) are unchecked.
+- **The camera stores one byte per character.** Latin-1 text round-trips exactly (`"© café"`); characters above U+00FF
+  are stored as their low byte: `"日本"` came back as `"å,"` and an emoji as `"=÷"`. The writer refuses text above
+  U+00FF instead of sending it. The decode on read is unaffected (a stored byte comes back as the Latin-1 character).
+- Not done: the Z6III (not attached; a Wi-Fi write of these from NX Field was seen in July), artist and copyright writes on
+  the Z9, IPTC.
+
+Also recorded here: the Z9's `0x90EB` device-name string is still empty (it read `Z_9_3023668` before the `0x90EC` probes
+described in `nx-field-ftp-profile-session-2026-07-10.md`). No MAID capability and no snapshot holds it, and the earlier
+attempt to write it back with `0x90EC` did not take, so it is likely a camera-menu setting, for example the network name.
+That is a guess; where it lives in the menu has not been checked.
