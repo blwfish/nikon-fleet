@@ -965,11 +965,11 @@ fn level_color(level: Level) -> Option<egui::Color32> {
 }
 
 impl eframe::App for FleetApp {
-    // eframe 0.34 requires ui() for the simplified single-panel path; our
-    // update() override handles layout directly so this is never called.
-    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
-
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The floating windows and the viewports still take the context; the
+        // panels are laid out inside the root `Ui`.
+        let ctx = root.ctx().clone();
+        let ctx = &ctx;
         self.poll();
         self.poll_views();
         self.drop_stale_confirmation();
@@ -978,9 +978,9 @@ impl eframe::App for FleetApp {
         self.check.sync(&self.cameras);
         self.poll_firmware(ctx);
         self.handle_native_menu(ctx);
-        self.ui_menu_bar(ctx);
-        self.ui_toolbar(ctx);
-        self.ui_notices(ctx);
+        self.ui_menu_bar(root);
+        self.ui_toolbar(root);
+        self.ui_notices(root);
         self.ui_preferences(ctx);
         self.ui_about(ctx);
         self.ui_vendor_ops(ctx);
@@ -988,15 +988,15 @@ impl eframe::App for FleetApp {
         self.ui_restore(ctx);
         self.ui_check(ctx);
         self.ui_firmware(ctx);
-        self.ui_sidebar(ctx);
-        self.ui_main(ctx);
+        self.ui_sidebar(root);
+        self.ui_main(root);
         self.ui_snapshot_viewers(ctx);
     }
 }
 
 impl FleetApp {
-    fn ui_toolbar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+    fn ui_toolbar(&mut self, root: &mut egui::Ui) {
+        egui::Panel::top("toolbar").show_inside(root, |ui| {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!self.busy(), |ui| {
                     if ui.button("⟳ Discover").clicked() {
@@ -1008,7 +1008,7 @@ impl FleetApp {
                     // No animated spinner: it repaints every frame. A once-a-second
                     // repaint keeps the elapsed time moving.
                     ui.label(format!("⏳ Working… {}s", since.elapsed().as_secs()));
-                    ctx.request_repaint_after(Duration::from_secs(1));
+                    ui.ctx().request_repaint_after(Duration::from_secs(1));
                 } else {
                     let text = egui::RichText::new(&self.status.text);
                     ui.label(match level_color(self.status.level) {
@@ -1021,11 +1021,11 @@ impl FleetApp {
     }
 
     /// Warnings and the CLI's own messages from the last operation.
-    fn ui_notices(&mut self, ctx: &egui::Context) {
+    fn ui_notices(&mut self, root: &mut egui::Ui) {
         if self.notices.is_empty() && self.cli_log.trim().is_empty() {
             return;
         }
-        egui::TopBottomPanel::bottom("notices").show(ctx, |ui| {
+        egui::Panel::bottom("notices").show_inside(root, |ui| {
             for n in &self.notices {
                 ui.colored_label(egui::Color32::from_rgb(200, 120, 0), n);
             }
@@ -1197,12 +1197,13 @@ impl FleetApp {
     }
 
     /// The in-window menu bar, for platforms (and a macOS failure) without a native one.
-    fn ui_menu_bar(&mut self, ctx: &egui::Context) {
+    fn ui_menu_bar(&mut self, root: &mut egui::Ui) {
         if self.has_native_menu() {
             return;
         }
+        let ctx = root.ctx().clone();
         let mut chosen = None;
-        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+        egui::Panel::top("menubar").show_inside(root, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 for m in menus(MACOS) {
                     ui.menu_button(m.title, |ui| {
@@ -1225,7 +1226,7 @@ impl FleetApp {
             });
         });
         if let Some(a) = chosen {
-            self.do_menu_action(ctx, a);
+            self.do_menu_action(&ctx, a);
         }
     }
 
@@ -1412,11 +1413,11 @@ impl FleetApp {
         }
     }
 
-    fn ui_sidebar(&mut self, ctx: &egui::Context) {
+    fn ui_sidebar(&mut self, root: &mut egui::Ui) {
         let mut cam_select: Option<usize> = None;
         let mut stored_select: Option<(String, String)> = None;
         let stored = self.listing.as_ref().map(|l| l.stored_only_bodies(&self.cameras)).unwrap_or_default();
-        egui::SidePanel::left("cameras").min_width(180.0).show(ctx, |ui| {
+        egui::Panel::left("cameras").min_size(180.0).show_inside(root, |ui| {
             ui.heading("Cameras");
             ui.separator();
             if self.cameras.is_empty() {
@@ -1456,7 +1457,8 @@ impl FleetApp {
         }
     }
 
-    fn ui_main(&mut self, ctx: &egui::Context) {
+    fn ui_main(&mut self, root: &mut egui::Ui) {
+        let ctx = root.ctx().clone();
         let mut snap_trigger = false;
         let mut check_trigger = false;
         let mut ref_action: Option<String> = None;
@@ -1466,7 +1468,7 @@ impl FleetApp {
         let busy = self.busy();
         let data_ready = self.settings.data_dir.is_some();
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(root, |ui| {
             let connected = self.selected.and_then(|i| self.cameras.get(i));
             let stored = if connected.is_none() { self.selected_stored.clone() } else { None };
             let Some((model, serial)) =
@@ -1600,7 +1602,7 @@ impl FleetApp {
             self.send(Cmd::SetReference { file });
         }
         if let Some((file, is_reference, name_lossy)) = view_action {
-            self.open_snapshot(ctx, &file, is_reference, name_lossy);
+            self.open_snapshot(&ctx, &file, is_reference, name_lossy);
         }
         if let Some((body, file)) = transplant_from {
             self.start_transplant_from(body, file);
