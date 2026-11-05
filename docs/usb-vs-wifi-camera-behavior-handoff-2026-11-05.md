@@ -301,6 +301,9 @@ accepts any client GUID that begins `01 00 4e 58`, with no pairing list. **A pro
 parameter `0`, `0x90EE(N, 0)` replaces slot N and moves it to the front. This supersedes the
 "adding a profile" gaps recorded above (the USB `0x90EE(1, 0)` stall was a write one past the end with the
 second parameter at 0). Also recorded there: one out-of-range slot value hung the camera's network.
+Later the same evening, over USB on the Z9: the `0x90EB` slot field is the index of the *selected*
+profile, `0x90EF(n)` deletes profile n, `0x90EA` deletes them all, and `0x90E9` / `0x90EC` exist but are
+unexplained (see section 6 of that document); `vendor-probe-op` is the command that sends them.
 
 ## Experiments, cheapest first
 

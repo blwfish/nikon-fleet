@@ -5,7 +5,7 @@ profiles, plus a from-scratch PTP/IP client (`scripts/ptpip_read_ftp.py`) that r
 Follows `docs/usb-vs-wifi-camera-behavior-handoff-2026-11-05.md` (which found the USB read op
 `0x90ED` and the blob layout) and `docs/nx-field-session-2026-07-09.md`.
 
-Everything here was observed on one camera, almost certainly the "Z9a" of the handoff doc: its slot 1
+Everything here was observed on one camera, the Z9 `Z_9_3023668` (its serial was read over USB later in the session; the owner called it "Z9a"): its slot 1
 still holds `txid-edit` (host `192.0.2.2`, user `txid2`), the throwaway profile written to Z9a
 earlier. The camera model was not re-read in this session. Treat anything model-specific as unverified.
 
@@ -158,11 +158,12 @@ raw blob. Dry run unless `--send`. It refuses a slot at or past the stored count
 - **Rule so far:** writing a profile into slot N with second parameter 0 replaces slot N and moves it to
   the front. With the second parameter 1 and slot = count it inserts a new profile at the front.
   What the second parameter means in general is unknown; only 0 and 1 have worked.
-- **Order is not "the profile in use".** After the adds, the camera kept logging in with the profile
-  that was *not* in slot 0 (an earlier guess that slot 0 is the active profile was wrong). The `0x90EB`
-  "slot" field stayed `0` throughout, so it is not an active-profile index either. Which profile the
-  camera connects with is chosen elsewhere (the owner selects it in the camera's FTP menu); no way to
-  select one over the wire has been found.
+- **List order is not the selection.** Right after the adds, the camera kept logging in with a profile that
+  was *not* in slot 0, and the `0x90EB` "slot" field read `0` while the list was `FtpPi`, `NxProfile`,
+  `txid-edit`. That first reading seemed to say the field is not an index of anything. **Section 6 corrects
+  this**: with a clean test the field is the index of the *selected* profile (it followed the selected
+  profile as other profiles were inserted and reordered). One reading, at 00:55, still does not fit.
+
 - **Durability:** a profile added with `(count, 1)` was still there, byte-identical (SHA-256 matched), after
   the owner powered the camera off from its menu and on again.
 - **Wi-Fi restart after a write is not established for this client.** NX Field's writes were each followed
@@ -187,21 +188,99 @@ raw blob. Dry run unless `--send`. It refuses a slot at or past the stored count
 - **Ordering assumption:** a first replacement test was meant to be a no-op and instead swapped two profiles,
   because writing any slot moves it to the front. Restore with a write of the other profile.
 
-## 6. Open questions
+## 6. The same ops over USB, the selection field, and the rest of the FTP op range
 
-- Which camera models accept this client. Only the one camera above was tried.
+Done later the same evening on the same Z9 (`Z_9_3023668`), with `vendor-read-ftp`,
+`vendor-write-ftp-blob` and a new `vendor-probe-op` (below).
+
+### Reads and the `00` tag byte
+
+- `vendor-read-ftp --slot N` reads every stored profile over USB. The first USB run reported
+  `count 3, limit 20, slot 0`.
+- The Rust decoder rejected two of the blobs: byte 105, the first byte of the 2.4 GHz tag, was `00` where
+  every earlier blob had `03` (`03 00 xx 00`). It is `00` in `NxProfile` and `FtpPi` and `03` in
+  `txid-edit`. `NxProfile` descends from `SNOOP`, which was made in the camera's own menu and then
+  rewritten by NX Field; `txid-edit` was written earlier by this tool's encoder. That is the only
+  difference found, so "camera-menu lineage gives `00`" is a guess; the byte's meaning is unknown. The
+  decoder now accepts `03` or `00`, keeps the byte as `ssid24_lead`, and `as_encodable()` refuses `00`
+  (the encoder writes `03`). Anything else is still rejected with the offset.
+
+### Adding over USB
+
+`vendor-write-ftp-blob --file F --slot COUNT --param2 1` does the same add as over Wi-Fi: count 3 → 4,
+new profile (`UsbPi`) at the front. The tool already allowed `slot == count`; its dry run called the add
+"untested".
+
+### The `0x90EB` slot field is the selected profile's index
+
+- After `UsbPi` was added at the front of `[NxProfile, FtpPi, txid-edit]`, the field read `1`. It had read
+  `0` when `NxProfile` was first, so it had followed `NxProfile`.
+- The owner then picked `FtpPi` in the camera's FTP menu. Result: `FtpPi` moved to the front of the list
+  and the field read `0`. **Selecting a profile in the menu moves it to the front.**
+- Then `0x90EE(2, 0)` was sent with `NxProfile`'s own bytes (it was at index 2). `NxProfile` moved to the
+  front and the field read `1`, pointing at `FtpPi`, which had been pushed down one place. **A write
+  moves its profile to the front but does not change the selection.**
+- After a delete-all (below) the field reads `0xFF`, and re-adding profiles leaves it at `0xFF`: adds do
+  not select. How to select one over the wire is still unknown.
+
+### Probing the unused ops in the range
+
+`vendor-probe-op OP [--param N]... [--setup]` sends one op with no data from a fixed list (`0x90E9`,
+`0x90EA`, `0x90EC`, `0x90EF`, and `0x9FFF` as a control that should not exist), at most two parameters
+and never `0xFFFFFFFF`. It reads the profile list and the selected index before and after. If the op gets
+no reply the session is unusable, so the "after" listing is then unavailable and `vendor-read-ftp` is run
+again. Results, Z9:
+
+| Call | Result |
+|---|---|
+| `0x9FFF`, bare or after the `0x90E8` setup | `0x2005` OperationNotSupported at once; list unchanged. What a nonexistent op looks like. |
+| **`0x90EA`, bare** | `0x2001` OK. **All profiles deleted**: count 4 → 0, selected index `0xFF`. |
+| **`0x90EF(1)`** | `0x2001` OK. **The profile at index 1 was deleted** (count 4 → 3, the others kept their order). |
+| `0x90EF`, bare | USB pipe stall (`Pipe error`). Camera fine afterwards. The same way a bad slot number was refused over USB. |
+| `0x90EC`, bare | no reply, USB timeout. Camera answered again immediately in a new session. |
+| `0x90E9`, bare, after the setup, over Wi-Fi | no reply within 8 s, and then the camera answered nothing on Wi-Fi (port 15740 closed) or on USB (every transaction timed out) until the owner power-cycled it. |
+
+- **`0x90EA` and `0x90EF(n)` are the delete operations** (all, and one). They are destructive and run
+  with no confirmation. The four profiles were restored from saved raw blobs: re-added in reverse order
+  (each add goes to the front) and compared byte-for-byte with the originals.
+- `0x90E9` and `0x90EC` exist (they do not answer `0x2005`) but sent bare they get no reply. A guess is
+  that they expect a data phase or parameters. Neither has been sent anything else. `0x90E9` left the
+  camera's PTP engine stuck on both transports; the stuck state was probably the unanswered transaction
+  (unverified).
+- None of the probed ops changed the selection. Only `0x90E9` and `0x90EC` are candidates for a "select"
+  operation.
+
+### Operation map (Z9, this evening)
+
+| Op | Effect |
+|---|---|
+| `0x90E8` | setup, data-out `01 00 00`, sent before the others |
+| `0x90EB` | info: count, limit 20, selected index (`0xFF` = none) |
+| `0x90ED(n)` | read profile n |
+| `0x90EE(n, 0)` | replace profile n, move it to the front |
+| `0x90EE(count, 1)` | add a profile at the front |
+| `0x90EF(n)` | delete profile n |
+| `0x90EA` | delete all profiles |
+| `0x90E9`, `0x90EC` | exist; purpose unknown |
+
+## 7. Open questions
+
+- Which camera models accept this client and the probes. Only the Z9 above was tried. The Z6III answered
+  the read ops over USB earlier but has not been probed.
+- How to select a profile over the wire. `0x90E9` and `0x90EC` with a parameter or data are untried;
+  either could hang the camera until a power cycle.
 - What the second parameter of `0x90EE` means beyond 0 (replace) and 1 (add), and what the `0x90E8`
-  setup byte (always `01 00 00`) selects. Neither was varied; the batch of setup-byte variants and
-  bare calls to `0x90E9`, `0x90EA`, `0x90EC` and `0x90EF` was not run.
-- How to delete a profile, and how to choose the active one, over the wire.
-- Whether the reverted profile list after the power cycle was the hang or a normal "commit on shutdown".
+  setup byte (always `01 00 00`) selects. Neither was varied.
+- What the `00` / `03` byte in the 2.4 GHz tag means.
+- Whether the reverted profile list after the first power cycle was the hang or a normal "commit on
+  shutdown", and the unexplained 00:55 slot-field reading.
 - Whether NX Field defaults to SFTP/22, and whether its form really prefills from the read.
 - What `ObjectAdded` pairs mean on a dual-slot camera.
 - Whether the Wi-Fi restart after a save is the save or the unreachable host, and whether writes sent by
-  this client cause one at all (record the station's connected time before and after to settle it).
-- Porting the PTP/IP client into the Rust tool (something like `vendor-read-ftp --wifi IP`, and a write
-  command with the same guards). The USB command already has `--save-blob FILE`, added upstream while
-  this was being written, so a Wi-Fi transport would reuse it.
+  the Wi-Fi client cause one at all (record the station's connected time before and after).
+- Porting the PTP/IP client into the Rust tool (something like `vendor-read-ftp --wifi IP`). The USB
+  commands already cover read, add, replace, and (through `vendor-probe-op`) delete; there is no
+  dedicated delete command, and `vendor-probe-op` is deliberately restricted to a fixed op list.
 
 ## Credentials
 

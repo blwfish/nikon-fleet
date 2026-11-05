@@ -357,6 +357,16 @@ pub enum PtpUsbError {
          stalls the USB pipe, so it was not sent"
     )]
     FtpSlotOutOfRange { slot: u32, count: u32 },
+    #[error(
+        "operation 0x{op:04x} is not on the FTP-probe list (0x90E9, 0x90EA, 0x90EC, 0x90EF, and 0x9FFF as a \
+         control); it was not sent"
+    )]
+    FtpProbeOpNotAllowed { op: u16 },
+    #[error(
+        "the FTP probe takes at most 2 parameters and refuses 0xFFFFFFFF (an out-of-range slot value that \
+         hung a camera's network stack); {params:?} was not sent"
+    )]
+    FtpProbeBadParams { params: Vec<u32> },
     #[error("FTP profile field {field} is {len} {unit}, exceeds the {max}-{unit} limit")]
     FtpFieldTooLong { field: &'static str, len: usize, max: usize, unit: &'static str },
     #[error("FTP profile field {field} contains non-ASCII characters, which this encoding does not support")]
@@ -948,6 +958,12 @@ impl FtpCameraNetwork {
 }
 
 const FTP_TAG_SSID_24GHZ: [u8; 4] = [0x03, 0x00, 0x01, 0x00];
+/// The first byte of that tag is `03` in every July/November capture and in
+/// what the encoder writes, but `00` in profiles that began life in the
+/// camera's own menu (seen 2026-07-11 on a Z 9: the profiles `NxProfile` and
+/// `FtpPi`, both lineally derived from one made on the camera). The decoder
+/// accepts either and keeps the byte as [`DecodedFtpProfile::ssid24_lead`].
+const FTP_TAG_SSID_24GHZ_LEADS: [u8; 2] = [0x03, 0x00];
 const FTP_TAG_SSID_5GHZ: [u8; 2] = [0x04, 0x04];
 const FTP_TAG_HOST: u8 = 0x01;
 const FTP_TAG_USERNAME: [u8; 3] = [0x00, 0x15, 0x00];
@@ -1455,6 +1471,11 @@ pub struct DecodedFtpProfile {
     /// (`03 00 xx 00`): `01` in most profiles, `0x30` in one with no stored
     /// camera address. Meaning unknown. The encoder writes `01`.
     pub ssid24_kind: u8,
+    /// The first byte of that same tag: `03` in the captured and encoded
+    /// profiles, `00` in some profiles made in the camera's own menu. Meaning
+    /// unknown (a guess, unverified: how the 2.4 GHz network was configured).
+    /// The encoder writes `03`, so [`Self::as_encodable`] refuses `00`.
+    pub ssid24_lead: u8,
     /// The string the encoder calls the 5 GHz SSID. **Probably the Wi-Fi
     /// password, not an SSID**: in the July blob it is `nikon5ghz`, the
     /// passphrase of the capture rig's access point, and in the profiles read
@@ -1513,7 +1534,7 @@ impl DecodedFtpProfile {
     }
 
     pub fn as_encodable(&self) -> Option<FtpProfile> {
-        (self.folder.is_empty() && self.option_flags == 0x0005 && self.ftp_port == 21 && self.ssid5_kind == FTP_TAG_SSID_5GHZ[0] && self.ssid24_kind == FTP_TAG_SSID_24GHZ[2])
+        (self.folder.is_empty() && self.option_flags == 0x0005 && self.ftp_port == 21 && self.ssid5_kind == FTP_TAG_SSID_5GHZ[0] && self.ssid24_kind == FTP_TAG_SSID_24GHZ[2] && self.ssid24_lead == FTP_TAG_SSID_24GHZ[0])
             .then(|| FtpProfile {
             profile_name: self.profile_name.clone(),
             ssid_24ghz: self.ssid_24ghz.clone(),
@@ -1552,10 +1573,11 @@ pub fn decode_ftp_profile(blob: &[u8]) -> Result<DecodedFtpProfile, PtpUsbError>
     let camera_network = FtpCameraNetwork { ipv4: [addr[3], addr[2], addr[1], addr[0]], prefix_len };
     let tag_at = r.pos;
     let tag24 = r.take("2.4 GHz SSID tag", 4)?;
-    if tag24[0] != FTP_TAG_SSID_24GHZ[0] || tag24[1] != FTP_TAG_SSID_24GHZ[1] || tag24[3] != FTP_TAG_SSID_24GHZ[3] {
+    if !FTP_TAG_SSID_24GHZ_LEADS.contains(&tag24[0]) || tag24[1] != FTP_TAG_SSID_24GHZ[1] || tag24[3] != FTP_TAG_SSID_24GHZ[3] {
         r.pos = tag_at;
-        return Err(r.bad("2.4 GHz SSID tag", format!("expected 03 00 xx 00, found {}", hex_bytes(tag24))));
+        return Err(r.bad("2.4 GHz SSID tag", format!("expected 03|00 00 xx 00, found {}", hex_bytes(tag24))));
     }
+    let ssid24_lead = tag24[0];
     let ssid24_kind = tag24[2];
     let ssid_24ghz = r.ascii_u32_len("2.4 GHz SSID")?;
     let tag_at = r.pos;
@@ -1592,6 +1614,7 @@ pub fn decode_ftp_profile(blob: &[u8]) -> Result<DecodedFtpProfile, PtpUsbError>
         camera_network,
         ssid_24ghz,
         ssid24_kind,
+        ssid24_lead,
         ssid_5ghz,
         ssid5_kind,
         host,
@@ -2612,6 +2635,123 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         };
         Ok(FtpProfileReadout { info, profile, warnings, reply_matched_command: matched })
     }
+}
+
+/// The only operations [`PtpUsbSession::probe_ftp_op`] will send: the unused numbers in the FTP range
+/// plus `0x9FFF`, which should not exist, as a control for "what does an op the camera does not
+/// have look like". All are sent with no parameters and no data.
+pub const FTP_PROBE_OPS: [u16; 5] = [0x90E9, 0x90EA, 0x90EC, 0x90EF, 0x9FFF];
+
+/// The camera's stored FTP profile list as the probe sees it: the count, the `0x90EB` slot field
+/// (the index of the selected profile, which follows that profile as the list is reordered) and
+/// the profile names in list order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtpListState {
+    pub count: u32,
+    pub selected: u32,
+    pub names: Vec<String>,
+}
+
+/// What one bare FTP-range op did. `reply` is the response code and data, or the error text if
+/// the transaction failed (a timeout or a pipe stall poisons the session, so `after` is then an
+/// error too and the list must be re-read with a fresh process).
+#[derive(Debug)]
+pub struct FtpOpProbe {
+    pub op: u16,
+    pub params: Vec<u32>,
+    pub setup_first: bool,
+    pub before: FtpListState,
+    pub reply: Result<FtpProbeReply, String>,
+    pub after: Result<FtpListState, String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtpProbeReply {
+    pub response_code: u16,
+    pub data: Vec<u8>,
+    pub data_containers: usize,
+}
+
+impl<T: BulkTransport> PtpUsbSession<T> {
+    /// `0x90E8` setup, `0x90EB`, then `0x90ED(n)` for every stored profile. Read-only.
+    fn ftp_list_state(&mut self) -> Result<FtpListState, PtpUsbError> {
+        let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
+        Self::require_ok(OP_FTP_SETUP, setup.code)?;
+        let info_reply = self.transact(OP_FTP_PROFILE_INFO, &[], None, TxidCheck::Unchecked)?;
+        Self::require_ok(OP_FTP_PROFILE_INFO, info_reply.code)?;
+        if info_reply.data_containers == 0 {
+            return Err(PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_INFO });
+        }
+        let info = parse_ftp_profile_info(&info_reply.data)?;
+        let mut names = Vec::new();
+        for n in 0..info.count {
+            let reply = self.transact(OP_FTP_PROFILE_READ, &[n], None, TxidCheck::Unchecked)?;
+            Self::require_ok(OP_FTP_PROFILE_READ, reply.code)?;
+            if reply.data_containers == 0 {
+                return Err(PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_READ });
+            }
+            names.push(match decode_ftp_profile(&reply.data) {
+                Ok(d) => d.profile_name,
+                Err(_) => format!("(undecodable, {} bytes)", reply.data.len()),
+            });
+        }
+        Ok(FtpListState { count: info.count, selected: info.slot, names })
+    }
+
+    /// Send one bare op from [`FTP_PROBE_OPS`] (no parameters, no data), optionally right after the
+    /// `0x90E8` setup that the profile ops need, and report the profile list before and after.
+    /// EXPERIMENTAL: what these ops do is unknown, so the list is read first and again afterwards
+    /// and both are returned. The refused-op check happens before any I/O.
+    pub fn probe_ftp_op(&mut self, op: u16, setup_first: bool, params: &[u32]) -> Result<FtpOpProbe, PtpUsbError> {
+        if !FTP_PROBE_OPS.contains(&op) {
+            return Err(PtpUsbError::FtpProbeOpNotAllowed { op });
+        }
+        if params.len() > 2 || params.contains(&u32::MAX) {
+            return Err(PtpUsbError::FtpProbeBadParams { params: params.to_vec() });
+        }
+        let mut warnings = Vec::new();
+        if sdk_model_name(self.model()).is_none() {
+            warnings.push(format!(
+                "camera model {:?} is not one of the surveyed models ({:?}); the FTP-profile ops were only captured on a Z 9",
+                self.model(),
+                KNOWN_MODELS
+            ));
+        }
+        let before = self.ftp_list_state()?;
+        let sent = (|| {
+            if setup_first {
+                let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
+                Self::require_ok(OP_FTP_SETUP, setup.code)?;
+            }
+            self.transact(op, params, None, TxidCheck::Unchecked)
+        })();
+        let reply = match sent {
+            Ok(r) => Ok(FtpProbeReply { response_code: r.code, data: r.data, data_containers: r.data_containers }),
+            Err(e) => Err(e.to_string()),
+        };
+        let after = self.ftp_list_state().map_err(|e| e.to_string());
+        Ok(FtpOpProbe { op, params: params.to_vec(), setup_first, before, reply, after, warnings })
+    }
+}
+
+/// [`PtpUsbSession::probe_ftp_op`] for a caller already holding the [`CameraLock`]; see
+/// [`PtpUsbSession::open_locked`]. One probe per session.
+pub fn probe_ftp_op_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    op: u16,
+    setup_first: bool,
+    params: &[u32],
+) -> Result<FtpOpProbe, PtpUsbError> {
+    if !FTP_PROBE_OPS.contains(&op) {
+        return Err(PtpUsbError::FtpProbeOpNotAllowed { op });
+    }
+    if params.len() > 2 || params.contains(&u32::MAX) {
+        return Err(PtpUsbError::FtpProbeBadParams { params: params.to_vec() });
+    }
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.probe_ftp_op(op, setup_first, params)
 }
 
 impl<T: BulkTransport> Drop for PtpUsbSession<T> {
@@ -5719,6 +5859,30 @@ mod tests {
     }
 
     #[test]
+    fn decode_accepts_the_00_lead_byte_of_camera_made_profiles_but_will_not_re_encode_it() {
+        let mut blob = hex::decode_hex(reference_ftp_blob_hex());
+        assert_eq!(blob[99], 0x03, "fixture offset of the 2.4 GHz tag's first byte");
+        let usual = decode_ftp_profile(&blob).expect("usual blob decodes");
+        assert_eq!(usual.ssid24_lead, 0x03);
+        blob[99] = 0x00;
+        let camera_made = decode_ftp_profile(&blob).expect("00 lead byte decodes");
+        assert_eq!(camera_made.ssid24_lead, 0x00);
+        // Nothing else about the profile changed.
+        assert_eq!(camera_made.profile_name, usual.profile_name);
+        assert_eq!(camera_made.ssid_24ghz, usual.ssid_24ghz);
+        assert_eq!(camera_made.host, usual.host);
+        // The encoder writes 03, so it cannot reproduce the 00 form.
+        assert!(usual.as_encodable().is_some(), "the reference blob is re-encodable");
+        assert!(camera_made.as_encodable().is_none());
+        // Any other lead byte is still rejected, with the offset.
+        blob[99] = 0x02;
+        assert!(matches!(
+            decode_ftp_profile(&blob),
+            Err(PtpUsbError::FtpBlobMalformed { what: "2.4 GHz SSID tag", offset: 99, .. })
+        ));
+    }
+
+    #[test]
     fn decode_rejects_trailing_bytes_and_unknown_tags_with_their_offset() {
         let blob = hex::decode_hex(reference_ftp_blob_hex());
         let mut longer = blob.clone();
@@ -5865,6 +6029,100 @@ mod tests {
         let out = s.read_ftp_profile_slot(Some(2)).unwrap();
         assert!(out.profile.is_some() && !out.info.has_active_profile());
         assert_eq!(t.sent().last().unwrap(), &(CONTAINER_COMMAND, OP_FTP_PROFILE_READ, 2, le(2)));
+    }
+
+    /// Replies for one `ftp_list_state` read of a one-profile list: setup, info, one profile.
+    fn list_state_replies(blob: &[u8], selected: u32) -> Vec<Step> {
+        vec![
+            resp(RESP_OK),
+            data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(1, selected, "Z_9_0000000")),
+            resp(RESP_OK),
+            data_c(OP_FTP_PROFILE_READ, blob),
+            resp(RESP_OK),
+        ]
+    }
+
+    #[test]
+    fn probe_ftp_op_refuses_an_op_off_the_list_before_any_io() {
+        let (mut s, t) = session(vec![], "Z 9");
+        assert!(matches!(
+            s.probe_ftp_op(0x90EE, false, &[]).unwrap_err(),
+            PtpUsbError::FtpProbeOpNotAllowed { op: 0x90EE }
+        ));
+        assert!(matches!(
+            s.probe_ftp_op(0x90ED, true, &[]).unwrap_err(),
+            PtpUsbError::FtpProbeOpNotAllowed { op: 0x90ED }
+        ));
+        assert!(t.sent().iter().all(|(_, op, _, _)| *op != 0x90EE && *op != 0x90ED && *op != OP_FTP_SETUP));
+    }
+
+    #[test]
+    fn probe_ftp_op_reads_the_list_before_and_after_and_reports_the_reply_verbatim() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(0x2005)); // OperationNotSupported
+        replies.extend(list_state_replies(&blob, 0));
+        let (mut s, t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x9FFF, false, &[]).unwrap();
+        assert_eq!(p.reply.as_ref().unwrap().response_code, 0x2005);
+        assert_eq!(p.before, p.after.clone().unwrap());
+        assert_eq!(p.before.count, 1);
+        assert_eq!(p.before.selected, 0);
+        assert_eq!(p.before.names.len(), 1);
+        // Bare means nothing between the "before" read and the op: the op follows the last 0x90ED.
+        let ops: Vec<u16> = t.sent().iter().map(|(_, op, _, _)| *op).collect();
+        assert_eq!(ops.iter().filter(|o| **o == 0x9FFF).count(), 1);
+        let at = ops.iter().position(|o| *o == 0x9FFF).unwrap();
+        assert_eq!(ops[at - 1], OP_FTP_PROFILE_READ, "no 0x90E8 setup between the read and the bare op");
+    }
+
+    #[test]
+    fn probe_ftp_op_with_setup_sends_the_setup_right_before_the_op() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(RESP_OK)); // the setup
+        replies.push(resp(0x2005)); // the op
+        replies.extend(list_state_replies(&blob, 0));
+        let (mut s, t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90E9, true, &[]).unwrap();
+        assert!(p.setup_first);
+        assert_eq!(p.reply.unwrap().response_code, 0x2005);
+        let ops: Vec<u16> = t.sent().iter().map(|(_, op, _, _)| *op).collect();
+        let at = ops.iter().position(|o| *o == 0x90E9).expect("op sent");
+        assert_eq!(ops[at - 1], OP_FTP_SETUP, "the setup immediately precedes the op");
+    }
+
+    #[test]
+    fn probe_ftp_op_sends_the_given_parameters_and_refuses_too_many_or_the_hang_value() {
+        let (mut s, t) = session(vec![], "Z 9");
+        for bad in [&[1u32, 2, 3][..], &[u32::MAX][..], &[0, u32::MAX][..]] {
+            assert!(matches!(s.probe_ftp_op(0x90EF, false, bad).unwrap_err(), PtpUsbError::FtpProbeBadParams { .. }));
+        }
+        assert!(t.sent().iter().all(|(_, op, _, _)| *op != 0x90EF && *op != OP_FTP_SETUP));
+
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(RESP_OK));
+        replies.extend(list_state_replies(&blob, 0));
+        let (mut s, t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90EF, false, &[1]).unwrap();
+        assert_eq!(p.params, vec![1]);
+        let sent = t.sent();
+        let (_, _, _, payload) = sent.iter().find(|(_, op, _, _)| *op == 0x90EF).expect("op sent");
+        assert_eq!(payload, &1u32.to_le_bytes().to_vec(), "the parameter reached the wire");
+    }
+
+    #[test]
+    fn probe_ftp_op_reports_a_changed_list() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(RESP_OK));
+        // After: the selection has moved to a profile that is not there to read (count 1, selected 0
+        // becomes selected 5), so the two states differ.
+        replies.extend(list_state_replies(&blob, 5));
+        let (mut s, _t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90EC, false, &[]).unwrap();
+        assert_ne!(p.before, p.after.unwrap());
     }
 
     #[test]

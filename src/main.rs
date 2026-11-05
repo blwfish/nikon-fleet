@@ -204,6 +204,16 @@ enum Cmd {
     /// guess, which this command exists to test. It sends nothing else (no
     /// setup, no data-out) and one query per run. Never run over USB before.
     VendorOpSupport(VendorOpSupportArgs),
+    /// EXPERIMENTAL. Send ONE bare operation (no parameters, no data) from a
+    /// short fixed list (0x90E9, 0x90EA, 0x90EC, 0x90EF in the FTP-profile
+    /// range, and 0x9FFF as a control that should not exist) and print the
+    /// response, with the profile list and selected index read before and
+    /// after. What these ops do is unknown; one of them may delete a profile
+    /// or change the selection, which the before/after listing shows. A call
+    /// that gets no reply can stall the USB pipe or poison the session, in
+    /// which case the "after" listing is unavailable and `vendor-read-ftp`
+    /// must be run again.
+    VendorProbeOp(VendorProbeOpArgs),
 }
 
 #[derive(Args, Debug)]
@@ -603,6 +613,36 @@ struct VendorOpSupportArgs {
     /// bare number is decimal.
     #[arg(value_parser = nikon_fleet::ptp_usb::parse_propcode)]
     op: u16,
+    /// Camera serial to target; same rules as vendor-read's --serial.
+    #[arg(long)]
+    serial: Option<String>,
+}
+
+/// A `u32` given in decimal or `0x` hex (for the probe's `--param`).
+fn parse_u32_any(s: &str) -> Result<u32, String> {
+    let t = s.trim();
+    match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).map_err(|e| format!("invalid hex number {t:?}: {e}")),
+        None => t.parse::<u32>().map_err(|e| format!("invalid number {t:?}: {e}")),
+    }
+}
+
+#[derive(Args, Debug)]
+struct VendorProbeOpArgs {
+    /// Operation code to send, e.g. "0x90E9". Must be one of 0x90E9, 0x90EA,
+    /// 0x90EC, 0x90EF, 0x9FFF; anything else is refused before any I/O.
+    #[arg(value_parser = nikon_fleet::ptp_usb::parse_propcode)]
+    op: u16,
+    /// A parameter to send with the op (up to two; repeat the flag). Decimal
+    /// or 0x-prefixed hex. 0xFFFFFFFF is refused: it hung a camera's network
+    /// stack when used as a slot number.
+    #[arg(long = "param", value_parser = parse_u32_any)]
+    params: Vec<u32>,
+    /// Send the 0x90E8 setup (data-out 01 00 00) immediately before the op,
+    /// as the profile ops need. Without it the op is sent bare in a fresh
+    /// session.
+    #[arg(long)]
+    setup: bool,
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
     serial: Option<String>,
@@ -1604,6 +1644,65 @@ fn cmd_vendor_op_support(args: &VendorOpSupportArgs) -> Result<()> {
     Ok(())
 }
 
+/// Send one bare op from the fixed probe list and print the list before and after.
+fn cmd_vendor_probe_op(args: &VendorProbeOpArgs) -> Result<()> {
+    let probe = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
+        .and_then(|(lock, serial)| {
+            nikon_fleet::ptp_usb::probe_ftp_op_locked(lock, serial.as_deref(), args.op, args.setup, &args.params).map_err(anyhow::Error::new)
+        })
+        .with_context(|| format!("probing operation 0x{:04x} over USB PTP", args.op))?;
+    for w in &probe.warnings {
+        eprintln!("warning: {w}");
+    }
+    println!("{}", ftp_probe_text(&probe));
+    Ok(())
+}
+
+/// What `vendor-probe-op` prints: the response verbatim and whether the profile list changed.
+fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
+    use nikon_fleet::ptp_usb::{hex_bytes, FtpListState, PtpResponseCode};
+    fn list(s: &FtpListState) -> String {
+        let items: Vec<String> = s
+            .names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| if i as u32 == s.selected { format!("[{i}] {n} (selected)") } else { format!("[{i}] {n}") })
+            .collect();
+        format!("{} profile(s): {}", s.count, items.join(", "))
+    }
+    let args = if p.params.is_empty() {
+        String::new()
+    } else {
+        format!("({})", p.params.iter().map(|v| format!("0x{v:x}")).collect::<Vec<_>>().join(", "))
+    };
+    let mut out = format!(
+        "0x{:04x}{}{}: ",
+        p.op,
+        args,
+        if p.setup_first { " after the 0x90E8 setup" } else if p.params.is_empty() { " bare" } else { "" }
+    );
+    match &p.reply {
+        Ok(r) => {
+            out.push_str(&format!("response {}", PtpResponseCode(r.response_code)));
+            if r.data_containers == 0 {
+                out.push_str(", no data phase");
+            } else {
+                out.push_str(&format!(", {} byte(s) in {} data container(s): {}", r.data.len(), r.data_containers, hex_bytes(&r.data)));
+            }
+        }
+        Err(e) => out.push_str(&format!("NO USABLE REPLY: {e}")),
+    }
+    out.push_str(&format!("\nbefore: {}", list(&p.before)));
+    match &p.after {
+        Ok(a) => {
+            out.push_str(&format!("\nafter:  {}", list(a)));
+            out.push_str(if *a == p.before { "\nthe profile list is unchanged" } else { "\n*** the profile list CHANGED ***" });
+        }
+        Err(e) => out.push_str(&format!("\nafter:  could not be read in this session ({e}); run vendor-read-ftp to see the list")),
+    }
+    out
+}
+
 /// What `vendor-op-support` prints. Deliberately says nothing like "supported": the response
 /// code and the bytes are the whole report.
 fn vendor_op_query_text(q: &nikon_fleet::ptp_usb::VendorOpQuery) -> String {
@@ -1689,6 +1788,9 @@ fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: 
             let n = d.camera_network;
             let _ = writeln!(out, "profile name:   {}", shown.profile_name);
             let _ = writeln!(out, "SSID 2.4 GHz:   {}", shown.ssid_24ghz);
+            if d.ssid24_lead != 0x03 {
+                let _ = writeln!(out, "                (tag lead byte 0x{:02x}, not the usual 0x03; seen on profiles made in the camera's menu)", d.ssid24_lead);
+            }
             let _ = writeln!(out, "5 GHz field:    {}  (probably the Wi-Fi password; tag 0x{:02x}04)", shown.ssid_5ghz, d.ssid5_kind);
             let _ = writeln!(out, "host:           {}", shown.host);
             let _ = writeln!(out, "FTP port:       {}", shown.ftp_port);
@@ -3328,6 +3430,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::VendorReadFtp(args) => cmd_vendor_read_ftp(args),
         Cmd::VendorWriteFtpBlob(args) => cmd_vendor_write_ftp_blob(args),
         Cmd::VendorOpSupport(args) => cmd_vendor_op_support(args),
+        Cmd::VendorProbeOp(args) => cmd_vendor_probe_op(args),
         Cmd::Firmware(sub) => match sub {
             FirmwareCmd::Add(args) => cmd_firmware_add(&cli.data_dir, args),
             FirmwareCmd::Ls(args) => cmd_firmware_ls(&cli.data_dir, args),
