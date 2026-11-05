@@ -113,7 +113,21 @@ libgphoto2 (LGPL) and the CLI (GPL) are open source, so any claim below can be c
   This corroborates the property identification in the NX Field doc from a second, independent source.
 - `config.c` has a generic "Other PTP Device Properties" fallback (`/main/other/<hex>`): every property listed in the
   camera's DeviceInfo gets a widget via `GetDevicePropDesc`, typed from the descriptor's form (none/range/enum).
-  Unnamed ones are labelled "PTP Property 0xNNNN". Read side verified; I did not read the write side.
+  Unnamed ones are labelled "PTP Property 0xNNNN". The widget is marked read-only when the descriptor's GetSet is
+  Get (`config.c`, end of the fallback loop). The loop only covers properties listed in the camera's DeviceInfo
+  `DeviceProps` (Nikon's vendor list is evidently merged in; not checked), and the "suppress already-decoded
+  properties" block is `#if 0`, so named properties also show up a second time here. That plausibly explains
+  todo.md's "codes listed twice" anomaly; it does **not** explain the later `0x200A` on the second pass.
+- Write side (`config.c`, "Generic property setter"): by hex name, `--set-config-value d0xx=<n>` (or `--set-config`).
+  It re-reads `GetDevicePropDesc` first and **refuses client-side** ("currently read-only") unless GetSet is
+  writable, so the camera never sees the write. Then it sends a standard `SetDevicePropValue` (`0x1016`) with the
+  descriptor's data type (ints parsed with `%ld`, strings as-is) and reports a non-OK response code with its number.
+  Consequence for experiment 3: gphoto2 cannot reproduce the `0x200F` refusal if the descriptor already says
+  read-only; use a raw `0x1016` path in `ptp_usb.rs` for that. Ranges that are small, step-1 integers are shown as
+  menus. The code has a TODO noting the set path ignores some return values.
+- Tracing: `usb.c` logs each PTP operation (code, name, params), data phase and response at debug level, and
+  `ptp_debug` dumps data bytes. The installed CLI has `--debug`, `--debug-loglevel=[error|debug|data|all]` and
+  `--debug-logfile=FILE`. Events on the interrupt endpoint were not checked.
 - `ptpip.c` implements PTP/IP: address `ptpip:IP[:port[:eventport]]`, default port 15740, and the init command sends a
   16-byte GUID. The GUID is generated randomly once and stored in gphoto2's settings (`ptp2_ip`/`guid`), with a
   comment that Nikon WU-1 adapters may use a fixed GUID. So the handshake is a plain init-with-GUID; whether a
