@@ -380,3 +380,23 @@ The owner then said the Z9 holds several profiles, and approved `vendor-read-ftp
 - Still unconfirmed against the camera's menu: what the option flags, the `ssid24_kind`/`ssid5_kind` tags and the
   "folder" string mean. A per-profile comparison with the menu (protocol, passive, anonymous, proxy, security type) would
   settle them.
+
+### The Z6III's profiles, and what the menu confirmed (2026-11-05)
+
+`vendor-read-ftp --slot 0..2` on the Z6III (`count` 3, `0x90EB` slot `0xff`):
+
+| Slot | Name | Host | Folder | Login | Port | Flags |
+|---|---|---|---|---|---|---|
+| 0 | CLAUDE | 192.168.66.1 | | fleet | 21 | `0x0005` |
+| 1 | Home | 192.168.68.250 | `/Volumes/archive3/images/2026/incoming-ftp` | blw | 22 | `0x0009` |
+| 2 | PHONE_DIREC10 | 10.46.210.82 | | none | 2221 | `0x0007` |
+
+- Slot 0 is exactly what our encoder writes (camera address 192.168.66.87/24, port 21, second port 8080): a leftover from
+  the earlier `vendor-write-ftp` tests. The old note that the USB write was "reverted" is wrong for this body.
+- **Confirmed:** the string between host and username is the **destination folder** (`Home` carries a real path), and
+  option bit **`0x08` is SFTP** (the owner confirmed `Home` is SFTP; `NETSOL`, the other port-22 profile, also has it).
+- Option bits across the 8 profiles read: `0x08` = SFTP; `0x02` appears only on the empty-login (probably anonymous)
+  profiles; `0x04` unexplained (set on `CLAUDE`, `NETSOL`, the phone profiles; clear on `Home` and the iPad-made one;
+  maybe passive mode); `0x01` set on all but the iPad-made profile.
+- The `FtpProfile.port` problem stands: the encoder writes its port to the second-port field and fixes the FTP port at
+  21, no folder, no SFTP bit. A correct writer needs `ftp_port`, `folder` and the option bits as inputs.

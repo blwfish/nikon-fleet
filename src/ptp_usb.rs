@@ -1455,10 +1455,9 @@ pub struct DecodedFtpProfile {
     /// type. The encoder writes `04`.
     pub ssid5_kind: u8,
     pub host: String,
-    /// A PTP string between host and username. Empty in two of three
-    /// captures; `"Claude"` in the third, a profile typed in through NX
-    /// Field. **Probably the FTP destination folder; unconfirmed** — check
-    /// against the camera's menu. The encoder cannot write it.
+    /// A PTP string between host and username: the **destination folder**
+    /// (confirmed 2026-11-05: a Z6III profile carried a real directory path
+    /// here). Empty when none is set. The encoder cannot write it.
     pub folder: String,
     pub username: String,
     /// In plain text, as the camera returns it. Callers should not log it.
@@ -1468,10 +1467,12 @@ pub struct DecodedFtpProfile {
     /// certainly the **FTP/SFTP server port** (the July body profile was
     /// typed in with port 21). The encoder hard-codes it as 21.
     pub ftp_port: u16,
-    /// The u16 after the password: `0x0005` in the 325 B and 317 B blobs (and
-    /// what the encoder writes), `0x0001` in the 331 B one, `0x000d` in a
-    /// profile read over USB. Unknown meaning; probably option bits
-    /// (protocol, passive mode, ...).
+    /// The u16 after the password: option bits. Seen: `0x0001`, `0x0005` (what
+    /// the encoder writes), `0x0007`, `0x0009`, `0x000d`. `0x0008` is **SFTP**
+    /// (confirmed on one profile whose menu says SFTP; set on both port-22
+    /// profiles seen). `0x0002` is set only on profiles with an empty login
+    /// (probably anonymous). `0x0004` is unexplained (maybe passive mode).
+    /// `0x0001` was set on all but one profile.
     pub option_flags: u16,
     /// The u16 after the option flags: 8080 in most blobs seen, 0 in one
     /// (a hotspot profile with no stored camera address). 8080 is the usual
@@ -1492,6 +1493,12 @@ impl DecodedFtpProfile {
     /// is not `04`, or [`Self::ssid24_kind`] is not `01`, since the encoder has
     /// no way to carry any of them. `FtpProfile.port` receives
     /// [`Self::second_port`] (where the encoder writes it).
+    /// The SFTP option bit (`0x0008`). Confirmed against the camera's menu on
+    /// one profile; see [`Self::option_flags`].
+    pub fn is_sftp(&self) -> bool {
+        self.option_flags & 0x0008 != 0
+    }
+
     pub fn as_encodable(&self) -> Option<FtpProfile> {
         (self.folder.is_empty() && self.option_flags == 0x0005 && self.ftp_port == 21 && self.ssid5_kind == FTP_TAG_SSID_5GHZ[0] && self.ssid24_kind == FTP_TAG_SSID_24GHZ[2])
             .then(|| FtpProfile {
@@ -5454,6 +5461,15 @@ mod tests {
         assert_eq!((d.username.as_str(), d.password.as_str()), ("", ""));
         assert_eq!((d.ftp_port, d.option_flags, d.second_port), (2221, 0x0007, 8080));
         assert!(d.as_encodable().is_none());
+    }
+
+    #[test]
+    fn the_sftp_bit_is_set_on_the_port_22_profile_and_not_on_the_ftp_ones() {
+        let sftp = decode_ftp_profile(&hex::decode_hex(ftp_blob_port22_hex())).unwrap();
+        assert!(sftp.is_sftp());
+        for hex in [reference_ftp_blob_hex(), ftp_blob_331_hex(), ftp_blob_anonymous_hex()] {
+            assert!(!decode_ftp_profile(&hex::decode_hex(hex)).unwrap().is_sftp());
+        }
     }
 
     #[test]

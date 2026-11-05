@@ -1526,10 +1526,15 @@ fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: 
             let _ = writeln!(out, "5 GHz field:    {}  (probably the Wi-Fi password; tag 0x{:02x}04)", shown.ssid_5ghz, d.ssid5_kind);
             let _ = writeln!(out, "host:           {}", shown.host);
             let _ = writeln!(out, "FTP port:       {}", shown.ftp_port);
-            let _ = writeln!(out, "folder (?):     {}", shown.folder);
+            let _ = writeln!(out, "folder:          {}", shown.folder);
             let _ = writeln!(out, "username:       {}", shown.username);
             let _ = writeln!(out, "password:       {}", shown.password);
-            let _ = writeln!(out, "option flags:   0x{:04x}", shown.option_flags);
+            let _ = writeln!(
+                out,
+                "option flags:   0x{:04x}{}",
+                shown.option_flags,
+                if d.is_sftp() { "  (bit 0x08 = SFTP)" } else { "" }
+            );
             let _ = writeln!(out, "second port:    {}  (8080 in most blobs; probably the proxy port)", shown.second_port);
             let _ = write!(
                 out,
