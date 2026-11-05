@@ -141,9 +141,9 @@ const VENDOR_OP_QUERY_PARAM2: u32 = 0;
 /// (2026-11-05). A closed list: any other code is refused, never passed through.
 pub const STRING_PROPS: [(u16, &str); 3] = [(0xD072, "Artist"), (0xD073, "Copyright"), (0xD090, "Image comment")];
 
-/// Models [`PtpUsbSession::set_string_property`] accepts without `force_unconfirmed_model`. The Z 9's
-/// descriptors say read-write and a Z6III took these over Wi-Fi from NX Field; a USB write has been
-/// confirmed on neither until the first hardware run is recorded.
+/// Models [`PtpUsbSession::set_string_property`] accepts without `force_unconfirmed_model`. A USB write
+/// of the image comment (`0xD090`) was confirmed on both, 2026-11-05: written, read back in a separate
+/// session, and restored byte for byte. Artist and copyright writes have not been run on either.
 pub const STRING_PROP_WRITE_MODELS: &[&str] = &["Z 9", "Z6_3"];
 
 /// The slot `0x90EB` reports when the camera has no *active* FTP profile.

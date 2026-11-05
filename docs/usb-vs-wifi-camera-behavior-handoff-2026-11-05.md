@@ -594,8 +594,7 @@ What the Z9 showed:
 - **The camera stores one byte per character.** Latin-1 text round-trips exactly (`"© café"`); characters above U+00FF
   are stored as their low byte: `"日本"` came back as `"å,"` and an emoji as `"=÷"`. The writer refuses text above
   U+00FF instead of sending it. The decode on read is unaffected (a stored byte comes back as the Latin-1 character).
-- Not done: the Z6III (not attached; a Wi-Fi write of these from NX Field was seen in July), artist and copyright writes on
-  the Z9, IPTC.
+- Not done on the Z9: artist and copyright writes, and IPTC. (The Z6III is covered in the next section.)
 
 Also recorded here: the Z9's `0x90EB` device-name string is still empty (it read `Z_9_3023668` before the `0x90EC` probes
 described in `nx-field-ftp-profile-session-2026-07-10.md`). No MAID capability and no snapshot holds it, and the earlier
@@ -605,3 +604,21 @@ the camera (model plus serial) and the `0x90EC` probes overwrote it; that is an 
 (the camera still joins, logs in and uploads). Decision (owner, 2026-11-05): leave it empty and do not do a network-settings
 reset to try to regenerate it; a reset would also lose the Wi-Fi and pairing setup and the selected-FTP-profile setting,
 which cannot be restored over USB. Untried: reading the Z6III's string to see whether bodies normally carry that default.
+
+### The same on the Z6III (`Z6_3_3014527`, firmware 2.00, 2026-11-05)
+
+- **Reads:** `0x1015` and `0x1014` work for `0xD072`, `0xD073`, `0xD090`, `0xD053` and `0xD091`. The three strings are
+  read-write strings; `0xD053` and `0xD091` are `uint8`, read-write, range 0 to 1, both `01` here (on the Z9: `01` and `00`).
+- **The values are leftovers from July's NX Field write tests**, space-padded to the field width: `"Artist modified"` to 36
+  characters, `"Copyright modified"` to 54, `"New Image comment modified"` to 36. The camera stores exactly what it is
+  sent: NX Field pads, the Z9's menu-typed values are unpadded. The widths 36, 54 and 36 match the limit measured on the
+  Z9 for the comment (36); the other two limits are inferred from these widths, not tested.
+- **USB write confirmed for the image comment:** `"fleet-test"` was written and read back in the same session and in a
+  separate one, then the original (including its 10 trailing spaces) was written back and read from the camera
+  byte-identical to the bytes saved beforehand. A 37-character value was refused with `InvalidDevicePropFormat`
+  (`0x201B`) and left the value byte-identical, as on the Z9.
+- **The `0x90EB` name string is present:** `Z6_3_3014527` (model and serial, no leading zeros), with the same
+  `f4 01` trailer. This fits the reading that the camera generates the name and the Z9's empty one is the `0x90EC`
+  probes' doing; it does not say how to restore it.
+- Not done: artist and copyright writes on either body; whether the Z6III also keeps only the low byte of each character
+  (the writer refuses text above U+00FF, so this cannot be tried without bypassing it); IPTC.

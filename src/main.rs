@@ -215,7 +215,7 @@ enum Cmd {
     /// the camera holds what was sent. In one session it reads the property's descriptor (refusing a
     /// property that is not a read-write string right now) and its current value, which it prints so
     /// the change can be undone. `--dry-run` shows the current value and sends nothing. No other
-    /// property can be written with this. Never run over USB on a Z6III; on a Z 9 see the handoff doc.
+    /// property can be written with this. Confirmed over USB on a Z 9 and a Z6III for the image comment only; see the handoff doc.
     VendorSetString(VendorSetStringArgs),
     /// EXPERIMENTAL. Send ONE bare operation (no parameters, no data) from a
     /// short fixed list (0x90E9, 0x90EA, 0x90EC, 0x90EF in the FTP-profile
