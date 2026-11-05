@@ -181,6 +181,13 @@ enum Cmd {
     /// of the wire format that are still opaque-but-fixed.
     #[command(after_help = VENDOR_WRITE_HELP)]
     VendorWriteFtp(VendorWriteFtpArgs),
+
+    /// Read the camera's FTP profile (0x90E8 → 0x90EB → 0x90ED) over raw USB
+    /// PTP and decode it. Writes nothing. The sequence is NX Field's own, as
+    /// captured on a Z 9; it has not been run over USB on a camera yet, so
+    /// treat the first run as the test. The password is masked unless
+    /// --show-password is given.
+    VendorReadFtp(VendorReadFtpArgs),
 }
 
 #[derive(Args, Debug)]
@@ -454,7 +461,7 @@ Exit status:
   1  any other error; nothing was sent to the camera unless the message says so
   2  command-line usage error
   4  the profile data was sent but the write then failed: the camera MAY have changed.
-     The profile cannot be read back over USB; check it in the camera's menu before retrying";
+     Check it in the camera's menu (or with `vendor-read-ftp`, not yet tried on a camera) before retrying";
 
 #[derive(Args, Debug)]
 struct FirmwareBrowseArgs {
@@ -572,6 +579,22 @@ struct VendorReadArgs {
     /// real serial or "usb-<bus>:<addr>".
     #[arg(long)]
     serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct VendorReadFtpArgs {
+    /// Camera serial to target; same rules as vendor-read's --serial.
+    #[arg(long)]
+    serial: Option<String>,
+    /// Print the FTP password in clear text instead of asterisks. Without
+    /// --raw the hex dump below also contains it, so --raw masks it too
+    /// unless this is given.
+    #[arg(long)]
+    show_password: bool,
+    /// Also print the profile blob as hex (password bytes zeroed unless
+    /// --show-password).
+    #[arg(long)]
+    raw: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1451,6 +1474,83 @@ fn cmd_vendor_read(args: &VendorReadArgs) -> Result<()> {
     Ok(())
 }
 
+/// Read and decode the camera's FTP profile via raw USB PTP. Read-only. See
+/// `nikon_fleet::ptp_usb::PtpUsbSession::read_ftp_profile`.
+fn cmd_vendor_read_ftp(args: &VendorReadFtpArgs) -> Result<()> {
+    let readout = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
+        .and_then(|(lock, serial)| {
+            nikon_fleet::ptp_usb::read_ftp_profile_locked(lock, serial.as_deref()).map_err(anyhow::Error::new)
+        })
+        .context("reading the FTP profile over USB PTP")?;
+    for w in &readout.warnings {
+        eprintln!("warning: {w}");
+    }
+    println!("{}", ftp_readout_text(&readout, args.show_password, args.raw));
+    Ok(())
+}
+
+/// What `vendor-read-ftp` prints. The password is masked, in the decoded
+/// fields and in the hex dump, unless `show_password`.
+fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: bool, raw: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let i = &r.info;
+    let _ = writeln!(
+        out,
+        "camera: {}  (0x90EB: count {}, limit {}, slot {})",
+        i.device_name.text,
+        i.count,
+        i.limit,
+        if i.has_profile() { i.slot.to_string() } else { "none (0xff)".to_string() }
+    );
+    let Some(p) = &r.profile else {
+        out.push_str("no FTP profile on the camera (0x90ED not sent)");
+        return out;
+    };
+    match &p.decoded {
+        Ok(d) => {
+            let shown = if show_password { d.clone() } else { d.with_password_masked() };
+            let n = d.camera_network;
+            let _ = writeln!(out, "profile name:   {}", shown.profile_name);
+            let _ = writeln!(out, "SSID 2.4 GHz:   {}", shown.ssid_24ghz);
+            let _ = writeln!(out, "SSID 5 GHz:     {}", shown.ssid_5ghz);
+            let _ = writeln!(out, "host:           {}", shown.host);
+            let _ = writeln!(out, "port:           {}", shown.port);
+            let _ = writeln!(out, "folder (?):     {}", shown.folder);
+            let _ = writeln!(out, "username:       {}", shown.username);
+            let _ = writeln!(out, "password:       {}", shown.password);
+            let _ = writeln!(out, "port flags:     0x{:02x}", shown.port_flags);
+            let _ = write!(
+                out,
+                "camera address: {}.{}.{}.{}/{}",
+                n.ipv4[0], n.ipv4[1], n.ipv4[2], n.ipv4[3], n.prefix_len
+            );
+        }
+        Err(e) => {
+            let _ = write!(out, "the {}-byte profile data was not decoded: {e}", p.raw.len());
+        }
+    }
+    if raw {
+        let mut bytes = p.raw.clone();
+        if !show_password && let Ok(d) = &p.decoded {
+            // Zero the password bytes in the dump: they sit right after the
+            // username, found by searching for the plaintext.
+            if let Some(at) = find_subslice(&bytes, d.password.as_bytes()) {
+                bytes[at..at + d.password.len()].fill(0);
+            }
+        }
+        let _ = write!(out, "\nraw ({} bytes): {}", bytes.len(), nikon_fleet::ptp_usb::hex_bytes(&bytes));
+    }
+    out
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Read the PTP DeviceInfo dataset via raw USB PTP (`0x1001`) and print it with the serial
 /// comparison. Read-only. See `nikon_fleet::ptp_usb`.
 fn cmd_device_info(args: &DeviceInfoArgs) -> Result<()> {
@@ -1697,7 +1797,7 @@ fn ftp_receipt_note(r: &nikon_fleet::ptp_usb::FtpWriteReceipt) -> Option<String>
     }
     (!notes.is_empty()).then(|| {
         format!(
-            "note: the camera answered OK, but {}. The profile cannot be read back, so check it in the camera's menu.",
+            "note: the camera answered OK, but {}. The OK does not show what the profile now holds: check it in the camera's menu (or with `vendor-read-ftp`, not yet tried on a camera).",
             notes.join(", and ")
         )
     })
@@ -3026,6 +3126,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::VendorRead(args) => cmd_vendor_read(args),
         Cmd::DeviceInfo(args) => cmd_device_info(args),
         Cmd::VendorWriteFtp(args) => cmd_vendor_write_ftp(args),
+        Cmd::VendorReadFtp(args) => cmd_vendor_read_ftp(args),
         Cmd::Firmware(sub) => match sub {
             FirmwareCmd::Add(args) => cmd_firmware_add(&cli.data_dir, args),
             FirmwareCmd::Ls(args) => cmd_firmware_ls(&cli.data_dir, args),
@@ -4291,6 +4392,55 @@ mod tests {
         assert!(params.contains("[7, 9]") && !params.contains("transaction id"), "{params}");
         let both = note(false, &[1]).unwrap();
         assert!(both.contains("transaction id") && both.contains("[1]"), "{both}");
+    }
+
+    fn ftp_readout_with_profile() -> nikon_fleet::ptp_usb::FtpProfileReadout {
+        use nikon_fleet::ptp_usb::*;
+        let blob = encode_ftp_profile(&FtpProfile {
+            profile_name: "CLAUDE".into(),
+            ssid_24ghz: "nikon-snoop".into(),
+            ssid_5ghz: "nikon5ghz".into(),
+            host: "192.168.66.1".into(),
+            port: 8080,
+            username: "fleet".into(),
+            password: "s3cretpw".into(),
+        })
+        .unwrap();
+        let mut info = vec![0xc8, 0x00];
+        info.extend_from_slice(&7u32.to_le_bytes());
+        info.extend_from_slice(&0x14u32.to_le_bytes());
+        info.extend_from_slice(&0u32.to_le_bytes());
+        info.extend_from_slice(&[0xAB; 16]);
+        info.extend_from_slice(&[0x03, b'Z', 0, b'9', 0, 0, 0]);
+        info.extend_from_slice(&[0xf4, 0x01]);
+        FtpProfileReadout {
+            info: parse_ftp_profile_info(&info).unwrap(),
+            profile: Some(FtpProfileBlob { decoded: decode_ftp_profile(&blob), raw: blob }),
+            warnings: vec![],
+            reply_matched_command: true,
+        }
+    }
+
+    #[test]
+    fn vendor_read_ftp_masks_the_password_in_fields_and_in_the_hex_dump_by_default() {
+        let r = ftp_readout_with_profile();
+        let masked = ftp_readout_text(&r, false, true);
+        assert!(masked.contains("password:       ********"), "{masked}");
+        assert!(!masked.contains("s3cretpw"), "{masked}");
+        let hex_of_pw = nikon_fleet::ptp_usb::hex_bytes(b"s3cretpw");
+        assert!(!masked.contains(&hex_of_pw), "the dump must not carry the password bytes: {masked}");
+        assert!(masked.contains("profile name:   CLAUDE") && masked.contains("port:           8080"), "{masked}");
+        let shown = ftp_readout_text(&r, true, true);
+        assert!(shown.contains("s3cretpw") && shown.contains(&hex_of_pw), "{shown}");
+    }
+
+    #[test]
+    fn vendor_read_ftp_says_so_when_the_camera_holds_no_profile() {
+        let mut r = ftp_readout_with_profile();
+        r.profile = None;
+        r.info.slot = 0xff;
+        let text = ftp_readout_text(&r, false, false);
+        assert!(text.contains("slot none (0xff)") && text.contains("no FTP profile"), "{text}");
     }
 
     #[test]

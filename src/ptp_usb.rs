@@ -100,6 +100,26 @@ const FTP_SETUP_DATA: [u8; 3] = [0x01, 0x00, 0x00];
 const OP_FTP_PROFILE_WRITE: u16 = 0x90EE;
 const FTP_PROFILE_WRITE_PARAMS: [u32; 2] = [0, 0];
 
+/// `0x90EB` — FTP profile info. No params, no data-out; the data-in phase is
+/// 57–59 bytes (see [`FtpProfileInfo`]). Always the second step of NX Field's
+/// `0x90E8` → `0x90EB` → `0x90ED` sequence, and the only place the slot for
+/// `0x90ED` comes from.
+const OP_FTP_PROFILE_INFO: u16 = 0x90EB;
+
+/// `0x90ED` — FTP profile **read**. One param, the profile slot taken from
+/// the `0x90EB` reply; the data-in phase is the profile blob in the same
+/// layout `0x90EE` writes. Confirmed offline from the 2026-07-09 Z 9 captures
+/// (a 325-byte read, then a byte-identical 325-byte write; 317-byte reads
+/// byte-identical to the 317-byte write before them); **not yet run over USB
+/// on any camera**. A bare `0x90ED` with no param stalls the pipe.
+const OP_FTP_PROFILE_READ: u16 = 0x90ED;
+
+/// The slot `0x90EB` reports when the camera holds no FTP profile. NX Field
+/// still sent `0x90ED(0xff)` in that state and got `0x201F`
+/// (TransactionCancelled) with no data, five times in the captures; this
+/// module does not send it, since the `0x90EB` reply already says so.
+const FTP_NO_PROFILE_SLOT: u32 = 0xff;
+
 const RESP_OK: u16 = 0x2001;
 const RESP_SESSION_ALREADY_OPEN: u16 = 0x201E;
 
@@ -315,6 +335,8 @@ pub enum PtpUsbError {
     NoDataPhase { op: u16 },
     #[error("PTP DeviceInfo dataset is malformed at its {field} (byte offset {offset}): {fault}")]
     DeviceInfoMalformed { field: &'static str, offset: usize, fault: DeviceInfoFault },
+    #[error("FTP profile data is not in a layout this decoder knows: {what} at byte offset {offset}: {detail}")]
+    FtpBlobMalformed { what: &'static str, offset: usize, detail: String },
     #[error("FTP profile field {field} is {len} {unit}, exceeds the {max}-{unit} limit")]
     FtpFieldTooLong { field: &'static str, len: usize, max: usize, unit: &'static str },
     #[error("FTP profile field {field} contains non-ASCII characters, which this encoding does not support")]
@@ -323,8 +345,8 @@ pub enum PtpUsbError {
     FtpFieldControlChar { field: &'static str },
     #[error(
         "FTP profile write may or may not have taken effect: the 0x90EE data had already been sent when \
-         this failed ({cause}). The profile cannot be read back, so check it in the camera's menu; \
-         repeating the write is idempotent"
+         this failed ({cause}). Check it in the camera's menu (or with `vendor-read-ftp`, not yet tried on a \
+         camera); repeating the write is idempotent"
     )]
     FtpWriteIndeterminate { cause: Box<PtpUsbError> },
     #[error("camera model {0:?} is not in this module's confirmed-safe list for vendor writes; wire format may not match")]
@@ -1228,6 +1250,280 @@ pub fn encode_ftp_profile_with(profile: &FtpProfile, network: &FtpCameraNetwork)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// 0x90ED FTP-profile read: decoding the blob and the 0x90EB info reply
+//
+// Worked out offline from the 2026-07-09 Z 9 captures (three distinct blobs:
+// 325 B, 331 B, 317 B). The layout is the one `encode_ftp_profile_with`
+// writes, plus one field the encoder does not model: a PTP string between
+// host and username (see `DecodedFtpProfile::folder`). The decoder is
+// strict: any structural byte it does not recognise is an error carrying
+// the offset, because a silently wrong decode of a profile is worse than
+// none. The raw bytes are always available to the caller.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// What `0x90EB` returns: the camera's identity and where its FTP profile
+/// is. Layout (57–59 bytes; **inferred from five replies in three body
+/// states, not documented**): `u16 0x00c8`, `u32 count`, `u32 0x14`,
+/// `u32 slot`, 16-byte GUID, PTP string (the body's `<model>_<serial>`),
+/// `u16 0x01f4`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtpProfileInfo {
+    /// `0x00c8` (200) in every reply seen; possibly a limit.
+    pub header: u16,
+    /// 6 then 7 on a Z 9 (before / after it gained an FTP profile), 3 on a
+    /// Z6III with none. Meaning unknown; could count saved network profiles
+    /// rather than FTP ones.
+    pub count: u32,
+    /// `0x14` (20) in every reply seen; possibly a limit.
+    pub limit: u32,
+    /// The slot to pass to `0x90ED`: `0` when the camera holds a profile,
+    /// [`FTP_NO_PROFILE_SLOT`] (`0xff`) when it does not.
+    pub slot: u32,
+    pub guid: [u8; 16],
+    /// Contains the body's serial number.
+    pub device_name: PtpString,
+    /// `0x01f4` (500) in every reply seen; the same value as the profile
+    /// blob's two-byte header.
+    pub trailer: u16,
+}
+
+impl FtpProfileInfo {
+    pub fn has_profile(&self) -> bool {
+        self.slot != FTP_NO_PROFILE_SLOT
+    }
+}
+
+/// A bounds-checked cursor over an FTP-profile blob or `0x90EB` reply. Every
+/// read names what it is for, and failures carry the offset.
+struct FtpBlobReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> FtpBlobReader<'a> {
+    fn bad(&self, what: &'static str, detail: impl Into<String>) -> PtpUsbError {
+        PtpUsbError::FtpBlobMalformed { what, offset: self.pos, detail: detail.into() }
+    }
+
+    fn take(&mut self, what: &'static str, n: usize) -> Result<&'a [u8], PtpUsbError> {
+        let remaining = self.data.len() - self.pos;
+        if n > remaining {
+            return Err(self.bad(what, format!("needs {n} byte(s) but only {remaining} remain")));
+        }
+        let bytes = &self.data[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(bytes)
+    }
+
+    fn u8(&mut self, what: &'static str) -> Result<u8, PtpUsbError> {
+        Ok(self.take(what, 1)?[0])
+    }
+
+    fn u16(&mut self, what: &'static str) -> Result<u16, PtpUsbError> {
+        Ok(u16::from_le_bytes(self.take(what, 2)?.try_into().expect("take(2) returns 2 bytes")))
+    }
+
+    fn u32(&mut self, what: &'static str) -> Result<u32, PtpUsbError> {
+        Ok(u32::from_le_bytes(self.take(what, 4)?.try_into().expect("take(4) returns 4 bytes")))
+    }
+
+    /// A literal tag: the bytes must be exactly `expected`.
+    fn expect(&mut self, what: &'static str, expected: &[u8]) -> Result<(), PtpUsbError> {
+        let at = self.pos;
+        let got = self.take(what, expected.len())?;
+        if got != expected {
+            self.pos = at;
+            return Err(self.bad(what, format!("expected {}, found {}", hex_bytes(expected), hex_bytes(got))));
+        }
+        Ok(())
+    }
+
+    /// `[u8 count incl. null][utf16le]`; count 0 is the empty string with no
+    /// further bytes. A non-empty string must end in the null.
+    fn ptp_string(&mut self, what: &'static str) -> Result<PtpString, PtpUsbError> {
+        let at = self.pos;
+        let chars = usize::from(self.u8(what)?);
+        let bytes = self.take(what, chars * 2)?;
+        let mut units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let mut anomalies = Vec::new();
+        if !units.is_empty() {
+            if units.last() == Some(&0) {
+                units.pop();
+            } else {
+                anomalies.push(StringAnomaly::MissingTerminator);
+            }
+        }
+        if units.contains(&0) {
+            anomalies.push(StringAnomaly::EmbeddedNul);
+        }
+        let mut text = String::with_capacity(units.len());
+        for decoded in char::decode_utf16(units) {
+            match decoded {
+                Ok(c) => text.push(c),
+                Err(_) => {
+                    text.push(char::REPLACEMENT_CHARACTER);
+                    if !anomalies.contains(&StringAnomaly::UnpairedSurrogate) {
+                        anomalies.push(StringAnomaly::UnpairedSurrogate);
+                    }
+                }
+            }
+        }
+        if !anomalies.is_empty() {
+            let tags: Vec<&str> = anomalies.iter().map(|a| a.tag()).collect();
+            self.pos = at;
+            return Err(self.bad(what, format!("string is not well-formed ({})", tags.join(", "))));
+        }
+        Ok(PtpString { text, anomalies })
+    }
+
+    /// `[u32 length in bytes][ascii]`, no null. Non-ASCII is an error.
+    fn ascii_u32_len(&mut self, what: &'static str) -> Result<String, PtpUsbError> {
+        let at = self.pos;
+        let len = self.u32(what)? as usize;
+        if len > self.data.len() - self.pos {
+            self.pos = at;
+            return Err(self.bad(what, format!("declares {len} byte(s) but only {} remain", self.data.len() - at - 4)));
+        }
+        let bytes = self.take(what, len)?;
+        if !bytes.is_ascii() {
+            self.pos = at;
+            return Err(self.bad(what, "contains non-ASCII bytes"));
+        }
+        Ok(String::from_utf8(bytes.to_vec()).expect("checked ASCII"))
+    }
+}
+
+/// Decode a `0x90EB` reply. Strict on length and the PTP string; the other
+/// fields are returned as read (see [`FtpProfileInfo`] for what is known).
+pub fn parse_ftp_profile_info(data: &[u8]) -> Result<FtpProfileInfo, PtpUsbError> {
+    let mut r = FtpBlobReader { data, pos: 0 };
+    let header = r.u16("info header")?;
+    let count = r.u32("info count")?;
+    let limit = r.u32("info limit")?;
+    let slot = r.u32("info slot")?;
+    let guid: [u8; 16] = r.take("info GUID", 16)?.try_into().expect("take(16) returns 16 bytes");
+    let device_name = r.ptp_string("info device name")?;
+    let trailer = r.u16("info trailer")?;
+    if r.pos != data.len() {
+        return Err(r.bad("info end", format!("{} unexpected byte(s) after the trailer", data.len() - r.pos)));
+    }
+    Ok(FtpProfileInfo { header, count, limit, slot, guid, device_name, trailer })
+}
+
+/// An FTP profile as read back from the camera by `0x90ED`. Every byte of
+/// the blob is accounted for: the fields the encoder writes, the one it does
+/// not model ([`Self::folder`]), and the structural bytes the decoder
+/// verified against literals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedFtpProfile {
+    pub profile_name: String,
+    /// The two UTF-16 strings after the name. All-zero date-time shape
+    /// (`"00000000T000000"`) in every capture; probably timestamps that were
+    /// never set. Kept as read.
+    pub timestamps: [String; 2],
+    /// The camera's own address and prefix length as stored in the profile
+    /// (192.168.66.87/24 in every capture; the capture rig's Z 9).
+    pub camera_network: FtpCameraNetwork,
+    pub ssid_24ghz: String,
+    pub ssid_5ghz: String,
+    pub host: String,
+    /// A PTP string between host and username. Empty in two of three
+    /// captures; `"Claude"` in the third, a profile typed in through NX
+    /// Field. **Probably the FTP destination folder; unconfirmed** — check
+    /// against the camera's menu. The encoder cannot write it.
+    pub folder: String,
+    pub username: String,
+    /// In plain text, as the camera returns it. Callers should not log it.
+    pub password: String,
+    /// The byte before the port: `05` in the 325 B and 317 B blobs (and what
+    /// the encoder writes), `01` in the 331 B one. Unknown meaning; probably
+    /// flags (passive mode? server type?).
+    pub port_flags: u8,
+    pub port: u16,
+    /// The three IPv6-shaped fields at the end, as read
+    /// (`"0000:…:0000"` in every capture).
+    pub ipv6_fields: [String; 3],
+}
+
+impl DecodedFtpProfile {
+    /// The [`FtpProfile`] the encoder would need to write this profile back,
+    /// when it can: not possible if [`Self::folder`] is non-empty or
+    /// [`Self::port_flags`] is not the encoder's `05`, since the encoder has
+    /// no way to carry either.
+    pub fn as_encodable(&self) -> Option<FtpProfile> {
+        (self.folder.is_empty() && self.port_flags == FTP_TAG_PORT_SECTION[0]).then(|| FtpProfile {
+            profile_name: self.profile_name.clone(),
+            ssid_24ghz: self.ssid_24ghz.clone(),
+            ssid_5ghz: self.ssid_5ghz.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            username: self.username.clone(),
+            password: self.password.clone(),
+        })
+    }
+
+    /// This profile with the password replaced by asterisks (same length),
+    /// for display.
+    pub fn with_password_masked(&self) -> Self {
+        DecodedFtpProfile { password: "*".repeat(self.password.len()), ..self.clone() }
+    }
+}
+
+/// Decode a `0x90ED` reply (or any `0x90EE` data-out blob) into its fields.
+/// Strict: an unrecognised structural byte, a truncated field or trailing
+/// bytes is [`PtpUsbError::FtpBlobMalformed`] with the offset.
+pub fn decode_ftp_profile(blob: &[u8]) -> Result<DecodedFtpProfile, PtpUsbError> {
+    let mut r = FtpBlobReader { data: blob, pos: 0 };
+    r.expect("blob header", &FTP_BLOB_HEADER)?;
+    let profile_name = r.ptp_string("profile name")?.text;
+    let timestamps = [r.ptp_string("timestamp 1")?.text, r.ptp_string("timestamp 2")?.text];
+    r.expect("network tag", &FTP_TEMPLATE_NETWORK_TAG)?;
+    let addr: [u8; 4] = r.take("camera address", 4)?.try_into().expect("take(4) returns 4 bytes");
+    let prefix_len = r.u8("camera prefix length")?;
+    r.expect("network padding", &FTP_TEMPLATE_NETWORK_PAD)?;
+    let camera_network = FtpCameraNetwork { ipv4: [addr[3], addr[2], addr[1], addr[0]], prefix_len };
+    r.expect("2.4 GHz SSID tag", &FTP_TAG_SSID_24GHZ)?;
+    let ssid_24ghz = r.ascii_u32_len("2.4 GHz SSID")?;
+    r.expect("5 GHz SSID tag", &FTP_TAG_SSID_5GHZ)?;
+    let ssid_5ghz = r.ascii_u32_len("5 GHz SSID")?;
+    r.expect("host tag", &[FTP_TAG_HOST])?;
+    let host = r.ptp_string("host")?.text;
+    let folder = r.ptp_string("folder")?.text;
+    // The encoder's FTP_TAG_USERNAME is [00 15 00]: its first byte is the
+    // empty `folder` string (count 0), which is why the two views agree
+    // byte-for-byte when the folder is empty.
+    r.expect("username tag", &FTP_TAG_USERNAME[1..])?;
+    let username = r.ascii_u32_len("username")?;
+    let password = r.ascii_u32_len("password")?;
+    let port_flags = r.u8("port-section flags")?;
+    r.expect("port-section tag", &FTP_TAG_PORT_SECTION[1..])?;
+    let port = r.u16("port")?;
+    r.expect("port-section padding", &FTP_PORT_SECTION_PAD)?;
+    let ipv6_a = r.ascii_u32_len("IPv6 field 1")?;
+    r.expect("IPv6 separator", &[FTP_IPV6_FIELD1_SEPARATOR])?;
+    let ipv6_b = r.ascii_u32_len("IPv6 field 2")?;
+    let ipv6_c = r.ascii_u32_len("IPv6 field 3")?;
+    r.expect("blob trailer", &[FTP_BLOB_TRAILER])?;
+    if r.pos != blob.len() {
+        return Err(r.bad("blob end", format!("{} unexpected byte(s) after the trailer", blob.len() - r.pos)));
+    }
+    Ok(DecodedFtpProfile {
+        profile_name,
+        timestamps,
+        camera_network,
+        ssid_24ghz,
+        ssid_5ghz,
+        host,
+        folder,
+        username,
+        password,
+        port_flags,
+        port,
+        ipv6_fields: [ipv6_a, ipv6_b, ipv6_c],
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Session
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1266,6 +1562,28 @@ pub struct FtpWriteReceipt {
     /// False when a reply to the setup or write carried a different
     /// transaction id (or a data container a different op code) than the
     /// command — tolerated because those ops have no capture to hold them to.
+    pub reply_matched_command: bool,
+}
+
+/// The profile bytes of an FTP-profile read, with the decode attempted on
+/// them. The raw bytes are kept whether or not the decode worked.
+#[derive(Debug)]
+pub struct FtpProfileBlob {
+    pub raw: Vec<u8>,
+    pub decoded: Result<DecodedFtpProfile, PtpUsbError>,
+}
+
+/// What [`PtpUsbSession::read_ftp_profile`] found.
+#[derive(Debug)]
+pub struct FtpProfileReadout {
+    pub info: FtpProfileInfo,
+    /// `None` when `0x90EB` said the camera holds no profile; `0x90ED` was
+    /// not sent then.
+    pub profile: Option<FtpProfileBlob>,
+    /// Things worth telling the user that are not failures.
+    pub warnings: Vec<String>,
+    /// False when a reply carried a different transaction id or operation
+    /// code than its command (tolerated; these ops have no USB capture).
     pub reply_matched_command: bool,
 }
 
@@ -2056,6 +2374,52 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         let reply_matched_command = setup.deviations.is_empty() && reply.deviations.is_empty();
         Ok(FtpWriteReceipt { response_params: reply.params, reply_matched_command })
     }
+
+    /// Read the camera's FTP profile: `0x90E8` (the same fixed 3-byte setup
+    /// the write sends) → `0x90EB` (info; says whether a profile exists and
+    /// in which slot) → `0x90ED(slot)` (the profile blob). That is NX
+    /// Field's own sequence, as captured; **it has not yet been run over USB
+    /// on a camera**, so the first run is the test of this method. Nothing
+    /// in it writes a profile.
+    ///
+    /// When `0x90EB` reports no profile (slot `0xff`), `0x90ED` is not sent
+    /// and the readout's `profile` is `None`. A blob that the decoder does
+    /// not recognise is still returned (raw bytes plus the decode error),
+    /// since the bytes are the finding.
+    pub fn read_ftp_profile(&mut self) -> Result<FtpProfileReadout, PtpUsbError> {
+        let mut warnings = Vec::new();
+        if sdk_model_name(self.model()).is_none() {
+            warnings.push(format!(
+                "camera model {:?} is not one of the surveyed models ({:?}); the FTP-profile read was only captured on a Z 9",
+                self.model(),
+                KNOWN_MODELS
+            ));
+        }
+        let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
+        Self::require_ok(OP_FTP_SETUP, setup.code)?;
+
+        let info_reply = self.transact(OP_FTP_PROFILE_INFO, &[], None, TxidCheck::Unchecked)?;
+        Self::require_ok(OP_FTP_PROFILE_INFO, info_reply.code)?;
+        if info_reply.data_containers == 0 {
+            return Err(PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_INFO });
+        }
+        let info = parse_ftp_profile_info(&info_reply.data)?;
+        let mut matched = setup.deviations.is_empty() && info_reply.deviations.is_empty();
+
+        let profile = if info.has_profile() {
+            let reply = self.transact(OP_FTP_PROFILE_READ, &[info.slot], None, TxidCheck::Unchecked)?;
+            Self::require_ok(OP_FTP_PROFILE_READ, reply.code)?;
+            if reply.data_containers == 0 {
+                return Err(PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_READ });
+            }
+            matched &= reply.deviations.is_empty();
+            let decoded = decode_ftp_profile(&reply.data);
+            Some(FtpProfileBlob { raw: reply.data, decoded })
+        } else {
+            None
+        };
+        Ok(FtpProfileReadout { info, profile, warnings, reply_matched_command: matched })
+    }
 }
 
 impl<T: BulkTransport> Drop for PtpUsbSession<T> {
@@ -2134,6 +2498,13 @@ pub fn write_ftp_profile_locked(
 ) -> Result<FtpWriteReceipt, PtpUsbError> {
     let mut session = PtpUsbSession::open_locked(lock, serial)?;
     session.write_ftp_profile(profile, force_unconfirmed_model)
+}
+
+/// [`PtpUsbSession::read_ftp_profile`] for a caller already holding the
+/// [`CameraLock`]; see [`PtpUsbSession::open_locked`]. Read-only.
+pub fn read_ftp_profile_locked(lock: CameraLock, serial: Option<&str>) -> Result<FtpProfileReadout, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.read_ftp_profile()
 }
 
 /// Format `data` as lowercase space-separated hex byte pairs, e.g.
@@ -2450,12 +2821,11 @@ mod tests {
         // length correctly, not just in the one reference case.
         //
         // NOTE: port 56171's instance (331 bytes) is NOT reproducible by
-        // this encoder -- it has an extra optional UTF-16 field (content
-        // "Claude", likely a device/hostname field) between host and
-        // username that doesn't appear in this or the reference capture.
-        // Not modeled here since it isn't needed for any field this API
-        // exposes; see docs/nx-field-session-2026-07-09.md. So "byte for
-        // byte" holds for two of the three captures.
+        // this encoder -- it has an extra PTP string (content "Claude",
+        // probably the destination folder; the decoder calls it `folder`)
+        // between host and username, and flag byte 01 instead of 05 before
+        // the port. `decode_331_blob_finds_the_folder_the_encoder_cannot_write`
+        // pins that down. So "byte for byte" holds for two of the three captures.
         let hex = concat!(
             "f401034300320000001030003000300030003000300030003000540030003000300030003000",
             "3000000010300030003000300030003000300030005400300030003000300030003000000002",
@@ -4842,5 +5212,289 @@ mod tests {
         assert!(matches!(err, PtpUsbError::NoDevice), "the finder's error, not a self-inflicted camera_busy: {err:?}");
         assert_eq!(held_during_find.get(), Some(true), "the lock was not held while the bus was read");
         assert!(CameraLock::acquire_at(&path).is_ok(), "the failed open released the lock it was handed");
+    }
+
+    // ── FTP profile read (0x90E8 → 0x90EB → 0x90ED) ──────────────────────
+    //
+    // Fixtures are the real blobs from session-20260709-204600-ftptest.pcap
+    // (Z 9, 2026-07-09). The 0x90EB replies are rebuilt from their decoded
+    // fields with a dummy GUID and serial, so no body identity is committed.
+
+    /// The 317-byte blob: profile "C2", empty folder. Seen as a `0x90EE`
+    /// write, then read back three times byte-identically.
+    fn ftp_blob_317_hex() -> &'static str {
+        concat!(
+            "f401034300320000001030003000300030003000300030003000540030003000300030003000",
+            "3000000010300030003000300030003000300030005400300030003000300030003000000002",
+            "03035742a8c0180000000000000000030001000b0000006e696b6f6e2d736e6f6f7004040900",
+            "00006e696b6f6e3567687a010d3100390032002e003100360038002e00360036002e00310000",
+            "0000150005000000666c6565740800000031323334353637380500901f000000000027000000",
+            "303030303a303030303a303030303a303030303a303030303a303030303a303030303a303030",
+            "304027000000303030303a303030303a303030303a303030303a303030303a303030303a3030",
+            "30303a3030303027000000303030303a303030303a303030303a303030303a303030303a3030",
+            "30303a303030303a3030303081",
+        )
+    }
+
+    /// The 331-byte blob: profile "C2" read before a rewrite, with a non-empty
+    /// string between host and username and `01` instead of `05` before the port.
+    fn ftp_blob_331_hex() -> &'static str {
+        concat!(
+            "f40103430032000000103000300030003000300030003000300054003000300030003000300030",
+            "000000103000300030003000300030003000300054003000300030003000300030000000020303",
+            "5742a8c0180000000000000000030001000b0000006e696b6f6e2d736e6f6f700404090000006e",
+            "696b6f6e3567687a010d3100390032002e003100360038002e00360036002e0031000000074300",
+            "6c0061007500640065000000150005000000666c6565740800000031323334353637380100901f",
+            "000000000027000000303030303a303030303a303030303a303030303a303030303a303030303a",
+            "303030303a303030304027000000303030303a303030303a303030303a303030303a303030303a",
+            "303030303a303030303a3030303027000000303030303a303030303a303030303a303030303a30",
+            "3030303a303030303a303030303a3030303081",
+        )
+    }
+
+    /// A `0x90EB` reply built from its decoded fields (dummy GUID).
+    fn ftp_info_bytes(count: u32, slot: u32, name: &str) -> Vec<u8> {
+        let mut v = vec![0xc8, 0x00];
+        v.extend_from_slice(&le(count));
+        v.extend_from_slice(&le(0x14));
+        v.extend_from_slice(&le(slot));
+        v.extend_from_slice(&[0xAB; 16]);
+        v.extend_from_slice(&utf16_u8_len_bytes(&name.encode_utf16().collect::<Vec<_>>()));
+        v.extend_from_slice(&[0xf4, 0x01]);
+        v
+    }
+
+    #[test]
+    fn decode_reference_blob_gives_every_field_and_reencodes_byte_for_byte() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let d = decode_ftp_profile(&blob).unwrap();
+        assert_eq!(d.profile_name, "CLAUDE");
+        assert_eq!(d.timestamps, ["00000000T000000", "00000000T000000"]);
+        assert_eq!(d.camera_network, FtpCameraNetwork::CAPTURED);
+        assert_eq!((d.ssid_24ghz.as_str(), d.ssid_5ghz.as_str()), ("nikon-snoop", "nikon5ghz"));
+        assert_eq!((d.host.as_str(), d.folder.as_str()), ("192.168.66.1", ""));
+        assert_eq!((d.username.as_str(), d.password.as_str()), ("fleet", "12345678"));
+        assert_eq!((d.port_flags, d.port), (0x05, 8080));
+        assert!(d.ipv6_fields.iter().all(|f| f == FTP_IPV6_PLACEHOLDER));
+        let profile = d.as_encodable().expect("empty folder and the encoder's flag byte");
+        assert_eq!(encode_ftp_profile(&profile).unwrap(), blob);
+    }
+
+    #[test]
+    fn decode_317_blob_reencodes_byte_for_byte() {
+        let blob = hex::decode_hex(ftp_blob_317_hex());
+        let d = decode_ftp_profile(&blob).unwrap();
+        assert_eq!(d.profile_name, "C2");
+        assert_eq!(encode_ftp_profile(&d.as_encodable().unwrap()).unwrap(), blob);
+    }
+
+    #[test]
+    fn decode_331_blob_finds_the_folder_the_encoder_cannot_write() {
+        let blob = hex::decode_hex(ftp_blob_331_hex());
+        assert_eq!(blob.len(), 331);
+        let d = decode_ftp_profile(&blob).unwrap();
+        assert_eq!(d.profile_name, "C2");
+        assert_eq!(d.folder, "Claude");
+        assert_eq!(d.port_flags, 0x01);
+        assert_eq!((d.host.as_str(), d.username.as_str(), d.port), ("192.168.66.1", "fleet", 8080));
+        assert!(d.as_encodable().is_none(), "the encoder cannot carry a folder or flag byte 01");
+    }
+
+    #[test]
+    fn the_331_blob_is_the_317_blob_plus_the_folder_string_and_flag_byte() {
+        // The capture's own evidence: the 317-byte write that followed the
+        // 331-byte read is that read with the 15-byte string
+        // `07 "Claude" 00 00` (offset 153) replaced by the single empty-string
+        // byte `00`, and the flag byte 01 → 05 (offset 191 in the read).
+        let read = hex::decode_hex(ftp_blob_331_hex());
+        let written = hex::decode_hex(ftp_blob_317_hex());
+        let mut edited = read;
+        edited[191] = 0x05;
+        edited.splice(153..168, [0x00]);
+        assert_eq!(edited, written);
+    }
+
+    #[test]
+    fn decode_never_panics_on_a_truncated_blob_and_always_says_it_failed() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        for cut in 0..blob.len() {
+            assert!(
+                matches!(decode_ftp_profile(&blob[..cut]), Err(PtpUsbError::FtpBlobMalformed { .. })),
+                "a blob cut to {cut} byte(s) must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes_and_unknown_tags_with_their_offset() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let mut longer = blob.clone();
+        longer.push(0);
+        assert!(matches!(
+            decode_ftp_profile(&longer),
+            Err(PtpUsbError::FtpBlobMalformed { what: "blob end", offset, .. }) if offset == blob.len()
+        ));
+        let mut bad_tag = blob.clone();
+        bad_tag[99] ^= 0xff; // first byte of the 2.4 GHz SSID tag
+        assert!(matches!(
+            decode_ftp_profile(&bad_tag),
+            Err(PtpUsbError::FtpBlobMalformed { what: "2.4 GHz SSID tag", offset: 99, .. })
+        ));
+        let mut bad_header = blob;
+        bad_header[0] = 0;
+        assert!(matches!(
+            decode_ftp_profile(&bad_header),
+            Err(PtpUsbError::FtpBlobMalformed { what: "blob header", offset: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn password_masking_keeps_the_length_and_hides_the_text() {
+        let d = decode_ftp_profile(&hex::decode_hex(reference_ftp_blob_hex())).unwrap();
+        assert_eq!(d.with_password_masked().password, "********");
+        assert_eq!(d.password, "12345678", "masking returns a copy");
+    }
+
+    #[test]
+    fn info_decodes_a_z9_reply_with_a_profile_and_one_without() {
+        let with = parse_ftp_profile_info(&ftp_info_bytes(7, 0, "Z_9_0000000")).unwrap();
+        assert_eq!((with.header, with.count, with.limit, with.slot, with.trailer), (0xc8, 7, 0x14, 0, 0x1f4));
+        assert_eq!(with.device_name.text, "Z_9_0000000");
+        assert!(with.has_profile());
+        let raw = ftp_info_bytes(3, 0xff, "Z6_3_0000000");
+        assert_eq!(raw.len(), 59);
+        let without = parse_ftp_profile_info(&raw).unwrap();
+        assert!(!without.has_profile());
+        assert_eq!(ftp_info_bytes(6, 0xff, "Z_9_0000000").len(), 57);
+    }
+
+    #[test]
+    fn info_rejects_truncation_and_trailing_bytes() {
+        let ok = ftp_info_bytes(7, 0, "Z_9_0000000");
+        for cut in 0..ok.len() {
+            assert!(parse_ftp_profile_info(&ok[..cut]).is_err(), "cut to {cut}");
+        }
+        let mut longer = ok;
+        longer.push(0);
+        assert!(matches!(parse_ftp_profile_info(&longer), Err(PtpUsbError::FtpBlobMalformed { what: "info end", .. })));
+    }
+
+    #[test]
+    fn read_ftp_profile_runs_the_captured_sequence_and_decodes_the_blob() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let info = ftp_info_bytes(7, 0, "Z_9_0000000");
+        let (mut s, t) = session(
+            vec![
+                resp(RESP_OK),
+                data_c(OP_FTP_PROFILE_INFO, &info),
+                resp(RESP_OK),
+                data_c(OP_FTP_PROFILE_READ, &blob),
+                resp(RESP_OK),
+            ],
+            "Z 9",
+        );
+        let out = s.read_ftp_profile().unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![
+                (CONTAINER_COMMAND, OP_FTP_SETUP, 0, vec![]),
+                (CONTAINER_DATA, OP_FTP_SETUP, 0, FTP_SETUP_DATA.to_vec()),
+                (CONTAINER_COMMAND, OP_FTP_PROFILE_INFO, 1, vec![]),
+                (CONTAINER_COMMAND, OP_FTP_PROFILE_READ, 2, le(0)),
+            ],
+            "0x90E8 with its data, 0x90EB with no params, 0x90ED with the slot 0x90EB reported; nothing else"
+        );
+        assert!(out.reply_matched_command && out.warnings.is_empty());
+        let p = out.profile.expect("a profile was reported");
+        assert_eq!(p.raw, blob);
+        assert_eq!(p.decoded.unwrap().profile_name, "CLAUDE");
+    }
+
+    #[test]
+    fn read_ftp_profile_passes_the_slot_from_the_info_reply_to_0x90ed() {
+        let blob = hex::decode_hex(ftp_blob_317_hex());
+        let (mut s, t) = session(
+            vec![
+                resp(RESP_OK),
+                data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(7, 4, "Z_9_0000000")),
+                resp(RESP_OK),
+                data_c(OP_FTP_PROFILE_READ, &blob),
+                resp(RESP_OK),
+            ],
+            "Z 9",
+        );
+        s.read_ftp_profile().unwrap();
+        assert_eq!(t.sent().last().unwrap(), &(CONTAINER_COMMAND, OP_FTP_PROFILE_READ, 2, le(4)));
+    }
+
+    #[test]
+    fn read_ftp_profile_with_no_profile_never_sends_0x90ed() {
+        let (mut s, t) = session(
+            vec![resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(3, 0xff, "Z6_3_0000000")), resp(RESP_OK)],
+            "Z6_3",
+        );
+        let out = s.read_ftp_profile().unwrap();
+        assert!(out.profile.is_none() && !out.info.has_profile());
+        assert!(t.sent().iter().all(|(_, op, _, _)| *op != OP_FTP_PROFILE_READ));
+    }
+
+    #[test]
+    fn read_ftp_profile_keeps_the_raw_bytes_when_the_blob_is_not_recognised() {
+        let mut odd = hex::decode_hex(reference_ftp_blob_hex());
+        odd[0] = 0x00;
+        let (mut s, _t) = session(
+            vec![
+                resp(RESP_OK),
+                data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(7, 0, "Z_9_0000000")),
+                resp(RESP_OK),
+                data_c(OP_FTP_PROFILE_READ, &odd),
+                resp(RESP_OK),
+            ],
+            "Z 9",
+        );
+        let p = s.read_ftp_profile().unwrap().profile.unwrap();
+        assert_eq!(p.raw, odd);
+        assert!(matches!(p.decoded, Err(PtpUsbError::FtpBlobMalformed { what: "blob header", .. })));
+    }
+
+    #[test]
+    fn read_ftp_profile_reports_a_refused_0x90ed_as_that_op_failing() {
+        let (mut s, _t) = session(
+            vec![
+                resp(RESP_OK),
+                data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(7, 0, "Z_9_0000000")),
+                resp(RESP_OK),
+                resp(0x201F),
+            ],
+            "Z 9",
+        );
+        assert!(matches!(
+            s.read_ftp_profile().unwrap_err(),
+            PtpUsbError::OperationFailed { op: OP_FTP_PROFILE_READ, code: PtpResponseCode(0x201F) }
+        ));
+    }
+
+    #[test]
+    fn read_ftp_profile_info_ok_without_data_is_no_data_phase_and_stops() {
+        let (mut s, t) = session(vec![resp(RESP_OK), resp(RESP_OK)], "Z 9");
+        assert!(matches!(s.read_ftp_profile().unwrap_err(), PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_INFO }));
+        assert!(t.sent().iter().all(|(_, op, _, _)| *op != OP_FTP_PROFILE_READ));
+    }
+
+    #[test]
+    fn read_ftp_profile_setup_failure_stops_before_the_info_op() {
+        let (mut s, t) = session(vec![resp(0x2002)], "Z 9");
+        assert!(matches!(s.read_ftp_profile().unwrap_err(), PtpUsbError::OperationFailed { op: OP_FTP_SETUP, .. }));
+        assert!(t.sent().iter().all(|(_, op, _, _)| *op == OP_FTP_SETUP));
+    }
+
+    #[test]
+    fn read_ftp_profile_on_an_unsurveyed_model_still_reads_and_warns() {
+        let (mut s, _t) = session(
+            vec![resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(3, 0xff, "Z_8_0000000")), resp(RESP_OK)],
+            "Z 8",
+        );
+        let out = s.read_ftp_profile().unwrap();
+        assert_eq!(out.warnings.len(), 1);
     }
 }

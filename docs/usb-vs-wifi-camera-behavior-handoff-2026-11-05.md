@@ -244,6 +244,52 @@ data-out phase, and read the camera's data-in reply. If the reply carries the pr
 camera, and no more `vendor-write-ftp` experiments until a read exists** (they overwrite the slot with no way to
 see the old value).
 
+### Result of the offline walk (2026-11-05): `0x90ED` is the FTP profile read, confirmed from captures
+
+Method: a small PTP/IP walker (reassembles TCP per direction, groups command / data / response by transaction) run
+over the four July pcaps in `captures/2026-07-09/` and the November Z6III pcap. No camera was touched. (The pcaps are
+in the repo checkout on this Mac; the "they live on the MacBook" line above was wrong.)
+
+- **`0x90ED` takes one param, the profile slot, and returns the profile blob as its data-in phase.** In
+  `session-20260709-204600-ftptest.pcap` (Z9) the reply to `0x90ED(0x0)` is 325 B, and the `0x90EE(0x0,0x0)`
+  data-out 16 s later is **byte-identical** (325 B). Later reads of 317 B are byte-identical to the 317 B write
+  that preceded them (read-back after write), and three consecutive reads are identical to each other. So the read
+  and write blobs share one layout, and `encode_ftp_profile` can be checked against any `0x90ED` reply.
+- **Sequence NX Field uses:** `0x90E8` (data-out `01 00 00`) → `0x90EB` (57–59 B, identity + slot info) →
+  `0x90ED(slot)`. The slot value comes from `0x90EB`: after the Z9 had an FTP profile it was `0`; with none it was
+  `0xff`. `0x944C(0x90ED, 0)` (32 B of mostly zeros, `01 01 01 …`) is sent before the FTP screen; it looks like a
+  per-op support query. Not decoded further.
+- **Why the November Z6III "had no active profile":** there `0x90ED(0xff)` was answered **`0x201F`
+  (Transaction Cancelled)** at 260 s and 363 s, no data phase. Same answer in the July Z9 filtered capture when no
+  profile existed. So `0x201F` on `0x90ED(0xff)` is the camera saying "no profile in that slot", which explains
+  NX Field refusing to edit.
+- **`0x90EB` layout (inference, 3 body states):** `c8 00` | u32 `N` | u32 `0x14` | u32 slot | 16-byte GUID |
+  `u8 nchars` + UTF-16LE name (the body's `<model>_<serial>` string, so do not commit it) | `f4 01`. `N` was 6 and
+  slot `0xff` on the Z9 before it had a profile, `N` 7 and slot `0` after; `N` was 3 on the Z6III (no profile).
+  The `0x14` (20) and `0xc8` (200) are possibly limits. Meaning of `N` unknown (could be a count of saved network
+  profiles, not only FTP).
+- **The 331 B blob** (the one the encoder does not model) is a read, not a write, and the decoder now explains it. It
+  has a PTP string `07 "Claude" 00` between host and username (offset 153), and flag byte `01` instead of `05` before
+  the port (offset 191). The 317 B write sent right after is that read with the string replaced by a single `00` (the
+  empty string, which is the first byte of the encoder's `[00 15 00]` username tag) and the flag set to `05`; a test
+  pins this byte for byte. The string is **probably the FTP destination folder** (unconfirmed; the camera's menu would
+  say), and the flag byte probably holds options such as passive mode (unknown). The encoder can write neither.
+- **Standing rule still holds** for hardware: no `0x90ED` on a camera until we choose to run exactly the captured
+  sequence (`0x90E8` data `01 00 00`, `0x90EB`, then `0x90ED` with the slot that `0x90EB` reports). `0x90ED(0xff)`
+  is known to give `0x201F` without side effects in 5 captured instances, but that was via NX Field.
+
+**Done in code (2026-11-05, not run on a camera):** `src/ptp_usb.rs` now has `decode_ftp_profile` (strict, offset in
+every error, never panics on truncation), `parse_ftp_profile_info` for `0x90EB`, and `PtpUsbSession::read_ftp_profile`
+(`0x90E8` → `0x90EB` → `0x90ED(slot)`; when the slot is `0xff` it does not send `0x90ED`). The CLI has
+`vendor-read-ftp [--serial=S] [--show-password] [--raw]`; the password is masked, and zeroed in the hex dump, unless
+`--show-password`. Tests use the real 325/317/331 B blobs (round-trip through the encoder for the first two) and
+`0x90EB` replies rebuilt with a dummy GUID and serial. Stale "cannot be read back" wording in the write path's
+messages now points at the new command.
+
+First hardware run, when wanted: `vendor-read-ftp` on the Z6III (expected: slot `none (0xff)`, no `0x90ED` sent), then on
+the Z9 (expected: the profile; compare against its menu, which also settles what the extra string is). It is read-only,
+but `0x90E8` is the same setup step the write path sends and has only been captured, never sent by this tool alone.
+
 ## Experiments, cheapest first
 
 Items 1, 2, 4 and 5 are read-only. Item 3 writes a property (a no-op write of its current value).
