@@ -114,6 +114,19 @@ const OP_FTP_PROFILE_INFO: u16 = 0x90EB;
 /// on any camera**. A bare `0x90ED` with no param stalls the pipe.
 const OP_FTP_PROFILE_READ: u16 = 0x90ED;
 
+/// `0x944C` — NX Field sends `0x944C(0x90ED, 0)` before opening the FTP screen
+/// and gets 32 bytes back, mostly zeros starting `01 01 01` (handoff doc, the
+/// offline walk of the 2026-07-09 Z 9 captures; the exact bytes are in the
+/// pcaps, not in this repo). **That it asks "does this camera implement
+/// operation X" is an inference**, not a finding: the first parameter looks
+/// like an operation code and the reply like a table of flags, nothing more.
+/// The Z 9 lists `0x944C` in its DeviceInfo; the Z 5 does not.
+/// This module sends it only through [`PtpUsbSession::query_vendor_op`], with
+/// the second parameter fixed at its captured value, so it cannot be used to
+/// fire another operation.
+const OP_VENDOR_OP_QUERY: u16 = 0x944C;
+const VENDOR_OP_QUERY_PARAM2: u32 = 0;
+
 /// The slot `0x90EB` reports when the camera has no *active* FTP profile.
 /// **Not** "no profile stored": on 2026-11-05 a Z9 that the owner says holds
 /// FTP profiles reported this too, so 0xff is probably "none selected". NX Field
@@ -1665,6 +1678,40 @@ pub struct VendorRead {
     pub warnings: Vec<String>,
 }
 
+/// What one `0x944C` query answered. Unlike the other reads here, a non-OK
+/// response code is **data, not an error**: for a query whose meaning is
+/// being worked out, the code the camera gives for an operation it does not
+/// know is as much the finding as the bytes it gives for one it does. So
+/// nothing is called "supported" here; read [`Self::response_code`] and
+/// [`Self::data`] yourself. Transport faults (a timeout, a stalled pipe) are
+/// still `Err`, and poison the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendorOpQuery {
+    /// The operation code asked about (the first `0x944C` parameter).
+    pub target_op: u16,
+    /// The camera's response code to the `0x944C` command itself.
+    pub response_code: u16,
+    /// The data-in phase, concatenated (empty when there was none).
+    pub data: Vec<u8>,
+    /// How many data containers arrived: 0 is "no data phase", which is not
+    /// the same as a data phase of zero bytes.
+    pub data_containers: usize,
+    /// False when the reply carried a different transaction id or operation
+    /// code than the command (tolerated: no USB capture exists to hold a
+    /// `0x944C` reply to).
+    pub reply_matched_command: bool,
+    /// Things worth telling the user that are not failures.
+    pub warnings: Vec<String>,
+}
+
+impl VendorOpQuery {
+    /// The camera answered the command with `OK`. Says nothing about whether
+    /// `target_op` is implemented; that reading is the open question.
+    pub fn is_ok(&self) -> bool {
+        self.response_code == RESP_OK
+    }
+}
+
 /// Why a DeviceInfo dataset could not be parsed (the `fault` of
 /// [`PtpUsbError::DeviceInfoMalformed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -2370,6 +2417,38 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         Ok(VendorRead { data: reply.data, warnings })
     }
 
+    /// Send `0x944C(target_op, 0)` and report the answer as it came; see
+    /// [`OP_VENDOR_OP_QUERY`] for what is and is not known about it. **Not yet
+    /// run over USB on any camera**: this module has never sent `0x944C`, so
+    /// the first runs are the test, and an unfamiliar `target_op` is a guess
+    /// at the parameter (a stalled pipe is the failure seen so far from a
+    /// wrong parameter on other ops, and the session recovers from it). It
+    /// sends nothing but that one command: no data-out phase, no setup step.
+    pub fn query_vendor_op(&mut self, target_op: u16) -> Result<VendorOpQuery, PtpUsbError> {
+        let mut warnings = Vec::new();
+        if sdk_model_name(self.model()).is_none() {
+            warnings.push(format!(
+                "camera model {:?} is not one of the surveyed models ({:?}); 0x944C was only captured on a Z 9",
+                self.model(),
+                KNOWN_MODELS
+            ));
+        }
+        let reply = self.transact(
+            OP_VENDOR_OP_QUERY,
+            &[u32::from(target_op), VENDOR_OP_QUERY_PARAM2],
+            None,
+            TxidCheck::Unchecked,
+        )?;
+        Ok(VendorOpQuery {
+            target_op,
+            response_code: reply.code,
+            data: reply.data,
+            data_containers: reply.data_containers,
+            reply_matched_command: reply.deviations.is_empty(),
+            warnings,
+        })
+    }
+
     /// Read the DeviceInfo dataset (`0x1001`, standard and read-only). Same
     /// checks as a vendor read: a non-OK answer is [`PtpUsbError::OperationFailed`], an OK
     /// answer with no data container at all is [`PtpUsbError::NoDataPhase`], and the dataset is
@@ -2636,6 +2715,17 @@ pub fn read_ftp_profile_locked(
 ) -> Result<FtpProfileReadout, PtpUsbError> {
     let mut session = PtpUsbSession::open_locked(lock, serial)?;
     session.read_ftp_profile_slot(slot)
+}
+
+/// [`PtpUsbSession::query_vendor_op`] for a caller already holding the
+/// [`CameraLock`]; see [`PtpUsbSession::open_locked`]. One query per session.
+pub fn query_vendor_op_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    target_op: u16,
+) -> Result<VendorOpQuery, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.query_vendor_op(target_op)
 }
 
 /// Format `data` as lowercase space-separated hex byte pairs, e.g.
@@ -4837,6 +4927,85 @@ mod tests {
         let (mut s, t) = session(vec![data_c(OP_VENDOR_PROP_READ, &[0xAA, 0xBB]), resp(RESP_OK)], "Z 9");
         assert_eq!(s.read_vendor_property(0xD053).unwrap(), vec![0xAA, 0xBB]);
         assert_eq!(t.sent(), vec![(CONTAINER_COMMAND, OP_VENDOR_PROP_READ, 0, le(0x1D053))]);
+    }
+
+    // ── 0x944C query ─────────────────────────────────────────────────────
+    // The reply bytes below are SYNTHETIC (the real one is in pcaps that are not in this repo); they pin
+    // framing and reporting, not what a camera says.
+
+    fn query_reply_bytes() -> Vec<u8> {
+        let mut v = vec![0u8; 32];
+        v[..3].copy_from_slice(&[1, 1, 1]);
+        v
+    }
+
+    #[test]
+    fn query_vendor_op_sends_one_command_with_the_target_and_a_zero_and_nothing_else() {
+        let (mut s, t) = session(vec![data_c(OP_VENDOR_OP_QUERY, &query_reply_bytes()), resp(RESP_OK)], "Z 9");
+        let q = s.query_vendor_op(0x90ED).unwrap();
+        let mut params = le(0x90ED);
+        params.extend(le(0));
+        assert_eq!(
+            t.sent(),
+            vec![(CONTAINER_COMMAND, OP_VENDOR_OP_QUERY, 0, params)],
+            "0x944C(target, 0): no setup step, no data-out"
+        );
+        assert!(q.is_ok() && q.reply_matched_command && q.warnings.is_empty());
+        assert_eq!((q.target_op, q.data_containers, q.data), (0x90ED, 1, query_reply_bytes()));
+    }
+
+    #[test]
+    fn query_vendor_op_target_is_sent_zero_extended_at_the_edges_of_the_u16() {
+        // 0x8000 is the sign bit of an i16, 0xFFFF the top: neither may sign-extend into the u32 param.
+        for target in [0x0000u16, 0x7FFF, 0x8000, 0x9FFF, 0xFFFF] {
+            let (mut s, t) = session(vec![resp(RESP_OK)], "Z 9");
+            s.query_vendor_op(target).unwrap();
+            let mut params = le(u32::from(target));
+            params.extend(le(0));
+            assert_eq!(t.sent(), vec![(CONTAINER_COMMAND, OP_VENDOR_OP_QUERY, 0, params)], "target 0x{target:04x}");
+        }
+    }
+
+    #[test]
+    fn query_vendor_op_reports_a_non_ok_code_as_data_not_as_an_error() {
+        let (mut s, _t) = session(vec![resp(0x2005)], "Z 9");
+        let q = s.query_vendor_op(0x9FFF).unwrap();
+        assert_eq!(q.response_code, 0x2005);
+        assert!(!q.is_ok(), "a non-OK code must never read as OK");
+        assert_eq!((q.data_containers, q.data.len()), (0, 0));
+    }
+
+    #[test]
+    fn query_vendor_op_keeps_no_data_phase_apart_from_an_empty_one() {
+        let (mut none, _t) = session(vec![resp(RESP_OK)], "Z 9");
+        let a = none.query_vendor_op(0x90ED).unwrap();
+        let (mut empty, _t) = session(vec![data_c(OP_VENDOR_OP_QUERY, &[]), resp(RESP_OK)], "Z 9");
+        let b = empty.query_vendor_op(0x90ED).unwrap();
+        assert_eq!((a.data_containers, b.data_containers), (0, 1));
+        assert!(a.data.is_empty() && b.data.is_empty());
+        assert_ne!(a, b, "OK-with-no-data and OK-with-empty-data are different answers");
+    }
+
+    #[test]
+    fn query_vendor_op_tolerates_a_mismatched_transaction_id_and_says_so() {
+        let (mut s, _t) = session(vec![resp_id(RESP_OK, 99)], "Z 9");
+        let q = s.query_vendor_op(0x90ED).unwrap();
+        assert!(q.is_ok() && !q.reply_matched_command);
+    }
+
+    #[test]
+    fn query_vendor_op_warns_on_an_unsurveyed_model_but_still_asks() {
+        let (mut s, t) = session(vec![resp(RESP_OK)], "Z 99");
+        let q = s.query_vendor_op(0x90ED).unwrap();
+        assert_eq!(q.warnings.len(), 1, "{:?}", q.warnings);
+        assert_eq!(t.sent().len(), 1);
+    }
+
+    #[test]
+    fn query_vendor_op_transport_failure_is_an_error_and_poisons_the_session() {
+        let (mut s, _t) = session(vec![Step::Err(rusb::Error::Pipe)], "Z 9");
+        assert!(matches!(s.query_vendor_op(0x90ED), Err(PtpUsbError::Usb(rusb::Error::Pipe))));
+        assert!(matches!(s.query_vendor_op(0x90ED), Err(PtpUsbError::SessionPoisoned { .. })), "a second query must not touch the pipe");
     }
 
     #[test]

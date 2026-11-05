@@ -196,6 +196,14 @@ enum Cmd {
     /// handoff doc). The blob must decode, the slot may not pass the stored
     /// count, and the camera is read first so the plan can be printed.
     VendorWriteFtpBlob(VendorWriteFtpBlobArgs),
+
+    /// EXPERIMENTAL, read-only. Send `0x944C(<op>, 0)` and print what the
+    /// camera answers: the response code and the data bytes, with no
+    /// interpretation. NX Field sends `0x944C(0x90ED, 0)` before its FTP
+    /// screen; that the reply says whether the camera implements `<op>` is a
+    /// guess, which this command exists to test. It sends nothing else (no
+    /// setup, no data-out) and one query per run. Never run over USB before.
+    VendorOpSupport(VendorOpSupportArgs),
 }
 
 #[derive(Args, Debug)]
@@ -590,6 +598,17 @@ struct VendorReadArgs {
 }
 
 #[derive(Args, Debug)]
+struct VendorOpSupportArgs {
+    /// Operation code to ask about, e.g. "0x90ED". Hex needs the 0x prefix; a
+    /// bare number is decimal.
+    #[arg(value_parser = nikon_fleet::ptp_usb::parse_propcode)]
+    op: u16,
+    /// Camera serial to target; same rules as vendor-read's --serial.
+    #[arg(long)]
+    serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
 struct VendorReadFtpArgs {
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
@@ -610,6 +629,11 @@ struct VendorReadFtpArgs {
     /// --show-password).
     #[arg(long)]
     raw: bool,
+    /// Save the profile's true raw bytes (password included, unmasked) to this
+    /// file, for `vendor-write-ftp-blob --file`. Created with mode 0600; refuses
+    /// to overwrite an existing file.
+    #[arg(long)]
+    save_blob: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1565,6 +1589,43 @@ fn cmd_vendor_write_ftp_blob(args: &VendorWriteFtpBlobArgs) -> Result<()> {
     Ok(())
 }
 
+/// Ask the camera `0x944C(op, 0)` over raw USB PTP and print the answer verbatim. Read-only in
+/// intent; see `nikon_fleet::ptp_usb::PtpUsbSession::query_vendor_op` for what is unknown.
+fn cmd_vendor_op_support(args: &VendorOpSupportArgs) -> Result<()> {
+    let q = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
+        .and_then(|(lock, serial)| {
+            nikon_fleet::ptp_usb::query_vendor_op_locked(lock, serial.as_deref(), args.op).map_err(anyhow::Error::new)
+        })
+        .with_context(|| format!("asking 0x944C about operation 0x{:04x} over USB PTP", args.op))?;
+    for w in &q.warnings {
+        eprintln!("warning: {w}");
+    }
+    println!("{}", vendor_op_query_text(&q));
+    Ok(())
+}
+
+/// What `vendor-op-support` prints. Deliberately says nothing like "supported": the response
+/// code and the bytes are the whole report.
+fn vendor_op_query_text(q: &nikon_fleet::ptp_usb::VendorOpQuery) -> String {
+    use nikon_fleet::ptp_usb::{hex_bytes, PtpResponseCode};
+    // `PtpResponseCode`'s Display already carries the hex code, e.g. "OK (0x2001)".
+    let mut line = format!("0x944C(0x{:04x}, 0): response {}", q.target_op, PtpResponseCode(q.response_code));
+    if q.data_containers == 0 {
+        line.push_str(", no data phase");
+    } else {
+        line.push_str(&format!(
+            ", {} byte(s) in {} data container(s): {}",
+            q.data.len(),
+            q.data_containers,
+            hex_bytes(&q.data)
+        ));
+    }
+    if !q.reply_matched_command {
+        line.push_str("\nnote: the reply carried a different transaction id or operation code than the command");
+    }
+    line
+}
+
 /// Read and decode the camera's FTP profile via raw USB PTP. Read-only. See
 /// `nikon_fleet::ptp_usb::PtpUsbSession::read_ftp_profile`.
 fn cmd_vendor_read_ftp(args: &VendorReadFtpArgs) -> Result<()> {
@@ -1577,6 +1638,22 @@ fn cmd_vendor_read_ftp(args: &VendorReadFtpArgs) -> Result<()> {
         eprintln!("warning: {w}");
     }
     println!("{}", ftp_readout_text(&readout, args.show_password, args.raw));
+    if let Some(path) = &args.save_blob {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let Some(profile) = &readout.profile else {
+            bail!("--save-blob: the camera reported no active profile, so nothing was read; pass --slot N");
+        };
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {} (it must not already exist)", path.display()))?;
+        f.write_all(&profile.raw).with_context(|| format!("writing {}", path.display()))?;
+        f.sync_all().with_context(|| format!("syncing {}", path.display()))?;
+        println!("Saved {} raw byte(s) to {}", profile.raw.len(), path.display());
+    }
     Ok(())
 }
 
@@ -3245,6 +3322,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::VendorWriteFtp(args) => cmd_vendor_write_ftp(args),
         Cmd::VendorReadFtp(args) => cmd_vendor_read_ftp(args),
         Cmd::VendorWriteFtpBlob(args) => cmd_vendor_write_ftp_blob(args),
+        Cmd::VendorOpSupport(args) => cmd_vendor_op_support(args),
         Cmd::Firmware(sub) => match sub {
             FirmwareCmd::Add(args) => cmd_firmware_add(&cli.data_dir, args),
             FirmwareCmd::Ls(args) => cmd_firmware_ls(&cli.data_dir, args),
@@ -4590,6 +4668,28 @@ mod tests {
         );
         assert_eq!(warned.0, "0x5001: 0 byte(s): ");
         assert_eq!(warned.1, ["warning: model \"Z 8\" is not surveyed", "warning: second"], "one line per warning, none dropped");
+    }
+
+    #[test]
+    fn vendor_op_support_text_reports_code_and_bytes_and_never_says_supported() {
+        use nikon_fleet::ptp_usb::VendorOpQuery;
+        let base = VendorOpQuery {
+            target_op: 0x90ed,
+            response_code: 0x2001,
+            data: vec![1, 1, 0],
+            data_containers: 1,
+            reply_matched_command: true,
+            warnings: vec![],
+        };
+        assert_eq!(vendor_op_query_text(&base), "0x944C(0x90ed, 0): response OK (0x2001), 3 byte(s) in 1 data container(s): 01 01 00");
+        let refused = VendorOpQuery { response_code: 0x2005, data: vec![], data_containers: 0, ..base.clone() };
+        let text = vendor_op_query_text(&refused);
+        assert_eq!(text, "0x944C(0x90ed, 0): response OperationNotSupported (0x2005), no data phase");
+        assert!(!text.contains("is supported") && !text.contains("yes"), "no verdict, only the code and bytes: {text}");
+        let empty_phase = VendorOpQuery { data: vec![], ..base.clone() };
+        assert!(vendor_op_query_text(&empty_phase).contains("0 byte(s) in 1 data container(s)"), "an empty data phase is not 'no data phase'");
+        let mismatched = VendorOpQuery { reply_matched_command: false, ..base };
+        assert!(vendor_op_query_text(&mismatched).contains("\nnote:"));
     }
 
     // ── device-info output ───────────────────────────────────────────────
