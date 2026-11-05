@@ -14,9 +14,12 @@ NX Field does it)? Same properties accepted or refused? Same response codes? Sam
 
 ## Short answer
 
-Unknown, with weak evidence that the camera is the same device on both transports. The repo has **no like-for-like
-data**: nothing was captured on one body, for one property, over both USB and WiFi. What exists is vendor-op replay
-on a Z6III (A), parallel but non-overlapping property sets (B), and a few contradictions (C).
+**Probably the same device on both, with real (if indirect) evidence.** The first desk pass concluded the repo had no
+like-for-like data. That was wrong: the gitignored July USB `GetDevicePropDesc` baseline for the Z6III
+(`references/z6iii-ptp-baseline-2026-07-09.txt`) lists the writable flag and the allowed values for the same
+properties NX Field touched in November, and it agrees with every WiFi outcome I compared (section A2). Caveats: the
+two were taken months apart in different camera states, and GetSet is state-dependent. It is not a paired experiment.
+What else exists is vendor-op replay on a Z6III (A), parallel property sets (B), and a few contradictions (C).
 
 Abbreviations: **NXS** = docs/nx-field-session-2026-07-09.md, **HF** = docs/mcp-hardware-findings.md,
 **PU** = src/ptp_usb.rs.
@@ -50,6 +53,45 @@ Abbreviations: **NXS** = docs/nx-field-session-2026-07-09.md, **HF** = docs/mcp-
 - **Z9 vs Z6III over WiFi:** `0xD07F`/`0xD1F0` accepted on the Z9 (July), refused `0x200A` on the Z6III (November).
   The `0xD07F` result agrees with the USB-derived "Z9-only" list (todo.md, 2026-07-09 baseline pass).
 
+## (A2) Same body, USB descriptors (July) vs WiFi outcomes (November)
+
+Source: `references/z6iii-ptp-baseline-2026-07-09.txt`, a `gphoto2` dump of `GetDevicePropDesc` for the Z6III over
+USB. **`references/` is gitignored, so this file is not in the remote**: copy it from the Mac Studio or regenerate it
+(it also carries the body's serial number; the Z8 file carries a third party's name, so do not commit any of them).
+State at capture: exposure program A, F-number reads f/0 (so probably no lens), release mode CH. `ro`/`rw` below is
+the descriptor's GetSet flag.
+
+| Property | USB descriptor (July) | WiFi outcome (Nov) | Agree? |
+|---|---|---|---|
+| `0x500E` exposure program | ro, u16, [1,2,3,4,0x8010,0x8050,0x8051,0x8052] | write → `0x200F` (3) | yes |
+| `0xD100` shutter | ro, u32, [65537] (in A mode) | write refused `0x200F` in A (11/11), accepted in M (3/3) | yes for A; M descriptor not captured |
+| `0xD1A6` (LiveViewSelector) | ro, u8, [0,1] | write → `0x200F` (2) | yes |
+| `0x5013` release mode | **rw**, u16, [1,2,0x8010,0x8011,0x8019,0x810F,0x811E,0x813C,0x8178] | values seen = exactly this list; NX Field never wrote it | list matches; see note 1 |
+| `0x500B` metering | rw, u16, [2,3,4,0x8010] | all four set OK | yes, identical list |
+| `0xD148` secondary slot | rw, u8, [0,1,2,4] | 0,1,2,4 set OK; 3 "not seen" | yes, identical list |
+| `0xD068` CL speed | rw, u8, [1..7] | 7 and 5 set OK | yes |
+| `0xD0B4` ISO | rw, u32, [50 … 204800] | 2000 and 100 set OK | yes |
+| `0xD060` IPTC profile | rw, u8, range 0–13 (libgphoto2: "[Unknown Property]") | set to 1 OK | yes |
+| `0xD053/54/72/73/90/91` | all rw | all OK | yes |
+| `0x5010` exp. comp | rw, i16, ±5000 in 1/3 steps | −2000, +1666, 0 OK | yes |
+| `0x5007` aperture | **ro**, [0] (f/0) | writes OK | no — see note 2 |
+| `0xD07F`, `0xD1F0` | absent from the Z6III list | write → `0x200A` | yes |
+
+Notes:
+1. NXS and this doc said release mode is "read-only from the phone". That is an NX Field limitation (it has no
+   control and sent nothing when tried). The camera's descriptor says writable; whether the camera would accept a
+   write is untested.
+2. `0x5007` is the one mismatch: ro with a single value in July, written successfully in November. The likely
+   explanation is camera state (no lens, or A mode, in July), which would also show GetSet is state-dependent.
+   Not tested.
+3. `0xD025` (libgphoto2 name "White Balance Preset Value 0") is in the Z6III's vendor property list but its descriptor
+   query returns `0x200A` in the baseline, while NX Field read and wrote it through `0x943B`/`0x943C` as the
+   pre-release burst setting. So some vendor properties are only reachable via `0x943B`/`0x943C`, not
+   `GetDevicePropDesc`. Also: `0x1D025` is simply `0x10000 | 0xD025`, the **same parameter form `ptp_usb.rs` already
+   uses** for `0x943B`. The NXS note "`0x1D000` plus a low byte" and the discrepancy listed under C below are artefacts
+   of reading it that way; the pre-release burst is property `0xD025`, and `0x1D03D` is `0xD03D` (a rw u8 in the
+   baseline).
+
 ## (B) One transport only
 
 **WiFi only (Z6III), no USB counterpart:**
@@ -80,12 +122,13 @@ Abbreviations: **NXS** = docs/nx-field-session-2026-07-09.md, **HF** = docs/mcp-
 
 ## (C) Contradictions and open anomalies
 
-1. **`0xD0B4` is unresolved.** NXS ("USB-transport test") explains the USB `0x200A` as "Z9-only per the todo.md
-   per-body table". But todo.md lists only `d0b0`–`d0b3` as Z9-only, so `d0b4` is **not** on that list. NX Field
-   wrote `0xD0B4` (ISO) on the Z6III over WiFi and got OK, and the SDK config lists 53428 (0xD0B4) for `Z6_3`.
-   The explanation looks wrong. Candidates: our `0x943B` wrapper (the param form `0x10000|prop` is untested for
-   this property; the WiFi pre-release burst used `0x1D025`/`0x1D03D`), the camera's state at the time, or the key
-   encoding. **Do not cite "0xD0B4 is Z9-only" as established.**
+1. **`0xD0B4` is not Z9-only; the cause of the USB `0x200A` is still open.** NXS ("USB-transport test") explains
+   the USB `0x200A` as "Z9-only per the todo.md per-body table". That is wrong: todo.md lists only `d0b0`–`d0b3` as
+   Z9-only, NX Field wrote `0xD0B4` on the Z6III over WiFi, the SDK config lists it for `Z6_3`, and the July USB
+   baseline shows it as `ExposureIndexEx (d0b4 rw u32)` with the full ISO list on the Z6III itself. So the property
+   exists and is writable, and the `0x200A` came from the `0x943B` read of it. The param form is not the culprit
+   (see A2 note 3). Remaining candidates: `0x943B` serves only some vendor properties, or the camera's state at the
+   time. Experiment 1 settles it.
 2. **`0xD1F0`:** listed Z5-only in the USB property list, yet a Z9 accepted a WiFi write to it (July). USB enumeration
    may not show everything settable over WiFi.
 3. **Events:** the July Z9 notes say `0x4006` goes silent after connect; the November Z6III notes say it follows
@@ -111,6 +154,15 @@ libgphoto2 (LGPL) and the CLI (GPL) are open source, so any claim below can be c
   `0xD100` ExposureTime ("Shutter Speed"), `0xD148` Slot2SaveMode, `0xD068` D1ShootingSpeed ("continuous speed
   low"), `0xD060` IPTCPresetSelect, `0xD053` EnableCopyright, `0xD072` ArtistName, `0xD090` ImageCommentString.
   This corroborates the property identification in the NX Field doc from a second, independent source.
+- **Coverage limit, checked** (`library.c` ~L646–680): after `GetDeviceInfo`, if the camera lists Nikon op `0x90CA`
+  (GetVendorPropCodes) among its operations, libgphoto2 calls it and **appends** the result to `DeviceProps`; it does
+  the same for `GetVendorCodes`. There is no de-duplication, so any code in both lists appears twice. That, not
+  only the disabled suppression block, accounts for todo.md's "listed twice" anomaly (the later `0x200A` on the Z9's
+  second pass is still unexplained). A property in neither list is unreachable by name, and the listing loop silently
+  skips (`continue`) any property whose `GetDevicePropDesc` fails. Checked against real data: of 20 properties NX
+  Field touched on the Z6III, 18 are in the July baseline; the two absent (`0xD07F`, `0xD1F0`) are the ones the
+  camera refused over WiFi with `0x200A`. So in practice the limit cost us nothing for this set. (A caveat from
+  `library.c` comments: GetVendorPropCodes is known to crash some Nikon 1 bodies, which is why libgphoto2 gates it.)
 - `config.c` has a generic "Other PTP Device Properties" fallback (`/main/other/<hex>`): every property listed in the
   camera's DeviceInfo gets a widget via `GetDevicePropDesc`, typed from the descriptor's form (none/range/enum).
   Unnamed ones are labelled "PTP Property 0xNNNN". The widget is marked read-only when the descriptor's GetSet is
@@ -152,9 +204,10 @@ Items 1, 2, 4 and 5 are read-only. Item 3 writes a property (a no-op write of it
 
 1. **`0xD0B4` on the Z6III.** Over USB: `vendor-read` of `0xD0B4`, then `0xD053` as a control (known-good), then a
    plain `GetDevicePropValue` on `0xD0B4`. Repeat in two body states (idle, then in playback/menu). Settles C1.
-2. **GetSet flag over USB.** `GetDevicePropDesc` (e.g. via gphoto2 `--debug`) on `0x500E`, `0x5013`, `0xD100`,
-   `0xD07F`, `0xD1F0`, `0xD1A6`. Does the writable flag predict the WiFi refusals? If yes, that supports
-   "same camera behavior".
+2. **GetSet flag over USB.** Partly answered by the July baseline (A2): the flag matched every WiFi refusal. What is
+   still worth doing is the *state* test: `gphoto2 --list-all-config` with the dial in M and then A, with a lens on,
+   and look at `d100` and `5007` (expect `d100` rw in M; explains the `5007` mismatch). A fresh dump also gives a
+   same-day pair with a WiFi write if one is done in the same session.
 3. **Mode dependence over USB.** Write the current `0xD100` value back in M and in A; compare `0x200F` with the WiFi
    result. Needs a small `0x1016` path in `ptp_usb.rs` (does not exist yet).
 4. **Events over USB.** Log the interrupt endpoint while changing release mode and the exposure dial on the body;
