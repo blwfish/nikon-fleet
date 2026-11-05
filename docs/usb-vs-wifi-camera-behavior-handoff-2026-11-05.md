@@ -261,11 +261,11 @@ in the repo checkout on this Mac; the "they live on the MacBook" line above was 
   per-op support query. Not decoded further.
 - **Why the November Z6III "had no active profile":** there `0x90ED(0xff)` was answered **`0x201F`
   (Transaction Cancelled)** at 260 s and 363 s, no data phase. Same answer in the July Z9 filtered capture when no
-  profile existed. So `0x201F` on `0x90ED(0xff)` is the camera saying "no profile in that slot", which explains
+  profile existed. So `0x201F` on `0x90ED(0xff)` is the camera saying "nothing in that slot" (**not** proof that no profile is stored: see the 2026-11-05 USB runs below), which fits
   NX Field refusing to edit.
 - **`0x90EB` layout (inference, 3 body states):** `c8 00` | u32 `N` | u32 `0x14` | u32 slot | 16-byte GUID |
   `u8 nchars` + UTF-16LE name (the body's `<model>_<serial>` string, so do not commit it) | `f4 01`. `N` was 6 and
-  slot `0xff` on the Z9 before it had a profile, `N` 7 and slot `0` after; `N` was 3 on the Z6III (no profile).
+  slot `0xff` on the Z9 before it had a profile, `N` 7 and slot `0` after; `N` was 3 on the Z6III (slot `0xff`).
   The `0x14` (20) and `0xc8` (200) are possibly limits. Meaning of `N` unknown (could be a count of saved network
   profiles, not only FTP).
 - **The 331 B blob** (the one the encoder does not model) is a read, not a write, and the decoder now explains it. It
@@ -319,3 +319,40 @@ Items 1, 2, 4 and 5 are read-only. Item 3 writes a property (a no-op write of it
   cameras" → remote mode. Set the phone's Auto-Lock to Never if NX Field is also in use.
 - Local `master` was fast-forwarded to `origin/master` (`ce5d57a`) at the start of this session; that is the base
   for this note.
+
+### First USB runs (2026-11-05) and a correction
+
+`vendor-read-ftp` ran on the Z6III (`Z6_3`, `N`=3) and on two different Z9 bodies (`N`=1 and `N`=3). All three answered
+`0x90E8` and `0x90EB` over USB and parsed cleanly, and all three reported slot `0xff`. The owner says the second Z9 holds
+FTP profiles. So **slot `0xff` means "no active (selected) profile", not "no profile stored"**; the earlier reading
+("no profile") was an inference from two July bodies and was wrong. The tool's output and a constant's name were
+corrected to say "active". `0x90ED` has still not been sent over USB: with the slot at `0xff` the tool does not send it.
+
+Open: how to read a stored-but-inactive profile. Options: make one profile active in the camera's menu and rerun (no
+guessing); or send `0x90ED(0)` / other slot numbers (the only captured successful read is slot 0; this is the "guess
+`0x90ED` params" the standing rule forbids until the owner says otherwise). Also unknown: what the profile count `N` counts.
+
+### First profile read over USB (2026-11-05): `0x90ED(0)` works, and the "port" is not where the encoder puts it
+
+With one profile made active in the camera's menu, `0x90EB` reported slot `0` and `0x90ED(0)` returned a 354-byte profile
+from a Z9 over USB, so **the read works on hardware**. Layout corrections found from it (the layout rebuilds the 325 B and
+331 B July blobs and this 354 B one byte for byte):
+
+- The u16 between the (usually empty) folder string and the username is a **port**: 21 in the July blobs, 22 in this one.
+  The old "username tag `[00 15 00]`" was the empty folder string plus the FTP port 21 as a constant.
+- The u16 after the password, which `FtpProfile.port` and `vendor-write-ftp --port` write, is **8080 in all four blobs**
+  (including one made on the camera with port 21 typed in). 8080 is the usual default proxy port. So the encoder's `port`
+  almost certainly lands in a different field than the FTP port, and the FTP port is always written as 21. Unconfirmed
+  against the menu: check the profile's server port and proxy settings on the body.
+- The u16 before it ("option flags") was `0x0005`, `0x0001` and now `0x000d`; meaning unknown, probably protocol/passive
+  bits. This profile used port 22 and flags `0x0d`.
+- `decode_ftp_profile` now exposes `ftp_port`, `option_flags` and `second_port`; `as_encodable` is `None` unless the port
+  is 21, the flags `0x0005` and the folder empty.
+
+Not yet matched against the camera's menu: the profile's server type (FTP/FTPS/SFTP), port, passive mode, proxy and
+folder. That comparison would settle the port, flags and folder meanings.
+
+Slot semantics: the slot is the **active** profile (0xff = none selected), not a count of stored ones.
+
+Process note: the first run printed the raw hex of a blob the decoder rejected, which included that profile's password
+in clear. `vendor-read-ftp --raw` now withholds the dump when it cannot locate the password, unless `--show-password`.

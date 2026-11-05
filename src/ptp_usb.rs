@@ -114,11 +114,13 @@ const OP_FTP_PROFILE_INFO: u16 = 0x90EB;
 /// on any camera**. A bare `0x90ED` with no param stalls the pipe.
 const OP_FTP_PROFILE_READ: u16 = 0x90ED;
 
-/// The slot `0x90EB` reports when the camera holds no FTP profile. NX Field
+/// The slot `0x90EB` reports when the camera has no *active* FTP profile.
+/// **Not** "no profile stored": on 2026-11-05 a Z9 that the owner says holds
+/// FTP profiles reported this too, so 0xff is probably "none selected". NX Field
 /// still sent `0x90ED(0xff)` in that state and got `0x201F`
 /// (TransactionCancelled) with no data, five times in the captures; this
 /// module does not send it, since the `0x90EB` reply already says so.
-const FTP_NO_PROFILE_SLOT: u32 = 0xff;
+const FTP_NO_ACTIVE_SLOT: u32 = 0xff;
 
 const RESP_OK: u16 = 0x2001;
 const RESP_SESSION_ALREADY_OPEN: u16 = 0x201E;
@@ -1088,6 +1090,11 @@ pub struct FtpProfile {
     pub ssid_5ghz: String,
     /// Hostname or IP address of the FTP server.
     pub host: String,
+    /// **Probably not the FTP server port.** This is written to the u16
+    /// after the password, which holds 8080 in every blob read from a real
+    /// camera (the usual default proxy port); the FTP port (21 or 22) is the
+    /// u16 before the username, which the encoder hard-codes as 21. See
+    /// [`DecodedFtpProfile::ftp_port`] and the handoff doc, 2026-11-05.
     pub port: u16,
     pub username: String,
     pub password: String,
@@ -1277,7 +1284,8 @@ pub struct FtpProfileInfo {
     /// `0x14` (20) in every reply seen; possibly a limit.
     pub limit: u32,
     /// The slot to pass to `0x90ED`: `0` when the camera holds a profile,
-    /// [`FTP_NO_PROFILE_SLOT`] (`0xff`) when it does not.
+    /// [`FTP_NO_ACTIVE_SLOT`] (`0xff`) when none is active (stored profiles may
+    /// still exist; see that constant).
     pub slot: u32,
     pub guid: [u8; 16],
     /// Contains the body's serial number.
@@ -1288,8 +1296,8 @@ pub struct FtpProfileInfo {
 }
 
 impl FtpProfileInfo {
-    pub fn has_profile(&self) -> bool {
-        self.slot != FTP_NO_PROFILE_SLOT
+    pub fn has_active_profile(&self) -> bool {
+        self.slot != FTP_NO_ACTIVE_SLOT
     }
 }
 
@@ -1435,11 +1443,21 @@ pub struct DecodedFtpProfile {
     pub username: String,
     /// In plain text, as the camera returns it. Callers should not log it.
     pub password: String,
-    /// The byte before the port: `05` in the 325 B and 317 B blobs (and what
-    /// the encoder writes), `01` in the 331 B one. Unknown meaning; probably
-    /// flags (passive mode? server type?).
-    pub port_flags: u8,
-    pub port: u16,
+    /// The u16 between the folder string and the username: 21 in the Z 9
+    /// blobs from July, 22 in a profile read over USB on 2026-11-05. Almost
+    /// certainly the **FTP/SFTP server port** (the July body profile was
+    /// typed in with port 21). The encoder hard-codes it as 21.
+    pub ftp_port: u16,
+    /// The u16 after the password: `0x0005` in the 325 B and 317 B blobs (and
+    /// what the encoder writes), `0x0001` in the 331 B one, `0x000d` in a
+    /// profile read over USB. Unknown meaning; probably option bits
+    /// (protocol, passive mode, ...).
+    pub option_flags: u16,
+    /// The u16 after the option flags: 8080 in every blob seen. 8080 is the
+    /// usual default proxy port, so this is probably the proxy-server port.
+    /// **The encoder's `FtpProfile.port` is written here**, not into
+    /// [`Self::ftp_port`].
+    pub second_port: u16,
     /// The three IPv6-shaped fields at the end, as read
     /// (`"0000:…:0000"` in every capture).
     pub ipv6_fields: [String; 3],
@@ -1447,16 +1465,18 @@ pub struct DecodedFtpProfile {
 
 impl DecodedFtpProfile {
     /// The [`FtpProfile`] the encoder would need to write this profile back,
-    /// when it can: not possible if [`Self::folder`] is non-empty or
-    /// [`Self::port_flags`] is not the encoder's `05`, since the encoder has
-    /// no way to carry either.
+    /// when it can: not possible if [`Self::folder`] is non-empty, or
+    /// [`Self::option_flags`] is not the encoder's `0x0005`, or
+    /// [`Self::ftp_port`] is not the 21 it hard-codes, since the encoder has
+    /// no way to carry any of them. `FtpProfile.port` receives
+    /// [`Self::second_port`] (where the encoder writes it).
     pub fn as_encodable(&self) -> Option<FtpProfile> {
-        (self.folder.is_empty() && self.port_flags == FTP_TAG_PORT_SECTION[0]).then(|| FtpProfile {
+        (self.folder.is_empty() && self.option_flags == 0x0005 && self.ftp_port == 21).then(|| FtpProfile {
             profile_name: self.profile_name.clone(),
             ssid_24ghz: self.ssid_24ghz.clone(),
             ssid_5ghz: self.ssid_5ghz.clone(),
             host: self.host.clone(),
-            port: self.port,
+            port: self.second_port,
             username: self.username.clone(),
             password: self.password.clone(),
         })
@@ -1489,15 +1509,14 @@ pub fn decode_ftp_profile(blob: &[u8]) -> Result<DecodedFtpProfile, PtpUsbError>
     r.expect("host tag", &[FTP_TAG_HOST])?;
     let host = r.ptp_string("host")?.text;
     let folder = r.ptp_string("folder")?.text;
-    // The encoder's FTP_TAG_USERNAME is [00 15 00]: its first byte is the
-    // empty `folder` string (count 0), which is why the two views agree
-    // byte-for-byte when the folder is empty.
-    r.expect("username tag", &FTP_TAG_USERNAME[1..])?;
+    // The encoder's FTP_TAG_USERNAME is [00 15 00]: the first byte is the
+    // empty `folder` string (count 0) and `15 00` is the FTP port, 21. It is
+    // a u16 here because a profile read on 2026-11-05 carried `16 00` (22).
+    let ftp_port = r.u16("FTP port")?;
     let username = r.ascii_u32_len("username")?;
     let password = r.ascii_u32_len("password")?;
-    let port_flags = r.u8("port-section flags")?;
-    r.expect("port-section tag", &FTP_TAG_PORT_SECTION[1..])?;
-    let port = r.u16("port")?;
+    let option_flags = r.u16("option flags")?;
+    let second_port = r.u16("second port")?;
     r.expect("port-section padding", &FTP_PORT_SECTION_PAD)?;
     let ipv6_a = r.ascii_u32_len("IPv6 field 1")?;
     r.expect("IPv6 separator", &[FTP_IPV6_FIELD1_SEPARATOR])?;
@@ -1517,8 +1536,9 @@ pub fn decode_ftp_profile(blob: &[u8]) -> Result<DecodedFtpProfile, PtpUsbError>
         folder,
         username,
         password,
-        port_flags,
-        port,
+        ftp_port,
+        option_flags,
+        second_port,
         ipv6_fields: [ipv6_a, ipv6_b, ipv6_c],
     })
 }
@@ -1577,7 +1597,7 @@ pub struct FtpProfileBlob {
 #[derive(Debug)]
 pub struct FtpProfileReadout {
     pub info: FtpProfileInfo,
-    /// `None` when `0x90EB` said the camera holds no profile; `0x90ED` was
+    /// `None` when `0x90EB` reported no active profile (slot `0xff`); `0x90ED` was
     /// not sent then.
     pub profile: Option<FtpProfileBlob>,
     /// Things worth telling the user that are not failures.
@@ -2382,7 +2402,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// on a camera**, so the first run is the test of this method. Nothing
     /// in it writes a profile.
     ///
-    /// When `0x90EB` reports no profile (slot `0xff`), `0x90ED` is not sent
+    /// When `0x90EB` reports no active profile (slot `0xff`), `0x90ED` is not sent
     /// and the readout's `profile` is `None`. A blob that the decoder does
     /// not recognise is still returned (raw bytes plus the decode error),
     /// since the bytes are the finding.
@@ -2406,7 +2426,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         let info = parse_ftp_profile_info(&info_reply.data)?;
         let mut matched = setup.deviations.is_empty() && info_reply.deviations.is_empty();
 
-        let profile = if info.has_profile() {
+        let profile = if info.has_active_profile() {
             let reply = self.transact(OP_FTP_PROFILE_READ, &[info.slot], None, TxidCheck::Unchecked)?;
             Self::require_ok(OP_FTP_PROFILE_READ, reply.code)?;
             if reply.data_containers == 0 {
@@ -5274,7 +5294,7 @@ mod tests {
         assert_eq!((d.ssid_24ghz.as_str(), d.ssid_5ghz.as_str()), ("nikon-snoop", "nikon5ghz"));
         assert_eq!((d.host.as_str(), d.folder.as_str()), ("192.168.66.1", ""));
         assert_eq!((d.username.as_str(), d.password.as_str()), ("fleet", "12345678"));
-        assert_eq!((d.port_flags, d.port), (0x05, 8080));
+        assert_eq!((d.ftp_port, d.option_flags, d.second_port), (21, 0x0005, 8080));
         assert!(d.ipv6_fields.iter().all(|f| f == FTP_IPV6_PLACEHOLDER));
         let profile = d.as_encodable().expect("empty folder and the encoder's flag byte");
         assert_eq!(encode_ftp_profile(&profile).unwrap(), blob);
@@ -5295,9 +5315,39 @@ mod tests {
         let d = decode_ftp_profile(&blob).unwrap();
         assert_eq!(d.profile_name, "C2");
         assert_eq!(d.folder, "Claude");
-        assert_eq!(d.port_flags, 0x01);
-        assert_eq!((d.host.as_str(), d.username.as_str(), d.port), ("192.168.66.1", "fleet", 8080));
+        assert_eq!((d.ftp_port, d.option_flags, d.second_port), (21, 0x0001, 8080));
+        assert_eq!((d.host.as_str(), d.username.as_str()), ("192.168.66.1", "fleet"));
         assert!(d.as_encodable().is_none(), "the encoder cannot carry a folder or flag byte 01");
+    }
+
+    /// A profile read over USB from a Z 9 on 2026-11-05 (354 B), rebuilt with
+    /// placeholder names, host and credentials: same layout, SFTP-style port 22,
+    /// option flags 0x0d, a /22 camera network. Its real counterpart is what
+    /// showed that the u16 before the username is a port, not a constant.
+    fn ftp_blob_port22_hex() -> &'static str {
+        concat!(
+            "f4010a500052004f00460049004c0045002d004200000010300030003000300030003000300030",
+            "005400300030003000300030003000000010300030003000300030003000300030005400300030",
+            "00300030003000300000000203035344a8c0160000000000000000030001000600000073736964",
+            "2d61040406000000737369642d6201106600740070002e006500780061006d0070006c0065002e",
+            "0063006f006d00000000160004000000757365720800000070617373313233340d00901f000000",
+            "000027000000303030303a303030303a303030303a303030303a303030303a303030303a303030",
+            "303a303030304027000000303030303a303030303a303030303a303030303a303030303a303030",
+            "303a303030303a3030303027000000303030303a303030303a303030303a303030303a30303030",
+            "3a303030303a303030303a3030303081",
+        )
+    }
+
+    #[test]
+    fn decode_a_profile_with_a_non_default_ftp_port_and_option_flags() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        let d = decode_ftp_profile(&blob).unwrap();
+        assert_eq!(d.profile_name, "PROFILE-B");
+        assert_eq!(d.camera_network, FtpCameraNetwork { ipv4: [192, 168, 68, 83], prefix_len: 22 });
+        assert_eq!((d.host.as_str(), d.folder.as_str()), ("ftp.example.com", ""));
+        assert_eq!((d.username.as_str(), d.password.as_str()), ("user", "pass1234"));
+        assert_eq!((d.ftp_port, d.option_flags, d.second_port), (22, 0x000d, 8080));
+        assert!(d.as_encodable().is_none(), "the encoder hard-codes port 21 and flags 0x0005");
     }
 
     #[test]
@@ -5360,11 +5410,11 @@ mod tests {
         let with = parse_ftp_profile_info(&ftp_info_bytes(7, 0, "Z_9_0000000")).unwrap();
         assert_eq!((with.header, with.count, with.limit, with.slot, with.trailer), (0xc8, 7, 0x14, 0, 0x1f4));
         assert_eq!(with.device_name.text, "Z_9_0000000");
-        assert!(with.has_profile());
+        assert!(with.has_active_profile());
         let raw = ftp_info_bytes(3, 0xff, "Z6_3_0000000");
         assert_eq!(raw.len(), 59);
         let without = parse_ftp_profile_info(&raw).unwrap();
-        assert!(!without.has_profile());
+        assert!(!without.has_active_profile());
         assert_eq!(ftp_info_bytes(6, 0xff, "Z_9_0000000").len(), 57);
     }
 
@@ -5434,7 +5484,7 @@ mod tests {
             "Z6_3",
         );
         let out = s.read_ftp_profile().unwrap();
-        assert!(out.profile.is_none() && !out.info.has_profile());
+        assert!(out.profile.is_none() && !out.info.has_active_profile());
         assert!(t.sent().iter().all(|(_, op, _, _)| *op != OP_FTP_PROFILE_READ));
     }
 

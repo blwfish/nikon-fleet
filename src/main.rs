@@ -1501,10 +1501,12 @@ fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: 
         i.device_name.text,
         i.count,
         i.limit,
-        if i.has_profile() { i.slot.to_string() } else { "none (0xff)".to_string() }
+        if i.has_active_profile() { i.slot.to_string() } else { "none (0xff)".to_string() }
     );
     let Some(p) = &r.profile else {
-        out.push_str("no FTP profile on the camera (0x90ED not sent)");
+        out.push_str(
+            "the camera reports no active FTP profile (slot 0xff; 0x90ED not sent). Profiles may still be stored on it: this does not say there are none.",
+        );
         return out;
     };
     match &p.decoded {
@@ -1515,11 +1517,12 @@ fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: 
             let _ = writeln!(out, "SSID 2.4 GHz:   {}", shown.ssid_24ghz);
             let _ = writeln!(out, "SSID 5 GHz:     {}", shown.ssid_5ghz);
             let _ = writeln!(out, "host:           {}", shown.host);
-            let _ = writeln!(out, "port:           {}", shown.port);
+            let _ = writeln!(out, "FTP port:       {}", shown.ftp_port);
             let _ = writeln!(out, "folder (?):     {}", shown.folder);
             let _ = writeln!(out, "username:       {}", shown.username);
             let _ = writeln!(out, "password:       {}", shown.password);
-            let _ = writeln!(out, "port flags:     0x{:02x}", shown.port_flags);
+            let _ = writeln!(out, "option flags:   0x{:04x}", shown.option_flags);
+            let _ = writeln!(out, "second port:    {}  (8080 in every blob seen; probably the proxy port)", shown.second_port);
             let _ = write!(
                 out,
                 "camera address: {}.{}.{}.{}/{}",
@@ -1532,11 +1535,26 @@ fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: 
     }
     if raw {
         let mut bytes = p.raw.clone();
-        if !show_password && let Ok(d) = &p.decoded {
-            // Zero the password bytes in the dump: they sit right after the
-            // username, found by searching for the plaintext.
-            if let Some(at) = find_subslice(&bytes, d.password.as_bytes()) {
-                bytes[at..at + d.password.len()].fill(0);
+        match (&p.decoded, show_password) {
+            (_, true) => {}
+            (Ok(d), false) => {
+                // Zero the password bytes in the dump: they sit right after
+                // the username, found by searching for the plaintext.
+                if let Some(at) = find_subslice(&bytes, d.password.as_bytes()) {
+                    bytes[at..at + d.password.len()].fill(0);
+                }
+            }
+            (Err(_), false) => {
+                // The password cannot be located in a blob that did not
+                // decode, so nothing is printed rather than something that
+                // might carry it.
+                let _ = write!(
+                    out,
+                    "\nraw dump withheld: the {}-byte profile did not decode, so the password cannot be masked in it. \
+                     Pass --show-password to print the bytes as they are.",
+                    bytes.len()
+                );
+                return out;
             }
         }
         let _ = write!(out, "\nraw ({} bytes): {}", bytes.len(), nikon_fleet::ptp_usb::hex_bytes(&bytes));
@@ -4429,9 +4447,23 @@ mod tests {
         assert!(!masked.contains("s3cretpw"), "{masked}");
         let hex_of_pw = nikon_fleet::ptp_usb::hex_bytes(b"s3cretpw");
         assert!(!masked.contains(&hex_of_pw), "the dump must not carry the password bytes: {masked}");
-        assert!(masked.contains("profile name:   CLAUDE") && masked.contains("port:           8080"), "{masked}");
+        assert!(masked.contains("profile name:   CLAUDE") && masked.contains("FTP port:       21") && masked.contains("second port:    8080"), "{masked}");
         let shown = ftp_readout_text(&r, true, true);
         assert!(shown.contains("s3cretpw") && shown.contains(&hex_of_pw), "{shown}");
+    }
+
+    #[test]
+    fn vendor_read_ftp_withholds_the_hex_dump_when_the_blob_did_not_decode_and_the_password_is_unmasked() {
+        let mut r = ftp_readout_with_profile();
+        let p = r.profile.as_mut().unwrap();
+        p.raw[0] = 0; // not a recognised blob any more
+        p.decoded = nikon_fleet::ptp_usb::decode_ftp_profile(&p.raw);
+        assert!(p.decoded.is_err());
+        let withheld = ftp_readout_text(&r, false, true);
+        assert!(withheld.contains("raw dump withheld") && !withheld.contains("raw ("), "{withheld}");
+        assert!(!withheld.contains(&nikon_fleet::ptp_usb::hex_bytes(b"s3cretpw")), "{withheld}");
+        let shown = ftp_readout_text(&r, true, true);
+        assert!(shown.contains(&nikon_fleet::ptp_usb::hex_bytes(b"s3cretpw")), "--show-password prints the bytes: {shown}");
     }
 
     #[test]
@@ -4440,7 +4472,7 @@ mod tests {
         r.profile = None;
         r.info.slot = 0xff;
         let text = ftp_readout_text(&r, false, false);
-        assert!(text.contains("slot none (0xff)") && text.contains("no FTP profile"), "{text}");
+        assert!(text.contains("slot none (0xff)") && text.contains("no active FTP profile"), "{text}");
     }
 
     #[test]
