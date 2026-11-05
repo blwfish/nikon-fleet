@@ -290,6 +290,14 @@ First hardware run, when wanted: `vendor-read-ftp` on the Z6III (expected: slot 
 the Z9 (expected: the profile; compare against its menu, which also settles what the extra string is). It is read-only,
 but `0x90E8` is the same setup step the write path sends and has only been captured, never sent by this tool alone.
 
+## Follow-up: live NX Field session and a PTP/IP profile read (2026-07-10/11)
+
+Written up in `docs/nx-field-ftp-profile-session-2026-07-10.md`. In short: NX Field's profile editor
+rewrites slot 0 only (no way to add a profile found); its first write carried four mistakes that
+produced the camera errors 31, 32 and 34; a PTP/IP client, `scripts/ptpip_read_ftp.py`, reads both
+stored profiles over Wi-Fi with the same `0x90E8` / `0x90EB` / `0x90ED` ops as USB; and the camera
+accepts any client GUID that begins `01 00 4e 58`, with no pairing list.
+
 ## Experiments, cheapest first
 
 Items 1, 2, 4 and 5 are read-only. Item 3 writes a property (a no-op write of its current value).
