@@ -630,7 +630,7 @@ struct VendorReadFtpArgs {
     #[arg(long)]
     raw: bool,
     /// Save the profile's true raw bytes (password included, unmasked) to this
-    /// file, for `vendor-write-ftp-blob --file`. Created with mode 0600; refuses
+    /// file, for `vendor-write-ftp-blob --file`. Created with mode 0600 on Unix; refuses
     /// to overwrite an existing file.
     #[arg(long)]
     save_blob: Option<PathBuf>,
@@ -1640,14 +1640,19 @@ fn cmd_vendor_read_ftp(args: &VendorReadFtpArgs) -> Result<()> {
     println!("{}", ftp_readout_text(&readout, args.show_password, args.raw));
     if let Some(path) = &args.save_blob {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         let Some(profile) = &readout.profile else {
             bail!("--save-blob: the camera reported no active profile, so nothing was read; pass --slot N");
         };
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        // The file holds the profile's password. Owner-only where the platform has modes;
+        // elsewhere the directory's own permissions apply.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
             .open(path)
             .with_context(|| format!("creating {} (it must not already exist)", path.display()))?;
         f.write_all(&profile.raw).with_context(|| format!("writing {}", path.display()))?;
