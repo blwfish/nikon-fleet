@@ -243,13 +243,15 @@ again. Results, Z9:
 | `0x90EC(1)` with data-out `01` | USB pipe stall. Camera fine afterwards. |
 | `0x90EC` with data-out `0c 5a 00 5f 00 39 00 5f 00 33 00 30 00 32 00 33 00 36 00 36 00 38 00 00 00` (the original name as a PTP string), then `02 41 00 00` and `02 41 00 00 00` (`"A"`) | `0x2001` OK each time; the name stayed empty. |
 | `0x90E9`, bare, after the setup, over Wi-Fi | no reply within 8 s, and then the camera answered nothing on Wi-Fi (port 15740 closed) or on USB (every transaction timed out) until the owner power-cycled it. |
+| **`0x90E9` with data-out** `01`, `01 00 00 00`, `01 00 00` (after the setup), and `00`; no parameters; over Wi-Fi | `0x2001` OK each time. The whole `0x90EB` reply (including the empty device name) and the profile names were byte-for-byte unchanged afterwards. The owner saw no difference in the camera's FTP menu, and two shots taken after the `01` and `00` payloads were each uploaded as usual (`_BLW9416.JPG`, `_BLW9417.JPG`, deleted afterwards). So `0x90E9` takes data, but no visible effect was found. |
 
 - **`0x90EA` and `0x90EF(n)` are the delete operations** (all, and one). They are destructive and run
   with no confirmation. The four profiles were restored from saved raw blobs: re-added in reverse order
   (each add goes to the front) and compared byte-for-byte with the originals.
-- `0x90E9` and `0x90EC` exist (they do not answer `0x2005`) but sent bare they get no reply. `0x90E9` has
-  not been sent anything else; it left the camera's PTP engine stuck on both transports (probably the
-  unanswered transaction, unverified). `0x90EC` takes data-out and no parameters.
+- `0x90E9` and `0x90EC` exist (they do not answer `0x2005`) but sent bare they get no reply. Sent bare,
+  `0x90E9` left the camera's PTP engine stuck on both transports (probably the unanswered transaction,
+  unverified); with data-out it answers OK and the camera stays responsive. Both take data-out and no
+  parameters. `0x90E9` showed no effect anywhere we looked; `0x90EC` blanked the device-name string.
 - **An unintended change.** The `0x90EB` reply is `c8 00`, count, limit, selected index, a 16-byte GUID, a
   PTP string, `f4 01`. The string was `Z_9_3023668` (model and serial) before the three `0x90EC` data runs
   and is `01 00 00` (an empty string) after them; the GUID did not change. It stayed empty through a power
@@ -275,15 +277,17 @@ again. Results, Z9:
 | `0x90EF(n)` | delete profile n |
 | `0x90EA` | delete all profiles |
 | `0x90EC` + data | accepted with 1, 3 or 4 bytes; blanked the `0x90EB` device-name string (cause unclear); stalls if given a parameter |
-| `0x90E9` | exists; purpose unknown; sent bare it wedged the camera until a power cycle |
+| `0x90E9` + data | accepted with 1 or 4 bytes (`01`, `01 00 00 00`, `01 00 00`, `00`); no visible effect found; sent bare it wedged the camera until a power cycle |
 
 ## 7. Open questions
 
 - Which camera models accept this client and the probes. Only the Z9 above was tried. The Z6III answered
   the read ops over USB earlier but has not been probed.
-- How to select a profile over the wire, if it can be done at all. `0x90E9` has only been sent bare;
-  `0x90EC` takes data of an unknown format. Either could hang the camera until a power cycle, or change a
-  stored value (`0x90EC` did).
+- How to select a profile over the wire, if it can be done at all. `0x90E9` and `0x90EC` take data-out of
+  an unknown format and neither selected anything with the short payloads tried. Further guessing risks
+  another stored change (`0x90EC` blanked the device name); a capture of the camera's own menu activity
+  (changing an FTP setting, selecting a profile) over Wi-Fi would show whether any of these ops is ever
+  sent.
 - What the `0x90EB` device-name string is for, why it blanked, and how to set it back to
   `Z_9_3023668`.
 - What the second parameter of `0x90EE` means beyond 0 (replace) and 1 (add), and what the `0x90E8`
