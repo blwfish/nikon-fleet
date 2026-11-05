@@ -450,3 +450,13 @@ With the owner's permission (the only stored profile there was a non-functional 
    untested value risks a stall (harmless so far) and none should be sent without the owner's say-so.
 4. Copying profiles between bodies is therefore possible only as "replace slot 0" for now; adding to a camera that holds
    other profiles is unsolved. Reading, and replacing the single slot-0 profile, are solid.
+
+### Z5 tested (2026-11-05): the FTP profile operations time out
+
+`vendor-read-ftp` on the Z5 (V1.43) failed with `USB error: Operation timed out`. OpenSession had succeeded and a
+DeviceInfo read right afterwards worked, so the first FTP operation (`0x90E8`, with its 3-byte data phase) got no reply at
+all, rather than the clean `0x2005` OperationNotSupported. The session was poisoned as designed and the camera was fine.
+So the Z5 does not implement the FTP profile operations under these codes (consistent with its having no FTP profile
+feature; its menu was not checked). The error does not say which operation timed out; that is inferred from the session
+opening normally. This supersedes the "not tested" paragraph for the Z5 above; the point there that DeviceInfo says nothing
+about the hidden `0x90E_` operations still stands.
