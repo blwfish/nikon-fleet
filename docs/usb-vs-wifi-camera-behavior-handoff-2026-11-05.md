@@ -622,3 +622,20 @@ which cannot be restored over USB. Untried: reading the Z6III's string to see wh
   probes' doing; it does not say how to restore it.
 - Not done: artist and copyright writes on either body; whether the Z6III also keeps only the low byte of each character
   (the writer refuses text above U+00FF, so this cannot be tried without bypassing it); IPTC.
+
+### The same on the Z5 (`Z_5_3021501`, firmware 1.43, 2026-11-05)
+
+The Z5 has no FTP profile operations, but the standard property operations work on it.
+
+- **Reads:** `0x1015` and `0x1014` work for `0xD072`, `0xD073`, `0xD090`, `0xD053` and `0xD091`: three read-write strings and
+  two read-write `uint8` flags (range 0 to 1, both `01`). Only standard PTP operations were sent; none of the FTP ones
+  that time out on this body.
+- **Values were real settings, not test leftovers:** Artist `"Brian L Wong"`, Copyright `"(c)2026"`, Image comment
+  `"(c)2024 Brian L Wong"` (a copyright-style string in the comment field). A transplant would copy them as they are.
+- **USB write confirmed for the image comment:** `"fleet-test"` written (needing `--force-unconfirmed-model`, since the
+  Z5 was not in the list), read back in the same session and a separate one, then `"(c)2024 Brian L Wong"` written back and
+  read from the camera byte-identical to the bytes saved beforehand. A 37-character value was refused with
+  `InvalidDevicePropFormat` (`0x201B`) and left the value byte-identical: the same limit and refusal as the Z9 and Z6III.
+- The Z5 is now in `STRING_PROP_WRITE_MODELS` (Z9, Z6III, Z5). The Z8 is not: it has never been tried.
+- Still not done on any body: artist and copyright writes; whether the Z5 and Z6III keep only the low byte of each
+  character (the writer refuses text above U+00FF); IPTC.

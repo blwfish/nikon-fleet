@@ -142,9 +142,10 @@ const VENDOR_OP_QUERY_PARAM2: u32 = 0;
 pub const STRING_PROPS: [(u16, &str); 3] = [(0xD072, "Artist"), (0xD073, "Copyright"), (0xD090, "Image comment")];
 
 /// Models [`PtpUsbSession::set_string_property`] accepts without `force_unconfirmed_model`. A USB write
-/// of the image comment (`0xD090`) was confirmed on both, 2026-11-05: written, read back in a separate
-/// session, and restored byte for byte. Artist and copyright writes have not been run on either.
-pub const STRING_PROP_WRITE_MODELS: &[&str] = &["Z 9", "Z6_3"];
+/// of the image comment (`0xD090`) was confirmed on all three, 2026-11-05: written, read back in a
+/// separate session, and restored byte for byte, with a 37-character value refused. Artist and
+/// copyright writes have not been run on any of them. The Z 8 and other bodies are not listed.
+pub const STRING_PROP_WRITE_MODELS: &[&str] = &["Z 9", "Z6_3", "Z 5"];
 
 /// The slot `0x90EB` reports when the camera has no *active* FTP profile.
 /// **Not** "no profile stored": on 2026-11-05 a Z9 that the owner says holds
@@ -5451,10 +5452,11 @@ mod tests {
 
     #[test]
     fn a_model_outside_the_confirmed_list_is_refused_unless_forced() {
-        let (mut s, t) = session(set_script(1, "a", RESP_OK, "b"), "Z 5");
+        // The Z 8 is assumed to match the Z 9 but has never been tried: not in the list.
+        let (mut s, t) = session(set_script(1, "a", RESP_OK, "b"), "Z 8");
         assert!(matches!(s.set_string_property(0xD090, "b", false), Err(PtpUsbError::UnconfirmedModel(_))));
         assert!(t.sent().is_empty());
-        let (mut s, _t) = session(set_script(1, "a", RESP_OK, "b"), "Z 5");
+        let (mut s, _t) = session(set_script(1, "a", RESP_OK, "b"), "Z 8");
         assert!(s.set_string_property(0xD090, "b", true).unwrap().verified);
         for m in STRING_PROP_WRITE_MODELS {
             let (mut s, _t) = session(set_script(1, "a", RESP_OK, "b"), m);
