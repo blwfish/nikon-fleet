@@ -311,10 +311,12 @@ Items 1, 2, 4 and 5 are read-only. Item 3 writes a property (a no-op write of it
 7. **Z 5:** retry a `0x943B` read; settle C4.
 8. Existing backlog (NXS "Open items"): still↔video switch side-effect check; `GetDevicePropDesc` on
    `0xD25B, 0xD038, 0xD039, 0xD03A`.
-9. **`device-info` on a Z6II and a Z8** (read-only; the Z6II is Vic's). Tests the Expeed 6 / Expeed 7 split with a second
-   body on each side: expect the Z6II's operation list like the Z5's (about 89, no `0x943B`/`0x943C`) and the Z8's like the
-   Z6III's (about 146). The July Z8 file in `references/` on the Mac Studio is a gphoto2 property dump and probably has no
-   operation list, so a live read is likely needed. See "Z5 vs Z9 operation lists" below.
+9. **`device-info` on a Z6II** (read-only; the Z6II is Vic's). Tests the Expeed 6 / Expeed 7 split with a second
+   Expeed 6 body: expect an operation list like the Z5's (about 89, no `0x943B`/`0x943C`). **The Z8 is deferred**: no Z8 is
+   available to the owner. The July Z8 file in `references/` on the Mac Studio is a gphoto2 property dump with no operation
+   list (checked 2026-11-05), so it cannot stand in. The owner's stated position, not proven: the Z8 has the same hardware
+   and a similar firmware base to the Z9, so treat it as Expeed 7 with the Z9's operation set (about 146, with `0x943B`/
+   `0x943C` and the FTP profile operations) until a live read says otherwise. See "Z5 vs Z9 operation lists" below.
 10. **Z5 Connect to PC operations**: capture Nikon's Wireless Transmitter Utility saving an entry to the Z5 over USB (check
     macOS USB capture first). The Z5 does not answer `0x90E8`–`0x90EE` and has FTP under Connect to PC; comparing
     DeviceInfo lists cannot find its operations (they are probably unlisted, as the Z9's are). See "Z5 tested" below.
