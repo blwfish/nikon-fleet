@@ -221,6 +221,29 @@ against the installed version):
 What MAID gives that gphoto2 doesn't: labeled enums/ranges/steps, capability dependencies, snapshot/restore/verify,
 and (probably) Nikon's vendor ops like `0x943B`/`0x9413` as named features.
 
+## Lead: the FTP profile read op is probably `0x90ED` (do this first, offline, on the MacBook)
+
+A write-only profile makes no sense (the camera shows it on its menu; NX Field knew "no active profile in camera"
+before sending anything in November). Nikon's vendor ops come in read/write pairs at adjacent codes: IPTC
+`0x9412` read / `0x9413` write (the November capture shows the read-back after the write), vendor properties
+`0x943B` read / `0x943C` write. By that pattern the read for `0x90EE` is **`0x90ED`**. This is an inference from
+the numbering, not captured fact.
+
+Supporting evidence already in the repo: the July capture `session-20260709-203300-filtered.pcap` has the
+FTP-profile-edit attempt running `0x90E8` → `0x90EB` → `0x90ED`, three times, byte-identical (NXS, "mining the
+other pcaps"); a bare `0x90ED` over USB stalls the pipe (so it needs params or a data-out phase, like `0x9412`,
+which took a slot parameter); `0x90EB` returned 59 bytes of device identity, not the profile. The November Z6III
+captures (e.g. `session-20260709-235137-nxfield-ops.pcap`; the FTP edit was rejected by the app there) may show the
+same sequence too.
+
+Plan: the pcaps live on the MacBook. Walk the PTP/IP packets by hand as in the NXS method note (a TCP segment can
+carry several packets; `tshark` was only used for counts), find each `0x90ED` request, record its params and any
+data-out phase, and read the camera's data-in reply. If the reply carries the profile in a layout close to the
+`0x90EE` blob (`encode_ftp_profile` in `src/ptp_usb.rs`), the read op is found. Only after that, a read-only USB
+`0x90ED` on the Z6III using the real params; standing rule from the owner: **do not guess `0x90ED` params on a
+camera, and no more `vendor-write-ftp` experiments until a read exists** (they overwrite the slot with no way to
+see the old value).
+
 ## Experiments, cheapest first
 
 Items 1, 2, 4 and 5 are read-only. Item 3 writes a property (a no-op write of its current value).
