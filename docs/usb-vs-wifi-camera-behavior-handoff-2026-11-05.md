@@ -400,3 +400,32 @@ The owner then said the Z9 holds several profiles, and approved `vendor-read-ftp
   maybe passive mode); `0x01` set on all but the iPad-made profile.
 - The `FtpProfile.port` problem stands: the encoder writes its port to the second-port field and fixes the FTP port at
   21, no folder, no SFTP bit. A correct writer needs `ftp_port`, `folder` and the option bits as inputs.
+
+### Z5 and the second Z9 (2026-11-05)
+
+**Z5 (V1.43): no FTP profile operations.** Its DeviceInfo lists 89 operations, 70 in the vendor range (`0x90C0`–`0x90CF`,
+`0x9201`–`0x920F`, `0x9400`–`0x9535`), and none of `0x90E8`, `0x90EB`, `0x90ED`, `0x90EE`, `0x943B`, `0x943C`. Nothing was
+sent to it: it says it does not support them, so `vendor-read-ftp` would at best get `0x2005`. This also settles C4 above on
+the evidence of the operation list alone: `vendor-read` (`0x943B`) on a Z5 should answer OperationNotSupported, which is what
+the `ptp_usb.rs` comment that mentions that reply says. (Not run: the list is the evidence.)
+
+**Second Z9 (`Z_9_3023668`): `count` 1, one profile, left over from our own write tests.**
+
+| Slot | Name | Host | Login | FTP port | Second port | Flags | Camera address |
+|---|---|---|---|---|---|---|---|
+| 0 | txid-test | 192.0.2.1 | txid | 21 | **21** | `0x0005` | 192.168.66.87/24 |
+
+`vendor-write-ftp --port` defaults to 21, and this profile's second-port field holds 21 where capture-based profiles hold
+8080. That is the encoder's `port` landing in the second-port field, as its code does; the FTP port stays at the hard-coded 21.
+So `--port` has never set the FTP port on any body.
+
+**Where every body stands** (`count` = stored profiles; `0x90EB` slot `0xff` = none selected as active):
+
+| Body | `count` | Profiles |
+|---|---|---|
+| Z9 `…3029610` | 3 | PHONE FTP, NETSOL (SFTP), PHONE_DIREC8 |
+| Z9 `…3023668` | 1 | txid-test (our write test) |
+| Z6III `…3014527` | 3 | CLAUDE (our write test), Home (SFTP, with folder), PHONE_DIREC10 |
+| Z5 | n/a | no FTP profile operations |
+
+The two test profiles (`txid-test`, and `CLAUDE` on the Z6III) can be deleted from the cameras' menus.
