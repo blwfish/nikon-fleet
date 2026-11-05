@@ -467,3 +467,29 @@ sets up a connection, or by comparing the Z5's vendor operation list with older 
 does not say which operation timed out; that is inferred from the session opening normally.
 This supersedes the "not tested" paragraph for the Z5 above; the point there that DeviceInfo says nothing
 about the hidden `0x90E_` operations still stands.
+
+### Z5 vs Z9 operation lists, and generations (2026-11-05)
+
+Per the owner (recall, not checked here): the Z5 is Expeed 6, as are the Z6II/Z7II, Z30, Z50, Zfc and original Z6/Z7;
+the Z8, Z9, Z6III and Zf are Expeed 7; the ZR is believed to be Expeed 7. The repo holds DeviceInfo data for only the Z5
+(Expeed 6) and the Z6III and Z9 (Expeed 7); the Z8's is in `references/` on the Mac Studio. So "Expeed 6 vs 7 gives a
+different protocol set" currently rests on one Expeed 6 body.
+
+Vendor-range operations (`>= 0x9000`) advertised in DeviceInfo, read over USB:
+
+- Z5 (V1.43): 89 operations in all, 70 vendor-range. Z9: 146 operations, 126 vendor-range.
+- **68 are shared. Only two are on the Z5 and not the Z9: `0x90CA` (GetVendorPropCodes) and `0x9432` (unknown).** The Z9
+  has 58 the Z5 lacks (`0x9401`, `0x9412`/`0x9413` IPTC, `0x942E`/`0x942F`, `0x9435`/`0x9436`/`0x9439`, `0x943A`–`0x9447`
+  including `0x943B`/`0x943C`, `0x944B`/`0x944C`, `0x9450`–`0x9454`, `0x945C`–`0x9478`, `0x9483`, `0x9527`–`0x9529`).
+  The Z5 is nearly a strict subset of the Z9's list.
+- The Z9's own FTP profile operations (`0x90E8`–`0x90EE`) are not in its list, so the Z5's Connect to PC operations are
+  probably unlisted too, and **comparing the lists cannot find them**. The only listed candidate is `0x9432`, and that is
+  a guess.
+
+Ways forward, none done:
+
+1. Capture the traffic of Nikon's Wireless Transmitter Utility while it saves a Connect to PC entry to the Z5 over USB
+   (macOS USB capture may need checking; the Pi captured Wi-Fi only).
+2. A read-only `device-info` on a Z6II (another Expeed 6 body, available through a friend) and on the Z8: if the Z6II's
+   list looks like the Z5's (about 89 operations, no `0x943B`/`0x943C`) and the Z8's like the Z6III's (about 146), the
+   generation split gets a second data point on each side.
