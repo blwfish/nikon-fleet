@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Read-only PTP/IP client: open a session with a Nikon camera and read one FTP profile.
 
+EXPERIMENTAL write mode (--write FILE): replaces one stored profile with the bytes in FILE.  It is a
+dry run unless --send is given.  Writes only to a slot below the stored count unless
+--allow-create is also given.  On the one camera tried, `--slot COUNT --param2 1 --allow-create` ADDS a
+profile at the front of the list; `--param2 0` replaces slot N and moves it to the front.  NX Field's
+accepted writes were each followed by a Wi-Fi re-association, so read back over a fresh connection
+after a write.  Never pass a slot number the camera has not already shown to be valid: slot
+0xFFFFFFFF hung the camera's network until it was power-cycled.
+
 Experimental research tool (see docs/nx-field-ftp-profile-session-2026-07-10.md).  Not part of the
 nikon-fleet binary; Python 3 standard library only.
 
@@ -16,7 +24,7 @@ The password and the "5 GHz" field are masked in the output.  --out saves the RA
 contains both in the clear: keep that file private and do not commit it.
 
 usage: ptpip_read_ftp.py CAMERA_IP [--slot N] [--guid HEX32] [--name NAME] [--prefix] [--incr-tid]
-                         [--out FILE]
+                         [--out FILE] [--write FILE [--param2 N] [--send] [--allow-create]]
 """
 import argparse, socket, struct, sys
 
@@ -134,6 +142,10 @@ def main():
     ap.add_argument("--prefix", action="store_true", help="replay NX Field's queries before the profile ops")
     ap.add_argument("--incr-tid", action="store_true", help="increment transaction ids (NX Field always uses 1)")
     ap.add_argument("--out", help="save the raw blob (contains the password!) to this file")
+    ap.add_argument("--write", metavar="FILE", help="EXPERIMENTAL: write this raw blob to --slot (dry run unless --send)")
+    ap.add_argument("--param2", type=int, default=0, help="second parameter of 0x90EE (always 0 so far)")
+    ap.add_argument("--send", action="store_true", help="actually send the write")
+    ap.add_argument("--allow-create", action="store_true", help="allow --slot equal to the stored count (tries to add a profile)")
     a = ap.parse_args()
 
     s = Session(a.ip, a.incr_tid, guid=parse_guid(a.guid), name=a.name)
@@ -157,6 +169,26 @@ def main():
     rc, _, info = step("0x90EB info", 0x90EB)
     if len(info) >= 14:
         print(f"   profiles stored: {struct.unpack_from('<I', info, 2)[0]}, limit {struct.unpack_from('<I', info, 6)[0]}")
+    count = struct.unpack_from("<I", info, 2)[0] if len(info) >= 14 else None
+    if a.write:
+        if count is None:
+            sys.exit("could not read the stored profile count; refusing to write")
+        limit = count + 1 if a.allow_create else count
+        if a.slot >= limit:
+            sys.exit(f"refusing: slot {a.slot} is not below the stored count {count}" + ("" if a.allow_create else " (use --allow-create to try adding)"))
+        new = open(a.write, "rb").read()
+        try:
+            d = decode_profile(new)
+        except Exception as e:  # noqa: BLE001 - any parse failure means do not send
+            sys.exit(f"refusing: {a.write} does not decode as a profile blob ({e})")
+        print(f"   write plan: slot {a.slot}, param2 {a.param2}, {len(new)} bytes, profile {d['name']!r}, host {d['host']}, {d['option_flags']}")
+        if not a.send:
+            print("   dry run: nothing sent (add --send)")
+            return
+        rc, _, _ = step(f"0x90EE({a.slot},{a.param2}) WRITE", 0x90EE, (a.slot, a.param2), data_out=new)
+        print("   write accepted" if rc == 0x2001 else "   write NOT accepted")
+        print("   the camera may restart its Wi-Fi after a write; read back over a fresh connection")
+        return
     rc, _, blob = step(f"0x90ED({a.slot}) read profile", 0x90ED, (a.slot,))
     if rc == 0x2001 and blob:
         for k, v in decode_profile(blob).items():

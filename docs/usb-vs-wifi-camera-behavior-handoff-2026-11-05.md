@@ -293,10 +293,14 @@ but `0x90E8` is the same setup step the write path sends and has only been captu
 ## Follow-up: live NX Field session and a PTP/IP profile read (2026-07-10/11)
 
 Written up in `docs/nx-field-ftp-profile-session-2026-07-10.md`. In short: NX Field's profile editor
-rewrites slot 0 only (no way to add a profile found); its first write carried four mistakes that
-produced the camera errors 31, 32 and 34; a PTP/IP client, `scripts/ptpip_read_ftp.py`, reads both
-stored profiles over Wi-Fi with the same `0x90E8` / `0x90EB` / `0x90ED` ops as USB; and the camera
-accepts any client GUID that begins `01 00 4e 58`, with no pairing list.
+rewrites slot 0 only; its first write carried four mistakes that
+produced the camera errors 31, 32 and 34; a PTP/IP client, `scripts/ptpip_read_ftp.py`, reads every
+stored profile over Wi-Fi with the same `0x90E8` / `0x90EB` / `0x90ED` ops as USB; and the camera
+accepts any client GUID that begins `01 00 4e 58`, with no pairing list. **A profile can be added**:
+`0x90EE(count, 1)` over Wi-Fi inserts a new one at the front (it survived a power cycle); with second
+parameter `0`, `0x90EE(N, 0)` replaces slot N and moves it to the front. This supersedes the
+"adding a profile" gaps recorded above (the USB `0x90EE(1, 0)` stall was a write one past the end with the
+second parameter at 0). Also recorded there: one out-of-range slot value hung the camera's network.
 
 ## Experiments, cheapest first
 

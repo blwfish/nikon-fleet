@@ -33,8 +33,9 @@ no message. The camera model has to be in that state before any PTP/IP client ca
 
 NX Field's profile editor does `0x90E8`, `0x90EB`, `0x90ED(0)` (read slot 0), and on save
 `0x90EE(0, 0)` (write slot 0). In this session it never touched slot 1 and never added a profile: the
-`0x90EB` count stayed at **2** after every write. This agrees with the USB result that `0x90EE(1, 0)`
-stalls. **No way of adding a profile has been found, over USB, PTP/IP or NX Field.**
+`0x90EB` count stayed at **2** after every NX Field write. NX Field only ever sends the second
+parameter as `0`. **Adding a profile does work, with the second parameter set to `1`** (found later in
+the session with our own client, section 5).
 
 History of slot 0, decoded with the blob layout from the handoff doc (password lengths only):
 
@@ -100,7 +101,9 @@ host is not separated by this data.
 
 ## 4. A PTP/IP client written from the capture: `scripts/ptpip_read_ftp.py`
 
-Reads FTP profiles over Wi-Fi with plain TCP, no NX Field, no USB. Read-only.
+Reads FTP profiles over Wi-Fi with plain TCP, no NX Field, no USB. By default it is read-only; an
+experimental `--write` mode (section 5) can replace or add a profile and is a dry run unless `--send`
+is given.
 
 ```bash
 python3 scripts/ptpip_read_ftp.py 192.168.66.40            # slot 0
@@ -136,17 +139,69 @@ the password in clear, so keep it private.
   each new connection, and the owner saw NX Field drop when the script first ran. A program on a
   MacBook would therefore disconnect the phone while it reads.
 
-## 5. Open questions
+## 5. Writing and adding profiles over Wi-Fi (experimental)
+
+`scripts/ptpip_read_ftp.py --write FILE` sends `0x90E8` (setup) then `0x90EE(slot, param2)` with the
+raw blob. Dry run unless `--send`. It refuses a slot at or past the stored count unless
+`--allow-create`. Camera: the same one as above, two stored profiles at the start. Raw blobs come from
+`--out`.
+
+| Call | Reply | Effect (read back over a fresh connection) |
+|---|---|---|
+| `0x90EE(1, 0)` with the profile already in slot 1 | `0x2001` | that profile is now slot 0; the old slot 0 is slot 1 |
+| `0x90EE(1, 0)` with a new-named blob | `0x2001` | slot 1's old profile is **replaced**, and the new one moved to slot 0; count unchanged |
+| `0x90EE(2, 0)` (one past the end) | `0x201F` TransactionCancelled | nothing changed, camera did not restart |
+| **`0x90EE(2, 1)`** (slot = count, second parameter 1) | `0x2001` | **a profile is added**: count 2 → 3, new profile at slot 0, the others shifted down |
+| `0x90EE(2, 2)`, `0x90EE(2, 0xFFFFFFFF)`, `0x90EE(0xFF, 0)` | `0x201F` | nothing changed |
+| `0x90EE(0xFFFFFFFF, 0)` | **no reply (timeout)** | **the camera's network stack hung** (see below) |
+
+- **Rule so far:** writing a profile into slot N with second parameter 0 replaces slot N and moves it to
+  the front. With the second parameter 1 and slot = count it inserts a new profile at the front.
+  What the second parameter means in general is unknown; only 0 and 1 have worked.
+- **Order is not "the profile in use".** After the adds, the camera kept logging in with the profile
+  that was *not* in slot 0 (an earlier guess that slot 0 is the active profile was wrong). The `0x90EB`
+  "slot" field stayed `0` throughout, so it is not an active-profile index either. Which profile the
+  camera connects with is chosen elsewhere (the owner selects it in the camera's FTP menu); no way to
+  select one over the wire has been found.
+- **Durability:** a profile added with `(count, 1)` was still there, byte-identical (SHA-256 matched), after
+  the owner powered the camera off from its menu and on again.
+- **Wi-Fi restart after a write is not established for this client.** NX Field's writes were each followed
+  by the camera re-associating with the access point (section 2). After this client's writes, port 15740
+  was open again at the first check, 3 s later, and the station's connected time was not recorded. A
+  refused write (`0x201F`) left the camera running and the connection numbers advancing normally. Any
+  NX Field session on the phone was dropped each time this client connected, as already noted.
+
+### What went wrong, so it is not repeated
+
+- **`0x90EE(0xFFFFFFFF, 0)` hung the camera.** It never replied; afterwards the camera stayed associated
+  with the access point but stopped answering ARP and ping, and port 15740 stayed closed for over a
+  minute. The camera showed a "wireless error" (the owner read it as `1f`; not matched to anything). A power
+  cycle cleared it. **Do not send out-of-range slot numbers other than the values in the table.**
+- **The power cycle after the hang reverted the profile list** to an earlier state: slot 0 `NxProfile`
+  with the `fleet` login NX Field had written (331 B), slot 1 `txid-edit`, count 2. Lost: the owner's
+  menu edit of the login, all the writes made over Wi-Fi that day, and the profile that had been added.
+  The camera then failed with error 32 because the Pi has no `fleet` account. The earlier NX Field
+  write had survived. Cause unknown; one guess is that the hang left changes uncommitted and the reboot
+  loaded the last committed copy. Restoring the profile with `--write` and a later clean power-off both
+  held.
+- **Ordering assumption:** a first replacement test was meant to be a no-op and instead swapped two profiles,
+  because writing any slot moves it to the front. Restore with a write of the other profile.
+
+## 6. Open questions
 
 - Which camera models accept this client. Only the one camera above was tried.
-- How to add a second profile, or write to a slot other than 0 (the PTP/IP client cannot write at all;
-  `vendor-write-ftp-blob` is USB-only and replaces slot 0).
+- What the second parameter of `0x90EE` means beyond 0 (replace) and 1 (add), and what the `0x90E8`
+  setup byte (always `01 00 00`) selects. Neither was varied; the batch of setup-byte variants and
+  bare calls to `0x90E9`, `0x90EA`, `0x90EC` and `0x90EF` was not run.
+- How to delete a profile, and how to choose the active one, over the wire.
+- Whether the reverted profile list after the power cycle was the hang or a normal "commit on shutdown".
 - Whether NX Field defaults to SFTP/22, and whether its form really prefills from the read.
 - What `ObjectAdded` pairs mean on a dual-slot camera.
-- Whether the Wi-Fi restart after a save is the save or the unreachable host.
-- Porting the PTP/IP read into the Rust tool (something like `vendor-read-ftp --wifi IP`). The USB
-  command already has `--save-blob FILE`, added upstream while this was being written, so a Wi-Fi
-  transport would reuse it.
+- Whether the Wi-Fi restart after a save is the save or the unreachable host, and whether writes sent by
+  this client cause one at all (record the station's connected time before and after to settle it).
+- Porting the PTP/IP client into the Rust tool (something like `vendor-read-ftp --wifi IP`, and a write
+  command with the same guards). The USB command already has `--save-blob FILE`, added upstream while
+  this was being written, so a Wi-Fi transport would reuse it.
 
 ## Credentials
 
