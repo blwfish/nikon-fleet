@@ -203,9 +203,15 @@ against the installed version):
   bodies. `0xD053` has no named setting but is reachable as `other/d053`. MAID has no capability for any of these.
   Not checked: what `_put_STR` does with the fixed-length, space-padded fields (36/54 chars). Write a value, read it
   back, and check before relying on it.
-- **FTP profile: no.** libgphoto2 has FTP-profile support only for Canon (`SetWftProfile`/`GetWftProfile`) and Sony
-  (FTP-setting properties). Nothing for Nikon `0x90E8`/`0x90EE`. `ptp_usb.rs` is the only working write path, and
-  the profile still has no read-back.
+- **FTP profile: no, and no vendor has working support in libgphoto2.** (An earlier version of this note said Canon
+  and Sony were supported; that was wrong.) Canon's `EOS_SetWftProfile`/`GetWftProfile`/`SetWFTData`/etc. (`0x9122`,
+  `0x9123`, `0x9187`, …) and Sony's `FTPSetting*` properties appear only as `#define`s in `ptp.h` and as name
+  strings in the opcode/property name tables in `ptp.c`, used for debug logs. Nothing in `config.c`, `library.c` or
+  `usb.c` calls them. Nikon `0x90E8`/`0x90EE` are not even named (the only repo hit for `0x90e8` is a camera-notes
+  file for a D100). Why upstream stops at names is not recorded: searching the project's GitHub issues for Nikon
+  FTP profiles, WftProfile and Wi-Fi settings returned nothing. Reasonable inference only: its scope is tethering and
+  file transfer, not configuring a camera's network-upload profile. `ptp_usb.rs` is the only working write path for
+  Nikon, and the profile still has no read-back.
 - **IPTC contents: no.** Only the preset selector `0xD060` is named (baseline: rw, range 0–13). `0x9412`/`0x9413`
   are absent; reading or writing the IPTC fields remains `ptp_usb.rs` work.
 - **`0x943B` / `0x943C`: no.** Neither op is in libgphoto2's op list. gphoto2 reaches properties through standard
