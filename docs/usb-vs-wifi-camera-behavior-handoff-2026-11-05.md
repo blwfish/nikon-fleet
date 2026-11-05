@@ -105,8 +105,22 @@ Abbreviations: **NXS** = docs/nx-field-session-2026-07-09.md, **HF** = docs/mcp-
 for the 2026-07-09 baseline (todo.md): it issues `0x1001`, `0x90CA`, and loops `GetDevicePropDesc` `0x1014`, and
 names hundreds of `0xD0xx` codes. `ptp_usb.rs` copies its wire framing. The repo never calls it at runtime.
 
-What it gives that MAID doesn't (general knowledge of libgphoto2, **not verified in this repo**; check against the
-installed version):
+**Source-checked 2026-11-05** (libgphoto2 `master`, `camlibs/ptp2/{ptp.h,config.c,ptpip.c}`; read, not run). Both
+libgphoto2 (LGPL) and the CLI (GPL) are open source, so any claim below can be checked in the source:
+- `ptp.h` independently names our WiFi-decoded properties with the same codes: `0xD0B4` ExposureIndexEx,
+  `0xD100` ExposureTime ("Shutter Speed"), `0xD148` Slot2SaveMode, `0xD068` D1ShootingSpeed ("continuous speed
+  low"), `0xD060` IPTCPresetSelect, `0xD053` EnableCopyright, `0xD072` ArtistName, `0xD090` ImageCommentString.
+  This corroborates the property identification in the NX Field doc from a second, independent source.
+- `config.c` has a generic "Other PTP Device Properties" fallback (`/main/other/<hex>`): every property listed in the
+  camera's DeviceInfo gets a widget via `GetDevicePropDesc`, typed from the descriptor's form (none/range/enum).
+  Unnamed ones are labelled "PTP Property 0xNNNN". Read side verified; I did not read the write side.
+- `ptpip.c` implements PTP/IP: address `ptpip:IP[:port[:eventport]]`, default port 15740, and the init command sends a
+  16-byte GUID. The GUID is generated randomly once and stored in gphoto2's settings (`ptp2_ip`/`guid`), with a
+  comment that Nikon WU-1 adapters may use a fixed GUID. So the handshake is a plain init-with-GUID; whether a
+  Z6III in remote mode accepts a stranger's GUID or wants pairing is still **untested**.
+
+What it gives that MAID doesn't (the rest is general knowledge of libgphoto2, **not verified in this repo**; check
+against the installed version):
 - `GetDevicePropDesc` for any property: type, GetSet (writable) flag, default, current, range/enum.
 - Properties with no MAID capability (artist, copyright, IPTC, the `0xD0xx` codes), by hex code; unnamed ones appear
   under their hex code and probably settable when writable.
