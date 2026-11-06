@@ -28,7 +28,7 @@ of the five `0xD0xx` ones, and its operation list has none of `0x90E8`..`0x90EF`
 `0x9413`), yet it reads all five properties and serves four FTP profiles. So:
 
 - the properties are asked for on every model; a body that lacks one answers `DevicePropNotSupported`;
-- FTP is skipped for the models in `FTP_ABSENT_MODELS` (the Z 5: owner-confirmed, and its `0x90E8` setup times out
+- FTP is skipped for the models the capability table (`ptp_usb::MODEL_CAPS`, `ftp: Absent`) says lack it (the Z 5: owner-confirmed, and its `0x90E8` setup times out
   after 5 s) and asked for on every other model, including ones this code has not seen.
 
 (An earlier note here called the Z 5's missing FTP ops proof that it has no FTP profiles. The Z 9 lacks them in the
@@ -83,7 +83,7 @@ and a read of the body afterwards to check what was written.
 | `strings` (Artist, Copyright, Image comment) | `SetDevicePropValue` | the value, by the write path |
 | `iptc` (each preset slot) | `0x9413` | the slot read again, byte for byte |
 | `switches` (EnableCopyright, IPTC preset) | `SetDevicePropValue`, one byte | the value |
-| `ftp` (the whole list) | `0x90EA` delete-all, then `0x90EE` adds last-first (an add lands at the front) | each add read back; the list read again at the end |
+| `ftp` (the whole list) | `0x90EF(n)` deletes, ONE profile at a time from the highest index down, the count read after each; then `0x90EE` adds last-first (an add lands at the front) | the count after each delete; each add read back; the list read again at the end |
 
 Order: strings, IPTC, switches, FTP (the preset switch comes after the presets). A run **stops at its first item that
 failed or may have changed the body**: every later item is reported `not_attempted` and sends nothing (an item that was
@@ -94,7 +94,8 @@ IPTC slot, the live FTP list, the target serial), so a body that changed under a
 when the change is to another value the plan displays the same way (the same count of FTP profiles, the same preset
 name and number of filled fields). Whether a string, a byte or an IPTC slot is a write or a skip is decided by the
 session's own gate functions (`ptp_usb::check_string_property_write`, `check_byte_property_write`,
-`iptc_write_confirmed`), not by a copy, and `ptp_usb`'s tests run the planner and a scripted session over the same
+`iptc_write_confirmed`, `ftp_write_confirmed`, `ftp_delete_confirmed`), which all read the one capability table
+(`ptp_usb::MODEL_CAPS`, `src/ptp_usb/model_caps.rs`), not by a copy, and `ptp_usb`'s tests run the planner and a scripted session over the same
 model-by-value grid. Apply writes the restore point
 first, as a snapshot with no MAID properties and the extended section as it was (label `restore-ext`), refusing first
 (like the MAID apply) if the data directory already holds the per-camera cap of restore points; restoring from
@@ -103,9 +104,18 @@ it undoes the restore. The report names it as `restore_point: {file, label}` (th
 the list); restoring the restore point with `--only` = `undo_set` puts back just those. Status: verified only if every write's read-back matched and the body, read again, matches the
 snapshot for every item written; a body that cannot be read for an item afterwards (the IPTC presets or the FTP list)
 leaves the apply unverified (`after_read_failed` names it), not verified. Indeterminate (exit 4) if any write's data may
-have gone out and the reply failed, **including an FTP delete-all the camera acknowledged and whose re-read failed or
-still showed profiles**. An FTP rebuild that fails after the delete-all was acknowledged is `failed` with a message that
-says the list was emptied (or partial) and how far it got; its category is in `undo_set`.
+have gone out and the reply failed, **including an FTP delete the camera acknowledged and whose count re-read failed or
+showed another count than the one expected**. The rebuild deletes ONE profile at a time with `0x90EF(n)`, highest index
+first so the remaining indexes stay put, and each delete reports the count the camera holds afterwards (deleting index
+`i` of `i + 1` must leave `i`, so the last delete proves the list is empty before anything is added). Its failure
+semantics: a delete refused before anything was deleted is `failed` and says nothing changed; a refusal after some
+deletes, a lost reply, an acknowledged delete with a failed re-read and an unexpected count are all `indeterminate`,
+and the message says how many profiles were deleted and that up to that many remain; nothing is added after any of
+them. A rebuild that fails during the adds is `failed` (or `indeterminate` if an add's reply was lost) with a message
+that says the list was emptied (or partial) and how far it got. Every one of these has its category in `undo_set`.
+There is no delete-all (`0x90EA`) in this path; it remains reachable only through the research command `vendor-probe-op`.
+A body is planned for a rebuild only if the capability table confirms FTP writes on its model, and, when it holds any
+profile, the single delete too.
 
 **A run that wrote nothing.** If every item is `same`, `not selected` or skipped for a routine reason (the snapshot holds
 no value, or the body lacks the feature) it is a verified no-op: `no_op: true`, `applied_verified`, no restore point. If
@@ -131,8 +141,9 @@ planned as a skip).
 dry run, apply with the echoed digest, restore point, undo from the restore point, restore again, final dry run `0 items
 would change`. Write paths verified earlier: strings on Z 9 / Z6III / Z 5, IPTC slot writes on Z 9 and Z6III (read back
 byte for byte), FTP adds and deletes on Z 9 and Z6III.
-**Not yet run on hardware through `restore-extended`:** the IPTC slots and the FTP rebuild (delete-all then reversed
-adds, and that the list ends in the snapshot's order), and `EnableCopyright` on a Z 9 or Z6III (the gate allows only
+**Not yet run on hardware through `restore-extended`:** the IPTC slots and the FTP rebuild (one-at-a-time deletes, highest
+index first, then reversed adds, and that the list ends in the snapshot's order; the single delete `0x90EF(n)` itself
+was run on a Z 9 and a Z6III, but the session method `delete_ftp_profile` and this sequence are UNVERIFIED on hardware), and `EnableCopyright` on a Z 9 or Z6III (the gate allows only
 the Z 5 until then). The `0xD060` preset switch is allowed on a Z6III only (a Z 9 refused it while its presets were
 empty).
 

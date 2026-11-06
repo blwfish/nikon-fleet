@@ -2,7 +2,10 @@
 
 The camera's own menu for FTP profiles checks nothing as you type and throws everything away on one error. This does
 the typing and the checking on the computer: edit a copy of a snapshot (`docs/snapshot-editing.md`), test the server,
-then restore the result to the body with `restore-extended` (a guarded plan, a restore point, a read-back).
+then restore the result to the body with `restore-extended` (a guarded plan, a restore point, a read-back). The restore
+replaces the body's whole list: it deletes the stored profiles one at a time (`0x90EF(n)`, highest index first, the
+count checked after each; there is no delete-all in the product path) and then adds the snapshot's, last first. That
+sequence is unverified on hardware (`docs/extended-snapshot.md`, "Not yet run on hardware").
 
 Code: `src/ftp_edit.rs` (fields), `ptp_usb::encode_decoded_ftp_profile` (the writer), `src/ftp_test.rs` (the test).
 **Neither the fields nor the test have touched a camera yet, and the window has not been seen on a screen** (see "Not verified").

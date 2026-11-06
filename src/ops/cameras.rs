@@ -27,10 +27,16 @@ use serde::Serialize;
 
 use crate::ops::baseline::baseline_for;
 use crate::ops::target::{body_firmware, storable_serial};
+use crate::ptp_usb::MODEL_CAPS;
+use crate::ptp_usb::model_caps::model_names;
 use crate::sdk::{DeviceInfo, UsbCameraInfo, UsbScan, UsbUnreadable, usb_camera_scan};
 
-/// Model names whose USB spelling is verified to equal the SDK/schema spelling.
-pub const KNOWN_MODELS: &[&str] = &["Z 5", "Z6_3", "Z 9"];
+const KNOWN_MODEL_NAMES: [&str; MODEL_CAPS.len()] = model_names(&MODEL_CAPS);
+
+/// Model names whose USB spelling is verified to equal the SDK/schema spelling. Built from the capability table
+/// (`ptp_usb::MODEL_CAPS`, the one place a model's name and what is confirmed on it are written), so a model cannot be
+/// in one and not the other, and has one spelling.
+pub const KNOWN_MODELS: &[&str] = &KNOWN_MODEL_NAMES;
 
 /// Whether `usb_model` (product string already stripped of its prefix) is a
 /// verified SDK model name. Exact: no case folding, no whitespace trimming,
@@ -210,7 +216,7 @@ mod tests {
     #[test]
     fn the_known_models_are_exactly_the_surveyed_spellings() {
         // docs/firmware-archive-spec.md §2 / §3.1; note Z6_3 has no space.
-        assert_eq!(KNOWN_MODELS, ["Z 5", "Z6_3", "Z 9"]);
+        assert_eq!(KNOWN_MODELS, ["Z 5", "Z 9", "Z6_3"]);
         for m in KNOWN_MODELS {
             assert_eq!(sdk_model_name(m), Some(*m), "identity for verified names");
         }

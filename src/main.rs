@@ -176,8 +176,8 @@ enum Cmd {
     /// Put a snapshot's owner strings, copyright and IPTC-preset switches, IPTC presets and FTP profiles back on a body
     /// (the `extended` section; `restore` does not touch them). Raw USB only: no SDK. Plans, then applies the plan it
     /// computed, or the one named by --expect-digest and --expect-summary. A restore point is written before the first
-    /// write; restoring from it undoes the restore. The FTP list is rebuilt by deleting every stored profile and adding
-    /// the snapshot's, so use --dry-run first.
+    /// write; restoring from it undoes the restore. The FTP list is rebuilt by deleting every stored profile one at a time (highest
+    /// index first, the count checked after each) and adding the snapshot's, so use --dry-run first.
     #[command(after_help = RESTORE_EXTENDED_HELP)]
     RestoreExtended(RestoreExtendedArgs),
 
@@ -272,7 +272,7 @@ enum Cmd {
     /// EXPERIMENTAL. Write a one-byte property with the standard `SetDevicePropValue` and read it back: 0xD053
     /// EnableCopyright (0 or 1) or 0xD060 IPTC preset (0..=13; 0 is none, and it changes which IPTC profile the camera
     /// embeds in photos). The value before is printed so it can be put back. Model-gated like the other writes: a write
-    /// of 0xD053 was confirmed on a Z 5 and of 0xD060 on a Z6III only (`BYTE_PROP_WRITE_MODELS`), anything else needs
+    /// of 0xD053 was confirmed on a Z 5 and of 0xD060 on a Z6III only (the `byte_writes` column of `ptp_usb::MODEL_CAPS`), anything else needs
     /// `--force-unconfirmed-model`. Exits 4 unless the read-back is exactly what was written.
     VendorSetByteProp(VendorSetBytePropArgs),
     #[command(after_help = VENDOR_SET_STRING_HELP)]
@@ -759,7 +759,7 @@ Exit status:
      Read the list (`vendor-read-ftp --slot 0`, or the camera's menu) BEFORE retrying: a repeated add
      stores a duplicate, and a repeated replace of a slot above 0 hits whichever profile is there now
 Write rules (found on a Z 9, 2026-11-05; not re-derived on a Z6III or any other model, though a write is confirmed on
-a Z 9 and a Z6III, `FTP_WRITE_CONFIRMED_MODELS`):
+a Z 9 and a Z6III, the `ftp` column of `ptp_usb::MODEL_CAPS`):
   --slot N --param2 0   replace the stored profile N (N below the count); it moves to the FRONT (slot 0)
                         and the profiles that were in front of it shift down; the count stays
   --slot COUNT --param2 1  add a profile at the FRONT; the count rises by one
@@ -1051,7 +1051,7 @@ struct VendorWriteIptcArgs {
     /// Print the data phase and send nothing (nothing is read from the camera either).
     #[arg(long)]
     dry_run: bool,
-    /// Write to a model outside `IPTC_WRITE_CONFIRMED_MODELS` (a Z 9 and a Z6III are the confirmed ones).
+    /// Write to a model the `iptc` column of `ptp_usb::MODEL_CAPS` does not confirm (a Z 9 and a Z6III are the confirmed ones).
     #[arg(long)]
     force_unconfirmed_model: bool,
     /// Camera serial to target; same rules as vendor-read's --serial.

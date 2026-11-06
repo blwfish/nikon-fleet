@@ -120,23 +120,19 @@ const OP_IPTC_READ: u16 = 0x9412;
 /// entries (length 0: empty, no bytes). Worked over USB on a Z6III by replaying a captured blob (2026-09-06); the
 /// layout of the leading entries is inferred, not confirmed.
 const OP_IPTC_WRITE: u16 = 0x9413;
-/// Models an IPTC write has been confirmed on (a Z6III 2026-09-06 by replay; a Z 9 and a Z6III 2026-11-06 by a new
-/// preset written to an empty slot and read back identical). Anything else needs the explicit override.
-pub const IPTC_WRITE_CONFIRMED_MODELS: &[&str] = &["Z 9", "Z6_3"];
+// Which models an IPTC write, an FTP write, a single FTP delete, a string write and a byte write have been confirmed on
+// is not decided here: it is one table, `model_caps::MODEL_CAPS`, and every gate below reads it.
 /// The IPTC preset selector: a u8, read-write, 0..=13 on a Z 9 and a Z6III (the range the selector reports).
-const PROP_IPTC_PRESET: u16 = 0xD060;
+pub(crate) const PROP_IPTC_PRESET: u16 = 0xD060;
 /// The highest value the selector takes, as the cameras report it (0 is none). Only slots 1..=10 are IPTC presets;
 /// slots 11..=13 are records of kind 2 whose meaning is unknown (`docs/extended-snapshot.md`), so what selecting
 /// 11..=13 does is UNVERIFIED. Restore replays a value the camera itself reported; `edit set-switch` accepts up to
 /// this maximum.
 pub const IPTC_PRESET_MAX: u8 = 13;
 /// `EnableCopyright`: a u8 switch, 0 or 1.
-const PROP_ENABLE_COPYRIGHT: u16 = 0xD053;
+pub(crate) const PROP_ENABLE_COPYRIGHT: u16 = 0xD053;
 /// The one-byte properties [`PtpUsbSession::set_byte_property`] writes, with the highest value each takes.
 pub const BYTE_PROPS: [(u16, &str, u8); 2] = [(PROP_ENABLE_COPYRIGHT, "EnableCopyright", 1), (PROP_IPTC_PRESET, "IPTCPresetSelect", IPTC_PRESET_MAX)];
-/// Models each byte property's write has been confirmed on. `0xD053`: a Z 5, 0 then 1 each read back (2026-11-06).
-/// `0xD060`: a Z6III ("set to 1 OK", 2026-11-05); a Z 9 answered `AccessDenied` while all its presets were empty.
-pub const BYTE_PROP_WRITE_MODELS: [(u16, &[&str]); 2] = [(PROP_ENABLE_COPYRIGHT, &["Z 5"]), (PROP_IPTC_PRESET, &["Z6_3"])];
 /// `0x943B` — generic vendor-property read wrapper. Param is
 /// `0x10000 | propcode`; response data is the property's raw bytes.
 const OP_VENDOR_PROP_READ: u16 = 0x943B;
@@ -157,6 +153,12 @@ const FTP_SETUP_DATA: [u8; 3] = [0x01, 0x00, 0x00];
 /// `[0, 0]`. See `docs/nx-field-session-2026-07-09.md`'s field table for the data blob.
 const OP_FTP_PROFILE_WRITE: u16 = 0x90EE;
 const FTP_PROFILE_WRITE_PARAMS: [u32; 2] = [0, 0];
+
+/// `0x90EF` — delete ONE stored FTP profile. One param, the index `n` as `0x90ED(n)` numbers them; the others keep their
+/// order and the count drops by one (Z 9, 2026-07-10: `0x90EF(1)`, count 4 to 3; run again on a Z 9 and a Z6III
+/// 2026-11-05/06). A bare `0x90EF`, or an index at or past the count, is not sent: the first stalled the pipe. The
+/// product path's only delete ([`PtpUsbSession::delete_ftp_profile`]); the delete-all op `0x90EA` is not used by it.
+const OP_FTP_PROFILE_DELETE: u16 = 0x90EF;
 
 /// `0x90EB` — FTP profile info. No params, no data-out; the data-in phase is
 /// 57–59 bytes (see [`FtpProfileInfo`]). Always the second step of NX Field's
@@ -188,22 +190,13 @@ const VENDOR_OP_QUERY_PARAM2: u32 = 0;
 /// The string properties [`PtpUsbSession::set_string_property`] will write: Artist, Copyright and
 /// Image comment. The names are libgphoto2's; the codes were read as read-write strings on a Z 9
 /// (2026-11-05). A closed list: any other code is refused, never passed through.
-pub const STRING_PROPS: [(u16, &str); 3] = [(0xD072, "Artist"), (0xD073, "Copyright"), (0xD090, "Image comment")];
-
-/// Models [`PtpUsbSession::set_string_property`] accepts without `force_unconfirmed_model`. A USB write
-/// of the image comment (`0xD090`) was confirmed on all three, 2026-11-05, and of Artist (`0xD072`) and
-/// Copyright (`0xD073`) on all three, 2026-11-06: written, read back (in a separate session for the
-/// image comment), restored byte for byte, with a value one character over the limit (36 / 54 / 36)
-/// refused with `InvalidDevicePropFormat` and the stored value unchanged. The Z 8 and other bodies are not listed.
-pub const STRING_PROP_WRITE_MODELS: &[&str] = &["Z 9", "Z6_3", "Z 5"];
-
-/// The properties of [`STRING_PROPS`] whose USB write was actually run on the models in
-/// [`STRING_PROP_WRITE_MODELS`]: all three now (image comment 2026-11-05; Artist and Copyright on the
-/// Z 9, Z6III and Z 5 2026-11-06). A property in [`STRING_PROPS`] but not in this list would need
-/// `force_unconfirmed_model`, like an unconfirmed model does: the gate is the pair (property, model),
-/// kept as [`check_string_write_gate`] so the mechanism stays tested for the next property or body. A test keeps
-/// this list inside [`STRING_PROPS`].
-pub const STRING_PROP_WRITE_CONFIRMED_PROPS: &[u16] = &[0xD072, 0xD073, 0xD090];
+pub const STRING_PROPS: [(u16, &str); 3] = [(PROP_ARTIST, "Artist"), (PROP_COPYRIGHT, "Copyright"), (PROP_IMAGE_COMMENT, "Image comment")];
+/// `Artist`.
+pub(crate) const PROP_ARTIST: u16 = 0xD072;
+/// `Copyright`.
+pub(crate) const PROP_COPYRIGHT: u16 = 0xD073;
+/// `Image comment`.
+pub(crate) const PROP_IMAGE_COMMENT: u16 = 0xD090;
 
 /// The slot `0x90EB` reports when the camera has no *active* FTP profile.
 /// **Not** "no profile stored": on 2026-11-05 a Z9 that the owner says holds
@@ -235,27 +228,6 @@ fn classify_open_session_response(code: u16) -> OpenSessionResponse {
     } else {
         OpenSessionResponse::Failed
     }
-}
-
-/// Camera models the `0x90EE` FTP-profile write has been confirmed against
-/// (see the module doc for the reverse-engineering history). Model strings
-/// match `firmware::model_from_usb_product`'s output exactly (e.g. `"Z 9"`,
-/// `"Z6_3"` for Z6III — space vs. underscore is not a typo, it's this
-/// codebase's existing inconsistent USB product-string convention).
-///
-/// This is a deliberate *subset* of the fleet's surveyed models
-/// ([`KNOWN_MODELS`], the one registry): the Z 5 is surveyed and its vendor
-/// reads work, but no FTP write was ever captured on it. A test fails if an
-/// entry here is not a surveyed model. There is no firmware dimension: the
-/// captures were firmware-specific (Z6_3 fw 2.00, Z 9 fw 5.31 per
-/// [`TxidCheck`]'s notes) but which firmware each *write* was confirmed on
-/// was never recorded, so this gate cannot say more than "this model".
-/// Sending an unconfirmed model a vendor write risks writing a malformed
-/// blob to hardware whose exact protocol implementation was never checked.
-pub const FTP_WRITE_CONFIRMED_MODELS: &[&str] = &["Z 9", "Z6_3"];
-
-pub(crate) fn ftp_write_confirmed(model: &str) -> bool {
-    FTP_WRITE_CONFIRMED_MODELS.contains(&model)
 }
 
 /// The one warning for a camera outside [`KNOWN_MODELS`] (`None` for a surveyed model). `what` names the
@@ -481,16 +453,17 @@ pub enum PtpUsbError {
     #[error("FTP profile field {field} contains a control character (NUL, newline, tab, ...)")]
     FtpFieldControlChar { field: &'static str },
     #[error(
-        "FTP profile write may or may not have taken effect: the 0x90EE data had already been sent when \
-         this failed ({cause}). Read the list back before doing anything else (`vendor-read-ftp --slot 0`, \
-         from a new session, or the camera's menu): a write that took effect put its profile at the FRONT. \
-         Do not just repeat it: a repeated add stores a duplicate, and a repeated replace of a slot above 0 \
-         hits whichever profile now sits there"
+        "FTP profile operation may or may not have taken effect: a 0x90EE write (its data had been sent) or a 0x90EF \
+         delete (the camera acknowledged it, or its reply never came) was under way when this failed ({cause}). Read \
+         the list back before doing anything else (`vendor-read-ftp --slot 0`, from a new session, or the camera's \
+         menu): a write that took effect put its profile at the FRONT, a delete that took effect removed one. Do not \
+         just repeat it: a repeated add stores a duplicate, a repeated replace of a slot above 0 hits whichever \
+         profile now sits there, and a repeated delete removes whichever profile now sits at that index"
     )]
     FtpWriteIndeterminate { cause: Box<PtpUsbError> },
     #[error("FTP profile write 0x90EE({slot}, {param2}) refused before anything was written: {why}")]
     FtpWriteRefused { slot: u32, param2: u32, why: FtpWriteRefusal },
-    #[error("camera model {0:?} is not in this module's confirmed-safe list for vendor writes; wire format may not match")]
+    #[error("{}", unconfirmed_model_text(.0))]
     UnconfirmedModel(String),
     #[error("property {propcode:#06x} is not one of the string properties this writes ({allowed}); nothing was sent")]
     PropWriteUnsupported { propcode: u16, allowed: String },
@@ -538,32 +511,39 @@ fn string_prop_name(propcode: u16) -> String {
         .map_or_else(|| format!("{propcode:#06x}"), |(_, n)| (*n).to_string())
 }
 
+/// What a refusal for a model the capability table does not confirm says: whether the model is recognized at all, and
+/// that nothing was sent (every gate refuses before any I/O). A model the table does not know is "not recognized", not
+/// treated as a known one.
+fn unconfirmed_model_text(model: &str) -> String {
+    if caps_of(model).is_none() {
+        format!(
+            "camera model {model:?} is not recognized (recognized models: {KNOWN_MODELS:?}), so this operation is not \
+             confirmed for it; nothing was sent"
+        )
+    } else {
+        format!("this operation has not been confirmed on camera model {model:?}; nothing was sent")
+    }
+}
+
 fn prop_write_unconfirmed_text(propcode: u16, model: &str) -> String {
     format!(
-        "writing {} ({propcode:#06x}) has not been confirmed on a camera (confirmed: {}, on {:?}); \
+        "writing {} ({propcode:#06x}) has not been confirmed on this camera model (confirmed on {:?}); \
          pass --force-unconfirmed-model to try it on this {model:?}",
         string_prop_name(propcode),
-        STRING_PROP_WRITE_CONFIRMED_PROPS.iter().map(|c| string_prop_name(*c)).collect::<Vec<_>>().join(", "),
-        STRING_PROP_WRITE_MODELS,
+        model_caps::string_write_models(propcode),
     )
 }
 
-/// The write gate of `vendor-set-string`: the model must be in `models` (checked first, so the error names
-/// the real cause), then the property in `confirmed`. Both lists are parameters so the mechanism is tested
-/// with lists that differ; the session passes [`STRING_PROP_WRITE_MODELS`] and [`STRING_PROP_WRITE_CONFIRMED_PROPS`].
-pub(crate) fn check_string_write_gate(model: &str, propcode: u16, models: &[&str], confirmed: &[u16]) -> Result<(), PtpUsbError> {
-    if !models.contains(&model) {
-        return Err(PtpUsbError::UnconfirmedModel(model.to_string()));
-    }
-    if !confirmed.contains(&propcode) {
-        return Err(PtpUsbError::PropWriteUnconfirmed { propcode, model: model.to_string() });
-    }
-    Ok(())
+/// The write gate of `vendor-set-string`, read from the capability table ([`MODEL_CAPS`]): a model with no confirmed
+/// string property, or not in the table, is [`PtpUsbError::UnconfirmedModel`] (checked first, so the error names the
+/// real cause), then the property must be confirmed on that model ([`PtpUsbError::PropWriteUnconfirmed`]).
+pub(crate) fn check_string_write_gate(model: &str, propcode: u16) -> Result<(), PtpUsbError> {
+    model_caps::string_write_gate(model, propcode)
 }
 
 /// The camera-free refusals of a byte-property write, in the order [`PtpUsbSession::set_byte_property`] makes them: the
 /// property is one of [`BYTE_PROPS`] ([`PtpUsbError::PropWriteUnsupported`]), `value` is at most its maximum
-/// ([`PtpUsbError::PropValueBad`]), and the model is in that property's [`BYTE_PROP_WRITE_MODELS`] entry unless
+/// ([`PtpUsbError::PropValueBad`]), and the property is confirmed on the model in [`MODEL_CAPS`] unless
 /// `force_unconfirmed_model` ([`PtpUsbError::UnconfirmedModel`]). The ONE statement of this gate: the session calls it
 /// before sending, and a restore planner calls it to decide whether an item is a write or a skip, so the two cannot
 /// disagree about what the session will accept.
@@ -576,17 +556,10 @@ pub fn check_byte_property_write(model: &str, propcode: u16, value: u8, force_un
     if value > max {
         return Err(bad(format!("{value} is above the highest value {name} takes, {max}")));
     }
-    let models: &[&str] = BYTE_PROP_WRITE_MODELS.iter().find(|(c, _)| *c == propcode).map_or(&[], |(_, m)| m);
-    if !force_unconfirmed_model && !models.contains(&model) {
+    if !force_unconfirmed_model && !byte_write_confirmed(model, propcode) {
         return Err(PtpUsbError::UnconfirmedModel(model.to_string()));
     }
     Ok(())
-}
-
-/// Whether an IPTC slot write has been confirmed on `model` ([`IPTC_WRITE_CONFIRMED_MODELS`]); what
-/// [`PtpUsbSession::write_iptc_slot`] requires without `force_unconfirmed_model`. The one place the list is consulted.
-pub fn iptc_write_confirmed(model: &str) -> bool {
-    IPTC_WRITE_CONFIRMED_MODELS.contains(&model)
 }
 
 /// The camera-free refusals of a string-property write: the property is one of [`STRING_PROPS`], the (model, property)
@@ -601,7 +574,7 @@ pub fn check_string_property_write(
 ) -> Result<Vec<u8>, PtpUsbError> {
     check_string_prop_known(propcode)?;
     if !force_unconfirmed_model {
-        check_string_write_gate(model, propcode, STRING_PROP_WRITE_MODELS, STRING_PROP_WRITE_CONFIRMED_PROPS)?;
+        check_string_write_gate(model, propcode)?;
     }
     encode_owner_string(text).map_err(|why| PtpUsbError::PropValueBad { propcode, why })
 }
@@ -1295,6 +1268,11 @@ mod ftp_golden;
 // ─────────────────────────────────────────────────────────────────────────
 
 pub mod ftp_layout;
+pub mod model_caps;
+pub use model_caps::{
+    FTP_WRITE_CONFIRMED_MODELS, MODEL_CAPS, ModelCaps, Support, byte_write_confirmed, ftp_absent, ftp_delete_confirmed, ftp_write_confirmed,
+    iptc_absent, iptc_write_confirmed, caps_of,
+};
 pub use ftp_layout::{FtpSecretSpan, FtpSecretSpans};
 
 /// The address-shaped part of the 82-byte template block (see the notes on
@@ -3138,26 +3116,39 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         Ok((count, slots))
     }
 
-    /// Delete every stored FTP profile (`0x90EA`, sent bare; the list is read before and after by the probe) and return
-    /// the count the camera reports afterwards. DESTRUCTIVE: it deletes without asking and nothing undoes it but writing
-    /// the profiles again. Needs a model in [`FTP_WRITE_CONFIRMED_MODELS`]. A reply that never came is
-    /// [`PtpUsbError::FtpWriteIndeterminate`].
-    pub fn delete_all_ftp_profiles(&mut self) -> Result<u32, PtpUsbError> {
-        let consent = FtpProbeConsent { force_unconfirmed_model: false, destructive_op: Some(0x90EA) };
-        let probe = self.probe_ftp_op(0x90EA, false, &[], None, consent)?;
-        match probe.outcome {
-            FtpProbeOutcome::Replied(r) if r.response_code == RESP_OK => {}
-            FtpProbeOutcome::Replied(r) => {
-                return Err(PtpUsbError::OperationFailed { op: 0x90EA, code: PtpResponseCode(r.response_code) });
-            }
-            FtpProbeOutcome::NotSent { cause } => return Err(cause),
-            FtpProbeOutcome::Indeterminate { cause, .. } => return Err(PtpUsbError::FtpWriteIndeterminate { cause: Box::new(cause) }),
+    /// Delete ONE stored FTP profile, `0x90EF(index)` (`index` numbered as `0x90ED(n)` reads them; the others keep their
+    /// order), and return the count the camera reports afterwards. DESTRUCTIVE: it deletes without asking and nothing
+    /// undoes it but writing the profile again. This is the product path's only delete; the delete-all op `0x90EA` is
+    /// reachable only through the research probe ([`Self::probe_ftp_op`]), never from here.
+    ///
+    /// Refused before anything is sent, in this order: a model whose `ftp_delete` the capability table
+    /// ([`MODEL_CAPS`]) does not confirm ([`PtpUsbError::UnconfirmedModel`]); an `index` at or past the stored count
+    /// ([`PtpUsbError::FtpSlotOutOfRange`], the count read in this session first with `0x90E8`/`0x90EB`, which send
+    /// nothing that changes the camera). A camera that answers the delete with a non-OK code refused it
+    /// ([`PtpUsbError::OperationFailed`]; nothing changed). A delete whose reply never came, or that was acknowledged
+    /// and whose follow-up count read failed, may have taken effect: [`PtpUsbError::FtpWriteIndeterminate`], never a
+    /// plain failure. The caller verifies the returned count (deleting index `i` of `n` should leave `n - 1`).
+    /// UNVERIFIED on hardware as a session method: the sequence (setup and info read, the delete, setup and info read)
+    /// is the one the research probe ran on a Z 9, rebuilt here without the probe.
+    pub fn delete_ftp_profile(&mut self, index: u32) -> Result<u32, PtpUsbError> {
+        if !ftp_delete_confirmed(self.model()) {
+            return Err(PtpUsbError::UnconfirmedModel(self.model().to_string()));
         }
-        // The camera acknowledged the delete (OK): the list is probably gone, and the read that would confirm it is
+        let (before, _) = self.read_ftp_info_step()?;
+        if index >= before.count {
+            return Err(PtpUsbError::FtpSlotOutOfRange { slot: index, count: before.count });
+        }
+        match self.transact(OP_FTP_PROFILE_DELETE, &[index], None, TxidCheck::Unchecked) {
+            Ok(reply) => Self::require_ok(OP_FTP_PROFILE_DELETE, reply.code)?,
+            Err(cause) if cause.nothing_was_sent() => return Err(cause),
+            // The command went out and the reply did not come (or was garbled): the delete may have happened.
+            Err(cause) => return Err(PtpUsbError::FtpWriteIndeterminate { cause: Box::new(cause) }),
+        }
+        // The camera acknowledged the delete (OK): the profile is probably gone, and the read that would confirm it is
         // what failed. That is not "nothing changed": it is an acked write whose effect cannot be confirmed, the same
         // class as a lost reply, so exit 4 and a look at the camera, never a plain failure a script may retry.
-        match probe.after {
-            Ok(state) => Ok(state.info.count),
+        match self.read_ftp_info_step() {
+            Ok((after, _)) => Ok(after.count),
             Err(cause) => Err(PtpUsbError::FtpWriteIndeterminate { cause: Box::new(cause) }),
         }
     }
@@ -3166,7 +3157,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// the slot held, whether the camera accepted the write, and what it holds now. `data` is sent as given and the
     /// result is not interpreted or compared here (the restore path does that). A write of a preset to an empty slot,
     /// read back identical, is confirmed on a Z 9 and a Z6III (2026-11-06); other writes are not.
-    /// Refused before anything is sent for a model outside [`IPTC_WRITE_CONFIRMED_MODELS`] unless
+    /// Refused before anything is sent for a model whose `iptc` is not confirmed in [`MODEL_CAPS`] unless
     /// `force_unconfirmed_model`. A reply that never came is an `Err` and the camera MAY have changed; read the slot
     /// again in a new session.
     pub fn write_iptc_slot(
@@ -3211,7 +3202,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// Write one of the [`BYTE_PROPS`] with `SetDevicePropValue`: [`Self::plan_byte_property`] (checks, descriptor, the
     /// value before), the write, the value read back.
     /// Changes the camera (`0xD060` changes which IPTC profile is embedded in photos); the caller keeps `previous`
-    /// to put it back. The value is range-checked before anything is sent. Gate: [`BYTE_PROP_WRITE_MODELS`] for the
+    /// to put it back. The value is range-checked before anything is sent. Gate: [`MODEL_CAPS`]' `byte_writes` for the
     /// property, unless `force_unconfirmed_model`. A failure after the value went out is
     /// [`PtpUsbError::PropWriteIndeterminate`]; one before it (a refused command) is the plain error.
     pub fn set_byte_property(&mut self, propcode: u16, value: u8, force_unconfirmed_model: bool) -> Result<BytePropReceipt, PtpUsbError> {
@@ -3280,8 +3271,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// [`PtpUsbError::PropWriteIndeterminate`]; a camera that *answers* non-OK is a definite refusal.
     /// The camera's length limit for each property is not known here: nothing is truncated by this
     /// code, and a camera that truncates shows up as `verified == false` with the read-back text.
-    /// Models outside [`STRING_PROP_WRITE_MODELS`], and properties outside
-    /// [`STRING_PROP_WRITE_CONFIRMED_PROPS`] (all three today), are
+    /// Models and properties the capability table ([`MODEL_CAPS`], `string_writes`) does not confirm are
     /// refused unless `force_unconfirmed_model`. Text is refused before anything is sent if it has a
     /// character above U+00FF (the camera keeps one byte per character) or any `char::is_control`
     /// character, which includes U+007F and the C1 range U+0080..=U+009F even though those are
@@ -3375,7 +3365,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// (confirmed 2026-09-06), and sending it unconditionally is simpler and
     /// safer than tracking write count.
     ///
-    /// Refuses to write to a camera model outside [`FTP_WRITE_CONFIRMED_MODELS`]
+    /// Refuses to write to a camera model whose `ftp` is not confirmed in [`MODEL_CAPS`]
     /// unless `force_unconfirmed_model` is set — see the module doc and
     /// [`PtpUsbError::UnconfirmedModel`].
     ///
@@ -3624,7 +3614,7 @@ impl FtpProbeRisk {
     }
 
     /// The op can change what the camera stores, so it passes the same model gate as the FTP writes
-    /// ([`FTP_WRITE_CONFIRMED_MODELS`] or `force_unconfirmed_model`). Only the control cannot.
+    /// ([`ftp_write_confirmed`] or `force_unconfirmed_model`). Only the control cannot.
     pub fn may_change_camera(self) -> bool {
         !matches!(self, FtpProbeRisk::Control)
     }
@@ -3691,7 +3681,7 @@ fn ftp_probe_ops_text() -> String {
 /// What the caller has agreed to for a probe, beyond the op being on the list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FtpProbeConsent {
-    /// Send an op that can change the camera to a model outside [`FTP_WRITE_CONFIRMED_MODELS`], like
+    /// Send an op that can change the camera to a model whose `ftp` is not confirmed in [`MODEL_CAPS`], like
     /// `force_unconfirmed_model` on the FTP writes.
     pub force_unconfirmed_model: bool,
     /// The destructive op the caller names as the one it means to send. Must equal the op sent;
@@ -3913,7 +3903,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// after the `0x90E8` setup that the profile ops need, and report the profile list before and after.
     /// EXPERIMENTAL: what these ops do is mostly unknown, so the list is read first and again afterwards
     /// and both are returned. Every refusal that needs no camera ([`check_ftp_probe_request`]) and the
-    /// model gate (any op but the control needs a model in [`FTP_WRITE_CONFIRMED_MODELS`] or
+    /// model gate (any op but the control needs a model [`ftp_write_confirmed`] holds for or
     /// `consent.force_unconfirmed_model`, the gate the FTP writes use) happen before any I/O.
     ///
     /// A reply that never came is not an `Err`: the list read before is worth having, so it is
@@ -5408,7 +5398,8 @@ mod tests {
         let (mut s, t) = session(vec![], "Z 5");
         assert!(matches!(s.write_iptc_slot(1, &[1], false).unwrap_err(), PtpUsbError::UnconfirmedModel(m) if m == "Z 5"));
         assert!(t.sent().is_empty(), "refused before any I/O");
-        assert_eq!(IPTC_WRITE_CONFIRMED_MODELS, ["Z 9", "Z6_3"], "the list is exactly what was confirmed");
+        let confirmed: Vec<&str> = MODEL_CAPS.iter().filter(|c| c.iptc == Support::Confirmed).map(|c| c.model).collect();
+        assert_eq!(confirmed, ["Z 9", "Z6_3"], "the table confirms exactly what was run");
     }
 
     #[test]
@@ -5619,7 +5610,7 @@ mod tests {
     #[test]
     fn the_byte_gate_helper_is_exact_at_the_maximum_for_each_property() {
         for &(code, name, max) in &BYTE_PROPS {
-            let model = BYTE_PROP_WRITE_MODELS.iter().find(|(c, _)| *c == code).unwrap().1[0];
+            let model = MODEL_CAPS.iter().find(|c| c.byte_writes.contains(&code)).unwrap().model;
             assert!(check_byte_property_write(model, code, max, false).is_ok(), "{name} at its maximum {max}");
             assert!(check_byte_property_write(model, code, 0, false).is_ok(), "{name} at 0");
             assert!(matches!(check_byte_property_write(model, code, max + 1, false), Err(PtpUsbError::PropValueBad { .. })), "{name} one above");
@@ -5703,51 +5694,21 @@ mod tests {
     }
 
     #[test]
-    fn every_model_list_of_a_camera_write_gate_is_inside_the_surveyed_registry() {
-        // Drift guard for the lists that decide what a camera may be sent: a name that is not a surveyed model (a typo,
-        // a spelling "Z6III" for "Z6_3") would silently gate nothing in or everything out.
-        let lists: Vec<(&str, Vec<&str>)> = vec![
-            ("FTP_WRITE_CONFIRMED_MODELS", FTP_WRITE_CONFIRMED_MODELS.to_vec()),
-            ("IPTC_WRITE_CONFIRMED_MODELS", IPTC_WRITE_CONFIRMED_MODELS.to_vec()),
-            ("STRING_PROP_WRITE_MODELS", STRING_PROP_WRITE_MODELS.to_vec()),
-            ("BYTE_PROP_WRITE_MODELS", BYTE_PROP_WRITE_MODELS.iter().flat_map(|(_, m)| m.iter().copied()).collect()),
-        ];
-        for (name, models) in lists {
-            assert!(!models.is_empty(), "{name}");
-            for m in models {
-                assert!(KNOWN_MODELS.contains(&m) && sdk_model_name(m).is_some(), "{name} lists {m:?}, which is not in KNOWN_MODELS");
+    fn every_camera_write_gate_reads_the_capability_table_not_a_list_of_its_own() {
+        // Drift guard (mutate a table cell and the matching gate must follow): for each row, each gate's verdict is exactly
+        // what the row says, through the SAME function the session and the restore planner call. A gate that kept its own
+        // copy of the model list would disagree with the table the moment either changed.
+        for c in &MODEL_CAPS {
+            assert!(KNOWN_MODELS.contains(&c.model) && sdk_model_name(c.model).is_some(), "{} is not in KNOWN_MODELS", c.model);
+            assert_eq!(ftp_write_confirmed(c.model), c.ftp == Support::Confirmed, "{}", c.model);
+            assert_eq!(iptc_write_confirmed(c.model), c.iptc == Support::Confirmed, "{}", c.model);
+            for &(code, _, max) in &BYTE_PROPS {
+                assert_eq!(check_byte_property_write(c.model, code, max, false).is_ok(), c.byte_writes.contains(&code), "{} {code:#x}", c.model);
+            }
+            for (code, _) in STRING_PROPS {
+                assert_eq!(check_string_property_write(c.model, code, "x", false).is_ok(), c.string_writes.contains(&code), "{} {code:#x}", c.model);
             }
         }
-        // One entry per byte property, and nothing for a code that is not one.
-        let codes: Vec<u16> = BYTE_PROPS.iter().map(|(c, ..)| *c).collect();
-        let gate_codes: Vec<u16> = BYTE_PROP_WRITE_MODELS.iter().map(|(c, _)| *c).collect();
-        assert_eq!(codes, gate_codes, "BYTE_PROPS and BYTE_PROP_WRITE_MODELS list the same properties in the same order");
-    }
-
-    // ── delete-all: an acknowledged delete whose follow-up read fails ────
-
-    #[test]
-    fn delete_all_acknowledged_but_the_list_cannot_be_read_afterwards_is_indeterminate_not_a_plain_failure() {
-        let blob = hex::decode_hex(reference_ftp_blob_hex());
-        let mut replies = list_state_replies(&blob, 0);
-        replies.push(resp(RESP_OK)); // 0x90EA answered OK: the list is probably gone
-        replies.push(Step::Err(rusb::Error::Timeout)); // and the read that would confirm it fails
-        let (mut s, t) = session(replies, "Z 9");
-        let err = s.delete_all_ftp_profiles().unwrap_err();
-        assert!(matches!(&err, PtpUsbError::FtpWriteIndeterminate { cause } if !matches!(**cause, PtpUsbError::OperationFailed { .. })), "{err:?}");
-        assert_eq!(crate::exit_status::write_kind_of_ptp_usb_error(&err), crate::exit_status::ExitKind::WriteIndeterminate);
-        assert_eq!(sent_op_codes(&t).iter().filter(|o| **o == 0x90EA).count(), 1, "the delete did go out, once");
-    }
-
-    #[test]
-    fn delete_all_the_camera_refuses_stays_a_plain_failure_even_when_the_list_read_after_fails_too() {
-        let blob = hex::decode_hex(reference_ftp_blob_hex());
-        let mut replies = list_state_replies(&blob, 0);
-        replies.push(resp(0x2005)); // OperationNotSupported: a definite refusal
-        replies.push(Step::Err(rusb::Error::Timeout));
-        let (mut s, _t) = session(replies, "Z 9");
-        let err = s.delete_all_ftp_profiles().unwrap_err();
-        assert!(matches!(err, PtpUsbError::OperationFailed { op: 0x90EA, code: PtpResponseCode(0x2005) }), "{err:?}");
     }
 
     // ── deviations of the unchecked IPTC replies are reported ────────────
@@ -5802,7 +5763,7 @@ mod tests {
         // or dropping one side makes this fail instead of silently diverging.
         for m in FTP_WRITE_CONFIRMED_MODELS {
             assert!(sdk_model_name(m).is_some(), "{m:?} is write-confirmed but not in KNOWN_MODELS");
-            assert!(KNOWN_MODELS.contains(m), "{m:?}");
+            assert!(KNOWN_MODELS.contains(&m), "{m:?}");
         }
     }
 
@@ -7336,7 +7297,7 @@ mod tests {
         // Each allowed code is accepted, and the write command carries exactly that code.
         for (code, _) in STRING_PROPS {
             let (mut s, t) = session(set_script_for(code, 1, "", RESP_OK, "x"), "Z 9");
-            let force = !STRING_PROP_WRITE_CONFIRMED_PROPS.contains(&code);
+            let force = model_caps::string_write_gate("Z 9", code).is_err();
             assert!(s.set_string_property(code, "x", force).unwrap().verified, "{code:#x}");
             assert_eq!(sent_ops(&t)[2], (CONTAINER_COMMAND, OP_SET_DEVICE_PROP_VALUE, le(u32::from(code))), "{code:#x}");
         }
@@ -7350,9 +7311,9 @@ mod tests {
         assert!(t.sent().is_empty());
         let (mut s, _t) = session(set_script(1, "a", RESP_OK, "b"), "Z 8");
         assert!(s.set_string_property(0xD090, "b", true).unwrap().verified);
-        for m in STRING_PROP_WRITE_MODELS {
-            let (mut s, _t) = session(set_script(1, "a", RESP_OK, "b"), m);
-            assert!(s.set_string_property(0xD090, "b", false).is_ok(), "{m}");
+        for c in MODEL_CAPS.iter().filter(|c| c.string_writes.contains(&0xD090)) {
+            let (mut s, _t) = session(set_script(1, "a", RESP_OK, "b"), c.model);
+            assert!(s.set_string_property(0xD090, "b", false).is_ok(), "{}", c.model);
         }
     }
 
@@ -8582,22 +8543,118 @@ mod tests {
         assert!(changes.contains(&FtpListChange::ProfileRemoved { index: 0 }), "{changes:?}");
     }
 
-    #[test]
-    fn delete_all_sends_0x90ea_once_and_returns_the_count_the_camera_reports_after() {
-        let blob = hex::decode_hex(reference_ftp_blob_hex());
-        let mut replies = list_state_replies(&blob, 0);
-        replies.push(resp(RESP_OK));
-        replies.extend(list_state_replies_of(0, &blob, 0xff, "Z_9_0000000"));
-        let (mut s, t) = session(replies, "Z 9");
-        assert_eq!(s.delete_all_ftp_profiles().unwrap(), 0);
-        assert_eq!(sent_op_codes(&t).iter().filter(|o| **o == 0x90EA).count(), 1);
+    // ── the single-profile delete (0x90EF): the product path's only FTP delete ───────────────
+
+    /// Replies for one `read_ftp_info_step`: the `0x90E8` setup, then `0x90EB` reporting `count` profiles.
+    fn info_step_replies(count: u32) -> Vec<Step> {
+        vec![resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(count, 0, "Z_9_0000000")), resp(RESP_OK)]
+    }
+
+    /// The whole script of `delete_ftp_profile` on a list of `count` that the camera deletes from and reports
+    /// `count_after` for: info step, the delete's OK, info step.
+    fn delete_script(count: u32, count_after: u32) -> Vec<Step> {
+        let mut v = info_step_replies(count);
+        v.push(resp(RESP_OK));
+        v.extend(info_step_replies(count_after));
+        v
+    }
+
+    /// The `0x90EF` commands sent, as their parameter lists.
+    fn delete_commands(t: &ScriptedTransport) -> Vec<Vec<u8>> {
+        t.sent().into_iter().filter(|(k, op, ..)| *k == CONTAINER_COMMAND && *op == OP_FTP_PROFILE_DELETE).map(|(.., payload)| payload).collect()
     }
 
     #[test]
-    fn delete_all_on_an_unconfirmed_model_sends_nothing() {
-        let (mut s, t) = session(vec![], "Z 5");
-        assert!(matches!(s.delete_all_ftp_profiles().unwrap_err(), PtpUsbError::UnconfirmedModel(_)));
-        assert!(t.sent().is_empty());
+    fn delete_ftp_profile_sends_0x90ef_with_the_index_once_and_returns_the_count_the_camera_reports_after() {
+        // The thresholds of the index: 0 (the first), count - 1 (the highest), and the camera's maximum list of 20.
+        for (count, index) in [(1u32, 0u32), (2, 0), (2, 1), (4, 3), (20, 0), (20, 19)] {
+            let (mut s, t) = session(delete_script(count, count - 1), "Z 9");
+            assert_eq!(s.delete_ftp_profile(index).unwrap(), count - 1, "{index} of {count}");
+            assert_eq!(delete_commands(&t), [le(index)], "{index} of {count}: one delete, carrying the index");
+            // The setup carries a data-out container, so each setup shows twice (command, data).
+            assert_eq!(
+                sent_op_codes(&t),
+                [OP_FTP_SETUP, OP_FTP_SETUP, OP_FTP_PROFILE_INFO, OP_FTP_PROFILE_DELETE, OP_FTP_SETUP, OP_FTP_SETUP, OP_FTP_PROFILE_INFO],
+                "{index} of {count}"
+            );
+            assert!(!sent_op_codes(&t).contains(&0x90EA), "the delete-all op is never sent by the product path");
+            assert_eq!(t.unread(), 0, "{index} of {count}: every scripted reply was consumed");
+        }
+    }
+
+    #[test]
+    fn delete_ftp_profile_refuses_an_index_at_or_past_the_count_before_sending_the_delete() {
+        // One past the last, the empty list, and the values that stalled or hung a camera as slot numbers.
+        for (count, index) in [(1u32, 1u32), (2, 2), (20, 20), (0, 0), (3, u32::MAX)] {
+            let (mut s, t) = session(info_step_replies(count), "Z 9");
+            let err = s.delete_ftp_profile(index).unwrap_err();
+            assert!(matches!(err, PtpUsbError::FtpSlotOutOfRange { slot, count: c } if slot == index && c == count), "{index} of {count}: {err:?}");
+            assert!(delete_commands(&t).is_empty(), "{index} of {count}: 0x90EF must not be sent");
+            assert_eq!(crate::exit_status::write_kind_of_ptp_usb_error(&err), crate::exit_status::ExitKind::Failure, "a refusal before the send changed nothing");
+        }
+    }
+
+    #[test]
+    fn delete_ftp_profile_is_gated_by_the_capability_table_and_refuses_before_any_io() {
+        // Parity over every row of the table and some strangers: the session sends something exactly when
+        // `ftp_delete_confirmed` (the table's `ftp_delete` column) says so. Mutating the column changes the verdict here.
+        let strangers = ["Z 8", "", "z 9", "Z6III", "Z 9 "];
+        let models = MODEL_CAPS.iter().map(|c| c.model).chain(strangers);
+        for model in models {
+            let (mut s, t) = session(delete_script(1, 0), model);
+            let got = s.delete_ftp_profile(0);
+            if ftp_delete_confirmed(model) {
+                assert_eq!(got.unwrap(), 0, "{model:?}");
+                assert_eq!(delete_commands(&t).len(), 1, "{model:?}");
+            } else {
+                assert!(matches!(got.unwrap_err(), PtpUsbError::UnconfirmedModel(m) if m == model), "{model:?}");
+                assert!(t.sent().is_empty(), "{model:?}: refused before anything was sent");
+            }
+        }
+        assert!(ftp_delete_confirmed("Z 9") && ftp_delete_confirmed("Z6_3") && !ftp_delete_confirmed("Z 5"));
+    }
+
+    #[test]
+    fn an_unconfirmed_model_refusal_says_whether_the_model_is_recognized() {
+        let unknown = PtpUsbError::UnconfirmedModel("Z 8".into()).to_string();
+        assert!(unknown.contains("not recognized") && unknown.contains("nothing was sent") && unknown.contains("\"Z 8\""), "{unknown}");
+        assert!(unknown.contains("Z6_3"), "names the models it does recognize: {unknown}");
+        let known = PtpUsbError::UnconfirmedModel("Z 5".into()).to_string();
+        assert!(!known.contains("not recognized") && known.contains("not been confirmed") && known.contains("nothing was sent"), "{known}");
+    }
+
+    #[test]
+    fn a_delete_the_camera_acknowledges_whose_follow_up_count_read_fails_is_indeterminate_not_a_plain_failure() {
+        let mut replies = info_step_replies(2);
+        replies.push(resp(RESP_OK)); // 0x90EF answered OK: the profile is probably gone
+        replies.push(Step::Err(rusb::Error::Timeout)); // and the read that would confirm it fails
+        let (mut s, t) = session(replies, "Z 9");
+        let err = s.delete_ftp_profile(1).unwrap_err();
+        assert!(matches!(&err, PtpUsbError::FtpWriteIndeterminate { cause } if !matches!(**cause, PtpUsbError::OperationFailed { .. })), "{err:?}");
+        assert_eq!(crate::exit_status::write_kind_of_ptp_usb_error(&err), crate::exit_status::ExitKind::WriteIndeterminate);
+        assert_eq!(delete_commands(&t).len(), 1, "the delete did go out, once");
+    }
+
+    #[test]
+    fn a_delete_whose_reply_never_came_is_indeterminate() {
+        let mut replies = info_step_replies(2);
+        replies.push(Step::Err(rusb::Error::Timeout)); // the command went out; no answer
+        let (mut s, t) = session(replies, "Z 9");
+        let err = s.delete_ftp_profile(0).unwrap_err();
+        assert!(matches!(&err, PtpUsbError::FtpWriteIndeterminate { cause } if matches!(**cause, PtpUsbError::Usb(rusb::Error::Timeout))), "{err:?}");
+        assert_eq!(delete_commands(&t).len(), 1);
+    }
+
+    #[test]
+    fn a_delete_the_camera_refuses_is_a_plain_failure_and_the_count_is_not_read_again() {
+        let mut replies = info_step_replies(2);
+        replies.push(resp(0x2005)); // OperationNotSupported: a definite refusal
+        replies.extend(info_step_replies(2)); // would be consumed only if the session read on after a refusal
+        let (mut s, t) = session(replies, "Z 9");
+        let err = s.delete_ftp_profile(1).unwrap_err();
+        assert!(matches!(err, PtpUsbError::OperationFailed { op: 0x90EF, code: PtpResponseCode(0x2005) }), "{err:?}");
+        assert_eq!(crate::exit_status::write_kind_of_ptp_usb_error(&err), crate::exit_status::ExitKind::Failure);
+        assert_eq!(t.unread(), 3, "nothing was read after the refusal");
     }
 
     #[test]
@@ -9401,59 +9458,25 @@ mod tests {
     // ── the string write gate (b7d3#76, #15) ─────────────────────────────
 
     #[test]
-    fn string_write_gate_lists_are_pinned_literally() {
-        // Dropping an entry, renaming "Z6_3" (the real Z6III string) or adding an unconfirmed body each
-        // changes what a camera is allowed to receive: the lists are contract, so they are spelled out.
-        assert_eq!(STRING_PROP_WRITE_MODELS, ["Z 9", "Z6_3", "Z 5"]);
-        assert_eq!(STRING_PROP_WRITE_CONFIRMED_PROPS, [0xD072, 0xD073, 0xD090]);
-    }
-
-    #[test]
-    fn string_write_gate_lists_stay_inside_the_registries_they_draw_on() {
-        for m in STRING_PROP_WRITE_MODELS {
-            assert!(sdk_model_name(m).is_some(), "{m:?} is write-confirmed but not in KNOWN_MODELS");
-            assert!(KNOWN_MODELS.contains(m), "{m:?}");
-        }
-        for c in STRING_PROP_WRITE_CONFIRMED_PROPS {
-            assert!(STRING_PROPS.iter().any(|(p, _)| p == c), "{c:#x} is write-confirmed but not a string property");
-        }
+    fn string_write_gate_confirmations_are_pinned_literally() {
+        // Dropping a cell, renaming "Z6_3" (the real Z6III string) or adding an unconfirmed body each changes what a
+        // camera is allowed to receive: the confirmations are contract, so they are spelled out.
+        let confirmed: Vec<(&str, Vec<u16>)> = MODEL_CAPS.iter().map(|c| (c.model, c.string_writes.to_vec())).collect();
+        let all = vec![0xD072u16, 0xD073, 0xD090];
+        assert_eq!(confirmed, [("Z 5", all.clone()), ("Z 9", all.clone()), ("Z6_3", all)]);
     }
 
     /// Artist and Copyright were run on the Z 9, Z6III and Z 5 (2026-11-06, limits 36 / 54, restored byte for
     /// byte), so every string property is written without the force flag on every confirmed model.
     #[test]
     fn every_string_property_is_written_without_force_on_every_confirmed_model() {
-        for model in STRING_PROP_WRITE_MODELS {
+        for model in MODEL_CAPS.iter().filter(|c| !c.string_writes.is_empty()).map(|c| c.model) {
             for (code, _) in STRING_PROPS {
                 let (mut s, t) = session(set_script_for(code, 1, "a", RESP_OK, "b"), model);
                 assert!(s.set_string_property(code, "b", false).unwrap().verified, "{model} {code:#x}");
                 assert_eq!(sent_ops(&t)[2], (CONTAINER_COMMAND, OP_SET_DEVICE_PROP_VALUE, le(u32::from(code))), "{model} {code:#x}");
             }
         }
-    }
-
-    /// The (property, model) mechanism, with lists that differ (nothing in the real lists is unconfirmed any
-    /// more): an unlisted property is `PropWriteUnconfirmed` on a listed model, an unlisted model is
-    /// `UnconfirmedModel` first, and a listed pair passes. Each side of each membership test is pinned.
-    #[test]
-    fn the_write_gate_checks_the_model_first_then_the_property() {
-        let models = ["Z 9", "Z 5"];
-        let confirmed = [0xD090u16];
-        assert!(check_string_write_gate("Z 9", 0xD090, &models, &confirmed).is_ok());
-        assert!(check_string_write_gate("Z 5", 0xD090, &models, &confirmed).is_ok());
-        for code in [0xD072u16, 0xD073] {
-            let err = check_string_write_gate("Z 9", code, &models, &confirmed).unwrap_err();
-            assert!(matches!(&err, PtpUsbError::PropWriteUnconfirmed { propcode, model } if *propcode == code && model == "Z 9"), "{err:?}");
-            let text = err.to_string();
-            assert!(text.contains("has not been confirmed") && text.contains("--force-unconfirmed-model"), "{text}");
-        }
-        // an unlisted model fails on the model even for an unconfirmed property
-        for code in [0xD090u16, 0xD072] {
-            assert!(matches!(check_string_write_gate("Z 8", code, &models, &confirmed), Err(PtpUsbError::UnconfirmedModel(m)) if m == "Z 8"));
-        }
-        // empty lists refuse everything
-        assert!(check_string_write_gate("Z 9", 0xD090, &[], &confirmed).is_err());
-        assert!(check_string_write_gate("Z 9", 0xD090, &models, &[]).is_err());
     }
 
     #[test]
@@ -10267,16 +10290,19 @@ mod tests {
     }
 
     #[test]
-    fn the_delete_adapter_passes_the_count_the_camera_reports_afterwards_through() {
+    fn the_delete_adapter_deletes_the_index_it_is_given_and_passes_the_count_the_camera_reports_afterwards_through() {
         use crate::extended::ExtendedSink;
-        let blob = hex::decode_hex(reference_ftp_blob_hex());
-        for left in [0u32, 1] {
-            let mut replies = list_state_replies(&blob, 0);
-            replies.push(resp(RESP_OK));
-            replies.extend(list_state_replies_of(left, &blob, if left == 0 { 0xff } else { 0 }, "Z_9_0000000"));
-            let (mut s, _t) = session(replies, "Z 9");
-            assert_eq!(ExtendedSink::delete_all_ftp(&mut s).unwrap(), left);
+        // The adapter is the session's single delete and nothing else: the index goes out as the 0x90EF parameter, the
+        // count the camera reports comes back untouched (even one that disagrees with what the caller expects: judging
+        // it is the rebuild's job, tested there), and an unconfirmed model sends nothing.
+        for (count, index, left) in [(2u32, 1u32, 1u32), (1, 0, 0), (3, 0, 5)] {
+            let (mut s, t) = session(delete_script(count, left), "Z 9");
+            assert_eq!(ExtendedSink::delete_ftp(&mut s, index).unwrap(), left);
+            assert_eq!(delete_commands(&t), [le(index)]);
         }
+        let (mut s, t) = session(vec![], "Z 5");
+        assert!(matches!(ExtendedSink::delete_ftp(&mut s, 0), Err(PtpUsbError::UnconfirmedModel(_))));
+        assert!(t.sent().is_empty());
     }
 
     // ── the restore planner and the session answer the same gates alike ────────
@@ -10372,8 +10398,8 @@ mod tests {
         let with = |model: &str, blob: &[u8]| Extended { read_from: ReadFrom { model: model.into(), usb_serial: "S".into() }, props: Default::default(), ftp: store(blob), iptc: IptcState::NotRead };
         for model in ["Z 9", "Z6_3", "Z 5", "Z 8", ""] {
             let plan_says_write = planner_writes(&with(model, &one), &with(model, &two), "ftp");
-            let (mut s, t) = session(vec![], model);
-            let _ = s.delete_all_ftp_profiles();
+            let (mut s, t) = session(delete_script(1, 0), model);
+            let _ = s.delete_ftp_profile(0);
             assert_eq!(plan_says_write, !t.sent().is_empty(), "{model:?}");
         }
     }

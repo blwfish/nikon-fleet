@@ -17,7 +17,7 @@
 //! | `strings` | Artist, Copyright, Image comment | `SetDevicePropValue`, read back (`set_string_property`) |
 //! | `switches` | EnableCopyright, IPTC preset | `SetDevicePropValue` of one byte, read back (`set_byte_property`) |
 //! | `iptc` | each preset slot | `0x9413`, the slot read again and compared byte for byte |
-//! | `ftp` | the whole list | `0x90EA` delete-all, then `0x90EE` adds in reverse order (an add lands at the FRONT), each read back |
+//! | `ftp` | the whole list | `0x90EF(n)` single deletes, highest index first (one at a time, the count checked after each), then `0x90EE` adds in reverse order (an add lands at the FRONT), each read back |
 //!
 //! Order of apply: strings, IPTC, switches, FTP. The IPTC preset switch comes after the presets because a Z 9
 //! refused to select a preset while all of them were empty. A run STOPS at the first item that failed or may have
@@ -59,7 +59,7 @@ use crate::ops::retention;
 use crate::ops::worker::{PHASE_PLAN_VERIFIED, PHASE_READ_BACK, PHASE_RESTORE_POINT_WRITTEN, PHASE_WRITING};
 use crate::ptp_usb::{
     BYTE_PROPS, PtpUsbError, STRING_PROPS, check_byte_property_write, check_string_property_write, decode_ftp_profile,
-    ftp_write_confirmed, iptc_write_confirmed,
+    ftp_delete_confirmed, ftp_write_confirmed, iptc_write_confirmed,
 };
 use crate::snapshot::{Camera, Snapshot, SnapshotError, Transport};
 
@@ -461,6 +461,20 @@ fn iptc_not_writable_words(snapshot: &Result<IptcRecord, String>, body: &Result<
     [side("snapshot", snapshot), side("body", body)].into_iter().flatten().collect::<Vec<_>>().join("; ")
 }
 
+/// Why a rebuild of the FTP list is not planned on `model`, from what the capability table confirms there (`write_ok` is
+/// [`ftp_write_confirmed`], `delete_ok` is [`ftp_delete_confirmed`]; parameters so the four combinations are testable):
+/// the adds need the write confirmed, and the rebuild deletes the stored profiles one at a time, so a body holding any
+/// (`stored > 0`) needs the delete confirmed too. `None` when the rebuild may be planned.
+fn ftp_rebuild_refusal(model: &str, stored: usize, write_ok: bool, delete_ok: bool) -> Option<String> {
+    if !write_ok {
+        return Some(format!("FTP profile writes are not confirmed on {model}"));
+    }
+    if stored > 0 && !delete_ok {
+        return Some(format!("deleting a stored FTP profile is not confirmed on {model}"));
+    }
+    None
+}
+
 fn plan_ftp(source: &Extended, live: &Extended, model: &str, only: Option<&BTreeSet<Category>>, out: &mut Vec<Planned>) {
     let one = |action: ItemAction, fingerprint: &str, work: Option<Work>| Planned { item: item("ftp", "FTP profiles", Category::Ftp, action, fingerprint), work };
     if !selected(only, Category::Ftp) {
@@ -526,8 +540,8 @@ fn plan_ftp(source: &Extended, live: &Extended, model: &str, only: Option<&BTree
         out.push(refuse(SkipKind::ListTooLong, "more profiles than the body holds"));
         return;
     }
-    if !ftp_write_confirmed(model) {
-        out.push(refuse(SkipKind::ModelNotConfirmed, &format!("FTP profile writes are not confirmed on {model}")));
+    if let Some(why) = ftp_rebuild_refusal(model, now.profiles.len(), ftp_write_confirmed(model), ftp_delete_confirmed(model)) {
+        out.push(refuse(SkipKind::ModelNotConfirmed, &why));
         return;
     }
     let names: Vec<String> = blobs
@@ -537,7 +551,7 @@ fn plan_ftp(source: &Extended, live: &Extended, model: &str, only: Option<&BTree
     let from = if now.profiles.is_empty() {
         "none stored".to_string()
     } else {
-        format!("{} stored, all deleted first", now.profiles.len())
+        format!("{} stored, deleted one at a time first", now.profiles.len())
     };
     let what = if blobs.is_empty() { "0 profiles (the list is emptied)".to_string() } else { format!("{} profile(s): {}", blobs.len(), names.join(", ")) };
     // No operation that selects the active profile was found, so a rebuild cannot restore which one it was. Said in the
@@ -770,8 +784,8 @@ pub enum ItemOutcome {
     /// The write was accepted. `verified`: its own read-back matched.
     Written { verified: bool },
     /// The camera refused, or the request failed before any data went out: nothing changed for this item. The one
-    /// exception is an FTP rebuild that failed AFTER its delete-all was acknowledged: the list was emptied (or is
-    /// partial), its message says how far it got, and its category is in the report's `undo_set`.
+    /// exception is an FTP rebuild that failed AFTER its first single-profile delete was acknowledged: the list was
+    /// emptied (or is partial), its message says how far it got, and its category is in the report's `undo_set`.
     Failed { message: String },
     /// The data may have gone out: the item may or may not have changed.
     Indeterminate { message: String },
@@ -941,24 +955,38 @@ fn execute<S: ExtendedSink + ?Sized>(sink: &mut S, plan: &[Planned], live_ftp_co
     results
 }
 
-/// Delete everything, then add the profiles last-first, because an add lands at the front of the list.
+/// Delete every stored profile ONE AT A TIME with the single-profile delete (`0x90EF(n)`), highest index first so the
+/// indexes of the profiles still to delete do not move, then add the snapshot's profiles last-first, because an add
+/// lands at the front of the list. There is no delete-all in this path.
+///
+/// Failure semantics (a camera-writing path, so conservative and typed). Each delete reports the count the camera holds
+/// afterwards, and deleting index `i` of a list of `i + 1` must leave `i`; the last delete (index 0) therefore proves the
+/// list is empty before anything is added.
+/// - the first delete is refused (a definite refusal, or the session's pre-send checks): `Failed`, nothing changed;
+/// - a refusal after earlier deletes succeeded: `Indeterminate` (the list is partly deleted; the message says how many
+///   remain), never a plain failure;
+/// - a delete whose reply was lost, or acknowledged with a follow-up read that failed: `Indeterminate`;
+/// - a delete acknowledged with a count other than the one expected: `Indeterminate`.
+/// Nothing is added after any of these.
 fn execute_ftp<S: ExtendedSink + ?Sized>(sink: &mut S, blobs: &[Vec<u8>], live_count: u32) -> ItemOutcome {
-    let mut emptied = false;
-    if live_count > 0 {
-        match sink.delete_all_ftp() {
-            Ok(0) => emptied = true,
-            // The camera acknowledged the delete and still reports profiles: the list was touched and its state is not
+    let emptied = live_count > 0;
+    for (done, index) in (0..live_count).rev().enumerate() {
+        let remaining = live_count - done as u32; // stored before this delete (the previous deletes were verified)
+        let stopped = |why: String| format!("{why}; {done} of {live_count} profile(s) were deleted, up to {remaining} remain, and nothing was added; the restore point holds the original list");
+        match sink.delete_ftp(index) {
+            Ok(after) if after == index => {}
+            // The camera acknowledged the delete and reports another count: the list was touched and its state is not
             // the one either side described. Not "nothing changed".
-            Ok(n) => {
+            Ok(after) => {
                 return ItemOutcome::Indeterminate {
-                    message: format!(
-                        "the camera acknowledged the delete but reports {n} profile(s) still stored; nothing was added, and the list may be partly deleted; the restore point holds the original list"
-                    ),
+                    message: stopped(format!("the camera acknowledged deleting the profile at index {index} but reports {after} stored where {index} were expected")),
                 };
             }
-            // Includes an acknowledged delete whose re-read failed (`FtpWriteIndeterminate`).
-            Err(e) if is_indeterminate(&e) => return ItemOutcome::Indeterminate { message: e.to_string() },
-            Err(e) => return ItemOutcome::Failed { message: e.to_string() },
+            // Includes an acknowledged delete whose follow-up read failed (`FtpWriteIndeterminate`).
+            Err(e) if is_indeterminate(&e) => return ItemOutcome::Indeterminate { message: stopped(e.to_string()) },
+            // A refusal before anything was deleted changed nothing; after a delete it left the list partly deleted.
+            Err(e) if done == 0 => return ItemOutcome::Failed { message: format!("{e}; nothing was deleted or added") },
+            Err(e) => return ItemOutcome::Indeterminate { message: stopped(e.to_string()) },
         }
     }
     let mut all_verified = true;
@@ -1163,14 +1191,15 @@ mod tests {
         /// Front of the list first, as the camera orders it.
         ftp: Vec<Vec<u8>>,
         limit: u32,
-        /// Writes to these ids fail (`string:0xd072`, `iptc:2`, `ftp_add:2`, `ftp_delete`).
+        /// Writes to these ids fail (`string:0xd072`, `iptc:2`, `ftp_add:2`, `ftp_delete:1`: the delete of the profile at index 1).
         fail: Vec<String>,
         /// A failure of this kind is reported as indeterminate.
         indeterminate: Vec<String>,
         log: Vec<String>,
         unreadable: bool,
-        /// `delete_all_ftp` reports this many profiles left after an acknowledged delete.
-        delete_leaves: u32,
+        /// `(index, count)`: when the profile at `index` is deleted, the body reports `count` stored afterwards instead of the
+        /// number it holds.
+        delete_reports: Option<(u32, u32)>,
         /// Writes to these ids are accepted but their own read-back did not match (`Ok(false)`).
         unverified: Vec<String>,
         /// After the first write, reading the IPTC slots / the FTP list fails.
@@ -1217,7 +1246,7 @@ mod tests {
             indeterminate: vec![],
             log: vec![],
             unreadable: false,
-            delete_leaves: 0,
+            delete_reports: None,
             unverified: vec![],
             iptc_unreadable_after_write: false,
             ftp_unreadable_after_write: false,
@@ -1305,11 +1334,12 @@ mod tests {
             self.iptc[slot as usize - 1] = data.to_vec();
             Ok(!self.unverified.contains(&format!("iptc:{slot}")))
         }
-        fn delete_all_ftp(&mut self) -> Result<u32, PtpUsbError> {
-            self.log.push("ftp_delete".into());
-            self.err("ftp_delete", 0x90EA)?;
-            self.ftp.clear();
-            Ok(self.delete_leaves)
+        fn delete_ftp(&mut self, index: u32) -> Result<u32, PtpUsbError> {
+            self.log.push(format!("ftp_delete:{index}"));
+            self.err(&format!("ftp_delete:{index}"), 0x90EF)?;
+            assert!((index as usize) < self.ftp.len(), "a delete is sent for a stored index only (the session refuses the rest): {index} of {}", self.ftp.len());
+            self.ftp.remove(index as usize);
+            Ok(self.delete_reports.filter(|(i, _)| *i == index).map_or(self.ftp.len() as u32, |(_, n)| n))
         }
         fn add_ftp(&mut self, blob: &[u8], count_before: u32) -> Result<bool, PtpUsbError> {
             self.log.push(format!("ftp_add:{count_before}"));
@@ -1408,7 +1438,7 @@ mod tests {
         assert!(matches!(action(&plan, "0xd072"), ItemAction::Write { from: Some(a), to } if a == "\"Someone else\"" && to == "\"Brian\""));
         assert!(matches!(action(&plan, "iptc:1"), ItemAction::Write { .. }));
         assert!(matches!(action(&plan, "iptc:2"), ItemAction::Unchanged));
-        assert!(matches!(action(&plan, "ftp"), ItemAction::Write { from: Some(a), to } if a == "1 stored, all deleted first" && to.contains("\"one\"") && to.contains("\"two\"")));
+        assert!(matches!(action(&plan, "ftp"), ItemAction::Write { from: Some(a), to } if a == "1 stored, deleted one at a time first" && to.contains("\"one\"") && to.contains("\"two\"")));
         assert_eq!(plan.would_change, 3);
         let report = apply(&mut b, &f, None).unwrap();
         assert_eq!(report.status, ApplyStatus::AppliedVerified, "{report:?}");
@@ -1423,7 +1453,7 @@ mod tests {
         let (mut b, f) = drifted_on("Z6_3");
         b.props.insert(0xD060, vec![3]); // a switch change too (confirmed on a Z6III), so all four categories show
         apply(&mut b, &f, None).unwrap();
-        assert_eq!(b.log, ["string:0xd072", "iptc:1", "byte:0xd060", "ftp_delete", "ftp_add:0", "ftp_add:1"].map(String::from));
+        assert_eq!(b.log, ["string:0xd072", "iptc:1", "byte:0xd060", "ftp_delete:0", "ftp_add:0", "ftp_add:1"].map(String::from));
         // The adds: "two" first (it ends second), then "one" (it ends at the front).
     }
 
@@ -1770,7 +1800,7 @@ mod tests {
         let report = apply(&mut b, &f, None).unwrap();
         assert_eq!(report.status, ApplyStatus::AppliedUnverified, "{report:?}");
         assert!(matches!(report.results[0].outcome, ItemOutcome::Written { verified: false }));
-        assert_eq!(b.log, ["string:0xd072", "iptc:1", "ftp_delete", "ftp_add:0", "ftp_add:1"], "the later items still ran");
+        assert_eq!(b.log, ["string:0xd072", "iptc:1", "ftp_delete:0", "ftp_add:0", "ftp_add:1"], "the later items still ran");
     }
 
     #[test]
@@ -1792,7 +1822,7 @@ mod tests {
         assert_eq!(b.ftp.len(), 1, "one profile was added before it stopped");
         // A failed delete adds nothing.
         let (mut b, f) = drifted();
-        b.fail.push("ftp_delete".into());
+        b.fail.push("ftp_delete:0".into());
         apply(&mut b, &f, None).unwrap();
         assert!(!b.log.iter().any(|l| l.starts_with("ftp_add")), "{:?}", b.log);
     }
@@ -1821,7 +1851,7 @@ mod tests {
             fn write_string(&mut self, _: u16, _: &str) -> Result<bool, PtpUsbError> { Ok(true) }
             fn write_byte(&mut self, c: u16, v: u8) -> Result<bool, PtpUsbError> { self.0.write_byte(c, v) }
             fn write_iptc(&mut self, s: u32, d: &[u8]) -> Result<bool, PtpUsbError> { self.0.write_iptc(s, d) }
-            fn delete_all_ftp(&mut self) -> Result<u32, PtpUsbError> { self.0.delete_all_ftp() }
+            fn delete_ftp(&mut self, i: u32) -> Result<u32, PtpUsbError> { self.0.delete_ftp(i) }
             fn add_ftp(&mut self, b: &[u8], c: u32) -> Result<bool, PtpUsbError> { self.0.add_ftp(b, c) }
         }
         let (b, f) = drifted();
@@ -2061,7 +2091,7 @@ mod tests {
     fn a_live_ftp_list_that_became_another_list_of_the_same_size_makes_the_plan_stale() {
         let (mut b, f) = drifted(); // the body holds one profile, "new"
         let plan = plan_of(&mut b, &f, None);
-        // Same count, same name, a different password: what the plan shows ("1 stored, all deleted first") is unchanged.
+        // Same count, same name, a different password: what the plan shows ("1 stored, deleted one at a time first") is unchanged.
         b.ftp = vec![profile("new", "password-8")];
         let again = plan_of(&mut b, &f, None);
         assert_eq!(action(&again, "ftp"), action(&plan, "ftp"), "the display cannot tell the two lists apart");
@@ -2157,29 +2187,140 @@ mod tests {
     #[test]
     fn a_delete_the_camera_acknowledged_but_that_left_profiles_is_indeterminate_not_nothing_changed() {
         let (mut b, f) = drifted();
-        b.delete_leaves = 2;
+        b.delete_reports = Some((0, 2)); // deleting the only profile (index 0) should leave 0
         let report = apply(&mut b, &f, None).unwrap();
         assert_eq!(report.status, ApplyStatus::Indeterminate);
         let ItemOutcome::Indeterminate { message } = &report.results.iter().find(|r| r.id == "ftp").unwrap().outcome else { panic!("{:?}", report.results) };
-        assert!(message.contains("2 profile(s) still stored") && message.contains("restore point"), "{message}");
+        assert!(message.contains("reports 2 stored where 0 were expected") && message.contains("restore point"), "{message}");
         assert!(!b.log.iter().any(|l| l.starts_with("ftp_add")), "nothing was added after it: {:?}", b.log);
         assert!(report.undo_set.contains(&"ftp".to_string()));
     }
 
     #[test]
     fn an_acknowledged_delete_whose_re_read_failed_is_indeterminate() {
-        // The library reports it as `FtpWriteIndeterminate` (ptp_usb::delete_all_ftp_profiles).
+        // The library reports it as `FtpWriteIndeterminate` (ptp_usb::PtpUsbSession::delete_ftp_profile).
         let (mut b, f) = drifted();
-        b.fail.push("ftp_delete".into());
-        b.indeterminate.push("ftp_delete".into());
+        b.fail.push("ftp_delete:0".into());
+        b.indeterminate.push("ftp_delete:0".into());
         let report = apply(&mut b, &f, None).unwrap();
         assert_eq!(report.status, ApplyStatus::Indeterminate);
         assert!(matches!(report.results.iter().find(|r| r.id == "ftp").unwrap().outcome, ItemOutcome::Indeterminate { .. }));
-        // A delete the camera refused stays a plain failure.
+        // A delete the camera refused before anything was deleted stays a plain failure that says nothing changed.
         let (mut b, f) = drifted();
-        b.fail.push("ftp_delete".into());
+        b.fail.push("ftp_delete:0".into());
         let report = apply(&mut b, &f, None).unwrap();
         assert_eq!(report.status, ApplyStatus::Failed);
+        let ItemOutcome::Failed { message } = &report.results.iter().find(|r| r.id == "ftp").unwrap().outcome else { panic!() };
+        assert!(message.contains("nothing was deleted or added"), "{message}");
+        assert_eq!(b.ftp.len(), 1, "the list is as it was");
+    }
+
+    /// A body holding `n` profiles named `p0..p{n-1}` (front first), and a fixture whose snapshot holds one profile.
+    fn body_with_n_profiles(n: usize) -> (Body, Fixture) {
+        let mut source = body("Z 9");
+        source.ftp = vec![profile("kept", "password-k")];
+        let f = fixture(&mut source);
+        let mut b = body("Z 9");
+        b.ftp = (0..n).map(|i| profile(&format!("p{i}"), "pw")).collect();
+        (b, f)
+    }
+
+    fn deletes(b: &Body) -> Vec<String> {
+        b.log.iter().filter(|l| l.starts_with("ftp_delete")).cloned().collect()
+    }
+
+    #[test]
+    fn the_rebuild_deletes_one_profile_at_a_time_highest_index_first_and_never_asks_for_a_delete_all() {
+        // The thresholds of the list: 1 (just index 0), 2, and the camera's maximum of 20 (indexes 19 down to 0).
+        for n in [1usize, 2, 3, 20] {
+            let (mut b, f) = body_with_n_profiles(n);
+            let report = apply(&mut b, &f, None).unwrap();
+            let want: Vec<String> = (0..n).rev().map(|i| format!("ftp_delete:{i}")).collect();
+            assert_eq!(deletes(&b), want, "{n} stored");
+            assert_eq!(b.ftp, [profile("kept", "password-k")], "{n} stored: the list is the snapshot's");
+            assert_eq!(b.log.last().map(String::as_str), Some("ftp_add:0"), "{n} stored: the single add comes after every delete");
+            assert_eq!(report.status, ApplyStatus::AppliedVerified, "{n} stored: {report:?}");
+        }
+    }
+
+    #[test]
+    fn a_delete_refused_before_anything_was_deleted_is_a_plain_failure_and_sends_no_more() {
+        // Three stored: the first delete is index 2, and it is refused.
+        let (mut b, f) = body_with_n_profiles(3);
+        b.fail.push("ftp_delete:2".into());
+        let report = apply(&mut b, &f, None).unwrap();
+        assert_eq!(report.status, ApplyStatus::Failed);
+        let ItemOutcome::Failed { message } = &report.results.iter().find(|r| r.id == "ftp").unwrap().outcome else { panic!("{:?}", report.results) };
+        assert!(message.contains("nothing was deleted or added"), "{message}");
+        assert_eq!(deletes(&b), ["ftp_delete:2"], "stopped at the first failure");
+        assert_eq!(b.ftp.len(), 3);
+        assert!(!b.log.iter().any(|l| l.starts_with("ftp_add")));
+    }
+
+    #[test]
+    fn a_delete_refused_after_some_deletes_is_indeterminate_and_says_how_many_remain() {
+        let (mut b, f) = body_with_n_profiles(3);
+        b.fail.push("ftp_delete:1".into()); // index 2 goes, then index 1 is refused
+        let report = apply(&mut b, &f, None).unwrap();
+        assert_eq!(report.status, ApplyStatus::Indeterminate, "a partly deleted list is never a plain failure: {report:?}");
+        let ItemOutcome::Indeterminate { message } = &report.results.iter().find(|r| r.id == "ftp").unwrap().outcome else { panic!("{:?}", report.results) };
+        assert!(message.contains("1 of 3 profile(s) were deleted") && message.contains("up to 2 remain") && message.contains("nothing was added"), "{message}");
+        assert_eq!(deletes(&b), ["ftp_delete:2", "ftp_delete:1"]);
+        assert_eq!(b.ftp.len(), 2, "the list is left partly deleted, which is why the status says so");
+        assert!(!b.log.iter().any(|l| l.starts_with("ftp_add")));
+        assert!(report.undo_set.contains(&"ftp".to_string()));
+    }
+
+    #[test]
+    fn a_delete_whose_reply_was_lost_is_indeterminate_even_for_the_first_delete() {
+        let (mut b, f) = body_with_n_profiles(2);
+        b.fail.push("ftp_delete:1".into());
+        b.indeterminate.push("ftp_delete:1".into());
+        let report = apply(&mut b, &f, None).unwrap();
+        assert_eq!(report.status, ApplyStatus::Indeterminate);
+        let ItemOutcome::Indeterminate { message } = &report.results.iter().find(|r| r.id == "ftp").unwrap().outcome else { panic!() };
+        assert!(message.contains("0 of 2 profile(s) were deleted") && message.contains("up to 2 remain"), "{message}");
+    }
+
+    #[test]
+    fn a_count_that_is_not_the_one_expected_after_a_middle_delete_stops_the_rebuild() {
+        // Index 2 of three goes and the camera reports 2 (right); index 1 goes and it reports 2 again (wrong, 1 expected).
+        let (mut b, f) = body_with_n_profiles(3);
+        b.delete_reports = Some((1, 2));
+        let report = apply(&mut b, &f, None).unwrap();
+        assert_eq!(report.status, ApplyStatus::Indeterminate);
+        let ItemOutcome::Indeterminate { message } = &report.results.iter().find(|r| r.id == "ftp").unwrap().outcome else { panic!() };
+        assert!(message.contains("reports 2 stored where 1 were expected") && message.contains("1 of 3 profile(s) were deleted"), "{message}");
+        assert_eq!(deletes(&b), ["ftp_delete:2", "ftp_delete:1"], "nothing was sent after the surprise");
+    }
+
+    #[test]
+    fn the_rebuild_gate_needs_the_write_confirmed_and_the_delete_confirmed_only_when_there_is_something_to_delete() {
+        // The pure gate over its four inputs (the real table never has a model with the write and not the delete).
+        assert_eq!(ftp_rebuild_refusal("M", 0, true, true), None);
+        assert_eq!(ftp_rebuild_refusal("M", 3, true, true), None);
+        assert!(ftp_rebuild_refusal("M", 0, false, true).unwrap().contains("writes are not confirmed on M"));
+        assert!(ftp_rebuild_refusal("M", 0, false, false).unwrap().contains("writes are not confirmed on M"), "the write is judged first");
+        assert_eq!(ftp_rebuild_refusal("M", 0, true, false), None, "an empty list needs no delete");
+        assert!(ftp_rebuild_refusal("M", 1, true, false).unwrap().contains("deleting a stored FTP profile is not confirmed on M"));
+        assert!(ftp_rebuild_refusal("M", 20, true, false).is_some());
+    }
+
+    #[test]
+    fn the_planner_applies_the_capability_tables_ftp_columns() {
+        // Over every row and some strangers, with a stored list and with an empty one: Write exactly when the table says.
+        for model in crate::ptp_usb::MODEL_CAPS.iter().map(|c| c.model).chain(["Z 8", "Z6III", "z 9"]) {
+            for stored in [0usize, 2] {
+                let mut source = body(model);
+                let f = fixture(&mut source);
+                let mut b = body(model);
+                b.ftp = (0..stored).map(|i| profile(&format!("q{i}"), "pw")).collect();
+                let written = matches!(action(&plan_of(&mut b, &f, None), "ftp"), ItemAction::Write { .. });
+                let want = ftp_rebuild_refusal(model, stored, ftp_write_confirmed(model), ftp_delete_confirmed(model)).is_none()
+                    && !crate::ptp_usb::ftp_absent(model);
+                assert_eq!(written, want, "{model:?} with {stored} stored");
+            }
+        }
     }
 
     #[test]
@@ -2200,10 +2341,10 @@ mod tests {
         let mut b = body("Z 9"); // two stored profiles
         let plan = plan_of(&mut b, &f, None);
         let ItemAction::Write { from, to } = action(&plan, "ftp") else { panic!("{:?}", action(&plan, "ftp")) };
-        assert_eq!(from.as_deref(), Some("2 stored, all deleted first"));
+        assert_eq!(from.as_deref(), Some("2 stored, deleted one at a time first"));
         assert!(to.starts_with("0 profiles (the list is emptied)"), "{to}");
         let report = apply(&mut b, &f, None).unwrap();
-        assert_eq!(b.log, ["ftp_delete"]);
+        assert_eq!(b.log, ["ftp_delete:1", "ftp_delete:0"], "highest index first");
         assert!(b.ftp.is_empty());
         assert_eq!(report.status, ApplyStatus::AppliedVerified, "{report:?}");
     }

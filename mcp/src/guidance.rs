@@ -202,7 +202,7 @@ pub fn notes() -> Vec<Note> {
             "A snapshot's `extended` section is restored by its own pair of tools, over raw USB, with the same plan, digest and summary rules as restore_plan / restore_apply. \
              The plan lists one item per string, IPTC preset, switch and FTP list: same, write (old -> new), skip (a typed reason: the snapshot has no value, the body lacks it, \
              a model the write is not confirmed on, ...) or not_selected. `only` names categories (strings, iptc, switches, ftp), not properties. \
-             Passwords are never in a plan or a result; a changed profile is reported as changed. The FTP list is rebuilt whole (delete everything, add the snapshot's profiles), \
+             Passwords are never in a plan or a result; a changed profile is reported as changed. The FTP list is rebuilt whole (delete every stored profile one at a time, highest index first, then add the snapshot's profiles), \
              so a failure part-way leaves it partial: the restore point (a snapshot labelled restore-ext) holds the original: plan and apply it with `only` = the result's `undo_set` (categories) to restore it. \
              A run stops at the first failed or indeterminate write: the remaining items are not_attempted and send nothing. A result with no_op true and status failed means nothing was written because every difference was skipped for a non-routine reason: the body does NOT match the snapshot. \
              A snapshot taken with --no-extended, or before the section existed, is refused as snapshot_has_no_extended.",

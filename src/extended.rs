@@ -7,7 +7,8 @@
 //! ones, and its operation list has none of `0x90E8..0x90EF`, yet it reads all five properties and
 //! serves FTP profiles (measured 2026-11-06). So the properties are decided by asking (a body that lacks
 //! one answers `DevicePropNotSupported`, recorded as [`PropState::NotSupported`]), and the FTP profiles
-//! by a table of models known not to have them ([`FTP_ABSENT_MODELS`]: asking a Z 5 costs a 5 s
+//! by the capability table's list of models known not to have them ([`crate::ptp_usb::MODEL_CAPS`], read through
+//! [`crate::ptp_usb::ftp_absent`]: asking a Z 5 costs a 5 s
 //! timeout and teaches nothing); every other model is asked, and a failure is recorded with its cause.
 //!
 //! ## What the source can produce, and what happens to each item
@@ -37,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::iptc::{IptcRecord, decode_iptc_slot};
 use crate::ptp_usb::{
     FtpListState, FtpWriteOutcome, IptcWriteOutcome, PtpResponseCode, PtpUsbError, PtpUsbSession, decode_ftp_profile,
-    decode_ptp_string_value,
+    decode_ptp_string_value, ftp_absent, iptc_absent,
 };
 
 /// PTP response `DevicePropNotSupported`: the one definition (the property sweep uses it too). A test checks it
@@ -63,14 +64,11 @@ pub const EXTENDED_PROPS: [(u16, &str, PropKind); 5] = [
     (0xD060, "IPTCPresetSelect", PropKind::Bytes),
 ];
 
-/// Models known to have no FTP-profile feature (owner, 2026-11-06: the Z 5 menu has none; its `vendor-read-ftp` times
-/// out on the `0x90E8` setup). Matched against the USB model name. The one place this is decided.
-pub const FTP_ABSENT_MODELS: &[&str] = &["Z 5"];
-
-/// Models known to have no IPTC presets (owner, 2026-11-06: the Z 5 menu has none; its DeviceInfo lists neither `0x9412`
-/// nor `0x9413`). Matched against the USB model name. Unlike the FTP table, DeviceInfo does list these operations on the
-/// bodies that have them (Z 9), so this is a skip for a known case, not the test.
-pub const IPTC_ABSENT_MODELS: &[&str] = &["Z 5"];
+// Which models are known to lack FTP profiles or IPTC presets (the Z 5: owner, 2026-11-06; its `vendor-read-ftp` times out on
+// the `0x90E8` setup, and its DeviceInfo lists neither `0x9412` nor `0x9413`) is the `ftp` / `iptc` column of the one
+// capability table, `ptp_usb::MODEL_CAPS`, read through `ptp_usb::ftp_absent` / `iptc_absent`. A model the table does not
+// know is NOT absent: it is asked, so an unrecognized body loses nothing. Unlike the FTP skip, DeviceInfo does list the
+// IPTC operations on the bodies that have them (Z 9), so the IPTC skip is for a known case, not the test.
 
 /// At most this many IPTC slots are read; the directory's count above it is not trusted ([`IptcStore::truncated`]).
 pub const IPTC_READ_MAX: u32 = 32;
@@ -138,7 +136,7 @@ pub struct FtpStore {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum FtpState {
-    /// The model is in [`FTP_ABSENT_MODELS`]: not asked.
+    /// The capability table says the model has no FTP profiles ([`crate::ptp_usb::ftp_absent`]): not asked.
     NotOnModel,
     ReadFailed { tag: String, detail: String },
     Read(FtpStore),
@@ -172,7 +170,7 @@ pub enum IptcState {
     /// The snapshot was taken before IPTC was captured: says nothing about the body.
     #[default]
     NotRead,
-    /// The model is in [`IPTC_ABSENT_MODELS`]: not asked.
+    /// The capability table says the model has no IPTC presets ([`crate::ptp_usb::iptc_absent`]): not asked.
     NotOnModel,
     ReadFailed { tag: String, detail: String },
     Read(IptcStore),
@@ -318,8 +316,9 @@ pub trait ExtendedSink: ExtendedSource {
     fn write_string(&mut self, code: u16, text: &str) -> Result<bool, PtpUsbError>;
     fn write_byte(&mut self, code: u16, value: u8) -> Result<bool, PtpUsbError>;
     fn write_iptc(&mut self, slot: u32, data: &[u8]) -> Result<bool, PtpUsbError>;
-    /// Delete every stored FTP profile; the count the camera reports afterwards.
-    fn delete_all_ftp(&mut self) -> Result<u32, PtpUsbError>;
+    /// Delete the stored FTP profile at `index` (`0x90EF(index)`); the count the camera reports afterwards. The rebuild
+    /// deletes one profile at a time, highest index first; there is no delete-all.
+    fn delete_ftp(&mut self, index: u32) -> Result<u32, PtpUsbError>;
     /// Add one profile (it lands at the front of the list); `count_before` is the stored count.
     fn add_ftp(&mut self, blob: &[u8], count_before: u32) -> Result<bool, PtpUsbError>;
 }
@@ -338,8 +337,8 @@ impl<T: crate::ptp_usb::BulkTransport> ExtendedSink for PtpUsbSession<T> {
         Ok(iptc_write_verified(&out, data))
     }
 
-    fn delete_all_ftp(&mut self) -> Result<u32, PtpUsbError> {
-        self.delete_all_ftp_profiles()
+    fn delete_ftp(&mut self, index: u32) -> Result<u32, PtpUsbError> {
+        self.delete_ftp_profile(index)
     }
 
     fn add_ftp(&mut self, blob: &[u8], count_before: u32) -> Result<bool, PtpUsbError> {
@@ -399,7 +398,7 @@ pub fn read_extended<S: ExtendedSource + ?Sized>(src: &mut S) -> Extended {
         };
         props.insert(prop_key(code), ExtendedProp { code: u32::from(code), name: name.to_string(), state });
     }
-    let ftp = if FTP_ABSENT_MODELS.contains(&read_from.model.as_str()) {
+    let ftp = if ftp_absent(&read_from.model) {
         FtpState::NotOnModel
     } else {
         match src.ftp_list() {
@@ -422,7 +421,7 @@ pub fn read_extended<S: ExtendedSource + ?Sized>(src: &mut S) -> Extended {
             }
         }
     };
-    let iptc = if IPTC_ABSENT_MODELS.contains(&read_from.model.as_str()) {
+    let iptc = if iptc_absent(&read_from.model) {
         IptcState::NotOnModel
     } else {
         match src.iptc_slots(IPTC_READ_MAX) {
@@ -659,14 +658,22 @@ mod tests {
 
     #[test]
     fn ftp_is_skipped_for_exactly_the_models_known_to_lack_it() {
-        for model in FTP_ABSENT_MODELS {
+        // Driven by the capability table itself: the capture skips exactly the rows marked `Absent`, and asks every other row.
+        let mut skipped = 0;
+        for row in &crate::ptp_usb::MODEL_CAPS {
             let mut f = z9();
-            f.info = Ok(ReadFrom { model: (*model).into(), usb_serial: "5".into() });
-            assert_eq!(read_extended(&mut f).ftp, FtpState::NotOnModel, "{model}");
-            assert!(!f.asked.iter().any(|a| a == "ftp"), "{model}: {:?}", f.asked);
+            f.info = Ok(ReadFrom { model: row.model.into(), usb_serial: "5".into() });
+            if row.ftp == crate::ptp_usb::Support::Absent {
+                skipped += 1;
+                assert_eq!(read_extended(&mut f).ftp, FtpState::NotOnModel, "{}", row.model);
+                assert!(!f.asked.iter().any(|a| a == "ftp"), "{}: {:?}", row.model, f.asked);
+            } else {
+                assert!(matches!(read_extended(&mut f).ftp, FtpState::Read(_)), "{}", row.model);
+            }
         }
-        // Anything else is asked: a model this table has never heard of, and near-misses of the absent name.
-        for model in ["Z 9", "Z6_3", "Z_NEW", "Z 5 ", "z 5", "Z 50", ""] {
+        assert!(skipped >= 1, "the table has a body without FTP profiles (the Z 5), so the skip is exercised");
+        // Anything else is asked: a model the table has never heard of, and near-misses of the absent name.
+        for model in ["Z_NEW", "Z 5 ", "z 5", "Z 50", ""] {
             let mut f = z9();
             f.info = Ok(ReadFrom { model: model.into(), usb_serial: "1".into() });
             assert!(matches!(read_extended(&mut f).ftp, FtpState::Read(_)), "{model:?}");
@@ -679,11 +686,23 @@ mod tests {
         let IptcState::Read(store) = &e.iptc else { panic!("{:?}", e.iptc) };
         assert_eq!((store.count, store.truncated), (2, false));
         assert_eq!(store.slots.iter().map(|s| (s.slot, s.hex.as_str())).collect::<Vec<_>>(), [(1, "0102"), (2, "03")]);
-        for model in IPTC_ABSENT_MODELS {
+        let mut skipped = 0;
+        for row in &crate::ptp_usb::MODEL_CAPS {
             let mut f = z9();
-            f.info = Ok(ReadFrom { model: (*model).into(), usb_serial: "5".into() });
-            assert_eq!(read_extended(&mut f).iptc, IptcState::NotOnModel, "{model}");
-            assert!(!f.asked.iter().any(|a| a == "iptc"));
+            f.info = Ok(ReadFrom { model: row.model.into(), usb_serial: "5".into() });
+            if row.iptc == crate::ptp_usb::Support::Absent {
+                skipped += 1;
+                assert_eq!(read_extended(&mut f).iptc, IptcState::NotOnModel, "{}", row.model);
+                assert!(!f.asked.iter().any(|a| a == "iptc"));
+            } else {
+                assert!(matches!(read_extended(&mut f).iptc, IptcState::Read(_)), "{}", row.model);
+            }
+        }
+        assert!(skipped >= 1);
+        for model in ["Z_NEW", "Z 5 ", "z 5", "", "Z 50"] {
+            let mut f = z9();
+            f.info = Ok(ReadFrom { model: model.into(), usb_serial: "1".into() });
+            assert!(matches!(read_extended(&mut f).iptc, IptcState::Read(_)), "an unrecognized model is asked: {model:?}");
         }
         let mut f = z9();
         f.iptc = Err(PtpUsbError::NoDataPhase { op: 0x9412 });

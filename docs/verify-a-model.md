@@ -187,8 +187,12 @@ works), or a `NeverCopy` record if it is state or a read-out and should never be
 this replaces any `RangeVerified` one.
 
 Making the MCP server capture the model is separate: add a row to `docs/firmware-archive-spec.md` §2 from
-the probe in step 1, then add the stripped USB product string to `KNOWN_MODELS` in `src/ops/cameras.rs`
-and update its pinned tests (`the_known_models_are_exactly_the_surveyed_spellings`, the schema-section
+the probe in step 1, then add a row for the stripped USB product string to `MODEL_CAPS` in
+`src/ptp_usb/model_caps.rs` (the one capability table; `KNOWN_MODELS` in `src/ops/cameras.rs` is built from it).
+A new row starts with `Support::Unconfirmed` for FTP and IPTC and empty `string_writes` / `byte_writes`, so every
+camera write is refused (with a message saying the model is unconfirmed) until a hardware run is recorded in the
+table; set `Support::Absent` only for a feature the owner has confirmed the body lacks. Then update the pinned
+tests (`the_table_is_pinned_cell_by_cell` in `model_caps.rs`, `the_known_models_are_exactly_the_surveyed_spellings`, the schema-section
 test, and the baseline test, which needs either a shipped baseline for the model or the model named as
 an exception). The schema's section names (`ZR`, `Z 8`, `Z 6_2`, `Z 30`) are candidates for the spelling,
 not evidence: the Z6III is `Z6_3` and the Z6II is `Z 6_2`, so the spelling must come from the probe. The

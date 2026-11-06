@@ -7527,7 +7527,7 @@ mod tests {
         assert!(TRANSPLANT_APPLY_TIMEOUT > TRANSPLANT_PLAN_TIMEOUT, "an apply does a plan's reads and then writes");
         assert!(
             restore_ext::EXT_RESTORE_APPLY_TIMEOUT > restore::RESTORE_APPLY_TIMEOUT,
-            "an FTP rebuild (delete all, up to 20 adds with read-backs) is more camera work than a plain apply; a kill part-way leaves the list emptied"
+            "an FTP rebuild (up to 20 single deletes, then up to 20 adds with read-backs) is more camera work than a plain apply; a kill part-way leaves the list emptied"
         );
     }
 
