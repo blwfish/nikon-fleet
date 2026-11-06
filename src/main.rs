@@ -5,10 +5,11 @@
 
 mod cli_report;
 use cli_report::not_written_error;
+// The input assembly `restore-extended` and its worker share (it touches no file descriptor, so it is not unix-only).
+mod extended_restore_input;
 // The MCP server's child process; it takes an inherited file descriptor, which Windows has no
 // equivalent of here (fleet-mcp is unix-only too).
 #[cfg(unix)]
-mod extended_restore_input;
 mod worker_cmd;
 
 use std::collections::HashMap;
