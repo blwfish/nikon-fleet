@@ -59,9 +59,11 @@ camera is unknown (a write whose data went out and whose reply never came; an ap
 | transplant, restore | `plan`, `apply`, `execute_writes` | `plan_digest` (hashed), `status`, `written`, `write_errors`, `no_op`, `steps`, `dry_run` |
 | firmware | `http_get`, `http_download`, `fetch`, `ingest` | `host`, `bytes`, `error_kind`, `model`, `version` |
 | diag / cli events | `start` (role, `ppid`, `request_id`), `phase` (worker progress), `exit`, `panic` (location and bounded message) | |
+| maid_sdk event | `teardown_watchdog` (`limit_ms`, `code`): a write command's camera session did not close within the limit after the result was written, and the process was ended with its decided status; the `disconnect_device` span it cut short is recorded `abandoned` | |
 
-A hang in the SDK's `DisconnectDevice` (the known ~7% hang) shows as an open `disconnect_device` span in a process that is
-still running. A worker the MCP server killed at its deadline shows as a `worker_call` that ended `timeout` with the
+A hang in the SDK's `DisconnectDevice` shows as an open `disconnect_device` span in a process that is still running. On a
+write command it is bounded: after the result is written the process is ended 10 s later if it has not exited (see F26 in
+`mcp-hardware-findings.md`), and the report then shows a `teardown_watchdog` event, an `abandoned` disconnect span and a clean exit. A worker the MCP server killed at its deadline shows as a `worker_call` that ended `timeout` with the
 `phase` it was stuck at, and a `kill_worker` span for the kill.
 
 ## Joining the sides of one request

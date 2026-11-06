@@ -583,3 +583,82 @@ fn a_refused_camera_lock_is_recorded_as_an_event_in_the_refused_process() {
     assert_eq!(field(refused, "reason"), Some(&Val::text("camera_busy")));
     assert!(t.entries.iter().all(|e| e.op != "camera_lock_held"), "it never held the lock");
 }
+
+// ── the teardown watchdog ────────────────────────────────────────────────
+
+/// Wait for the child to exit on its own, up to `within`; the time it took, and its status code.
+fn wait_for_exit(w: &mut Worker, within: Duration) -> (Duration, Option<i32>) {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = w.child.try_wait().unwrap() {
+            return (start.elapsed(), status.code());
+        }
+        if start.elapsed() > within {
+            w.child.kill().unwrap();
+            let _ = w.child.wait();
+            panic!("the worker did not exit by itself within {within:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn stderr_of(w: &mut Worker) -> String {
+    use std::io::Read as _;
+    let mut e = String::new();
+    w.child.stderr.take().unwrap().read_to_string(&mut e).unwrap();
+    e
+}
+
+#[test]
+fn a_worker_that_hangs_after_its_result_is_ended_by_the_watchdog_with_the_status_it_was_going_to_have() {
+    use nikon_fleet::diag::{Val, Verdict};
+    let dir = tempfile::tempdir().unwrap();
+    let diag = dir.path().join("diag");
+    let env = [("NIKON_FLEET_DIAG_DIR", diag.to_str().unwrap())];
+    // Result out, watchdog armed at 500 ms, then a hang that would otherwise last for ever.
+    let mut w = spawn(&[], &["selftest", "--hang-after-result", "--teardown-limit-ms", "500"], &env);
+    let r = w.read();
+    assert_eq!(r.end, ReadEnd::Result(Outcome::ok(json!({"selftest": true}))), "the result is intact and arrived first");
+    let pid = w.child.id();
+    let (took, code) = wait_for_exit(&mut w, Duration::from_secs(20));
+    assert_eq!(code, Some(0), "the status the result had: ok");
+    assert!(took >= Duration::from_millis(400), "it must not cut the teardown short before its limit: {took:?}");
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    let err = stderr_of(&mut w);
+    assert!(err.contains("did not close within") && err.contains("exit status 0"), "{err}");
+
+    let t = worker_trace(&diag, pid);
+    assert_eq!(t.verdict(), Verdict::ExitedCleanly { code: 0 }, "an ended hang is a planned exit in the record");
+    let fired = t.entries.iter().find(|e| e.op == "teardown_watchdog").expect("a teardown_watchdog event");
+    assert_eq!(field(fired, "limit_ms"), Some(&Val::U64(500)));
+    assert_eq!(field(fired, "code"), Some(&Val::I64(0)));
+}
+
+#[test]
+fn the_watchdog_keeps_a_failed_results_status_and_an_explicit_exit_code() {
+    // A failed result (status 1) stays 1; an explicit exit code wins over the result's, as for exit_now.
+    for (args, want) in [(vec!["selftest", "--fail", "--hang-after-result", "--teardown-limit-ms", "300"], 1), (vec!["selftest", "--exit-code", "7", "--hang-after-result", "--teardown-limit-ms", "300"], 7)] {
+        let mut w = spawn(&[], &args, &[]);
+        let _ = w.read();
+        let (_, code) = wait_for_exit(&mut w, Duration::from_secs(20));
+        assert_eq!(code, Some(want), "{args:?}");
+    }
+}
+
+#[test]
+fn an_armed_watchdog_does_not_delay_a_worker_that_exits_normally() {
+    use nikon_fleet::diag::Verdict;
+    let dir = tempfile::tempdir().unwrap();
+    let diag = dir.path().join("diag");
+    // A 60 s limit and a worker that simply finishes: it must be gone almost at once and record no watchdog.
+    let mut w = spawn(&[], &["selftest", "--teardown-limit-ms", "60000"], &[("NIKON_FLEET_DIAG_DIR", diag.to_str().unwrap())]);
+    let _ = w.read();
+    let pid = w.child.id();
+    let (took, code) = wait_for_exit(&mut w, Duration::from_secs(20));
+    assert_eq!(code, Some(0));
+    assert!(took < Duration::from_secs(10), "an armed watchdog must not hold a healthy process: {took:?}");
+    let t = worker_trace(&diag, pid);
+    assert_eq!(t.verdict(), Verdict::ExitedCleanly { code: 0 });
+    assert!(t.entries.iter().all(|e| e.op != "teardown_watchdog"), "nothing fired");
+}
+

@@ -45,6 +45,7 @@ finding led to a code change, the commit is named.
 | F17 | The `worker` subcommand live: result delivered before a teardown hang; one SIGSEGV after a result | verified (one body) |
 | F16 | Targeted undo (`restore --only`) on the Z 9: restores the named property, leaves a later change alone | verified (two enum properties) |
 | F14 | Spike B: worker-style spawn, fd cleanliness, SIGKILL of a capture child | verified (small samples) |
+| F26 | Write applies hung in `DisconnectDevice` 10 of 20 times on a Z 9 in one batch, 0 of 10 after a power cycle (plus a 4.7 s slow mode); always after a verified result; the CLI now bounds the teardown at 10 s | measured; watchdog shipped |
 
 ---
 
@@ -883,6 +884,46 @@ property only: `ISOAutoShutterTimeAutoValue` (33584), the same property as F23, 
   range copies, 2 of which would change (`ISOAutoShutterTimeAutoValue` and `MovieRecMicrophoneValue`, the two settings that
   genuinely differ between the bodies), and no `range_unverified` or `range_scale_differs`. Not exercised on hardware: any
   range write across models, and the models nobody has captured (ZR, Z8, Z6II, Z30).
+
+## F26. Write applies hang in `DisconnectDevice` half the time; the CLI bounds the teardown (2026-11-05, Z 9)
+
+First found by the diagnostics (docs/diagnostics.md): a `restore` apply ended `applied_verified`, then sat in `disconnect_device`
+for 279 s with the camera lock held (the report named the open span; the process burned 57 s of CPU, mostly system time, in the
+SDK's run loop). Then measured: 20 real `nikon-fleet restore <snapshot> --only MovieWBTuneSunny` applies on the Z 9 (a movie-only
+white-balance fine-tune, one step either side of its default), alternating the two values, each under `timeout 90`.
+
+| | n | `DisconnectDevice` | whole command |
+|---|---|---|---|
+| clean | 10 | 1.546 to 1.579 s (9 timed) | 19.0 to 19.3 s, median 19.1 s |
+| hung | 10 | still open at the 90 s kill | killed at 90.1 s (exit 124) |
+
+- **Every one of the 20 ended `applied_verified`** (written 1, no write errors, read-back verified), and a whole-body dry run
+  against the snapshot taken before the experiment planned 0 changes afterwards. The hang never cost a result.
+- **Hung and clean runs are indistinguishable in the record:** the idle gap before the disconnect was 302 to 306 ms in both (it is
+  the 300 ms `PRE_DISCONNECT_PUMP`), apply time 8.2 s in both, connect time 4.7 s in both, and whether a run hung did not depend
+  on whether the previous one had (about 57% after a hang, 56% after a clean run). So F24's idle-gap account does not separate them,
+  and the cause is **not established**. What a write run has that a read-only run does not is the write itself (and a second full
+  capture for the read-back); that is a candidate, untested.
+- **Rate:** 50% here, against about 7% for read-only snapshots with the same pump (F24). One body, one property, 20 runs.
+  The Z6III's write path is unmeasured.
+- **Why bounding it is safe:** the MCP supervisor already SIGKILLs a worker 3 s after its result, and every kill after a write
+  so far (F3, F25 and eleven in this experiment) left the camera healthy; the next run's USB reset and open worked each time.
+- **Second batch, after the camera was powered off and on (10 more applies, with the watchdog build, limit 5 s at the time):**
+  **0 hangs**, all ten `applied_verified`, exit 0. `DisconnectDevice` took 1.553 to 1.577 s in 8 runs and **4.703 and 4.704 s in
+  2**: a third mode, slow but finishing (about 3.15 s longer than healthy, tight enough to look like an internal SDK timeout; possibly
+  the hang's mechanism in a camera state where the wait ends). The 5 s limit fired at the moment those two finished (0.3 s pump
+  plus 4.7 s is 5.0 s), a false alarm that changed nothing but the warning, so the limit was raised to 10 s. Why the first batch hung
+  half the time and the second never did is **not established**; the camera had been powered for hours and run many sessions in the
+  first, and had just been power-cycled for the second. That is the obvious suspect and is untested.
+- **Shipped:** `process_exit::arm_teardown_watchdog(TEARDOWN_LIMIT = 10 s, status, ...)`, armed after a write command has printed its
+  result and decided its exit status: CLI `restore` and `transplant` applies, and the worker's `transplant-apply` and
+  `restore-apply`. If the process has not exited 10 s later (twice the slow-but-finishing case) it records a
+  `teardown_watchdog` event, prints a warning, and ends with the status it was already going to have. It does not affect a
+  process that exits normally. Verified on the Z 9 only for the mechanism: in the second batch it ended both slow runs at 5 s with the
+  right status and a complete result; a true hang under the final 10 s limit has not been seen since. Not covered: a failure between
+  connecting and the first write that leaves the session open (the old behaviour: it waits), and read-only commands, which still skip
+  the disconnect (F24).
+- **Not tried:** a longer or repeated pump after a write, to find the cause. The watchdog bounds the cost; it does not remove the hang.
 
 ## F13. Still unverified
 

@@ -70,6 +70,10 @@ pub enum WorkerOp {
         /// before any `--hang-after-result` takes effect.
         #[arg(long)]
         exit_now: bool,
+        /// After the result, arm the teardown watchdog with this limit (milliseconds), as a write op does
+        /// with `TEARDOWN_LIMIT`: a process that then hangs is ended by it with the status it was going to have.
+        #[arg(long, value_name = "MS")]
+        teardown_limit_ms: Option<u64>,
     },
     /// List the attached bodies from the USB descriptors. No SDK, no lock, no
     /// camera session: works with no SDK bundle installed.
@@ -147,7 +151,8 @@ pub enum WorkerOp {
 /// What the worker does with the camera session once the result is out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Teardown {
-    /// Drop the `Device` and `Sdk` as usual: `DisconnectDevice`, after the run-loop pump.
+    /// Drop the `Device` and `Sdk` as usual: `DisconnectDevice`, after the run-loop pump, bounded by the teardown
+    /// watchdog (`process_exit::TEARDOWN_LIMIT`) once the result is out.
     Disconnect,
     /// Leave the session open and end the process with `_exit` (F24): the SDK's disconnect hangs on
     /// both bodies, and an operation that wrote nothing has nothing to close cleanly.
@@ -183,8 +188,8 @@ pub fn run(data_dir: &Path, bundle: &Path, schema: &Path, args: &WorkerArgs) -> 
     let mut em = Emitter::new(file);
     let teardown = Teardown::for_op(&args.op);
     match &args.op {
-        WorkerOp::Selftest { fail, hang_after_result, exit_code, exit_now } => {
-            selftest(&mut em, *fail, *hang_after_result, *exit_code, *exit_now)
+        WorkerOp::Selftest { fail, hang_after_result, exit_code, exit_now, teardown_limit_ms } => {
+            selftest(&mut em, *fail, *hang_after_result, *exit_code, *exit_now, *teardown_limit_ms)
         }
         WorkerOp::ListCameras => {
             progress(&mut em, "starting");
@@ -275,7 +280,14 @@ fn apply_progress<'a>(em: &'a mut Emitter<File>) -> impl FnMut(&str) + 'a {
     }
 }
 
-fn selftest(em: &mut Emitter<File>, fail: bool, hang_after_result: bool, exit_code: i32, exit_now: bool) -> i32 {
+fn selftest(
+    em: &mut Emitter<File>,
+    fail: bool,
+    hang_after_result: bool,
+    exit_code: i32,
+    exit_now: bool,
+    teardown_limit_ms: Option<u64>,
+) -> i32 {
     progress(em, "starting");
     progress(em, "working");
     let outcome = if fail {
@@ -284,6 +296,14 @@ fn selftest(em: &mut Emitter<File>, fail: bool, hang_after_result: bool, exit_co
         Outcome::ok(json!({"selftest": true}))
     };
     let code = finish(em, outcome);
+    if let Some(ms) = teardown_limit_ms {
+        // What a write op does after its result: bound the teardown that follows.
+        nikon_fleet::process_exit::arm_teardown_watchdog(
+            std::time::Duration::from_millis(ms),
+            if exit_code != 0 { exit_code } else { code },
+            None,
+        );
+    }
     if exit_now {
         nikon_fleet::process_exit::exit_now(if exit_code != 0 { exit_code } else { code });
     }
@@ -375,8 +395,12 @@ fn with_body(
         // The result line is out and flushed; nothing was written to the camera.
         nikon_fleet::process_exit::exit_now(code);
     }
+    // Anything that can write keeps the ordinary disconnect, but bounded: the result is out and the status is
+    // decided, so if `DisconnectDevice` hangs (10 of 20 write applies on a Z 9 did, F26) the process ends here with
+    // that status instead of waiting for the supervisor's kill.
+    nikon_fleet::process_exit::arm_teardown_watchdog(nikon_fleet::process_exit::TEARDOWN_LIMIT, code, None);
     code
-    // Otherwise `device` and `sdk` drop here, after the result line was written and flushed.
+    // `device` and `sdk` drop here, after the result line was written and flushed.
 }
 
 fn now() -> Result<String, Outcome> {
@@ -703,7 +727,7 @@ mod tests {
             ),
             (WorkerOp::ListCameras, Teardown::Disconnect),
             (
-                WorkerOp::Selftest { fail: false, hang_after_result: false, exit_code: 0, exit_now: false },
+                WorkerOp::Selftest { fail: false, hang_after_result: false, exit_code: 0, exit_now: false, teardown_limit_ms: None },
                 Teardown::Disconnect,
             ),
         ];

@@ -3302,6 +3302,12 @@ fn restore_run(
             }
         }
     }
+    // A write ran and its result is printed: bound the disconnect that follows when `device` and `sdk` drop.
+    let (status, line) = match &result {
+        Ok(()) => (0, None),
+        Err(e) => (transplant_exit_status(e, false, !*report_in_hand), Some(format!("Error: {e:?}"))),
+    };
+    bound_apply_teardown(status, line);
     result
 }
 
@@ -3352,10 +3358,35 @@ fn after_apply<R>(result: Result<R, nikon_fleet::ops::apply::ApplyError>, json: 
 /// written"; a stale plan keeps its own status. A dry run and an apply that had written keep the
 /// plain failure, 1.
 fn transplant_exit(e: anyhow::Error, dry_run: bool, wrote_nothing: bool) -> anyhow::Error {
-    if dry_run || !wrote_nothing || e.downcast_ref::<ExitCodeError>().is_some() {
+    if keeps_its_own_status(&e, dry_run, wrote_nothing) {
         return e;
     }
     ExitCodeError { code: nikon_fleet::ops::apply::EXIT_REFUSED_BEFORE_WRITE, message: format!("{e:?}") }.into()
+}
+
+/// Whether [`transplant_exit`] leaves `e` as it is. The one place the rule lives, shared by the error mapping and
+/// [`transplant_exit_status`].
+fn keeps_its_own_status(e: &anyhow::Error, dry_run: bool, wrote_nothing: bool) -> bool {
+    dry_run || !wrote_nothing || e.downcast_ref::<ExitCodeError>().is_some()
+}
+
+/// The exit status a failed transplant or restore will end with, for a caller that has to know it before the error
+/// is returned (the teardown watchdog, which may have to end the process itself). Always equal to
+/// `exit_code_for(&transplant_exit(e, ..))`; a test pins that.
+fn transplant_exit_status(e: &anyhow::Error, dry_run: bool, wrote_nothing: bool) -> i32 {
+    if keeps_its_own_status(e, dry_run, wrote_nothing) {
+        exit_code_for(e)
+    } else {
+        nikon_fleet::ops::apply::EXIT_REFUSED_BEFORE_WRITE
+    }
+}
+
+/// After a write command (a restore or transplant apply) has printed its result: if the camera session does not
+/// close within `TEARDOWN_LIMIT`, end the process with `status`. `DisconnectDevice` hung in 10 of 20 write applies
+/// on a Z 9, every time after a verified result (docs/mcp-hardware-findings.md F26); without this the command waits
+/// for ever. `status` and `error_line` are what `main` would have used, worked out by the caller.
+fn bound_apply_teardown(status: i32, error_line: Option<String>) {
+    nikon_fleet::process_exit::arm_teardown_watchdog(nikon_fleet::process_exit::TEARDOWN_LIMIT, status, error_line);
 }
 
 /// Copy a snapshot's settings onto a live camera that may be a different
@@ -3490,6 +3521,13 @@ fn transplant_run(
     if json {
         json_out.emit(&serde_json::to_string_pretty(&report)?)?;
     }
+    // The result is printed and the status is decided (a failing report ends 1, as `bail!` below does):
+    // bound the disconnect that follows when `device` and `sdk` drop.
+    let (status, line) = match &closing.failing {
+        Some(msg) => (transplant_exit_status(&anyhow::anyhow!("{msg}"), false, false), Some(format!("Error: {msg}"))),
+        None => (0, None),
+    };
+    bound_apply_teardown(status, line);
     if let Some(msg) = closing.failing {
         bail!("{msg}");
     }
@@ -5052,6 +5090,37 @@ mod tests {
         r.read_back = Err("boom".into());
         let t = vendor_set_string_text(&r);
         assert!(t.contains("previous \"old\"") && t.ends_with("Not confirmed: boom."), "{t}");
+    }
+
+    #[test]
+    fn the_status_a_transplant_error_will_end_with_is_known_before_it_is_returned() {
+        // `transplant_exit_status` must equal what `main` derives from the mapped error, for every combination:
+        // a plain error, one that carries its own status, and every (dry run, wrote nothing) pair.
+        let fresh: Vec<Box<dyn Fn() -> anyhow::Error>> = vec![
+            Box::new(|| anyhow::anyhow!("plain")),
+            Box::new(|| ExitCodeError { code: 5, message: "stale".into() }.into()),
+            Box::new(|| {
+                anyhow::Error::new(nikon_fleet::ptp_usb::PtpUsbError::PropWriteIndeterminate {
+                    propcode: 0xD090,
+                    cause: Box::new(nikon_fleet::ptp_usb::PtpUsbError::SessionPoisoned { cause: "x".into() }),
+                })
+            }),
+        ];
+        for make in &fresh {
+            for dry_run in [false, true] {
+                for wrote_nothing in [false, true] {
+                    let want = exit_code_for(&transplant_exit(make(), dry_run, wrote_nothing));
+                    assert_eq!(transplant_exit_status(&make(), dry_run, wrote_nothing), want, "{:?} dry_run={dry_run} wrote_nothing={wrote_nothing}", make());
+                }
+            }
+        }
+        // Pinned values: a plain error before any write is "refused before write"; after a report it is the plain 1.
+        let plain = anyhow::anyhow!("plain");
+        assert_eq!(transplant_exit_status(&plain, false, true), nikon_fleet::ops::apply::EXIT_REFUSED_BEFORE_WRITE);
+        assert_eq!(transplant_exit_status(&plain, false, false), 1);
+        assert_eq!(transplant_exit_status(&plain, true, true), 1, "a dry run keeps the plain failure");
+        let stale: anyhow::Error = ExitCodeError { code: 5, message: "stale".into() }.into();
+        assert_eq!(transplant_exit_status(&stale, false, true), 5, "a stale plan keeps its own status");
     }
 
     #[test]
