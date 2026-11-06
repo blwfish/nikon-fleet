@@ -184,7 +184,7 @@ fn publish_new(dest: &Path, bytes: &[u8], write: StageWrite<'_>, publish: Publis
 /// on (macOS/Linux path separator; also treated as a separator by Rust's
 /// `Path` on Windows); `\` is included too since it's the Windows separator
 /// and this codebase ships a Windows SDK bundle path.
-fn sanitize_filename_component(s: &str) -> String {
+pub(crate) fn sanitize_filename_component(s: &str) -> String {
     s.replace(['/', '\\'], "_")
 }
 

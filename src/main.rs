@@ -233,6 +233,15 @@ enum Cmd {
     /// `vendor-read` (0x943B), which on a Z 9 answers DevicePropNotSupported for the artist and
     /// image-comment strings. Sends nothing else.
     VendorGetProp(VendorGetPropArgs),
+    /// EXPERIMENTAL, read-only. Ask the body for the descriptor (`GetDevicePropDesc`, 0x1014) of every property code in
+    /// one or more blocks and save what it says (type, get/set flag, default, current value, allowed values) as a
+    /// dump in `<data-dir>/sweeps/`. To find which property a camera menu setting is: sweep, change that one setting on
+    /// the camera, sweep again, and compare with `vendor-sweep-diff`. Sends nothing but `GetDevicePropDesc`.
+    VendorSweep(VendorSweepArgs),
+    /// Compare two `vendor-sweep` dumps: which properties appeared, vanished or changed (current value, allowed values,
+    /// access). With `--noise`, a third dump of the same body taken with nothing changed, the properties that move on their
+    /// own (a clock, a counter) are set aside. Reads files only; no camera.
+    VendorSweepDiff(VendorSweepDiffArgs),
     /// EXPERIMENTAL, read-only. Send `0x9412(<slot>)` (the IPTC profile read, the pair of the write `0x9413`) and print the
     /// bytes it returns as hex, plus a best-effort split into `[u32 length][UTF-8]` entries. Never sent over USB before
     /// 2026-11-06. Changes nothing on the camera.
@@ -772,6 +781,39 @@ struct VendorGetPropArgs {
 }
 
 #[derive(Args, Debug)]
+struct VendorSweepArgs {
+    /// A block of property codes, `LO-HI` inclusive or one code, each in the usual format (`0x` hex, else decimal).
+    /// Repeat for several; overlapping or touching blocks are merged. Default: 0x5000-0x50FF and 0xD000-0xD4FF.
+    #[arg(long = "range", value_name = "LO-HI", value_parser = nikon_fleet::prop_sweep::CodeRange::parse)]
+    ranges: Vec<nikon_fleet::prop_sweep::CodeRange>,
+    /// What state the body is in for this sweep ("af-on-only"); it becomes part of the file name and is shown by the diff.
+    #[arg(long)]
+    label: Option<String>,
+    /// Camera serial to target; same rules as vendor-read's --serial.
+    #[arg(long)]
+    serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct VendorSweepDiffArgs {
+    /// The sweep before the change: a path, or a file name in `<data-dir>/sweeps/`.
+    a: PathBuf,
+    /// The sweep after it.
+    b: PathBuf,
+    /// A sweep of the same body in the same state as A (nothing changed between them). What differs between A and
+    /// this is noise: it is set aside from the differences between A and B.
+    #[arg(long, value_name = "SWEEP")]
+    noise: Option<PathBuf>,
+    /// Keep the noise in the differences instead of setting it aside (the count of what moved is still shown by
+    /// listing it).
+    #[arg(long, requires = "noise")]
+    keep_noise: bool,
+    /// Print the comparison as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
 struct VendorReadIptcArgs {
     /// The IPTC slot (NX Field read slot 1; it also sent 0 when its IPTC screen opened).
     #[arg(long, default_value_t = 1, value_parser = nikon_fleet::ptp_usb::parse_u32_number)]
@@ -1099,6 +1141,11 @@ fn snapshots_dir(data_dir: &Path) -> PathBuf {
 
 fn references_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("references")
+}
+
+/// Where `vendor-sweep` keeps its dumps. Not `snapshots/`: a listing of snapshots must not meet a file that is not one.
+fn sweeps_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("sweeps")
 }
 
 fn ensure_dir(p: &Path) -> Result<()> {
@@ -2285,6 +2332,72 @@ fn cmd_vendor_get_prop(args: &VendorGetPropArgs) -> Result<()> {
         eprintln!("warning: {w}");
     }
     println!("{}", vendor_get_prop_text(args.prop, args.desc, &read.data));
+    Ok(())
+}
+
+/// `vendor-sweep`: read every descriptor in the blocks and keep the dump. A sweep that had to stop early is still
+/// saved (what it found is real) and the command then fails, so a script does not take it for a whole one.
+fn cmd_vendor_sweep(data_dir: &Path, args: &VendorSweepArgs) -> Result<()> {
+    use nikon_fleet::prop_sweep::{SweepOptions, default_ranges, normalize, sweep};
+    let ranges = if args.ranges.is_empty() { default_ranges() } else { args.ranges.clone() };
+    let total: u32 = normalize(&ranges).iter().map(|r| r.count()).sum();
+    let opts = SweepOptions {
+        ranges,
+        label: args.label.clone(),
+        captured_at: OffsetDateTime::now_utc().format(&Rfc3339).context("formatting the time")?,
+    };
+    eprintln!("sweeping {total} property code(s); read-only");
+    let dump = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        let mut session = nikon_fleet::ptp_usb::PtpUsbSession::open_locked(lock, serial)?;
+        sweep(&mut session, &opts, &mut |p| {
+            if p.done > 0 && p.done % 256 == 0 {
+                eprintln!("  {} / {total} (at 0x{:04x})", p.done, p.code);
+            }
+        })
+    })
+    .context("sweeping property descriptors over USB PTP")?;
+    let path = dump.save_new(&sweeps_dir(data_dir)).context("saving the sweep")?;
+    let c = dump.counts;
+    println!(
+        "{}: asked {}, present {}, not supported {}, refused {}, no usable answer {}
+saved {}",
+        dump.body.model,
+        c.asked,
+        c.present,
+        c.not_supported,
+        c.refused,
+        c.failed,
+        path.display()
+    );
+    if let Some(ab) = &dump.aborted {
+        bail!("the sweep stopped at {}: {}. What it found before that is saved; it is not a whole sweep", ab.at, ab.reason);
+    }
+    Ok(())
+}
+
+/// A sweep named on the command line: the path as given, or else a file name in `<data-dir>/sweeps/`.
+fn resolve_sweep_path(data_dir: &Path, given: &Path) -> PathBuf {
+    if given.exists() || given.components().count() > 1 {
+        given.to_path_buf()
+    } else {
+        sweeps_dir(data_dir).join(given)
+    }
+}
+
+fn cmd_vendor_sweep_diff(data_dir: &Path, args: &VendorSweepDiffArgs) -> Result<()> {
+    use nikon_fleet::prop_sweep::{SweepDump, diff_sweeps};
+    let load = |p: &Path| -> Result<SweepDump> {
+        let path = resolve_sweep_path(data_dir, p);
+        SweepDump::load(&path).with_context(|| format!("reading {}", path.display()))
+    };
+    let (a, b) = (load(&args.a)?, load(&args.b)?);
+    let noise = args.noise.as_deref().map(load).transpose()?;
+    let d = diff_sweeps(&a, &b, noise.as_ref(), args.keep_noise);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&d)?);
+    } else {
+        print!("{}", d.to_text(&a, &b));
+    }
     Ok(())
 }
 
@@ -4307,6 +4420,8 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::VendorOpSupport(args) => cmd_vendor_op_support(args),
         Cmd::RestoreExtended(args) => cmd_restore_extended(&cli.data_dir, args),
         Cmd::VendorGetProp(args) => cmd_vendor_get_prop(args),
+        Cmd::VendorSweep(args) => cmd_vendor_sweep(&cli.data_dir, args),
+        Cmd::VendorSweepDiff(args) => cmd_vendor_sweep_diff(&cli.data_dir, args),
         Cmd::VendorReadIptc(args) => cmd_vendor_read_iptc(args),
         Cmd::VendorWriteIptc(args) => cmd_vendor_write_iptc(args),
         Cmd::VendorSetByteProp(args) => cmd_vendor_set_byte_prop(args),
