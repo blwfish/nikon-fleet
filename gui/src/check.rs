@@ -919,6 +919,7 @@ mod tests {
             label: Some("studio".into()),
             captured_at: "2026-10-27T10:00:00Z".into(),
             is_reference,
+            edited: false,
             name_lossy: false,
         };
         assert_eq!(reference_note(None, &target()), None, "no listing, nothing to say");

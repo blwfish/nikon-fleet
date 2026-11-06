@@ -576,6 +576,166 @@ pub fn ftp_move(snap: &mut Snapshot, from: usize, to: usize, now: &str) -> Resul
     Ok(finish(snap, now, Applied { changed: true, item: "ftp:move".to_string(), change }))
 }
 
+// ── what a front end may offer ───────────────────────────────────────────
+
+/// How one property can be edited, decided from the snapshot alone and by the same rules the setters apply, so a
+/// control offered for it is one its setter accepts (pinned by a test that tries every property of a snapshot).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Control {
+    /// One of these values (by value, not position).
+    Choice { values: Vec<i64>, current: Option<i64> },
+    /// A stepped range: positions `0..steps`, `index` the current one. A position's number is `lower + index * step`.
+    Scale { lower: f64, upper: f64, steps: u64, index: Option<u64> },
+    /// A range with no steps: any number between the ends.
+    Continuous { lower: f64, upper: f64, current: Option<f64> },
+    /// A whole number (no list of allowed values is stored for it).
+    Whole { current: i64 },
+    /// A number with a fraction.
+    Real { current: f64 },
+    Switch { current: bool },
+    /// Cannot be edited, and why.
+    Locked { reason: String },
+}
+
+/// The control for the property `name` of `snap`. The property must exist; an unknown name is `Locked`.
+pub fn property_control(snap: &Snapshot, name: &str) -> Control {
+    let locked = |reason: String| Control::Locked { reason };
+    let e = match entry(snap, name) {
+        Ok(e) => e,
+        Err(r) => return locked(r.to_string()),
+    };
+    match value_kind(&e.value) {
+        ValueKind::Enum => {
+            let values: Vec<i64> = e.value.get("values").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
+            let listed = e.value.get("values").and_then(Value::as_array).map_or(0, Vec::len);
+            if values.len() != listed {
+                return locked("some of the values it offers are not whole numbers".to_string());
+            }
+            let current = e.value.get("value_index").and_then(Value::as_u64).and_then(|i| values.get(i as usize).copied());
+            Control::Choice { values, current }
+        }
+        ValueKind::Range => match range_scale(&e.value) {
+            None => locked("the range has no usable lower, upper and steps".to_string()),
+            Some(_) if has_no_span(&e.value) => locked("the range holds a single number at both ends; there is no choice to make".to_string()),
+            Some((lower, upper, steps)) if is_stepped_range(&e.value) => {
+                let index = e.value.get("value_index").and_then(Value::as_u64).filter(|i| *i < steps);
+                Control::Scale { lower, upper, steps, index }
+            }
+            Some((lower, upper, _)) => Control::Continuous { lower: lower.min(upper), upper: lower.max(upper), current: e.value.get("value").and_then(Value::as_f64) },
+        },
+        ValueKind::Number => match &e.value {
+            Value::Number(n) if n.is_i64() => Control::Whole { current: n.as_i64().unwrap_or(0) },
+            Value::Number(n) if n.is_u64() => locked("a whole number too large to edit here".to_string()),
+            Value::Number(n) => Control::Real { current: n.as_f64().unwrap_or(0.0) },
+            _ => locked("not a number".to_string()),
+        },
+        ValueKind::Bool => Control::Switch { current: e.value.as_bool().unwrap_or(false) },
+        other => locked(format!("a value of kind {other}")),
+    }
+}
+
+/// The number a stepped range holds at position `index`.
+pub fn scale_value(lower: f64, upper: f64, steps: u64, index: u64) -> f64 {
+    value_at(lower, upper, steps, index)
+}
+
+/// One owner string as the editor shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerString {
+    pub code: u16,
+    pub name: &'static str,
+    /// `None`: not editable, and `note` says why (the body does not have it, or it was not read).
+    pub text: Option<String>,
+    pub max_chars: usize,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerSwitch {
+    pub code: u16,
+    pub name: &'static str,
+    pub value: Option<u8>,
+    pub max: u8,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IptcPresetView {
+    pub slot: u32,
+    pub name: String,
+    /// One per [`IPTC_FIELDS`] entry.
+    pub fields: Vec<String>,
+}
+
+/// The owner data of a snapshot as the editor shows it. Profiles are named, never read out: no password or key is here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerView {
+    pub strings: Vec<OwnerString>,
+    pub switches: Vec<OwnerSwitch>,
+    /// The presets that can be edited (other record kinds are left out); `Err` says why there are none to offer.
+    pub iptc: Result<Vec<IptcPresetView>, String>,
+    /// The FTP profile names in list order; `Err` says why the list cannot be rearranged.
+    pub ftp: Result<Vec<String>, String>,
+}
+
+/// `None` when the snapshot has no extended section.
+pub fn owner_view(snap: &Snapshot) -> Option<OwnerView> {
+    let ext = snap.extended.as_ref()?;
+    let state_note = |s: &PropState| match s {
+        PropState::NotSupported => Some("the body this was read from does not have it".to_string()),
+        PropState::Undecodable { why, .. } => Some(format!("could not be decoded ({why}); setting it replaces the stored bytes")),
+        PropState::ReadFailed { tag, .. } => Some(format!("was not read ({tag}); setting it adds a value")),
+        PropState::Text { .. } | PropState::Bytes { .. } => None,
+    };
+    let strings = OWNER_STRING_MAX_CHARS
+        .iter()
+        .map(|&(code, max_chars)| {
+            let prop = ext.props.get(&prop_key(code));
+            let (text, note) = match prop.map(|p| &p.state) {
+                Some(PropState::Text { text }) => (Some(text.clone()), None),
+                Some(s @ (PropState::Undecodable { .. } | PropState::ReadFailed { .. })) => (Some(String::new()), state_note(s)),
+                Some(s) => (None, state_note(s).or_else(|| Some("recorded as bytes, not text".to_string()))),
+                None => (None, Some("not recorded".to_string())),
+            };
+            OwnerString { code, name: ext_name(code), text, max_chars, note }
+        })
+        .collect();
+    let switches = BYTE_PROPS
+        .iter()
+        .map(|&(code, _, max)| {
+            let prop = ext.props.get(&prop_key(code));
+            let (value, note) = match prop.map(|p| &p.state) {
+                Some(PropState::Bytes { hex }) if hex.len() == 2 => (u8::from_str_radix(hex, 16).ok(), None),
+                Some(PropState::Bytes { hex }) => (None, Some(format!("holds {hex:?}, not one byte"))),
+                Some(s @ (PropState::ReadFailed { .. } | PropState::Undecodable { .. })) => (Some(0), state_note(s)),
+                Some(s) => (None, state_note(s).or_else(|| Some("recorded as text, not a byte".to_string()))),
+                None => (None, Some("not recorded".to_string())),
+            };
+            OwnerSwitch { code, name: ext_name(code), value, max, note }
+        })
+        .collect();
+    let iptc = match &ext.iptc {
+        IptcState::Read(store) => Ok(store
+            .slots
+            .iter()
+            .filter_map(|s| match s.decode() {
+                Ok(IptcRecord::Preset(p)) => Some(IptcPresetView { slot: s.slot, name: p.name, fields: p.fields }),
+                _ => None,
+            })
+            .collect()),
+        IptcState::NotRead => Err("the snapshot was taken before IPTC presets were captured".to_string()),
+        IptcState::NotOnModel => Err("this model has no IPTC presets".to_string()),
+        IptcState::ReadFailed { tag, .. } => Err(format!("reading them failed ({tag})")),
+    };
+    let ftp = match &ext.ftp {
+        FtpState::Read(store) if store.truncated => Err("the snapshot read only part of the list, so the rest cannot be rearranged".to_string()),
+        FtpState::Read(store) => Ok(store.profiles.iter().enumerate().map(|(i, p)| profile_label(&p.hex, i)).collect()),
+        FtpState::NotOnModel => Err("this model has no FTP profiles".to_string()),
+        FtpState::ReadFailed { tag, .. } => Err(format!("reading them failed ({tag})")),
+    };
+    Some(OwnerView { strings, switches, iptc, ftp })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,6 +1300,112 @@ mod tests {
         let step = p.steps.iter().find(|s| s.name == VR).expect("the edited property has a step");
         assert_eq!((step.outcome == crate::ops::restore::StepOutcome::WouldWrite, step.changes), (true, Some(true)), "it is the step that would be written, and it changes the body");
         assert_ne!(plan_of(&copy).digest, plan_of(&capture).digest, "so a plan made for one cannot be applied as the other");
+    }
+
+    // ── what a front end may offer ──
+
+    #[test]
+    fn each_shape_gets_the_control_that_fits_it_and_the_rest_are_locked_with_a_reason() {
+        let s = edited();
+        assert_eq!(property_control(&s, VR), Control::Choice { values: vec![0, 1, 2], current: Some(2) });
+        assert_eq!(property_control(&s, EC), Control::Scale { lower: -5.0, upper: 5.0, steps: 31, index: Some(15) });
+        assert_eq!(property_control(&s, "kNkMAIDCapability_Continuous"), Control::Continuous { lower: 0.0, upper: 10.0, current: Some(2.5) });
+        assert_eq!(property_control(&s, "kNkMAIDCapability_ElectronicVR"), Control::Whole { current: 1 });
+        assert_eq!(property_control(&s, "kNkMAIDCapability_Flag"), Control::Switch { current: true });
+        for (name, word) in [("kNkMAIDCapability_ModelName", "string"), ("kNkMAIDCapability_ClockDateTime", "datetime"), ("kNkMAIDCapability_NoSuch", "no property")] {
+            let Control::Locked { reason } = property_control(&s, name) else { panic!("{name} must be locked") };
+            assert!(reason.contains(word), "{name}: {reason}");
+        }
+        let mut t = edited();
+        t.insert("kNkMAIDCapability_Level", 33005, json!(0.25));
+        t.insert("kNkMAIDCapability_Readout", 33004, json!({"lower": 0.0, "upper": 0.0, "steps": 0, "value": 0.0, "value_index": 0}));
+        t.insert("kNkMAIDCapability_OddChoice", 33006, json!({"default_index": 0, "elem_bytes": 4, "elem_count": 2, "elem_type": 2, "value_index": 0, "values": [1, "x"]}));
+        assert_eq!(property_control(&t, "kNkMAIDCapability_Level"), Control::Real { current: 0.25 });
+        for name in ["kNkMAIDCapability_Readout", "kNkMAIDCapability_OddChoice"] {
+            assert!(matches!(property_control(&t, name), Control::Locked { .. }), "{name}");
+        }
+        let (code, name, _) = never_copy_table().into_iter().next().unwrap();
+        t.insert(format!("kNkMAIDCapability_{name}"), code, json!(1));
+        assert!(matches!(property_control(&t, &format!("kNkMAIDCapability_{name}")), Control::Locked { reason } if reason.contains("never copied")));
+        // a stepped range whose position is unusable has a scale but no current position
+        t.insert("kNkMAIDCapability_Broken", 33007, json!({"lower": 0.0, "upper": 4.0, "steps": 5, "value": 0.0, "value_index": 9}));
+        assert_eq!(property_control(&t, "kNkMAIDCapability_Broken"), Control::Scale { lower: 0.0, upper: 4.0, steps: 5, index: None });
+    }
+
+    #[test]
+    fn a_control_is_offered_only_for_what_its_setter_accepts_and_a_locked_one_is_refused_by_the_setter() {
+        let mut s = edited();
+        s.insert("kNkMAIDCapability_Level", 33005, json!(0.25));
+        s.insert("kNkMAIDCapability_Readout", 33004, json!({"lower": 0.0, "upper": 0.0, "steps": 0, "value": 0.0, "value_index": 0}));
+        let (code, name, _) = never_copy_table().into_iter().next().unwrap();
+        s.insert(format!("kNkMAIDCapability_{name}"), code, json!(1));
+        let names: Vec<String> = s.properties.keys().cloned().collect();
+        assert!(names.len() >= 9);
+        for name in names {
+            let text = match property_control(&s, &name) {
+                Control::Choice { current: Some(c), .. } => c.to_string(),
+                Control::Scale { lower, upper, steps, index: Some(i) } => scale_value(lower, upper, steps, i).to_string(),
+                Control::Continuous { current: Some(c), .. } => c.to_string(),
+                Control::Whole { current } => current.to_string(),
+                Control::Real { current } => current.to_string(),
+                Control::Switch { current } => current.to_string(),
+                Control::Locked { .. } => {
+                    let e = set_property_text(&mut s, &name, "1", NOW).unwrap_err();
+                    assert!(matches!(e.tag(), "shape_not_editable" | "never_copied" | "value_not_allowed"), "{name}: {e}");
+                    continue;
+                }
+                other => panic!("{name}: no current value to try: {other:?}"),
+            };
+            let (_, applied) = set_property_text(&mut s, &name, &text, NOW).unwrap_or_else(|e| panic!("{name} offered a control but its setter refused {text:?}: {e}"));
+            assert!(!applied.changed, "{name}: setting what it already holds is not a change");
+        }
+    }
+
+    #[test]
+    fn the_owner_view_shows_what_can_be_set_and_why_not_and_holds_no_secret() {
+        let v = owner_view(&edited()).unwrap();
+        let by = |code: u16| v.strings.iter().find(|s| s.code == code).unwrap();
+        assert_eq!((by(0xD072).text.as_deref(), by(0xD072).max_chars, by(0xD072).note.is_none()), (Some("Brian"), 36, true));
+        assert_eq!((by(0xD073).max_chars, by(0xD090).max_chars), (54, 36));
+        assert_eq!((by(0xD090).text.as_ref(), by(0xD090).note.as_deref().map(|n| n.contains("does not have"))), (None, Some(true)), "the body lacks Image comment");
+        assert_eq!(v.switches.iter().map(|w| (w.code, w.value, w.max)).collect::<Vec<_>>(), [(0xD053, Some(1), 1), (0xD060, Some(0), 13)]);
+        let presets = v.iptc.as_ref().unwrap();
+        assert_eq!(presets.iter().map(|p| (p.slot, p.name.as_str())).collect::<Vec<_>>(), [(1, "Race"), (2, "")], "slot 3 is another record kind and is not offered");
+        assert_eq!(presets[0].fields.len(), IPTC_FIELDS.len());
+        assert_eq!(presets[0].fields[2], "Hello");
+        assert_eq!(v.ftp.as_ref().unwrap(), &["\"alpha\"", "\"beta\"", "\"gamma\""]);
+        let dump = format!("{v:?}");
+        for secret in ["hunter2-secret", "key-secret-12345"] {
+            assert!(!dump.contains(secret), "{secret}");
+        }
+    }
+
+    #[test]
+    fn the_owner_view_says_why_a_section_has_nothing_to_edit() {
+        assert!(owner_view(&{
+            let mut s = edited();
+            s.extended = None;
+            s
+        })
+        .is_none());
+        let mut s = edited();
+        s.extended.as_mut().unwrap().iptc = IptcState::NotOnModel;
+        s.extended.as_mut().unwrap().ftp = FtpState::NotOnModel;
+        ext_state(&mut s, 0xD072, PropState::ReadFailed { tag: "t".into(), detail: "d".into() });
+        ext_state(&mut s, 0xD053, PropState::NotSupported);
+        let v = owner_view(&s).unwrap();
+        assert!(v.iptc.unwrap_err().contains("no IPTC") && v.ftp.unwrap_err().contains("no FTP"));
+        let artist = v.strings.iter().find(|x| x.code == 0xD072).unwrap();
+        assert!(artist.text.is_some() && artist.note.as_deref().unwrap().contains("not read"), "a failed read can be given a value");
+        assert!(v.switches.iter().find(|x| x.code == 0xD053).unwrap().value.is_none());
+        if let FtpState::Read(st) = &mut edited().extended.as_mut().unwrap().ftp {
+            st.truncated = true;
+        }
+        let mut t = edited();
+        if let FtpState::Read(st) = &mut t.extended.as_mut().unwrap().ftp {
+            st.truncated = true;
+        }
+        assert!(owner_view(&t).unwrap().ftp.unwrap_err().contains("only part"));
     }
 
     #[test]

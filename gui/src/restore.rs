@@ -2578,6 +2578,7 @@ mod tests {
             label: Some("studio".into()),
             captured_at: "2026-10-27T10:00:00Z".into(),
             is_reference: false,
+            edited: false,
             name_lossy: false,
         };
         assert!(restore_snapshot_label(&row, Some("5.31")).contains("fw 5.00  ⚠ other firmware"), "{}", restore_snapshot_label(&row, Some("5.31")));

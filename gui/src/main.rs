@@ -42,6 +42,7 @@ mod menu;
 mod firmware_win;
 mod restore;
 mod restore_ext;
+mod snapshot_editor;
 
 use check::{CheckRequest, CheckUi, CheckView};
 use guarded::{
@@ -52,6 +53,7 @@ use nikon_fleet::gui_argv;
 use firmware_win::FwUi;
 use restore::{RestoreApplyJson, RestorePlanJson, RestoreRequest, RestoreUi, SourceView, UndoOffer};
 use restore_ext::{ExtApplyJson, ExtPlanJson, ExtRestoreRequest, ExtRestoreUi};
+use snapshot_editor::{EditModel, EditUi, ViewEdit};
 
 // This GUI is a thin front end over the `nikon-fleet` CLI and the `nikon_fleet`
 // library. Everything that touches a camera (discover, snapshot, the guarded writes)
@@ -357,6 +359,8 @@ struct SnapRow {
     label: Option<String>,
     captured_at: String,
     is_reference: bool,
+    /// An edited copy, not a reading from a camera.
+    edited: bool,
     /// The file name was not valid UTF-8 (`list_dir` shows it lossily), so it cannot be
     /// named in a later operation.
     name_lossy: bool,
@@ -444,7 +448,7 @@ fn list_all(data_dir: &Path) -> SnapListing {
     };
     for entry in listing.entries {
         match entry.state {
-            EntryState::Ok { model, serial, firmware, label, captured_at, is_reference, .. } => out.rows.push(SnapRow {
+            EntryState::Ok { model, serial, firmware, label, captured_at, is_reference, edited, .. } => out.rows.push(SnapRow {
                 name_lossy: entry.file.contains('\u{FFFD}'),
                 file: entry.file,
                 model,
@@ -453,6 +457,7 @@ fn list_all(data_dir: &Path) -> SnapListing {
                 label,
                 captured_at,
                 is_reference: is_reference == Some(true),
+                edited,
             }),
             EntryState::Unreadable { error_kind, error } => {
                 out.unreadable.push(UnreadableRow { file: entry.file, error_kind, error })
@@ -469,7 +474,7 @@ fn list_all(data_dir: &Path) -> SnapListing {
 
 /// One snapshot window's state. Loading and drawing happen elsewhere; this is the part that has
 /// rules: what is shown, what the filter keeps, what a failed load looks like.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SnapshotViewer {
     /// The file's name in `snapshots/`: what identifies the window.
     file: String,
@@ -491,6 +496,14 @@ struct SnapshotViewer {
     extended: Option<RenderedExtended>,
     /// Show the secrets in the clear (the eye toggle). Per window, off whenever a window opens.
     reveal_secrets: bool,
+    /// The controls of an edited copy; `None` for a snapshot read from a camera, which is only viewed.
+    edit: Option<EditModel>,
+    /// Text being typed, a slider being dragged: cleared on every reload.
+    edit_ui: EditUi,
+    /// A change was saved and the file is being read again; the controls wait for it.
+    reloading: bool,
+    /// What the last change did, or why it was refused.
+    edit_notice: Option<(Level, String)>,
 }
 
 impl SnapshotViewer {
@@ -507,12 +520,18 @@ impl SnapshotViewer {
             labels_note: None,
             extended: None,
             reveal_secrets: false,
+            edit: None,
+            edit_ui: EditUi::default(),
+            reloading: false,
+            edit_notice: None,
         }
     }
 
     /// The load's answer: the rendered snapshot, or why there is none.
     fn finish(&mut self, result: Result<render::RenderedSnapshot, String>) {
         self.loading = false;
+        self.reloading = false;
+        self.edit_ui.clear();
         match result {
             Ok(r) => {
                 self.error = None;
@@ -527,6 +546,7 @@ impl SnapshotViewer {
                 self.rows.clear();
                 self.labels_note = None;
                 self.extended = None;
+                self.edit = None;
             }
         }
     }
@@ -545,7 +565,11 @@ impl SnapshotViewer {
 
     /// Model, serial, firmware, label and capture time; the file name until the file is read.
     fn title(&self) -> String {
-        let mark = if self.is_reference { "  ◄ ref" } else { "" };
+        let mark = match (self.is_reference, self.edit.is_some()) {
+            (true, _) => "  ◄ ref",
+            (false, true) => "  ✎ edited copy",
+            (false, false) => "",
+        };
         match &self.header {
             Some(h) => format!(
                 "{} {}  fw {}  {}  {}{mark}",
@@ -595,6 +619,17 @@ impl SnapshotViewers {
         }
     }
 
+    /// Give a window its controls (or take them away) once its file has been read.
+    fn set_edit(&mut self, file: &str, model: Option<EditModel>) {
+        if let Some(v) = self.open.iter_mut().find(|v| v.file == file) {
+            v.edit = model;
+        }
+    }
+
+    fn find_mut(&mut self, file: &str) -> Option<&mut SnapshotViewer> {
+        self.open.iter_mut().find(|v| v.file == file)
+    }
+
     /// Close the window for `file`; false if none was open.
     fn close(&mut self, file: &str) -> bool {
         let before = self.open.len();
@@ -630,16 +665,24 @@ impl SnapshotViewers {
 struct ViewLoad {
     file: String,
     result: Result<render::RenderedSnapshot, String>,
+    /// The controls, when the file is an edited copy that was read.
+    edit: Option<EditModel>,
 }
 
 /// Find, read, validate and render `snapshots/<file>` by the library's rules, so the window shows
 /// what `nikon-fleet show` prints. Reads a file: call it off the UI thread.
 fn load_for_view(data_dir: &Path, sdk_runtime: &Path, file: &str) -> Result<render::RenderedSnapshot, String> {
+    load_for_view_full(data_dir, sdk_runtime, file).map(|(rendered, _)| rendered)
+}
+
+/// [`load_for_view`], and the controls too when the file is an edited copy (read from the same parse).
+fn load_for_view_full(data_dir: &Path, sdk_runtime: &Path, file: &str) -> Result<(render::RenderedSnapshot, Option<EditModel>), String> {
     let path = render::find_named(&[&data_dir.join("snapshots")], file).map_err(|e| e.to_string())?;
     let snapshot = render::load(&path).map_err(|e| e.to_string())?;
     let firmware = Some(snapshot.camera.firmware.as_str()).filter(|f| !f.is_empty());
     let labels = Labels::load_for(sdk_runtime, &snapshot.camera.model, firmware);
-    Ok(render::render_snapshot_with(&snapshot, None, &labels))
+    let edit = EditModel::build(&snapshot, &labels);
+    Ok((render::render_snapshot_with(&snapshot, None, &labels), edit))
 }
 
 /// Where the SDK's names are: `$NIKON_FLEET_SDK_RUNTIME` if set, else the project's `sdk-runtime/`
@@ -654,9 +697,12 @@ fn resolve_sdk_runtime(env_override: Option<OsString>) -> PathBuf {
 fn spawn_view_load(data_dir: PathBuf, file: String, tx: mpsc::Sender<ViewLoad>, ctx: egui::Context) -> std::io::Result<()> {
     std::thread::Builder::new().name("snapshot-view".into()).spawn(move || {
         let sdk_runtime = resolve_sdk_runtime(std::env::var_os("NIKON_FLEET_SDK_RUNTIME"));
-        let result = load_for_view(&data_dir, &sdk_runtime, &file);
+        let (result, edit) = match load_for_view_full(&data_dir, &sdk_runtime, &file) {
+            Ok((rendered, edit)) => (Ok(rendered), edit),
+            Err(e) => (Err(e), None),
+        };
         // The receiver is gone only when the window closed; there is no one to tell.
-        let _ = tx.send(ViewLoad { file, result });
+        let _ = tx.send(ViewLoad { file, result, edit });
         ctx.request_repaint();
     })?;
     Ok(())
@@ -825,7 +871,9 @@ impl FleetApp {
 
     fn poll_views(&mut self) {
         while let Ok(load) = self.view_rx.try_recv() {
-            self.viewers.finish(&load.file, load.result);
+            if self.viewers.finish(&load.file, load.result) {
+                self.viewers.set_edit(&load.file, load.edit);
+            }
         }
     }
 
@@ -1296,6 +1344,7 @@ impl FleetApp {
         let mut view_action: Option<(String, bool, bool)> = None;
         let mut transplant_from: Option<((String, String), String)> = None;
         let mut restore_from: Option<((String, String), String)> = None;
+        let mut edit_copy_of: Option<String> = None;
         let busy = self.busy();
         let data_ready = self.settings.data_dir.is_some();
 
@@ -1378,14 +1427,15 @@ impl FleetApp {
                         let ts = snap.captured_at.get(..19).unwrap_or(&snap.captured_at);
                         let lbl = snap.label.as_deref().unwrap_or("(no label)");
                         let text = ui
-                            .add(egui::Label::new(format!("{ts}  {lbl}")).sense(egui::Sense::click()))
+                            .add(egui::Label::new(format!("{ts}  {lbl}{}", if snap.edited { "  ✎ edited" } else { "" })).sense(egui::Sense::click()))
                             .on_hover_text("Double-click to see what this snapshot holds");
                         if text.double_clicked() {
                             view_action = Some((snap.file.clone(), snap.is_reference, snap.name_lossy));
                         }
                         if snap.is_reference {
                             ui.label(egui::RichText::new("◀ ref").color(egui::Color32::LIGHT_GREEN));
-                        } else {
+                        } else if !snap.edited {
+                            // An edited copy is not a reading from a camera, and a reference is what `check` compares a body to.
                             ui.add_enabled_ui(!busy && !snap.name_lossy, |ui| {
                                 if ui.small_button("Set ref").clicked() {
                                     ref_action = Some(snap.file.clone());
@@ -1395,6 +1445,15 @@ impl FleetApp {
                         ui.add_enabled_ui(!snap.name_lossy, |ui| {
                             if ui.small_button("View").clicked() {
                                 view_action = Some((snap.file.clone(), snap.is_reference, snap.name_lossy));
+                            }
+                        });
+                        ui.add_enabled_ui(!snap.name_lossy, |ui| {
+                            if ui
+                                .small_button("Edit a copy…")
+                                .on_hover_text("Make a copy of this snapshot that you can change; the snapshot itself is never changed")
+                                .clicked()
+                            {
+                                edit_copy_of = Some(snap.file.clone());
                             }
                         });
                         ui.add_enabled_ui(!busy && !snap.name_lossy, |ui| {
@@ -1441,6 +1500,58 @@ impl FleetApp {
         if let Some((body, file)) = restore_from {
             self.start_restore_from(body, file);
         }
+        if let Some(file) = edit_copy_of {
+            self.start_edit_copy(&ctx, &file);
+        }
+    }
+
+    /// Make an editable copy of a stored snapshot and open it. A local file operation, quick, so not a worker command.
+    fn start_edit_copy(&mut self, ctx: &egui::Context, file: &str) {
+        let Some(data_dir) = self.settings.data_dir.clone() else {
+            self.status = Status::new(Level::Error, "The data directory is unknown, so no copy can be made.");
+            return;
+        };
+        match snapshot_editor::make_edit_copy(&data_dir, file, &snapshot_editor::now_rfc3339()) {
+            Ok(copy) => {
+                self.status = Status::new(Level::Info, format!("Made an editable copy of {file}: {copy}. The original is untouched."));
+                self.refresh_listing();
+                self.open_snapshot(ctx, &copy, false, false);
+            }
+            Err(e) => self.status = Status::new(Level::Error, format!("Could not make a copy of {file}: {e}")),
+        }
+    }
+
+    /// Save one change made in an edited copy's window, then read the file again so the window shows what is stored.
+    /// A refusal is shown in the window with its reason, and the field goes back to the stored value.
+    fn apply_viewer_edit(&mut self, ctx: &egui::Context, file: &str, req: ViewEdit) {
+        let Some(data_dir) = self.settings.data_dir.clone() else {
+            self.status = Status::new(Level::Error, "The data directory is unknown, so nothing can be saved.");
+            return;
+        };
+        let result = snapshot_editor::apply_view_edit(&data_dir, file, &req, &snapshot_editor::now_rfc3339());
+        let Some(viewer) = self.viewers.find_mut(file) else { return };
+        match result {
+            Ok(applied) if applied.changed => {
+                viewer.edit_notice = Some((Level::Info, applied.change));
+                viewer.reloading = true;
+                if let Err(e) = spawn_view_load(data_dir, file.to_string(), self.view_tx.clone(), ctx.clone()) {
+                    viewer.reloading = false;
+                    viewer.edit_notice = Some((Level::Warn, format!("Saved, but the file could not be read again ({e}); close and reopen this window.")));
+                }
+            }
+            Ok(applied) => {
+                viewer.edit_notice = Some((Level::Info, format!("No change: {}", applied.change)));
+                if let Some(k) = snapshot_editor::field_key(&req) {
+                    viewer.edit_ui.forget(&k);
+                }
+            }
+            Err(e) => {
+                viewer.edit_notice = Some((Level::Error, e));
+                if let Some(k) = snapshot_editor::field_key(&req) {
+                    viewer.edit_ui.forget(&k);
+                }
+            }
+        }
     }
 
     /// One window per open snapshot: a filter box, a count line and the rows in a scrollable
@@ -1453,7 +1564,9 @@ impl FleetApp {
         }
         let embedded = ctx.embed_viewports();
         let mut requests = Vec::new();
+        let mut edits: Vec<(String, ViewEdit)> = Vec::new();
         for viewer in &mut self.viewers.open {
+            let mut asked: Option<ViewEdit> = None;
             let requested = if embedded {
                 let mut open = true;
                 egui::Window::new(viewer.title())
@@ -1461,7 +1574,7 @@ impl FleetApp {
                     .open(&mut open)
                     .resizable(true)
                     .default_size([720.0, 480.0])
-                    .show(ctx, |ui| draw_snapshot_viewer(ui, viewer));
+                    .show(ctx, |ui| asked = draw_snapshot_viewer(ui, viewer));
                 !open
             } else {
                 let builder = egui::ViewportBuilder::default()
@@ -1472,17 +1585,23 @@ impl FleetApp {
                     if class == egui::ViewportClass::EmbeddedWindow {
                         // Not reachable under eframe (`embed_viewports` was false above); draw the
                         // contents rather than nothing.
-                        draw_snapshot_viewer(ui, viewer);
+                        asked = draw_snapshot_viewer(ui, viewer);
                         false
                     } else {
-                        egui::CentralPanel::default().show_inside(ui, |ui| draw_snapshot_viewer(ui, viewer));
+                        egui::CentralPanel::default().show_inside(ui, |ui| asked = draw_snapshot_viewer(ui, viewer));
                         ui.ctx().input(|i| i.viewport().close_requested())
                     }
                 })
             };
             requests.push((viewer.file.clone(), requested));
+            if let Some(edit) = asked {
+                edits.push((viewer.file.clone(), edit));
+            }
         }
         self.viewers.close_requested(requests);
+        for (file, edit) in edits {
+            self.apply_viewer_edit(ctx, &file, edit);
+        }
     }
 }
 
@@ -1492,14 +1611,22 @@ fn viewer_viewport_id(file: &str) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(("snapshot_viewer", file))
 }
 
-fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) {
+/// Draw one snapshot window. Returns the change the person made to an edited copy this frame, if any; the caller saves it.
+fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) -> Option<ViewEdit> {
     if viewer.loading {
         ui.label(egui::RichText::new("Reading the file…").italics().weak());
-        return;
+        return None;
     }
     if let Some(e) = &viewer.error {
         ui.colored_label(egui::Color32::from_rgb(200, 60, 60), format!("{} cannot be shown: {e}", viewer.file));
-        return;
+        return None;
+    }
+    let mut asked: Option<ViewEdit> = None;
+    // Taken out for the frame so the rows can stay borrowed from the viewer while the controls change it.
+    let mut edit_ui = std::mem::take(&mut viewer.edit_ui);
+    let controls_enabled = !viewer.reloading;
+    if let Some(model) = &viewer.edit {
+        snapshot_editor::draw_edit_header(ui, &viewer.file, model, viewer.edit_notice.as_ref(), viewer.reloading);
     }
     ui.horizontal(|ui| {
         ui.label("Filter:");
@@ -1519,12 +1646,27 @@ fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) {
     let warn = egui::Color32::from_rgb(200, 120, 0);
     let show_codes = viewer.show_codes;
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+        if let Some(owner) = viewer.edit.as_ref().and_then(|m| m.owner.as_ref()) {
+            if let Some(req) = snapshot_editor::draw_owner_editor(ui, &viewer.file, owner, &mut edit_ui, controls_enabled) {
+                asked = Some(req);
+            }
+            ui.add_space(6.0);
+        }
         egui::Grid::new(("snapshot_rows", &viewer.file)).striped(true).show(ui, |ui| {
             for row in viewer.visible_rows() {
-                ui.label(egui::RichText::new(row.short_name()).monospace());
+                let control = viewer.edit.as_ref().and_then(|m| m.controls.get(&row.name).map(|c| (m, c)));
+                let edited_mark = control.is_some_and(|(m, _)| m.property_edited(&row.name));
+                ui.label(egui::RichText::new(format!("{}{}", if edited_mark { "✎ " } else { "" }, row.short_name())).monospace());
                 ui.label(egui::RichText::new(row.extra_display_name().unwrap_or("")));
                 if show_codes {
                     ui.label(egui::RichText::new(row.code_hex()).monospace().weak());
+                }
+                if let Some((_, view)) = control.filter(|(_, c)| !matches!(c.control, nikon_fleet::snapshot_edit::Control::Locked { .. })) {
+                    if let Some(req) = snapshot_editor::property_cell(ui, &mut edit_ui, &row.name, view, controls_enabled) {
+                        asked = Some(req);
+                    }
+                    ui.end_row();
+                    continue;
                 }
                 let text = egui::RichText::new(&row.value.display).monospace();
                 let text = if row.value.is_problem() {
@@ -1534,7 +1676,10 @@ fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) {
                 } else {
                     text.weak()
                 };
-                let shown = ui.label(text);
+                let mut shown = ui.label(text);
+                if let Some((_, snapshot_editor::ControlView { control: nikon_fleet::snapshot_edit::Control::Locked { reason }, .. })) = control {
+                    shown = shown.on_hover_text(format!("Cannot be edited: {reason}"));
+                }
                 if !row.value.notes.is_empty() {
                     let tags: Vec<&str> = row.value.notes.iter().map(|n| n.tag()).collect();
                     shown.on_hover_text(tags.join(", "));
@@ -1547,6 +1692,8 @@ fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) {
             draw_extended(ui, &viewer.file, ext, &viewer.filter, show_codes, &mut viewer.reveal_secrets);
         }
     });
+    viewer.edit_ui = edit_ui;
+    asked
 }
 
 /// The owner strings and FTP profiles below the property rows. Secrets are masked unless the eye toggle is
@@ -3372,7 +3519,7 @@ fn camera_label(c: &CameraRow) -> String {
 fn snapshot_label(row: &SnapRow) -> String {
     let ts = row.captured_at.get(..19).unwrap_or(&row.captured_at);
     let label = row.label.as_deref().unwrap_or("(no label)");
-    format!("{ts}  {label}{}", if row.is_reference { "  ◀ ref" } else { "" })
+    format!("{ts}  {label}{}{}", if row.is_reference { "  ◀ ref" } else { "" }, if row.edited { "  ✎ edited" } else { "" })
 }
 
 fn draw_outcomes(ui: &mut egui::Ui, id: &str, title: String, open: bool, level: Level, rows: &[&OutcomeJson]) {
@@ -4949,6 +5096,7 @@ mod tests {
             label: None,
             captured_at: "2026-01-01T00:00:00Z".into(),
             is_reference: false,
+            edited: false,
             name_lossy: false,
         }
     }
@@ -6487,8 +6635,8 @@ mod tests {
     fn a_reference_set_while_a_window_is_open_marks_it() {
         let listing = SnapListing {
             rows: vec![
-                SnapRow { file: "a.json".into(), model: "Z 9".into(), serial: "1".into(), firmware: "5.31".into(), label: None, captured_at: "t".into(), is_reference: true, name_lossy: false },
-                SnapRow { file: "b.json".into(), model: "Z 9".into(), serial: "1".into(), firmware: "5.31".into(), label: None, captured_at: "t".into(), is_reference: false, name_lossy: false },
+                SnapRow { file: "a.json".into(), model: "Z 9".into(), serial: "1".into(), firmware: "5.31".into(), label: None, captured_at: "t".into(), is_reference: true, edited: false, name_lossy: false },
+                SnapRow { file: "b.json".into(), model: "Z 9".into(), serial: "1".into(), firmware: "5.31".into(), label: None, captured_at: "t".into(), is_reference: false, edited: false, name_lossy: false },
             ],
             ..SnapListing::default()
         };

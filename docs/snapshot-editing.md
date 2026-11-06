@@ -1,8 +1,8 @@
 # Editing a copy of a snapshot
 
 Code: `src/snapshot_edit.rs` (the rules, on a value), `src/ops/edit_snapshot.rs` (the files), CLI `nikon-fleet edit …`.
-Built 2026-11-06 (step 1 of the snapshot editor: library and CLI; the GUI window, the FTP profile field editor and the
-FTP test are later steps). Needs no camera.
+Built 2026-11-06 (step 1 of the snapshot editor: library and CLI; step 2: the GUI, below; the FTP profile field editor and
+the FTP test are later steps). Needs no camera.
 
 ## The rule
 
@@ -49,3 +49,30 @@ No password or key is written to the edit log; a profile is named by its stored 
 
 An in-place edit reads the file, changes it, and replaces it whole (`write_atomic`). Two editors working on one file at
 once (two windows, or the GUI and the CLI) would have the second overwrite the first's change; there is no lock.
+
+## In the GUI (step 2)
+
+`gui/src/snapshot_editor.rs`, in the snapshot viewer; no new window.
+
+- **Edit a copy…** on each row of a body's snapshot list (any row: a captured snapshot, a reference, an edited copy).
+  It makes the copy in `snapshots/` (a local file operation, not a worker command) and opens it. The original is only
+  read. Rows that are edited copies say `✎ edited`, and have no **Set ref** button.
+- An edited copy's window has a strip at the top (where it came from, a **History** of every change, and the last
+  change's result or refusal) and controls in place of the values: a choice is a drop-down (the SDK's names where
+  loaded, with the number), a position on a scale a slider (committed when the drag ends or on a click, not on every
+  frame), a number a text box, a switch a check box. A property that cannot be edited keeps its value and says why on
+  hover. Properties changed in this copy are marked `✎`.
+- **Owner data (edit)** above the table: Artist, Copyright and Image comment (with a character count against the
+  limit), the two switches, each IPTC preset's name and fields, and the FTP profile list with Up, Down and Delete (a
+  delete needs a second press on the same row). A text box commits when it loses focus (Enter, Tab, a click elsewhere)
+  and Escape gives up.
+- Every change is saved at once through the library's edit functions, which do all the checking; the window then
+  reads the file again, so what it shows is always what is stored. A refusal shows its reason and the field goes back
+  to the stored value. While the file is being read again the controls wait.
+- A snapshot read from a camera opens exactly as before, read-only.
+
+What the tests cover: the app path end to end (copy, open, change, reload, refusal, a capture refused), the controls
+driven with real input events (typing and Enter, Escape, a click on a switch, a click on a slider), the two-press
+delete and the ends of the list, and that the library offers a control only where its setter accepts the value.
+**Not covered:** the drop-down's item click, dragging a slider, and how the window looks (it has not been seen on a
+screen).
