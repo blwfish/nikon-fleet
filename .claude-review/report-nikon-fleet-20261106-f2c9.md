@@ -259,3 +259,7 @@ At the owner's request three of the deferred Mediums were then done: **#39** (`d
 ### Second follow-up (run nikon-fleet-remediate-20261106-d4f8)
 
 The last two Mediums were done at the owner's request: **#17** (`restore-ext` restore points are now known to retention: one classifier, one count, a `kind` filter on `list_snapshots`, honest cap wording; nothing is auto-deleted) and **#30** (a new FTP profile starts with no stored camera address instead of the capture rig's 192.168.66.87/24; unverified on a camera, with the check to run written in the docs). No Medium or High finding remains open. Totals after all three runs: 149 fixed, 15 wontfix, 1 false-positive, 10 still deferred (all Low: #61, #63, #68, #73, #86, #111, #123, #130, #134, #150).
+
+### Third follow-up (run nikon-fleet-remediate-20261106-f1a5)
+
+The nine Lows still deferred were fixed at the owner's request: #61 #63 #111 #123 #130 (library), #68 #86 #150 (GUI), #134 (SFTP login methods). Final state of the pass: **158 fixed, 15 wontfix, 1 false-positive, 0 deferred** (of 175; the 15 wontfix are Lows with a recorded reason). Still unverified, as everywhere in this pass: nothing was run on a camera, a real FTP/SFTP server, or a GUI screen, and the Windows CI is the only Windows check.
