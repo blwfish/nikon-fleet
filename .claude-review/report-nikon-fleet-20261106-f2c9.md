@@ -255,3 +255,7 @@ Unverified, as before: nothing in this remediation was run against a camera, a r
 ### Follow-up (run nikon-fleet-remediate-20261106-c9e2)
 
 At the owner's request three of the deferred Mediums were then done: **#39** (`dbfd1b6`: one `const` per-model capability table; an unrecognized model is refused with nothing sent; the FTP rebuild no longer uses delete-all 0x90EA but deletes one profile at a time with 0x90EF, which is unverified as a loop on a body), **#43** and **#45** (`0c827b4`: one shared window for both restore flows; snapshot edits written off the UI thread). The earlier "needs a GUI sitting" reason given for #43/#45 was wrong; the GUI is tested with synthetic input events. Totals after both runs: 147 fixed, 15 wontfix, 1 false-positive, 12 still deferred (2 Medium: #17, #30; 10 Low). Ledger entry: see the commit that follows this note.
+
+### Second follow-up (run nikon-fleet-remediate-20261106-d4f8)
+
+The last two Mediums were done at the owner's request: **#17** (`restore-ext` restore points are now known to retention: one classifier, one count, a `kind` filter on `list_snapshots`, honest cap wording; nothing is auto-deleted) and **#30** (a new FTP profile starts with no stored camera address instead of the capture rig's 192.168.66.87/24; unverified on a camera, with the check to run written in the docs). No Medium or High finding remains open. Totals after all three runs: 149 fixed, 15 wontfix, 1 false-positive, 10 still deferred (all Low: #61, #63, #68, #73, #86, #111, #123, #130, #134, #150).
