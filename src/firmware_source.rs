@@ -154,15 +154,37 @@ fn finish_http<T>(span: crate::diag::Span<'static>, result: &Result<T, SourceErr
     use crate::diag::{Outcome, Val};
     match result {
         Ok(v) => span.finish_with(Outcome::Ok, &[("bytes", Val::U64(bytes(v)))]),
-        Err(e) => {
-            let kind = match e {
-                SourceError::UnsupportedModel { .. } => "unsupported_model",
-                SourceError::Http { .. } => "http",
-                SourceError::Parse { .. } => "parse",
-                SourceError::Io(_) => "io",
-            };
-            span.finish_with(Outcome::Failed, &[("error_kind", Val::text(kind))]);
-        }
+        Err(e) => span.finish_with(Outcome::Failed, &[("error_kind", Val::text(source_error_kind(e)))]),
+    }
+}
+
+/// A closed name for a [`SourceError`] variant, for diagnostics (never the message, which can embed a URL).
+fn source_error_kind(e: &SourceError) -> &'static str {
+    match e {
+        SourceError::UnsupportedModel { .. } => "unsupported_model",
+        SourceError::Http { .. } => "http",
+        SourceError::Parse { .. } => "parse",
+        SourceError::Io(_) => "io",
+    }
+}
+
+/// What a fetch span records when it ends: the ingest's result on success; on failure a closed `error_kind`
+/// and, for a size or hash mismatch, the expected and computed values (the facts that distinguish a truncated
+/// download from a changed file).
+fn fetch_span_result(r: &Result<IngestOutcome, FetchError>) -> crate::firmware::SpanResult {
+    use crate::diag::{Outcome, Val};
+    use crate::firmware::{firmware_error_fields, ingest_ok_fields, sha_field};
+    match r {
+        Ok(o) => (Outcome::Ok, ingest_ok_fields(o)),
+        Err(FetchError::Archive(e)) => (Outcome::Failed, firmware_error_fields(e)),
+        Err(FetchError::Source(e)) => (Outcome::Failed, vec![("error_kind", Val::text(source_error_kind(e)))]),
+        Err(FetchError::Gated(_)) => (Outcome::Failed, vec![("error_kind", Val::text("gated"))]),
+        Err(FetchError::SizeMismatch { expected, got }) => (Outcome::Failed, vec![
+            ("error_kind", Val::text("size_mismatch")), ("expected_size", Val::Len(*expected)), ("got_size", Val::Len(*got)),
+        ]),
+        Err(FetchError::HashMismatch { expected, got }) => (Outcome::Failed, vec![
+            ("error_kind", Val::text("hash_mismatch")), ("expected_sha", sha_field(expected)), ("got_sha", sha_field(got)),
+        ]),
     }
 }
 
@@ -516,12 +538,19 @@ pub fn fetch_direct(
     scratch_dir: &Path,
     retrieved_at: &str,
 ) -> Result<IngestOutcome, FetchError> {
-    crate::diag::scoped_with(crate::diag::Subsystem::Firmware, "fetch", crate::diag::Class::Top, &[("model", crate::diag::Val::text(&release.model)), ("source", crate::diag::Val::text(source_id))], |_span| {
+    crate::diag::scoped_with(crate::diag::Subsystem::Firmware, "fetch", crate::diag::Class::Top, &[("model", crate::diag::Val::text(&release.model)), ("source", crate::diag::Val::text(source_id))], |span| {
+        use crate::diag::Val;
+        // What the source said about this release, known before any I/O: the page's non-fatal oddities
+        // (their count; the text is not recorded) and which checks the source gave us to run.
+        span.set("warnings", Val::U64(release.warnings.len() as u64));
         let DownloadAccess::Direct { url, expected_size, expected_sha256 } = &release.download else {
             return Err(FetchError::Gated(release.model.clone()));
         };
+        span.set("size_published", Val::Bool(expected_size.is_some()));
+        span.set("sha_published", Val::Bool(expected_sha256.is_some()));
         let tmp = scratch_dir.join("download.part");
         let got = http.get_to_file(url, &tmp)?;
+        span.set("got_size", Val::Len(got));
         if let Some(expected) = *expected_size {
             if expected != got {
                 return Err(FetchError::SizeMismatch { expected, got });
@@ -547,7 +576,7 @@ pub fn fetch_direct(
         Ok(ingest_bundle(
             data_dir, &release.model, &release.version.to_string(), &tmp, &prov, Some(&release.raw_page),
         )?)
-    }, |r| match r { Ok(_) => (crate::diag::Outcome::Ok, Vec::new()), Err(_) => (crate::diag::Outcome::Failed, Vec::new()) })
+    }, fetch_span_result)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -898,6 +927,40 @@ mod tests {
             data.path(), scratch.path(), "t").unwrap_err();
         assert!(matches!(e, FetchError::HashMismatch { .. }), "{e:?}");
         assert!(!crate::firmware::archive_exists(data.path(), "Z 9", "5.33"));
+    }
+
+    #[test]
+    fn fetch_span_result_records_the_variant_and_the_disagreeing_numbers() {
+        use crate::diag::{Outcome, Val};
+        let get = |f: &Vec<(&'static str, Val)>, k: &str| f.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+        let (data, scratch) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let http = Canned::new(&[("https://x.test/a.bin", "hello")]);
+        let run = |size: Option<u64>, sha: Option<&str>| fetch_direct(&http, "t", &direct_release("https://x.test/a.bin", size, sha),
+            data.path(), scratch.path(), "t");
+
+        let (o, f) = fetch_span_result(&run(Some(6), None));
+        assert_eq!(o, Outcome::Failed);
+        assert_eq!(get(&f, "error_kind"), Some(Val::text("size_mismatch")));
+        assert_eq!((get(&f, "expected_size"), get(&f, "got_size")), (Some(Val::Len(6)), Some(Val::Len(5))));
+
+        let (o, f) = fetch_span_result(&run(Some(5), Some("00ff")));
+        assert_eq!(o, Outcome::Failed);
+        assert_eq!(get(&f, "error_kind"), Some(Val::text("hash_mismatch")));
+        assert_eq!(get(&f, "expected_sha"), Some(Val::Hash("00ff".into())));
+        assert_eq!(get(&f, "got_sha"), Some(Val::Hash(HELLO_SHA[..16].into())));
+
+        let (o, f) = fetch_span_result(&run(Some(5), Some(HELLO_SHA)));
+        assert_eq!(o, Outcome::Ok);
+        assert_eq!(get(&f, "result"), Some(Val::text("archived")));
+        let (_, f) = fetch_span_result(&run(Some(5), Some(HELLO_SHA)));
+        assert_eq!(get(&f, "result"), Some(Val::text("already_present")));
+
+        let (_, f) = fetch_span_result(&fetch_direct(&Canned::new(&[]), "t", &release("5.33"), data.path(), scratch.path(), "t"));
+        assert_eq!(get(&f, "error_kind"), Some(Val::text("gated")));
+        let (_, f) = fetch_span_result(&Err(FetchError::Archive(FirmwareError::IncompleteArchive { path: "p".into() })));
+        assert_eq!(get(&f, "error_kind"), Some(Val::text("incomplete_archive")));
+        let (_, f) = fetch_span_result(&Err(FetchError::Source(SourceError::Io(std::io::Error::other("x")))));
+        assert_eq!(get(&f, "error_kind"), Some(Val::text("io")));
     }
 
     #[test]

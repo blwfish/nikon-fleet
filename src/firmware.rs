@@ -97,6 +97,23 @@ pub enum FirmwareError {
     UnsafePathComponent { what: &'static str, value: String },
 }
 
+impl FirmwareError {
+    /// A closed name for the variant, for diagnostics (never the message text).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            FirmwareError::Io(_) => "io",
+            FirmwareError::Json(_) => "json",
+            FirmwareError::UnsupportedVersion { .. } => "unsupported_version",
+            FirmwareError::AlreadyArchived { .. } => "already_archived",
+            FirmwareError::NotFound { .. } => "not_found",
+            FirmwareError::ChecksumMismatch { .. } => "checksum_mismatch",
+            FirmwareError::ContentMismatch { .. } => "content_mismatch",
+            FirmwareError::IncompleteArchive { .. } => "incomplete_archive",
+            FirmwareError::UnsafePathComponent { .. } => "unsafe_path_component",
+        }
+    }
+}
+
 // ─── Identity helpers ────────────────────────────────────────────────────────
 
 /// Convert a model identifier to a filesystem-safe slug: spaces → underscores.
@@ -196,10 +213,18 @@ fn safe_component(what: &'static str, value: &str) -> Result<(), FirmwareError> 
 
 /// Archive `src` as `(model, version)` with provenance. Never replaces an
 /// existing bundle: identical bytes are a no-op, different bytes are
-/// `ContentMismatch`. `bin` is written to a temp name, re-hashed, and renamed
-/// into place, and `metadata.json` (the entry's existence marker, see
-/// `archive_exists`) is written last, so a crash never leaves a half entry
-/// that looks complete.
+/// `ContentMismatch`.
+///
+/// Crash-consistency: `bin` is copied to a temp name and re-hashed; every sidecar
+/// (`source-page.html`) is written BEFORE `firmware.bin` is renamed into place; and
+/// `metadata.json` (the entry's existence marker, see `archive_exists`) is written
+/// last. So a failure at any step before the rename (a full disk writing the sidecar,
+/// say) leaves no `firmware.bin`, only a `.part` the next attempt overwrites; and a
+/// crash between the rename and the metadata write leaves a `firmware.bin` that the
+/// next ingest of the SAME bytes completes (it hashes the orphan and, when it is the
+/// bytes being ingested, writes the sidecar and metadata around it). An orphan
+/// `firmware.bin` holding different bytes is still `IncompleteArchive`: never
+/// adopted, never replaced.
 pub fn ingest_bundle(
     data_dir: &Path,
     model: &str,
@@ -208,7 +233,7 @@ pub fn ingest_bundle(
     provenance: &Provenance,
     source_page: Option<&str>,
 ) -> Result<IngestOutcome, FirmwareError> {
-    crate::diag::scoped(crate::diag::Subsystem::Firmware, "ingest", crate::diag::Class::Top, &[("model", crate::diag::Val::text(model)), ("version", crate::diag::Val::text(version))], |_span| {
+    crate::diag::scoped_with(crate::diag::Subsystem::Firmware, "ingest", crate::diag::Class::Top, &[("model", crate::diag::Val::text(model)), ("version", crate::diag::Val::text(version))], |span| {
         safe_component("model", &model_slug(model))?;
         safe_component("version", version)?;
 
@@ -235,22 +260,51 @@ pub fn ingest_bundle(
                 })
             };
         }
-        if bin.exists() {
-            return Err(FirmwareError::IncompleteArchive { path: dir.display().to_string() });
-        }
 
-        fs::create_dir_all(&dir)?;
-        let part = dir.join("firmware.bin.part");
-        fs::copy(src, &part)?;
-        let copied_sha = sha256_file(&part)?;
-        if copied_sha != new_sha {
-            let _ = fs::remove_file(&part); // best effort; the mismatch below is the real error
-            return Err(FirmwareError::ChecksumMismatch { stored: new_sha, computed: copied_sha });
-        }
-        let size = fs::metadata(&part)?.len();
-        fs::rename(&part, &bin)?;
-        if let Some(html) = source_page {
-            fs::write(dir.join("source-page.html"), html)?;
+        let write_sidecar = || -> std::io::Result<()> {
+            match source_page {
+                Some(html) => fs::write(dir.join("source-page.html"), html),
+                None => Ok(()),
+            }
+        };
+        let size;
+        if bin.exists() {
+            // An interrupted archive (crashed or failed after the rename, before the metadata).
+            // Complete it only if it holds exactly the bytes being ingested.
+            if sha256_file(&bin).ok().as_deref() != Some(new_sha.as_str()) {
+                return Err(FirmwareError::IncompleteArchive { path: dir.display().to_string() });
+            }
+            size = fs::metadata(&bin)?.len();
+            write_sidecar()?;
+            span.set("adopted_incomplete", crate::diag::Val::Bool(true));
+        } else {
+            fs::create_dir_all(&dir)?;
+            let part = dir.join("firmware.bin.part");
+            // Best effort (the error being returned is the real one); a removal that fails leaves a
+            // full-size `.part` behind, which the span records.
+            let drop_part = || {
+                if let Err(e) = fs::remove_file(&part) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        span.set("part_cleanup_failed", crate::diag::Val::Bool(true));
+                    }
+                }
+            };
+            if let Err(e) = fs::copy(src, &part) {
+                drop_part();
+                return Err(e.into());
+            }
+            let copied_sha = sha256_file(&part)?;
+            if copied_sha != new_sha {
+                drop_part();
+                return Err(FirmwareError::ChecksumMismatch { stored: new_sha, computed: copied_sha });
+            }
+            size = fs::metadata(&part)?.len();
+            // Sidecar first: once `firmware.bin` exists only the metadata write is left to fail.
+            if let Err(e) = write_sidecar() {
+                drop_part();
+                return Err(e.into());
+            }
+            fs::rename(&part, &bin)?;
         }
 
         let meta = FirmwareMeta {
@@ -268,7 +322,52 @@ pub fn ingest_bundle(
         };
         save_meta(&meta, &dir)?;
         Ok(IngestOutcome::Archived(meta))
-    })
+    }, ingest_span_result)
+}
+
+/// A digest for a diagnostics field: the first 16 hex digits (the shape `diag::Val::hash` gives).
+pub(crate) fn sha_field(sha: &str) -> crate::diag::Val {
+    crate::diag::Val::Hash(sha.chars().take(16).collect::<String>().to_ascii_lowercase())
+}
+
+pub(crate) type SpanResult = (crate::diag::Outcome, Vec<(&'static str, crate::diag::Val)>);
+
+/// What an ingest span records when it ends: `result` (archived / already_present) on success; on failure a
+/// closed `error_kind` and the digests that disagreed.
+pub(crate) fn ingest_span_result(r: &Result<IngestOutcome, FirmwareError>) -> SpanResult {
+    use crate::diag::{Outcome, Val};
+    match r {
+        Ok(o) => (Outcome::Ok, ingest_ok_fields(o)),
+        Err(e) => (Outcome::Failed, firmware_error_fields(e)),
+    }
+}
+
+/// `result` (archived / already_present), size and digest of a successful ingest.
+pub(crate) fn ingest_ok_fields(o: &IngestOutcome) -> Vec<(&'static str, crate::diag::Val)> {
+    use crate::diag::Val;
+    let (result, m) = match o {
+        IngestOutcome::Archived(m) => ("archived", m),
+        IngestOutcome::AlreadyPresent(m) => ("already_present", m),
+    };
+    vec![("result", Val::text(result)), ("size", Val::Len(m.bin_size_bytes)), ("sha", sha_field(&m.bin_sha256))]
+}
+
+/// A closed `error_kind` and, for the two digest-disagreement errors, the digests.
+pub(crate) fn firmware_error_fields(e: &FirmwareError) -> Vec<(&'static str, crate::diag::Val)> {
+    use crate::diag::Val;
+    let mut f = vec![("error_kind", Val::text(e.kind()))];
+    match e {
+        FirmwareError::ContentMismatch { existing, new, .. } => {
+            f.push(("existing_sha", sha_field(existing)));
+            f.push(("new_sha", sha_field(new)));
+        }
+        FirmwareError::ChecksumMismatch { stored, computed } => {
+            f.push(("expected_sha", sha_field(stored)));
+            f.push(("got_sha", sha_field(computed)));
+        }
+        _ => {}
+    }
+    f
 }
 
 // ─── Listing ─────────────────────────────────────────────────────────────────
@@ -1159,6 +1258,96 @@ mod tests {
         let data = TempDir::new().unwrap();
         let err = ingest_bundle(data.path(), "Z 9", "5.33", Path::new("/nonexistent/x.bin"), &prov(), None).unwrap_err();
         assert!(matches!(err, FirmwareError::Io(_)));
+    }
+
+    #[test]
+    fn failed_sidecar_write_commits_nothing_and_a_retry_succeeds() {
+        // Fault injection: `source-page.html` is a directory, so writing the sidecar fails (the same
+        // class of failure as a full disk or a permission error). The failure must leave no
+        // `firmware.bin` (which would wedge every later ingest as IncompleteArchive), no `.part`, and
+        // no `metadata.json`.
+        let (data, src) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let a = file_with(src.path(), "a.bin", b"hello");
+        let dir = archive_dir(data.path(), "Z 9", "5.33");
+        fs::create_dir_all(dir.join("source-page.html")).unwrap();
+        let err = ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), Some("<html>page</html>")).unwrap_err();
+        assert!(matches!(err, FirmwareError::Io(_)), "{err:?}");
+        assert!(!dir.join("firmware.bin").exists(), "a failed sidecar must not leave a committed firmware.bin");
+        assert!(!dir.join("firmware.bin.part").exists(), "the temp copy must be cleaned up");
+        assert!(!archive_exists(data.path(), "Z 9", "5.33"));
+        assert!(list_archives(data.path(), None).is_empty());
+
+        // The fault clears; the same ingest now works (it did not wedge as IncompleteArchive).
+        fs::remove_dir(dir.join("source-page.html")).unwrap();
+        let out = ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), Some("<html>page</html>")).unwrap();
+        assert!(matches!(out, IngestOutcome::Archived(_)));
+        assert_eq!(fs::read_to_string(dir.join("source-page.html")).unwrap(), "<html>page</html>");
+        assert_eq!(fs::read(dir.join("firmware.bin")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn interrupted_archive_with_the_same_bytes_is_completed_other_bytes_are_not() {
+        // A crash between the rename and the metadata write leaves firmware.bin alone.
+        let (data, src) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let a = file_with(src.path(), "a.bin", b"hello");
+        let dir = archive_dir(data.path(), "Z 9", "5.33");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Same length, one byte different: not adopted, not replaced.
+        fs::write(dir.join("firmware.bin"), b"hellO").unwrap();
+        let err = ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), Some("<html>p</html>")).unwrap_err();
+        assert!(matches!(err, FirmwareError::IncompleteArchive { .. }), "{err:?}");
+        assert_eq!(fs::read(dir.join("firmware.bin")).unwrap(), b"hellO");
+        assert!(!dir.join("metadata.json").exists() && !dir.join("source-page.html").exists());
+
+        // The exact bytes: completed in place (sidecar and metadata written, bin untouched).
+        fs::write(dir.join("firmware.bin"), b"hello").unwrap();
+        let out = ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), Some("<html>p</html>")).unwrap();
+        let IngestOutcome::Archived(meta) = out else { panic!("expected Archived") };
+        assert_eq!(meta.bin_size_bytes, 5);
+        assert_eq!(load_meta(data.path(), "Z 9", "5.33").unwrap().bin_sha256, meta.bin_sha256);
+        assert_eq!(fs::read_to_string(dir.join("source-page.html")).unwrap(), "<html>p</html>");
+        assert_eq!(list_archives(data.path(), None).len(), 1);
+        assert!(matches!(
+            ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), None).unwrap(),
+            IngestOutcome::AlreadyPresent(_)
+        ));
+    }
+
+    #[test]
+    fn ingest_span_result_records_what_happened() {
+        use crate::diag::{Outcome, Val};
+        let get = |f: &Vec<(&'static str, Val)>, k: &str| f.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+        let (data, src) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let a = file_with(src.path(), "a.bin", b"hello");
+        let b = file_with(src.path(), "b.bin", b"hellO");
+
+        let archived = ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), None);
+        let (o, f) = ingest_span_result(&archived);
+        assert_eq!(o, Outcome::Ok);
+        assert_eq!(get(&f, "result"), Some(Val::text("archived")));
+        assert_eq!(get(&f, "size"), Some(Val::Len(5)));
+        assert_eq!(get(&f, "sha"), Some(Val::Hash("2cf24dba5fb0a30e".into())));
+
+        let again = ingest_bundle(data.path(), "Z 9", "5.33", &a, &prov(), None);
+        let (o, f) = ingest_span_result(&again);
+        assert_eq!(o, Outcome::Ok);
+        assert_eq!(get(&f, "result"), Some(Val::text("already_present")));
+
+        let clash = ingest_bundle(data.path(), "Z 9", "5.33", &b, &prov(), None);
+        let (o, f) = ingest_span_result(&clash);
+        assert_eq!(o, Outcome::Failed);
+        assert_eq!(get(&f, "error_kind"), Some(Val::text("content_mismatch")));
+        assert_eq!(get(&f, "existing_sha"), Some(Val::Hash("2cf24dba5fb0a30e".into())));
+        assert!(matches!(get(&f, "new_sha"), Some(Val::Hash(h)) if h.len() == 16 && h != "2cf24dba5fb0a30e"));
+
+        let missing = ingest_bundle(data.path(), "Z 9", "5.34", Path::new("/nonexistent/x.bin"), &prov(), None);
+        let (o, f) = ingest_span_result(&missing);
+        assert_eq!((o, get(&f, "error_kind")), (Outcome::Failed, Some(Val::text("io"))));
+
+        let (_, f) = ingest_span_result(&Err(FirmwareError::ChecksumMismatch { stored: "AB".repeat(32), computed: "cd".repeat(32) }));
+        assert_eq!(get(&f, "expected_sha"), Some(Val::Hash("abababababababab".into())), "lower-cased, 16 digits");
+        assert_eq!(get(&f, "got_sha"), Some(Val::Hash("cdcdcdcdcdcdcdcd".into())));
     }
 
     #[test]

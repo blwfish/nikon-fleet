@@ -57,7 +57,7 @@ camera is unknown (a write whose data went out and whose reply never came; an ap
 | lock | `camera_lock_held` (top, open for the whole hold); event `lock_refused` | `reason` |
 | snapshot | `capture_snapshot`, `restore_point`, `check`, `save_new` | `gate_waived` |
 | transplant, restore | `plan`, `apply`, `execute_writes` | `plan_digest` (hashed), `status`, `written`, `write_errors`, `no_op`, `steps`, `dry_run` |
-| firmware | `http_get`, `http_download`, `fetch`, `ingest` | `host`, `bytes`, `error_kind`, `model`, `version` |
+| firmware | `http_get`, `http_download`, `fetch`, `ingest` | `host`, `bytes`, `error_kind`, `model`, `version`; `fetch`: `source`, `warnings` (count), `size_published`, `sha_published`, `got_size`, and on a mismatch `expected_size`/`got_size` or `expected_sha`/`got_sha` (16 hex digits); `ingest`: `result` (`archived`, `already_present`), `size`, `sha`, `existing_sha`/`new_sha` on a content clash, `adopted_incomplete` (a crashed archive of the same bytes was completed), `part_cleanup_failed` (a full-size `.part` could not be removed) |
 | diag / cli events | `start` (role, `ppid`, `request_id`), `phase` (worker progress), `exit`, `panic` (location and bounded message) | |
 | maid_sdk event | `teardown_watchdog` (`limit_ms`, `code`): a write command's camera session did not close within the limit after the result was written, and the process was ended with its decided status; the `disconnect_device` span it cut short is recorded `abandoned` | |
 
