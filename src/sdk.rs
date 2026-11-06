@@ -334,7 +334,80 @@ pub enum SdkError {
 }
 
 fn check(call: &'static str, code: i32) -> Result<(), SdkError> {
-    if code < 0 { Err(SdkError::SdkCall { call, code }) } else { Ok(()) }
+    check_code(call, code).map(|_| ())
+}
+
+/// [`check`] that hands back the (non-negative) code, for a span that records it on success.
+fn check_code(call: &'static str, code: i32) -> Result<i32, SdkError> {
+    if code < 0 { Err(SdkError::SdkCall { call, code }) } else { Ok(code) }
+}
+
+impl SdkError {
+    /// Closed machine-readable tag. Exhaustive match: a new variant must be given a tag before this compiles.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            SdkError::Load { .. } => "load",
+            SdkError::Symbol(..) => "symbol",
+            SdkError::SdkCall { .. } => "sdk_call",
+            SdkError::Utf8(_) => "utf8",
+            SdkError::UnsupportedWrite(_) => "unsupported_write",
+            SdkError::InvalidValue => "invalid_value",
+            SdkError::StringTooLong { .. } => "string_too_long",
+        }
+    }
+
+    /// What a diagnostics span records for this error: typed fields, never the `Display` text. The tag is always
+    /// there as `error_kind`; the rest is the variant's own data: the SDK call and its return code (`call`,
+    /// `code`), the symbol that did not resolve (`symbol`, a name from this file's own list), the capability kind
+    /// (`kind`), the string length (`len`). A load failure also carries the loader's reason (`load_error`), which
+    /// names the bundle path the process was already told to load; nothing else here can embed a payload.
+    pub fn diag_fields(&self) -> Vec<(&'static str, crate::diag::Val)> {
+        use crate::diag::Val;
+        let mut f = vec![("error_kind", Val::text(self.tag()))];
+        match self {
+            SdkError::Load { source, .. } => f.push(("load_error", Val::text(&source.to_string()))),
+            SdkError::Symbol(name, _) => f.push(("symbol", Val::text(name))),
+            SdkError::SdkCall { call, code } => {
+                f.push(("call", Val::text(call)));
+                f.push(("code", Val::I64(i64::from(*code))));
+            }
+            SdkError::UnsupportedWrite(kind) => f.push(("kind", Val::U64(u64::from(*kind)))),
+            SdkError::StringTooLong { len } => f.push(("len", Val::U64(*len as u64))),
+            SdkError::Utf8(_) | SdkError::InvalidValue => {}
+        }
+        f
+    }
+}
+
+/// End a span for an SDK step: `ok_extra` on success, the error's typed fields ([`SdkError::diag_fields`]) on
+/// failure. The one place an SDK span's `Result` is turned into an outcome, so no site records an error as text
+/// or drops its code.
+fn finish_sdk<T>(span: crate::diag::Span<'_>, result: &Result<T, SdkError>) {
+    finish_sdk_with(span, result, |_| Vec::new());
+}
+
+/// [`finish_sdk`] with fields known only from the success value (`ok_extra` is not called on failure).
+fn finish_sdk_with<T>(
+    span: crate::diag::Span<'_>,
+    result: &Result<T, SdkError>,
+    ok_extra: impl FnOnce(&T) -> Vec<(&'static str, crate::diag::Val)>,
+) {
+    use crate::diag::Outcome;
+    match result {
+        Ok(v) => span.finish_with(Outcome::Ok, &ok_extra(v)),
+        Err(e) => span.finish_with(Outcome::Failed, &e.diag_fields()),
+    }
+}
+
+/// The `value_hash` field of a `write_cap` span: a short hash of the value's JSON. When the value cannot be
+/// serialised there is no hash to record, and the field says so (`value_unhashable`) rather than hashing an empty
+/// buffer, which would look like a genuine value.
+fn value_hash_field<T: serde::Serialize + ?Sized>(value: &T) -> (&'static str, crate::diag::Val) {
+    use crate::diag::Val;
+    match serde_json::to_vec(value) {
+        Ok(bytes) => ("value_hash", Val::hash(&bytes)),
+        Err(_) => ("value_unhashable", Val::Bool(true)),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -377,13 +450,17 @@ pub(crate) fn model_from_product_string(product: &str) -> String {
 }
 
 pub(crate) fn nikon_usb_devices() -> Vec<rusb::Device<rusb::GlobalContext>> {
-    let list = match rusb::DeviceList::new() {
-        Ok(l) => l,
-        Err(_) => return Vec::new(),
-    };
-    list.iter()
+    nikon_usb_devices_checked().unwrap_or_default()
+}
+
+/// [`nikon_usb_devices`] that says when the bus could not be listed instead of returning "no bodies".
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn nikon_usb_devices_checked() -> Result<Vec<rusb::Device<rusb::GlobalContext>>, rusb::Error> {
+    let list = rusb::DeviceList::new()?;
+    Ok(list
+        .iter()
         .filter(|d| d.device_descriptor().map(|desc| desc.vendor_id() == NIKON_VID).unwrap_or(false))
-        .collect()
+        .collect())
 }
 
 pub(crate) fn read_usb_string(handle: &rusb::DeviceHandle<rusb::GlobalContext>, idx: u8) -> String {
@@ -406,7 +483,8 @@ pub enum UsbStage {
     Open,
 }
 
-/// A Nikon USB device that is attached but whose identity could not be read.
+/// A Nikon USB device that is attached but whose identity could not be read. At the `Descriptor` stage the vendor
+/// itself was not established, so it is a device that may be a Nikon body.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct UsbUnreadable {
     pub bus: u8,
@@ -452,15 +530,31 @@ fn read_usb_identity(device: &rusb::Device<rusb::GlobalContext>) -> Result<UsbCa
 /// One pass over the USB bus, reporting what could not be read instead of
 /// dropping it.
 pub fn usb_camera_scan() -> UsbScan {
-    use crate::diag::{self, Class, Outcome, Subsystem, Val};
+    use crate::diag::{self, Class, Subsystem};
     // Opening a USB handle to read a serial can stall, so the scan is a span of its own.
     let span = diag::span(Subsystem::Usb, "usb_scan", Class::Top, &[]);
     let scan = usb_camera_scan_inner();
-    span.finish_with(
-        if scan.enumeration_error.is_some() { Outcome::Failed } else { Outcome::Ok },
-        &[("cameras", Val::U64(scan.cameras.len() as u64)), ("unreadable", Val::U64(scan.unreadable.len() as u64))],
-    );
+    let (outcome, fields) = scan.judge();
+    span.finish_with(outcome, &fields);
     scan
+}
+
+impl UsbScan {
+    /// How the `usb_scan` span ends: `failed` when the bus could not be listed (the error is recorded, as libusb
+    /// names it) or a device on it could not be read (`unreadable` counts them), else `ok`. Zero cameras with
+    /// nothing unreadable is `ok`: nothing is attached.
+    fn judge(&self) -> (crate::diag::Outcome, Vec<(&'static str, crate::diag::Val)>) {
+        use crate::diag::{Outcome, Val};
+        let mut fields = vec![
+            ("cameras", Val::U64(self.cameras.len() as u64)),
+            ("unreadable", Val::U64(self.unreadable.len() as u64)),
+        ];
+        if let Some(e) = &self.enumeration_error {
+            fields.push(("enumeration_error", Val::text(e)));
+        }
+        let failed = self.enumeration_error.is_some() || !self.unreadable.is_empty();
+        (if failed { Outcome::Failed } else { Outcome::Ok }, fields)
+    }
 }
 
 fn usb_camera_scan_inner() -> UsbScan {
@@ -468,11 +562,34 @@ fn usb_camera_scan_inner() -> UsbScan {
         Ok(l) => l,
         Err(e) => return UsbScan { enumeration_error: Some(e.to_string()), ..UsbScan::default() },
     };
+    classify_usb_devices(
+        list.iter(),
+        |d| match d.device_descriptor() {
+            Ok(desc) => Ok(desc.vendor_id()),
+            Err(e) => Err(UsbUnreadable { bus: d.bus_number(), address: d.address(), stage: UsbStage::Descriptor, error: e.to_string() }),
+        },
+        read_usb_identity,
+    )
+}
+
+/// Sort a bus listing into bodies read and devices not read. A device whose vendor cannot be established (its
+/// descriptor will not read) is reported as unreadable at the `Descriptor` stage, not dropped: it may be a body,
+/// and a missing body that is also missing from the list would look like one that is not attached. A device of
+/// another vendor is not Nikon's and is left out.
+fn classify_usb_devices<D>(
+    devices: impl IntoIterator<Item = D>,
+    vendor: impl Fn(&D) -> Result<u16, UsbUnreadable>,
+    identity: impl Fn(&D) -> Result<UsbCameraInfo, UsbUnreadable>,
+) -> UsbScan {
     let mut scan = UsbScan::default();
-    for device in list.iter().filter(|d| d.device_descriptor().map(|desc| desc.vendor_id() == NIKON_VID).unwrap_or(false)) {
-        match read_usb_identity(&device) {
-            Ok(info) => scan.cameras.push(info),
+    for device in devices {
+        match vendor(&device) {
             Err(u) => scan.unreadable.push(u),
+            Ok(v) if v != NIKON_VID => {}
+            Ok(_) => match identity(&device) {
+                Ok(info) => scan.cameras.push(info),
+                Err(u) => scan.unreadable.push(u),
+            },
         }
     }
     scan
@@ -517,24 +634,91 @@ pub fn pair_devices(
 /// On Windows the SDK's `EnumDevices` sees already-connected cameras without
 /// any reset, so this is a no-op there.
 #[cfg(target_os = "macos")]
-fn reset_nikon_usb_cameras() -> usize {
-    let mut count = 0;
-    for device in nikon_usb_devices() {
-        if let Ok(handle) = device.open() {
-            if handle.reset().is_ok() {
-                count += 1;
-            }
-        }
-    }
-    count
+fn reset_nikon_usb_cameras() -> UsbResetReport {
+    let devices = match nikon_usb_devices_checked() {
+        Ok(d) => d,
+        Err(_) => return UsbResetReport { enumeration_failed: true, ..UsbResetReport::default() },
+    };
+    tally_resets(devices, |device| match device.open() {
+        Err(_) => ResetStep::OpenFailed,
+        Ok(handle) => match handle.reset() {
+            Ok(()) => ResetStep::Reset,
+            Err(_) => ResetStep::ResetFailed,
+        },
+    })
 }
 
+/// Nothing is reset off macOS (see above): nothing was attempted, so nothing failed.
 #[cfg(not(target_os = "macos"))]
-fn reset_nikon_usb_cameras() -> usize { 0 }
+fn reset_nikon_usb_cameras() -> UsbResetReport { UsbResetReport::default() }
+
+/// How resetting one Nikon body ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetStep {
+    Reset,
+    OpenFailed,
+    ResetFailed,
+}
+
+/// What one pass of resetting the attached Nikon bodies did, kept so the `usb_reset` span records it instead of
+/// a bare "done": the count of resets that took is not the same as the count that were tried.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UsbResetReport {
+    /// Nikon bodies found on the bus.
+    devices: usize,
+    reset: usize,
+    open_failed: usize,
+    reset_failed: usize,
+    /// The bus could not be listed, so `devices` says nothing about what is attached.
+    enumeration_failed: bool,
+}
+
+/// Try `step` on every device and count how each ended.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn tally_resets<D>(devices: impl IntoIterator<Item = D>, step: impl Fn(&D) -> ResetStep) -> UsbResetReport {
+    let mut r = UsbResetReport::default();
+    for d in devices {
+        r.devices += 1;
+        match step(&d) {
+            ResetStep::Reset => r.reset += 1,
+            ResetStep::OpenFailed => r.open_failed += 1,
+            ResetStep::ResetFailed => r.reset_failed += 1,
+        }
+    }
+    r
+}
+
+impl UsbResetReport {
+    /// How the `usb_reset` span ends. No body attached is `ok` (nothing to reset; the enumeration after it says
+    /// whether that is right). Any body that could not be opened or reset, or a bus that could not be listed, is
+    /// `failed`, with the counts showing how many did reset: the SDK then initialises without that body's
+    /// reconnect event, and may not see it.
+    fn judge(&self) -> (crate::diag::Outcome, Vec<(&'static str, crate::diag::Val)>) {
+        use crate::diag::{Outcome, Val};
+        let failed = self.enumeration_failed || self.open_failed > 0 || self.reset_failed > 0;
+        (
+            if failed { Outcome::Failed } else { Outcome::Ok },
+            vec![
+                ("devices", Val::U64(self.devices as u64)),
+                ("reset", Val::U64(self.reset as u64)),
+                ("open_failed", Val::U64(self.open_failed as u64)),
+                ("reset_failed", Val::U64(self.reset_failed as u64)),
+                ("enumeration_failed", Val::Bool(self.enumeration_failed)),
+            ],
+        )
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Sdk — the loaded library + initialized session.
 // ─────────────────────────────────────────────────────────────────────────
+
+/// What the `sdk_load` span calls the bundle: the file name, or, for a path with none (`""`, `..`), the path
+/// itself, and for the empty path a marker, so the field is never an empty string that looks like a recorded name.
+fn bundle_label(path: &Path) -> String {
+    let label = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string_lossy().into_owned());
+    if label.is_empty() { "<empty path>".to_string() } else { label }
+}
 
 /// Resolved SDK entry points. Created with `Sdk::open`, kept alive for the
 /// duration of any camera I/O.
@@ -581,10 +765,9 @@ impl Sdk {
     pub fn open<P: AsRef<Path>>(bundle_exe_path: P) -> Result<Self, SdkError> {
         use crate::diag::{self, Class, Subsystem, Val};
         let path = bundle_exe_path.as_ref();
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let span = diag::span(Subsystem::MaidSdk, "sdk_load", Class::Top, &[("bundle", Val::text(&name))]);
+        let span = diag::span(Subsystem::MaidSdk, "sdk_load", Class::Top, &[("bundle", Val::text(&bundle_label(path)))]);
         let result = Self::open_inner(path);
-        span.done(&result);
+        finish_sdk(span, &result);
         result
     }
 
@@ -630,8 +813,8 @@ impl Sdk {
         {
             use crate::diag::{self, Class, Subsystem};
             let span = diag::span(Subsystem::Usb, "usb_reset", Class::Top, &[]);
-            reset_nikon_usb_cameras();
-            span.finish(crate::diag::Outcome::Ok);
+            let (outcome, fields) = reset_nikon_usb_cameras().judge();
+            span.finish_with(outcome, &fields);
         }
         self.initialize_sdk()
     }
@@ -650,7 +833,7 @@ impl Sdk {
         // InitializeSDK can block waiting for IOKit, so it is a span of its own.
         let span = crate::diag::span(crate::diag::Subsystem::MaidSdk, "initialize_sdk", crate::diag::Class::Top, &[]);
         let result = self.initialize_sdk_inner();
-        span.done(&result);
+        finish_sdk(span, &result);
         result
     }
 
@@ -684,9 +867,11 @@ impl Sdk {
         let span = diag::span(Subsystem::MaidSdk, "enum_devices", Class::Top, &[]);
         let mut list: *mut NkMAIDEnumDevices = ptr::null_mut();
         let mut code = 0i32;
+        let mut attempts = 0u32;
         for attempt in 0..10u32 {
             // The retry loop sleeps between attempts; the in-flight file shows which one a hang is in.
-            span.set("attempt", Val::U64(u64::from(attempt) + 1));
+            attempts = attempt + 1;
+            span.set("attempt", Val::U64(u64::from(attempts)));
             list = ptr::null_mut();
             code = unsafe {
                 (self.enum_devices)(&mut list, ptr::null_mut(), ptr::null_mut())
@@ -704,7 +889,7 @@ impl Sdk {
             // anyway (unconfirmed, but not ruled out) would otherwise skip
             // freeing it via the old `?`.
             unsafe { free_device_list(list) };
-            span.finish_with(Outcome::Failed, &[("code", Val::I64(i64::from(code)))]);
+            span.finish_with(Outcome::Failed, &e.diag_fields());
             return Err(e);
         }
         let mut out = Vec::new();
@@ -724,7 +909,8 @@ impl Sdk {
             }
             unsafe { free_device_list(list) };
         }
-        span.finish_with(Outcome::Ok, &[("devices", Val::U64(out.len() as u64))]);
+        // `attempts` is what tells an empty answer after ten tries from one on the first.
+        span.finish_with(Outcome::Ok, &[("devices", Val::U64(out.len() as u64)), ("attempts", Val::U64(u64::from(attempts))), ("code", Val::I64(i64::from(code)))]);
         Ok(out)
     }
 
@@ -736,7 +922,7 @@ impl Sdk {
         let mut cap_info: *mut NkMAIDEnumCapInfo = ptr::null_mut();
         let code = unsafe { (self.connect_device)(device_id, &mut cap_info) };
         if let Err(e) = check("ConnectDevice", code) {
-            span.finish_with(Outcome::Failed, &[("code", Val::I64(i64::from(code)))]);
+            span.finish_with(Outcome::Failed, &e.diag_fields());
             // take_capabilities is a no-op on a still-null cap_info (the
             // ordinary case), but frees it if the SDK populated the
             // out-pointer despite returning an error code.
@@ -788,19 +974,19 @@ impl<'sdk> Device<'sdk> {
     /// If GET_ARRAY fails (unknown e_type on older firmware, etc.) we fall back
     /// to the index-only representation already stored in `values: []`.
     pub fn read_capability(&self, capability_id: u32) -> Result<Value, SdkError> {
-        use crate::diag::{self, Class, Outcome, Subsystem, Val};
+        use crate::diag::{self, Class, Subsystem, Val};
         // A capture reads about two hundred of these, so it is a Leaf with the least that identifies it; the
         // report collapses a run of successes and keeps every failure.
         let span = diag::span(Subsystem::MaidSdk, "read_cap", Class::Leaf, &[("cap", Val::Hex(u64::from(capability_id)))]);
-        let result = self.read_capability_inner(capability_id);
-        match &result {
-            Ok(_) => span.finish(Outcome::Ok),
-            Err(e) => span.finish_with(Outcome::Failed, &[("error", Val::text(&e.to_string()))]),
-        }
+        let result = self.read_capability_inner(capability_id, &span);
+        // What the read found (`data_type`, and `values_missing`/`placeholder` when the value is degraded) was
+        // `set` on the span as it was learned; a failure adds the typed error.
+        finish_sdk(span, &result);
         result
     }
 
-    fn read_capability_inner(&self, capability_id: u32) -> Result<Value, SdkError> {
+    fn read_capability_inner(&self, capability_id: u32, span: &crate::diag::Span<'_>) -> Result<Value, SdkError> {
+        use crate::diag::Val;
         let mut data_ptr: *mut c_void = ptr::null_mut();
         let mut data_type: u32 = 0;
         let code = unsafe {
@@ -816,10 +1002,16 @@ impl<'sdk> Device<'sdk> {
             return Err(e);
         }
 
+        span.set("data_type", Val::U64(u64::from(data_type)));
         if data_type == DT_ENUM_PTR && !data_ptr.is_null() {
-            return Ok(unsafe { self.read_enum_capability(capability_id, data_ptr) });
+            return Ok(unsafe { self.read_enum_capability(capability_id, data_ptr, span) });
         }
 
+        // A type this reader cannot decode still reads as Ok (the SDK answered), with a placeholder value; the
+        // span says so, so a run of them is visible without opening the snapshot.
+        if decodes_to_placeholder(data_type) {
+            span.set("placeholder", Val::Bool(true));
+        }
         let value = unsafe { decode_value(data_ptr, data_type) };
         unsafe { free_cap_value(data_ptr, data_type) };
         Ok(value)
@@ -827,7 +1019,8 @@ impl<'sdk> Device<'sdk> {
 
     /// Two-call enum read: GET_VALUE for the current index, GET_ARRAY for the
     /// options list. Frees val_ptr before returning.
-    unsafe fn read_enum_capability(&self, capability_id: u32, val_ptr: *mut c_void) -> Value {
+    unsafe fn read_enum_capability(&self, capability_id: u32, val_ptr: *mut c_void, span: &crate::diag::Span<'_>) -> Value {
+        use crate::diag::Val;
         // Snapshot the index fields before freeing.
         let st = unsafe { &*(val_ptr as *const NkMAIDEnum) };
         let value_idx   = st.ul_value;
@@ -845,9 +1038,10 @@ impl<'sdk> Device<'sdk> {
         // Second call — retrieve the full options array.
         let mut arr_ptr: *mut c_void = ptr::null_mut();
         let mut arr_type: u32 = 0;
-        let arr_ok = unsafe {
+        let arr_code = unsafe {
             (self.sdk.get_capability)(capability_id, GET_ARRAY, &mut arr_ptr, &mut arr_type)
-        } >= 0;
+        };
+        let arr_ok = arr_code >= 0;
 
         let (values, effective_bytes) = if arr_ok && arr_type == DT_ENUM_PTR && !arr_ptr.is_null() {
             let arr_st = unsafe { &*(arr_ptr as *const NkMAIDEnum) };
@@ -857,6 +1051,10 @@ impl<'sdk> Device<'sdk> {
             (v, b)
         } else {
             if !arr_ptr.is_null() { unsafe { free_cap_value(arr_ptr, arr_type) }; }
+            // The options list could not be had: the read still returns the index (documented above), with an
+            // empty `values`. The span says so, with the second call's code, instead of looking like a full read.
+            span.set("values_missing", Val::Bool(true));
+            span.set("array_code", Val::I64(i64::from(arr_code)));
             (Value::Array(vec![]), elem_bytes)
         };
 
@@ -877,22 +1075,19 @@ impl<'sdk> Device<'sdk> {
     /// `value` must be the JSON that `read_capability` previously returned for
     /// this capability (or an equivalent with the same structure).
     pub fn write_capability(&self, capability_id: u32, cap_kind: u32, value: &Value) -> Result<(), SdkError> {
-        use crate::diag::{self, Class, Outcome, Subsystem, Val};
+        use crate::diag::{self, Class, Subsystem, Val};
         // The only place the SDK path changes a camera. A Top span so writes are the last thing the ring evicts,
         // and the value is recorded only as a hash: enough to see that two writes carried the same value.
-        let bytes = serde_json::to_vec(value).unwrap_or_default();
         let span = diag::span(
             Subsystem::MaidSdk,
             "write_cap",
             Class::Top,
-            &[("cap", Val::Hex(u64::from(capability_id))), ("kind", Val::U64(u64::from(cap_kind))), ("value_hash", Val::hash(&bytes))],
+            &[("cap", Val::Hex(u64::from(capability_id))), ("kind", Val::U64(u64::from(cap_kind))), value_hash_field(value)],
         );
         let result = unsafe { write_cap_value(self.sdk, capability_id, cap_kind, value) };
-        match &result {
-            Ok(()) => span.finish(Outcome::Ok),
-            Err(e) => span.finish_with(Outcome::Failed, &[("error", Val::text(&e.to_string()))]),
-        }
-        result
+        // SetCapability's own return code on success (non-negative), beside the hash of what was sent.
+        finish_sdk_with(span, &result, |code| vec![("code", Val::I64(i64::from(*code)))]);
+        result.map(|_| ())
     }
 }
 
@@ -954,8 +1149,11 @@ unsafe fn free_device_list(list: *mut NkMAIDEnumDevices) {
 unsafe fn take_capabilities(p: *mut NkMAIDEnumCapInfo) -> Vec<CapabilityInfo> {
     if p.is_null() { return Vec::new(); }
     let info = unsafe { &*p };
-    let mut out = Vec::with_capacity(info.ul_cap_count as usize);
-    for i in 0..info.ul_cap_count as usize {
+    // A count with no array behind it is read as no capabilities (the free below still runs); indexing a null
+    // array would be undefined behaviour. The `connect_device` span records `capabilities: 0` for it.
+    let count = if info.p_cap_array.is_null() { 0 } else { info.ul_cap_count as usize };
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
         let c = unsafe { &*info.p_cap_array.add(i) };
         out.push(CapabilityInfo {
             id: c.ul_id,
@@ -987,6 +1185,18 @@ unsafe fn free_cap_value(data_ptr: *mut c_void, data_type: u32) {
             unsafe { sdk_free(data_ptr) };
         }
         _ => {} // DT_NULL / by-value types — no allocation to free
+    }
+}
+
+/// Whether [`decode_value`] answers `data_type` with a placeholder object (`{"_type": ..}` or
+/// `{"_unknown_type": ..}`) instead of a value: the datetime and array types it does not carry, and any type it
+/// does not know. A test ties this to `decode_value` for every type code, so the two cannot drift.
+fn decodes_to_placeholder(data_type: u32) -> bool {
+    match data_type {
+        DT_NULL | DT_BOOLEAN | DT_INTEGER | DT_UNSIGNED | DT_BOOLEAN_PTR | DT_INTEGER_PTR | DT_UNSIGNED_PTR
+        | DT_FLOAT_PTR | DT_STRING_PTR | DT_ENUM_PTR | DT_RANGE_PTR => false,
+        DT_DATETIME_PTR | DT_ARRAY_PTR => true,
+        _ => true,
     }
 }
 
@@ -1193,7 +1403,7 @@ unsafe fn write_cap_value(
     capability_id: u32,
     cap_kind: u32,
     value: &Value,
-) -> Result<(), SdkError> {
+) -> Result<i32, SdkError> {
     let data = prepare_write(cap_kind, value)?;
     let (ptr, data_type): (*const c_void, _) = match &data {
         WriteData::Boolean(b) => (b as *const _ as *const c_void, DT_BOOLEAN_PTR),
@@ -1204,7 +1414,7 @@ unsafe fn write_cap_value(
         WriteData::Enum(st) => (st as *const _ as *const c_void, DT_ENUM_PTR),
         WriteData::Range(st) => (st as *const _ as *const c_void, DT_RANGE_PTR),
     };
-    check("SetCapability", unsafe { (sdk.set_capability)(capability_id, ptr, data_type) })
+    check_code("SetCapability", unsafe { (sdk.set_capability)(capability_id, ptr, data_type) })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1879,5 +2089,256 @@ mod tests {
         };
         let decoded = unsafe { decode_value(&r as *const _ as *mut c_void, DT_RANGE_PTR) };
         assert_eq!(fixture["range"], decoded);
+    }
+
+    // ── diagnostics: typed SDK errors, span helpers, the USB judges ──────
+
+    mod diag_fields {
+        use super::*;
+        use crate::diag::{Class, Config, Diag, Entry, Outcome, Subsystem, Val};
+
+        fn load_error() -> libloading::Error {
+            unsafe { Library::new("/nonexistent/nikon-fleet-test.bundle") }.err().expect("no such library")
+        }
+
+        fn utf8_error() -> std::str::Utf8Error {
+            let bytes = vec![0xffu8];
+            std::str::from_utf8(&bytes).unwrap_err()
+        }
+
+        fn every_error() -> Vec<SdkError> {
+            vec![
+                SdkError::Load { path: PathBuf::from("/x"), source: load_error() },
+                SdkError::Symbol("InitializeSDK".into(), load_error()),
+                SdkError::SdkCall { call: "GetCapability", code: -126 },
+                SdkError::Utf8(utf8_error()),
+                SdkError::UnsupportedWrite(12),
+                SdkError::InvalidValue,
+                SdkError::StringTooLong { len: 300 },
+            ]
+        }
+
+        fn field<'a>(fields: &'a [(&'static str, Val)], k: &str) -> Option<&'a Val> {
+            fields.iter().find(|(n, _)| *n == k).map(|(_, v)| v)
+        }
+
+        fn recorder() -> (tempfile::TempDir, Diag) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = Config::new(dir.path().to_path_buf(), Subsystem::Cli);
+            c.pid = 4242;
+            let d = Diag::new(c).unwrap();
+            (dir, d)
+        }
+
+        fn last(d: &Diag) -> Entry {
+            d.snapshot().pop().expect("an entry")
+        }
+
+        #[test]
+        fn every_sdk_error_has_its_own_closed_tag_recorded_as_error_kind() {
+            let errs = every_error();
+            let tags: std::collections::BTreeSet<_> = errs.iter().map(SdkError::tag).collect();
+            assert_eq!(tags.len(), errs.len(), "tags are unique");
+            for e in &errs {
+                let f = e.diag_fields();
+                assert_eq!(f[0], ("error_kind", Val::text(e.tag())), "{e}");
+            }
+        }
+
+        #[test]
+        fn an_sdk_call_failure_carries_the_call_and_its_code_as_typed_fields() {
+            let f = SdkError::SdkCall { call: "ConnectDevice", code: -106 }.diag_fields();
+            assert_eq!(field(&f, "call"), Some(&Val::text("ConnectDevice")));
+            assert_eq!(field(&f, "code"), Some(&Val::I64(-106)), "a typed code, not a number inside text");
+            let f = SdkError::SdkCall { call: "x", code: -1 }.diag_fields();
+            assert_eq!(field(&f, "code"), Some(&Val::I64(-1)));
+        }
+
+        #[test]
+        fn the_other_variants_carry_their_own_data() {
+            let sym = SdkError::Symbol("FreeSDK".into(), load_error()).diag_fields();
+            assert_eq!(field(&sym, "symbol"), Some(&Val::text("FreeSDK")));
+            let load = SdkError::Load { path: PathBuf::from("/x"), source: load_error() }.diag_fields();
+            assert!(matches!(field(&load, "load_error"), Some(Val::Text(t)) if !t.is_empty()), "{load:?}");
+            assert_eq!(field(&SdkError::UnsupportedWrite(12).diag_fields(), "kind"), Some(&Val::U64(12)));
+            assert_eq!(field(&SdkError::StringTooLong { len: 300 }.diag_fields(), "len"), Some(&Val::U64(300)));
+        }
+
+        /// Nothing but the closed tag, the call name, the symbol name and (for a load) the loader's reason is text:
+        /// a `Display` that grew a payload would not reach the record through here.
+        #[test]
+        fn no_variant_records_its_display_text() {
+            for e in every_error() {
+                for (k, v) in e.diag_fields() {
+                    if let Val::Text(t) = v {
+                        assert!(["error_kind", "call", "symbol", "load_error"].contains(&k), "{k} is text for {e}");
+                        assert_ne!(t, e.to_string(), "{k} must not be the Display text of {e}");
+                    }
+                }
+            }
+            // Utf8 and InvalidValue have nothing but the tag.
+            assert_eq!(SdkError::InvalidValue.diag_fields().len(), 1);
+            assert_eq!(SdkError::Utf8(utf8_error()).diag_fields().len(), 1);
+        }
+
+        #[test]
+        fn finish_sdk_records_the_error_code_on_failure_and_the_extra_fields_on_success() {
+            let (_dir, d) = recorder();
+            let failed: Result<(), SdkError> = Err(SdkError::SdkCall { call: "InitializeSDK", code: -9 });
+            finish_sdk(d.span(Subsystem::MaidSdk, "initialize_sdk", Class::Top, &[]), &failed);
+            let e = last(&d);
+            assert_eq!(e.outcome, Some(Outcome::Failed));
+            let get = |k: &str| e.fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            assert_eq!(get("code"), Some(Val::I64(-9)), "the InitializeSDK code reaches the record");
+            assert_eq!(get("call"), Some(Val::text("InitializeSDK")));
+            assert_eq!(get("error_kind"), Some(Val::text("sdk_call")));
+
+            let ok: Result<i32, SdkError> = Ok(3);
+            finish_sdk_with(d.span(Subsystem::MaidSdk, "write_cap", Class::Top, &[]), &ok, |c| vec![("code", Val::I64(i64::from(*c)))]);
+            let e = last(&d);
+            assert_eq!(e.outcome, Some(Outcome::Ok));
+            assert!(e.fields.iter().any(|(n, v)| n == "code" && *v == Val::I64(3)));
+            assert!(!e.fields.iter().any(|(n, _)| n == "error_kind"));
+
+            // The extra-fields closure is for success only.
+            let bad: Result<i32, SdkError> = Err(SdkError::InvalidValue);
+            finish_sdk_with(d.span(Subsystem::MaidSdk, "write_cap", Class::Top, &[]), &bad, |_| panic!("not called on failure"));
+            assert_eq!(last(&d).outcome, Some(Outcome::Failed));
+        }
+
+        #[test]
+        fn a_value_that_cannot_be_serialised_is_flagged_not_hashed_as_an_empty_buffer() {
+            struct Unserialisable;
+            impl serde::Serialize for Unserialisable {
+                fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                    Err(serde::ser::Error::custom("no"))
+                }
+            }
+            assert_eq!(value_hash_field(&Unserialisable), ("value_unhashable", Val::Bool(true)));
+            let empty_buffer_hash = Val::hash(b"");
+            let (k, v) = value_hash_field(&json!(1));
+            assert_eq!(k, "value_hash");
+            assert_eq!(v, Val::hash(b"1"));
+            assert_ne!(v, empty_buffer_hash);
+            assert_ne!(value_hash_field(&json!(1)).1, value_hash_field(&json!(2)).1);
+        }
+
+        #[test]
+        fn the_bundle_label_is_never_an_empty_string() {
+            assert_eq!(bundle_label(Path::new("/a/b/TypeCommon Module")), "TypeCommon Module");
+            assert_eq!(bundle_label(Path::new("TypeCommon Module")), "TypeCommon Module");
+            assert_eq!(bundle_label(Path::new("/a/b/..")), "/a/b/..", "no file name: the path itself");
+            assert_eq!(bundle_label(Path::new("")), "<empty path>");
+        }
+
+        // ── usb_reset ────────────────────────────────────────────────────
+
+        #[test]
+        fn tally_resets_counts_each_way_a_reset_can_end() {
+            let r = tally_resets([ResetStep::Reset, ResetStep::OpenFailed, ResetStep::ResetFailed, ResetStep::Reset], |s| *s);
+            assert_eq!(r, UsbResetReport { devices: 4, reset: 2, open_failed: 1, reset_failed: 1, enumeration_failed: false });
+            assert_eq!(tally_resets(Vec::<ResetStep>::new(), |s| *s), UsbResetReport::default());
+        }
+
+        #[test]
+        fn the_usb_reset_span_is_failed_by_any_body_that_was_not_reset_or_a_bus_that_was_not_listed() {
+            let ok = |devices, reset| UsbResetReport { devices, reset, ..UsbResetReport::default() };
+            assert_eq!(ok(0, 0).judge().0, Outcome::Ok, "no body attached: nothing to reset");
+            assert_eq!(ok(1, 1).judge().0, Outcome::Ok);
+            assert_eq!(ok(3, 3).judge().0, Outcome::Ok);
+            // One short of all reset, by either failure: failed.
+            assert_eq!(UsbResetReport { devices: 2, reset: 1, open_failed: 1, ..Default::default() }.judge().0, Outcome::Failed);
+            assert_eq!(UsbResetReport { devices: 2, reset: 1, reset_failed: 1, ..Default::default() }.judge().0, Outcome::Failed);
+            assert_eq!(UsbResetReport { devices: 1, open_failed: 1, ..Default::default() }.judge().0, Outcome::Failed, "none reset");
+            assert_eq!(UsbResetReport { enumeration_failed: true, ..Default::default() }.judge().0, Outcome::Failed);
+            let (_, f) = UsbResetReport { devices: 5, reset: 2, open_failed: 1, reset_failed: 2, enumeration_failed: false }.judge();
+            assert_eq!(field(&f, "devices"), Some(&Val::U64(5)));
+            assert_eq!(field(&f, "reset"), Some(&Val::U64(2)));
+            assert_eq!(field(&f, "open_failed"), Some(&Val::U64(1)));
+            assert_eq!(field(&f, "reset_failed"), Some(&Val::U64(2)));
+            assert_eq!(field(&f, "enumeration_failed"), Some(&Val::Bool(false)));
+        }
+
+        // ── usb_scan ─────────────────────────────────────────────────────
+
+        fn unreadable(stage: UsbStage) -> UsbUnreadable {
+            UsbUnreadable { bus: 1, address: 2, stage, error: "boom".into() }
+        }
+
+        fn camera(serial: &str) -> UsbCameraInfo {
+            UsbCameraInfo { product_id: 1, serial: serial.into(), firmware: "1.00".into(), model: "Z 9".into() }
+        }
+
+        #[test]
+        fn a_device_whose_descriptor_will_not_read_is_reported_unreadable_not_dropped() {
+            // 1 Nikon, 2 other vendor, 3 descriptor failure, 4 Nikon whose identity fails.
+            let scan = classify_usb_devices(
+                [1u8, 2, 3, 4],
+                |d| match d {
+                    1 | 4 => Ok(NIKON_VID),
+                    2 => Ok(0x1234),
+                    _ => Err(unreadable(UsbStage::Descriptor)),
+                },
+                |d| if *d == 4 { Err(unreadable(UsbStage::Open)) } else { Ok(camera("A")) },
+            );
+            assert_eq!(scan.cameras, vec![camera("A")]);
+            assert_eq!(scan.unreadable.iter().map(|u| u.stage).collect::<Vec<_>>(), vec![UsbStage::Descriptor, UsbStage::Open]);
+            assert_eq!(scan.cameras.len() + scan.unreadable.len(), 3, "another vendor's device is neither");
+            assert!(scan.enumeration_error.is_none());
+        }
+
+        #[test]
+        fn the_vendor_id_boundary_is_exactly_nikons() {
+            for (vid, is_nikon) in [(NIKON_VID - 1, false), (NIKON_VID, true), (NIKON_VID + 1, false)] {
+                let scan = classify_usb_devices([()], |_| Ok(vid), |_| Ok(camera("S")));
+                assert_eq!(scan.cameras.len(), usize::from(is_nikon), "vid {vid:#x}");
+            }
+        }
+
+        #[test]
+        fn the_usb_scan_span_records_the_enumeration_error_and_fails_on_an_unreadable_body() {
+            let clean = UsbScan { cameras: vec![camera("A")], ..UsbScan::default() };
+            assert_eq!(clean.judge().0, Outcome::Ok);
+            assert_eq!(UsbScan::default().judge().0, Outcome::Ok, "nothing attached");
+            let one_bad = UsbScan { cameras: vec![camera("A")], unreadable: vec![unreadable(UsbStage::Open)], ..UsbScan::default() };
+            let (o, f) = one_bad.judge();
+            assert_eq!(o, Outcome::Failed);
+            assert_eq!((field(&f, "cameras"), field(&f, "unreadable")), (Some(&Val::U64(1)), Some(&Val::U64(1))));
+            let no_bus = UsbScan { enumeration_error: Some("Access denied".into()), ..UsbScan::default() };
+            let (o, f) = no_bus.judge();
+            assert_eq!(o, Outcome::Failed);
+            assert_eq!(field(&f, "enumeration_error"), Some(&Val::text("Access denied")));
+            assert!(field(&clean.judge().1, "enumeration_error").is_none());
+        }
+
+        // ── read_cap ─────────────────────────────────────────────────────
+
+        /// `decodes_to_placeholder` is tied to `decode_value` for every type code around the known range: a type
+        /// that decodes to a `_type`/`_unknown_type` object is exactly one it says is a placeholder.
+        #[test]
+        fn the_placeholder_classification_matches_what_decode_value_returns() {
+            for t in 0..=40u32 {
+                let v = unsafe { decode_value(ptr::null_mut(), t) };
+                let is_placeholder = v.get("_type").is_some() || v.get("_unknown_type").is_some();
+                assert_eq!(decodes_to_placeholder(t), is_placeholder, "type {t}: {v}");
+            }
+            assert!(decodes_to_placeholder(DT_DATETIME_PTR) && decodes_to_placeholder(DT_ARRAY_PTR));
+            assert!(!decodes_to_placeholder(DT_ENUM_PTR) && !decodes_to_placeholder(DT_RANGE_PTR) && !decodes_to_placeholder(DT_NULL));
+        }
+
+        #[test]
+        fn a_capability_count_with_no_array_behind_it_reads_as_no_capabilities() {
+            let p = unsafe { sdk_alloc(std::mem::size_of::<NkMAIDEnumCapInfo>()) } as *mut NkMAIDEnumCapInfo;
+            unsafe { p.write(NkMAIDEnumCapInfo { p_cap_array: ptr::null_mut(), ul_cap_count: 5, ul_allocation_size: 0 }) };
+            let caps = unsafe { take_capabilities(p) };
+            assert!(caps.is_empty());
+        }
+
+        #[test]
+        fn check_code_hands_back_the_non_negative_code_and_fails_below_zero() {
+            assert_eq!(check_code("x", 0).unwrap(), 0);
+            assert_eq!(check_code("x", 7).unwrap(), 7);
+            assert!(matches!(check_code("x", -1), Err(SdkError::SdkCall { code: -1, .. })));
+        }
     }
 }

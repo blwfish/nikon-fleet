@@ -206,7 +206,28 @@ pub fn build_plan<P: CameraPort + ?Sized>(port: &P, guard: &CodeNameGuard, input
             let outcomes = transplant(port, &input.source.properties, guard, input.options, true);
             report_from(outcomes, input)
         },
-        |_| (crate::diag::Outcome::Ok, Vec::new()),
+        judge_plan,
+    )
+}
+
+/// How the transplant `plan` span ends. A plan is a report, and skips are its content (a healthy plan skips
+/// plenty), so it is `ok` with the counts beside it. The one thing that makes it a failure is that the body
+/// could not be read at all: it has outcomes and every one is `target_read_failed`, so nothing was planned and
+/// nothing can be called "unchanged". A plan with no outcomes (an empty source) planned nothing, and read
+/// nothing, so it is not that failure.
+fn judge_plan(plan: &PlanReport) -> (crate::diag::Outcome, Vec<(&'static str, crate::diag::Val)>) {
+    use crate::diag::{Outcome, Val};
+    let total = plan.outcomes.len();
+    let unread = plan.counts.by_tag.get(crate::transplant::SkipReason::TargetReadFailed(String::new()).tag()).copied().unwrap_or(0);
+    let outcome = if total > 0 && unread == total { Outcome::Failed } else { Outcome::Ok };
+    (
+        outcome,
+        vec![
+            ("outcomes", Val::U64(total as u64)),
+            ("copied", Val::U64(plan.counts.copied as u64)),
+            ("would_change", Val::U64(plan.counts.would_change as u64)),
+            ("target_read_failed", Val::U64(unread as u64)),
+        ],
     )
 }
 
@@ -622,5 +643,47 @@ mod tests {
         let o = opts(&["Num"]);
         let report = build_plan(&c, &guard(&entries), &PlanInput { source: &src, source_bytes: b"fixed source bytes", target: &target, options: &o });
         assert_eq!(report.digest, "5a41695ba4fcfeade8091fd65a4229b7c494f201de6f091a469593a033de63da");
+    }
+
+    // ── the plan span's judgement (diag) ─────────────────────────────────
+
+    /// A plan fails only when the body could not be read at all: outcomes exist and every one is
+    /// `target_read_failed`. One outcome that is not (here a string that needs no read), or none at all, is not.
+    #[test]
+    fn a_plan_is_failed_only_when_every_outcome_is_an_unreadable_target() {
+        use crate::diag::{Outcome, Val};
+        let en = json!({"value_index": 0, "default_index": 0, "elem_count": 2, "elem_type": 2, "elem_bytes": 4, "values": [1, 2]});
+        let enums = vec![("En1", 6, en.clone()), ("En2", 7, en.clone())];
+        let unreadable = FakeCamera::new()
+            .with(6, RW, json!(0))
+            .with(7, RW, json!(0))
+            .failing_read(6, Failure::Call(-106))
+            .failing_read(7, Failure::Call(-106));
+        let p = plan_with(&unreadable, &enums, "T", &[]);
+        assert_eq!(p.counts.by_tag.get("target_read_failed"), Some(&2));
+        let (outcome, fields) = judge_plan(&p);
+        assert_eq!(outcome, Outcome::Failed, "2 outcomes, 2 unread");
+        assert_eq!(fields[0], ("outcomes", Val::U64(2)));
+        assert_eq!(fields[3], ("target_read_failed", Val::U64(2)));
+
+        // One short of every outcome: ok.
+        let mixed_entries = vec![("En1", 6, en.clone()), ("Str", 2, json!("x"))];
+        let mixed = FakeCamera::new().with(6, RW, json!(0)).failing_read(6, Failure::Call(-106)).with(2, RW, json!("y"));
+        let p = plan_with(&mixed, &mixed_entries, "T", &[]);
+        assert_eq!((p.counts.by_tag.get("target_read_failed"), p.outcomes.len()), (Some(&1), 2));
+        let (outcome, fields) = judge_plan(&p);
+        assert_eq!(outcome, Outcome::Ok, "1 outcome of 2 unread");
+        assert_eq!(fields[1], ("copied", Val::U64(p.counts.copied as u64)));
+        assert_eq!(fields[2], ("would_change", Val::U64(p.counts.would_change as u64)));
+
+        // A single outcome that is unread is the boundary case: 1 of 1.
+        let p = plan_with(&unreadable, &[("En1", 6, en)], "T", &[]);
+        assert_eq!(p.outcomes.len(), 1);
+        assert_eq!(judge_plan(&p).0, Outcome::Failed);
+
+        // No outcomes at all: nothing planned, not an unreadable body.
+        let p = plan_with(&FakeCamera::new(), &[], "T", &[]);
+        assert!(p.outcomes.is_empty());
+        assert_eq!(judge_plan(&p).0, Outcome::Ok);
     }
 }

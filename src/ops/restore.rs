@@ -530,7 +530,16 @@ pub fn execute_from<P: CameraPort + ?Sized>(
                         if scale_differs {
                             StepOutcome::Skipped(RestoreSkip::RangeScaleDiffers)
                         } else if dry_run {
-                            StepOutcome::WouldWrite
+                            // A dry run makes no SDK call, but the kind decides the real run's answer: a kind
+                            // nothing writes (a datetime, an array) is refused by `prepare_write`, the one place
+                            // that decides it, so the plan says `unsupported_write_type` and not a write the real
+                            // run will refuse. (A value the kind cannot take is only found by the real write:
+                            // `write_failed`.)
+                            if port.write_kind_supported(step.code, cap.kind, &coherent_for_write(value)) {
+                                StepOutcome::WouldWrite
+                            } else {
+                                StepOutcome::UnsupportedWriteType
+                            }
                         } else {
                             match port.write_capability(step.code, cap.kind, &coherent_for_write(value)) {
                                 Ok(()) => StepOutcome::Written,
@@ -544,7 +553,26 @@ pub fn execute_from<P: CameraPort + ?Sized>(
             })
             .collect();
         RestoreRun { steps }
-    }, |run| (crate::diag::Outcome::Ok, vec![("steps", crate::diag::Val::U64(run.steps.len() as u64))]))
+    }, judge_run)
+}
+
+/// How the `execute_writes` span ends: `failed` when any step's write errored (its tag is `write_failed`, and the
+/// write may still have landed), else `ok`. Skips, unsupported kinds and unselected properties are routine and not
+/// failures; they are counted beside it. `written` counts would-writes in a dry run (the span's `dry_run` field
+/// says which).
+fn judge_run(run: &RestoreRun) -> (crate::diag::Outcome, Vec<(&'static str, crate::diag::Val)>) {
+    use crate::diag::{Outcome, Val};
+    let c = run.counts();
+    let outcome = if c.errors > 0 { Outcome::Failed } else { Outcome::Ok };
+    (
+        outcome,
+        vec![
+            ("steps", Val::U64(run.steps.len() as u64)),
+            ("written", Val::U64(c.written as u64)),
+            ("write_errors", Val::U64(c.errors as u64)),
+            ("unsupported_kind", Val::U64(c.skipped_type as u64)),
+        ],
+    )
 }
 
 /// What a read-back after a restore showed.
@@ -1113,6 +1141,75 @@ mod tests {
         assert_eq!(outcomes(&run), [("A", "would_write")]);
         assert_eq!(run.counts().written, 1);
         assert!(run.written_names().is_empty(), "nothing was actually written");
+    }
+
+    /// N01: a dry run used to list a kind nothing writes (the clock's datetime) as `would_write` while the real run
+    /// refused it as `unsupported_write_type`. The plan now says what the run will.
+    #[test]
+    fn a_dry_run_and_the_real_run_agree_on_a_kind_the_body_will_not_take() {
+        const CLOCK: u32 = 33000;
+        let held = json!({"_type": "datetime"});
+        for dry_run in [true, false] {
+            let cam = FakeCamera::new().with(1, RW, json!(0)).with(CLOCK, RW, held.clone());
+            let mut snap = snapshot_of(&[("kNkMAIDCapability_A", 1, 10)]);
+            snap.insert("kNkMAIDCapability_ClockDateTime", CLOCK, held.clone());
+            let run = execute(&cam, &snap.properties, None, dry_run);
+            let clock = run.steps.iter().find(|s| s.code == CLOCK).unwrap();
+            assert_eq!(clock.outcome, StepOutcome::UnsupportedWriteType, "dry_run={dry_run}");
+            let a = run.steps.iter().find(|s| s.code == 1).unwrap();
+            assert_eq!(a.outcome.tag(), if dry_run { "would_write" } else { "written" }, "a writable neighbour is unaffected");
+            assert_eq!((run.counts().written, run.counts().skipped_type), (1, 1), "dry_run={dry_run}");
+        }
+    }
+
+    /// The kind check is only the kind: a value the kind cannot take is found by the real write (`write_failed`),
+    /// and a dry run, which makes no write, still lists it as `would_write`. Pinned so a change is deliberate.
+    #[test]
+    fn a_dry_run_does_not_judge_a_value_the_kind_cannot_take() {
+        let cam = FakeCamera::new().with(1, RW, json!(0));
+        let mut snap = snapshot_of(&[]);
+        snap.insert("A", 1, json!("not a number"));
+        assert_eq!(execute(&cam, &snap.properties, None, true).steps[0].outcome, StepOutcome::WouldWrite);
+        assert_eq!(execute(&cam, &snap.properties, None, false).steps[0].outcome.tag(), "write_failed");
+    }
+
+    // ── the execute_writes span's judgement (diag) ───────────────────────
+
+    #[test]
+    fn execute_writes_is_failed_by_one_failed_write_and_not_by_routine_skips() {
+        use crate::diag::{Outcome, Val};
+        // One failed write among successes: failed (the write may have landed), counts beside it.
+        let cam = FakeCamera::new().with(1, RW, json!(0)).with(2, RW, json!(0)).failing_write(1, Failure::Call(-125));
+        let snap = snapshot_of(&[("A", 1, 10), ("B", 2, 20)]);
+        let run = execute(&cam, &snap.properties, None, false);
+        let (outcome, fields) = judge_run(&run);
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(
+            fields,
+            vec![("steps", Val::U64(2)), ("written", Val::U64(1)), ("write_errors", Val::U64(1)), ("unsupported_kind", Val::U64(0))]
+        );
+
+        // The same run with no failure: ok.
+        let cam = FakeCamera::new().with(1, RW, json!(0)).with(2, RW, json!(0));
+        let run = execute(&cam, &snap.properties, None, false);
+        let (outcome, fields) = judge_run(&run);
+        assert_eq!(outcome, Outcome::Ok);
+        assert_eq!(fields[2], ("write_errors", Val::U64(0)));
+
+        // Routine non-writes are not failures: a read-only property, an unsupported kind, an unselected one.
+        let cam = FakeCamera::new().with(1, OP_GET, json!(0)).with(2, RW, json!(0)).failing_write(2, Failure::UnsupportedWrite);
+        let only = BTreeSet::from(["A".to_string(), "B".to_string()]);
+        let run = execute(&cam, &snap.properties, Some(&only), false);
+        assert_eq!(outcomes(&run), [("A", "read_only"), ("B", "unsupported_write_type")]);
+        let (outcome, fields) = judge_run(&run);
+        assert_eq!(outcome, Outcome::Ok);
+        assert_eq!(fields[3], ("unsupported_kind", Val::U64(1)));
+
+        // Every step failing is failed too, and an empty run is ok.
+        let cam = FakeCamera::new().with(1, RW, json!(0)).failing_write(1, Failure::Call(-1));
+        let only_a = snapshot_of(&[("A", 1, 10)]);
+        assert_eq!(judge_run(&execute(&cam, &only_a.properties, None, false)).0, Outcome::Failed);
+        assert_eq!(judge_run(&RestoreRun { steps: vec![] }).0, Outcome::Ok);
     }
 
     #[test]

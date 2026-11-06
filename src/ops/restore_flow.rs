@@ -235,7 +235,7 @@ pub fn build_restore_plan<P: CameraPort + ?Sized>(
     port: &P,
     input: &RestorePlanInput<'_>,
 ) -> Result<RestorePlanReport, Refusal> {
-    crate::diag::scoped(crate::diag::Subsystem::Restore, "plan", crate::diag::Class::Top, &[], |_span| {
+    crate::diag::scoped_with(crate::diag::Subsystem::Restore, "plan", crate::diag::Class::Top, &[], |_span| {
         same_body(input.source, input.target, input.body_policy)?;
         let (steps, run) = plan_steps(port, input.source, input.only, Source::of(&input.source.camera.serial, &input.target.serial));
         let would_change = count_changes(&steps);
@@ -253,7 +253,26 @@ pub fn build_restore_plan<P: CameraPort + ?Sized>(
             steps,
             cannot_read: NOT_TRANSFERABLE,
         })
-    })
+    }, judge_restore_plan)
+}
+
+/// How the restore `plan` span ends: a plan is a report and its skips are content, so a built plan is `ok` with its
+/// counts beside it (`steps`, `would_change`, and `write_errors`, the steps that could not be planned as a write:
+/// a snapshot range with no usable position). A refusal (the snapshot is not of this body) is `failed` and carries
+/// the refusal's closed tag.
+fn judge_restore_plan(r: &Result<RestorePlanReport, Refusal>) -> (crate::diag::Outcome, Vec<(&'static str, crate::diag::Val)>) {
+    use crate::diag::{Outcome, Val};
+    match r {
+        Ok(p) => (
+            Outcome::Ok,
+            vec![
+                ("steps", Val::U64(p.steps.len() as u64)),
+                ("would_change", Val::U64(p.would_change as u64)),
+                ("write_errors", Val::U64(p.counts.errors as u64)),
+            ],
+        ),
+        Err(e) => (Outcome::Failed, vec![("error", Val::text(e.tag()))]),
+    }
 }
 
 pub struct RestoreApplyRequest<'a> {
@@ -328,6 +347,21 @@ pub struct RestoreApplyReport {
     pub undo_set: Vec<String>,
     /// Touched or changed properties an undo cannot put back; not in `undo_set`.
     pub undo_not_restorable: Vec<String>,
+}
+
+impl crate::ops::apply::ApplyDiag for RestoreApplyReport {
+    fn apply_status(&self) -> ApplyStatus {
+        self.status
+    }
+    fn written_count(&self) -> usize {
+        self.written.len()
+    }
+    fn write_error_count(&self) -> usize {
+        self.write_errors.len()
+    }
+    fn is_no_op(&self) -> bool {
+        self.no_op
+    }
 }
 
 /// Run the restore. `progress` is told `plan_verified`, `restore_point_written`,
@@ -467,7 +501,7 @@ pub fn apply_restore<P: CameraPort + ?Sized>(
             undo_set: undo.names,
             undo_not_restorable: undo.not_restorable,
         })
-    }, |r| match r { Ok(rep) => (rep.status.diag_outcome(), vec![("status", crate::diag::Val::text(rep.status.tag())), ("written", crate::diag::Val::U64(rep.written.len() as u64)), ("write_errors", crate::diag::Val::U64(rep.write_errors.len() as u64)), ("no_op", crate::diag::Val::Bool(rep.no_op))]), Err(_) => (crate::diag::Outcome::Failed, Vec::new()) })
+    }, |r| crate::ops::apply::judge_apply(r, RestoreApplyError::tag))
 }
 
 #[cfg(test)]
@@ -1496,5 +1530,64 @@ mod tests {
         let after: Vec<Value> = w.targets.iter().map(|(_, c)| w.cam.value(*c).unwrap()).collect();
         assert_eq!(after, before);
         assert_ne!(ur.restore_point.unwrap().file, rp.file);
+    }
+
+    // ── the spans' judgement (diag) ──────────────────────────────────────
+
+    #[test]
+    fn a_restore_report_is_judged_by_the_same_function_as_a_transplants_with_its_own_counts() {
+        use crate::diag::{Outcome, Val};
+        use crate::ops::apply::judge_apply;
+        let w = world();
+        let f = fixture(&w);
+        let r = apply_planned(&w, &f);
+        let rep = r.as_ref().unwrap();
+        assert_eq!(rep.status, ApplyStatus::AppliedVerified);
+        let (outcome, fields) = judge_apply(&r, RestoreApplyError::tag);
+        assert_eq!(outcome, Outcome::Ok);
+        let get = |k: &str| fields.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+        assert_eq!(get("status"), Some(Val::text("applied_verified")));
+        assert_eq!(get("written"), Some(Val::U64(rep.written.len() as u64)));
+        assert!(rep.written.len() > 0);
+        assert_eq!(get("write_errors"), Some(Val::U64(0)));
+
+        // A restore that could not do what was asked is `failed`, not `ok`.
+        let w = world_with(|c, t| c.with(t[1].1, OP_GET, json!("ro")), 0);
+        let mut f = fixture(&w);
+        f.only = BTreeSet::from([w.targets[1].0.clone()]);
+        let r = apply_planned(&w, &f);
+        let (outcome, _) = judge_apply(&r, RestoreApplyError::tag);
+        assert_eq!(r.as_ref().unwrap().status, ApplyStatus::Failed);
+        assert_eq!(outcome, Outcome::Failed);
+    }
+
+    #[test]
+    fn a_restore_refusal_is_judged_failed_with_its_tag() {
+        use crate::diag::{Outcome, Val};
+        let r: Result<RestoreApplyReport, RestoreApplyError> =
+            Err(RestoreApplyError::Refused(Refusal::SerialMismatch { snapshot: "a".into(), target: "b".into() }));
+        let (outcome, fields) = crate::ops::apply::judge_apply(&r, RestoreApplyError::tag);
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(fields, vec![("error", Val::text("serial_mismatch"))]);
+    }
+
+    #[test]
+    fn the_restore_plan_span_records_its_counts_and_a_refusal_as_failed_with_its_tag() {
+        use crate::diag::{Outcome, Val};
+        let w = world();
+        let f = fixture(&w);
+        let p = Ok(plan_of(&w, &f));
+        let (outcome, fields) = judge_restore_plan(&p);
+        assert_eq!(outcome, Outcome::Ok);
+        let plan = p.as_ref().unwrap();
+        assert_eq!(fields[0], ("steps", Val::U64(plan.steps.len() as u64)));
+        assert_eq!(fields[1], ("would_change", Val::U64(plan.would_change as u64)));
+        assert_eq!(fields[2], ("write_errors", Val::U64(plan.counts.errors as u64)));
+        assert!(plan.steps.len() > 1, "the counts are not trivially zero");
+
+        let refused: Result<RestorePlanReport, Refusal> = Err(Refusal::ModelMismatch { snapshot: "a".into(), target: "b".into() });
+        let (outcome, fields) = judge_restore_plan(&refused);
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(fields, vec![("error", Val::text("model_mismatch"))]);
     }
 }

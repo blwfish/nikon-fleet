@@ -3,8 +3,9 @@
 //! in-memory body for tests, so plan / apply / restore-point logic runs
 //! without hardware (docs/mcp-plan.md §6).
 //!
-//! The trait is exactly the three things the workflows do with a `Device`.
-//! It adds no behaviour: the properties that matter (what a failed read
+//! The trait is exactly the things the workflows do with a `Device`: list its
+//! capabilities, read one, write one, and ask whether a write would be refused
+//! by kind. It adds no behaviour: the properties that matter (what a failed read
 //! returns, that a write may change other values) are the fake's to model.
 
 use std::cell::RefCell;
@@ -23,6 +24,11 @@ pub trait CameraPort {
     fn capabilities(&self) -> &[CapabilityInfo];
     fn read_capability(&self, id: u32) -> Result<Value, SdkError>;
     fn write_capability(&self, id: u32, kind: u32, value: &Value) -> Result<(), SdkError>;
+    /// Whether a write of `value` to capability `id` of kind `kind` would get past the kind check (not be refused
+    /// as `SdkError::UnsupportedWrite`), decided without writing anything: what a dry run asks, so a plan names a
+    /// kind the body will not take as such. A value the kind cannot take (`InvalidValue`, `StringTooLong`) is not
+    /// a kind refusal, and only the write itself reports it.
+    fn write_kind_supported(&self, id: u32, kind: u32, value: &Value) -> bool;
 }
 
 impl CameraPort for Device<'_> {
@@ -36,6 +42,10 @@ impl CameraPort for Device<'_> {
     }
     fn write_capability(&self, id: u32, kind: u32, value: &Value) -> Result<(), SdkError> {
         Device::write_capability(self, id, kind, value)
+    }
+    fn write_kind_supported(&self, _id: u32, kind: u32, value: &Value) -> bool {
+        // `prepare_write` is the one place the kind is decided, and the real write goes through it.
+        !matches!(prepare_write(kind, value), Err(SdkError::UnsupportedWrite(_)))
     }
 }
 
@@ -203,6 +213,17 @@ impl CameraPort for FakeCamera {
         self.values.borrow().get(&id).cloned().ok_or(SdkError::SdkCall { call: "GetCapability", code: -126 })
     }
 
+    fn write_kind_supported(&self, id: u32, kind: u32, value: &Value) -> bool {
+        // Only the kind decides this. A configured `Failure::UnsupportedWrite` is a refusal at write time that the
+        // plan did not foresee (it is how tests reach the apply's handling of one), so it is not consulted here.
+        // The fake's placeholder kind 0 is judged by the value the body holds; a capability that holds nothing
+        // (an unreadable one) has no kind to judge, so it is not called unsupported here.
+        if kind == 0 && !self.values.borrow().contains_key(&id) {
+            return true;
+        }
+        !matches!(prepare_write(self.effective_kind(id, kind), value), Err(SdkError::UnsupportedWrite(_)))
+    }
+
     fn write_capability(&self, id: u32, kind: u32, value: &Value) -> Result<(), SdkError> {
         self.events.borrow_mut().push(Event::Write(id));
         if let Some(f) = self.write_failures.get(&id) {
@@ -217,8 +238,7 @@ impl CameraPort for FakeCamera {
         // capabilities carry kind 0, which the real path would refuse outright, so the kind is
         // taken from the value the body holds, and then the same `prepare_write` decides.
         let held = self.values.borrow().get(&id).cloned();
-        let effective_kind = if kind != 0 { kind } else { held.as_ref().map_or(0, kind_of) };
-        prepare_write(effective_kind, value)?;
+        prepare_write(self.effective_kind(id, kind), value)?;
         // A body keeps its own scale and option list: a write sets the position, not the scale.
         let merged = match &held {
             Some(h) if is_range_shape(h) && is_range_shape(value) => {
@@ -249,6 +269,14 @@ impl CameraPort for FakeCamera {
             }
         }
         Ok(())
+    }
+}
+
+impl FakeCamera {
+    /// The kind a write to `id` is judged by: the capability's own, or, for the fake's placeholder kind 0, the
+    /// kind of the value the body holds (see `write_capability`).
+    fn effective_kind(&self, id: u32, kind: u32) -> u32 {
+        if kind != 0 { kind } else { self.values.borrow().get(&id).map_or(0, kind_of) }
     }
 }
 
@@ -379,6 +407,26 @@ mod tests {
         // A datetime or array placeholder: no kind writes it.
         let cam = FakeCamera::new().with(1, OP_GET | OP_SET, json!({"_type": "datetime"}));
         assert!(matches!(cam.write_capability(1, 0, &json!("2026")), Err(SdkError::UnsupportedWrite(0))));
+    }
+
+    /// `write_kind_supported` asks the same question the write answers, without writing: true exactly when the
+    /// write would not be refused by kind. A value the kind cannot take is not a kind refusal.
+    #[test]
+    fn the_kind_check_agrees_with_the_write_and_writes_nothing() {
+        let cam = FakeCamera::new()
+            .with(1, OP_GET | OP_SET, json!({"_type": "datetime"}))
+            .with(2, OP_GET | OP_SET, json!(5));
+        assert!(!cam.write_kind_supported(1, 0, &json!("2026")), "a datetime placeholder: no kind writes it");
+        assert!(cam.write_kind_supported(2, 0, &json!(6)));
+        assert!(cam.write_kind_supported(2, 0, &json!("not a number")), "wrong shape for the kind is InvalidValue, not a kind refusal");
+        assert!(cam.write_kind_supported(99, 0, &json!(1)), "a capability that holds nothing has no kind to judge");
+        // The same answers as the real write's refusal.
+        assert!(matches!(cam.write_capability(1, 0, &json!("2026")), Err(SdkError::UnsupportedWrite(_))));
+        assert!(matches!(cam.write_capability(2, 0, &json!("not a number")), Err(SdkError::InvalidValue)));
+        assert_eq!(cam.writes(), [], "asking wrote nothing");
+        // An explicit kind wins over the held value, as in the write.
+        assert!(!cam.write_kind_supported(2, 99, &json!(6)));
+        assert!(cam.write_kind_supported(2, crate::sdk::CAP_TYPE_INTEGER, &json!(6)));
     }
 
     #[test]

@@ -48,6 +48,24 @@ pub fn property_key(name_lookup: &HashMap<u32, String>, code: u32) -> String {
     }
 }
 
+/// How the `capture_reads` span ends. The pass reads what it can: a healthy body still has properties that will
+/// not read (Z 9: 196 read, 11 not), so some failures are `ok`, with the counts beside it. A pass that attempted
+/// reads and got none of them back (`read_ok` 0 with `read_err` above 0) read nothing, and ends `failed`. A pass
+/// with nothing to attempt (`read_err` 0) is not a failure of the reads, whatever it skipped.
+fn judge_reads(st: &CaptureStats) -> (crate::diag::Outcome, Vec<(&'static str, crate::diag::Val)>) {
+    use crate::diag::{Outcome, Val};
+    let outcome = if st.read_err > 0 && st.read_ok == 0 { Outcome::Failed } else { Outcome::Ok };
+    (
+        outcome,
+        vec![
+            ("read_ok", Val::U64(st.read_ok as u64)),
+            ("read_err", Val::U64(st.read_err as u64)),
+            ("skipped_no_get", Val::U64(st.skipped_no_get as u64)),
+            ("unknown_schema", Val::U64(st.unknown_schema as u64)),
+        ],
+    )
+}
+
 /// Read every get-capable capability of `port` into `snap`, naming each from
 /// `name_lookup` (`cap_{:#x}` on a schema miss).
 pub fn capture<P: CameraPort + ?Sized>(
@@ -86,17 +104,7 @@ pub fn capture<P: CameraPort + ?Sized>(
         }
         stats
         },
-        |st| {
-            (
-                crate::diag::Outcome::Ok,
-                vec![
-                    ("read_ok", crate::diag::Val::U64(st.read_ok as u64)),
-                    ("read_err", crate::diag::Val::U64(st.read_err as u64)),
-                    ("skipped_no_get", crate::diag::Val::U64(st.skipped_no_get as u64)),
-                    ("unknown_schema", crate::diag::Val::U64(st.unknown_schema as u64)),
-                ],
-            )
-        },
+        judge_reads,
     )
 }
 
@@ -194,6 +202,42 @@ mod tests {
             serde_json::to_value(&st).unwrap(),
             json!({"read_ok": 0, "read_err": 1, "skipped_no_get": 0, "unknown_schema": 0,
                    "failed": [{"code": 7, "name": "G", "error": "SDK call `GetCapability` returned error code -126"}]})
+        );
+    }
+
+    // ── the capture_reads span's judgement (diag) ────────────────────────
+
+    use crate::diag::{Outcome, Val};
+
+    fn stats(read_ok: usize, read_err: usize) -> CaptureStats {
+        CaptureStats { read_ok, read_err, ..CaptureStats::default() }
+    }
+
+    /// Some reads failing is a healthy capture (Z 9: 196 read, 11 not); none succeeding is not. The boundary is
+    /// `read_ok` 1 vs 0 with a failure present.
+    #[test]
+    fn the_read_pass_is_failed_only_when_it_attempted_reads_and_none_came_back() {
+        assert_eq!(judge_reads(&stats(196, 11)).0, Outcome::Ok, "a healthy body has unreadable properties");
+        assert_eq!(judge_reads(&stats(1, 1)).0, Outcome::Ok, "one read back is not nothing");
+        assert_eq!(judge_reads(&stats(1, 10)).0, Outcome::Ok, "many failures, one success");
+        assert_eq!(judge_reads(&stats(0, 1)).0, Outcome::Failed, "the one read attempted failed");
+        assert_eq!(judge_reads(&stats(0, 207)).0, Outcome::Failed, "every read failed");
+        assert_eq!(judge_reads(&stats(0, 0)).0, Outcome::Ok, "nothing attempted is not a failed read");
+        assert_eq!(judge_reads(&stats(5, 0)).0, Outcome::Ok);
+    }
+
+    #[test]
+    fn the_read_pass_records_every_count() {
+        let st = CaptureStats { read_ok: 4, read_err: 3, skipped_no_get: 2, unknown_schema: 1, failed: vec![] };
+        let (_, fields) = judge_reads(&st);
+        assert_eq!(
+            fields,
+            vec![
+                ("read_ok", Val::U64(4)),
+                ("read_err", Val::U64(3)),
+                ("skipped_no_get", Val::U64(2)),
+                ("unknown_schema", Val::U64(1)),
+            ]
         );
     }
 }

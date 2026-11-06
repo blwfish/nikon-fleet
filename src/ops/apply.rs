@@ -121,6 +121,56 @@ impl ApplyStatus {
     }
 }
 
+/// What an apply report offers the diagnostics span that judges it: the same four facts for a
+/// transplant apply and a restore apply, so both end their `apply` span through [`judge_apply`] and a
+/// field added there reaches both records at once.
+pub trait ApplyDiag {
+    fn apply_status(&self) -> ApplyStatus;
+    /// Properties written.
+    fn written_count(&self) -> usize;
+    /// Writes that errored (any of which may still have landed).
+    fn write_error_count(&self) -> usize;
+    fn is_no_op(&self) -> bool;
+}
+
+impl ApplyDiag for ApplyReport {
+    fn apply_status(&self) -> ApplyStatus {
+        self.status
+    }
+    fn written_count(&self) -> usize {
+        self.written.len()
+    }
+    fn write_error_count(&self) -> usize {
+        self.write_errors.len()
+    }
+    fn is_no_op(&self) -> bool {
+        self.no_op
+    }
+}
+
+/// The outcome and fields an `apply` span ends with, for a transplant apply and a restore apply
+/// alike. A report is judged by its [`ApplyStatus`] ([`ApplyStatus::diag_outcome`]), so an unverified
+/// or indeterminate apply is not recorded `ok`. A refusal (`Err`) is `failed` and carries the error's
+/// closed tag (`error_tag`), never its text.
+pub fn judge_apply<R: ApplyDiag, E>(
+    result: &Result<R, E>,
+    error_tag: fn(&E) -> &'static str,
+) -> (crate::diag::Outcome, Vec<(&'static str, crate::diag::Val)>) {
+    use crate::diag::{Outcome, Val};
+    match result {
+        Ok(rep) => (
+            rep.apply_status().diag_outcome(),
+            vec![
+                ("status", Val::text(rep.apply_status().tag())),
+                ("written", Val::U64(rep.written_count() as u64)),
+                ("write_errors", Val::U64(rep.write_error_count() as u64)),
+                ("no_op", Val::Bool(rep.is_no_op())),
+            ],
+        ),
+        Err(e) => (Outcome::Failed, vec![("error", Val::text(error_tag(e)))]),
+    }
+}
+
 pub struct ApplyRequest<'a> {
     pub plan: PlanInput<'a>,
     pub guard: &'a CodeNameGuard,
@@ -528,7 +578,7 @@ pub fn apply_transplant<P: CameraPort + ?Sized>(
             undo_set: undo.names,
             undo_not_restorable: undo.not_restorable,
         })
-    }, |r| match r { Ok(rep) => (rep.status.diag_outcome(), vec![("status", crate::diag::Val::text(rep.status.tag())), ("written", crate::diag::Val::U64(rep.written.len() as u64)), ("write_errors", crate::diag::Val::U64(rep.write_errors.len() as u64)), ("no_op", crate::diag::Val::Bool(rep.no_op))]), Err(_) => (crate::diag::Outcome::Failed, Vec::new()) })
+    }, |r| judge_apply(r, ApplyError::tag))
 }
 
 #[cfg(test)]
@@ -1395,4 +1445,92 @@ mod tests {
         assert!(ApplyStatus::Failed.may_have_written(), "the writes are made one after another");
     }
 
+    // ── the apply span's judgement (diag) ────────────────────────────────
+
+    use crate::diag::{Outcome, Val};
+
+    /// Each status is pinned to its diagnostics outcome, one by one: an unverified or indeterminate apply is
+    /// `indeterminate` (not `ok`), a failed or refused one is `failed`, only a verified one is `ok`.
+    #[test]
+    fn every_apply_status_maps_to_its_diagnostics_outcome() {
+        let expected = [
+            (ApplyStatus::AppliedVerified, Outcome::Ok),
+            (ApplyStatus::AppliedUnverified, Outcome::Indeterminate),
+            (ApplyStatus::Indeterminate, Outcome::Indeterminate),
+            (ApplyStatus::Failed, Outcome::Failed),
+            (ApplyStatus::NotApplied, Outcome::Failed),
+        ];
+        // ALL is the complete list, so a new status must be added to `expected` to keep this passing.
+        assert_eq!(expected.len(), ApplyStatus::ALL.len());
+        for status in ApplyStatus::ALL {
+            let want = expected.iter().find(|(s, _)| *s == status).unwrap_or_else(|| panic!("{} not pinned", status.tag())).1;
+            assert_eq!(status.diag_outcome(), want, "{}", status.tag());
+        }
+    }
+
+    struct FakeReport {
+        status: ApplyStatus,
+        written: usize,
+        errors: usize,
+        no_op: bool,
+    }
+
+    impl ApplyDiag for FakeReport {
+        fn apply_status(&self) -> ApplyStatus {
+            self.status
+        }
+        fn written_count(&self) -> usize {
+            self.written
+        }
+        fn write_error_count(&self) -> usize {
+            self.errors
+        }
+        fn is_no_op(&self) -> bool {
+            self.no_op
+        }
+    }
+
+    fn field<'a>(fields: &'a [(&'static str, Val)], key: &str) -> &'a Val {
+        &fields.iter().find(|(k, _)| *k == key).unwrap_or_else(|| panic!("no field {key}")).1
+    }
+
+    #[test]
+    fn judge_apply_ends_the_span_by_the_reports_status_and_records_its_counts() {
+        for status in ApplyStatus::ALL {
+            let r: Result<FakeReport, ApplyError> = Ok(FakeReport { status, written: 3, errors: 2, no_op: false });
+            let (outcome, fields) = judge_apply(&r, ApplyError::tag);
+            assert_eq!(outcome, status.diag_outcome(), "{}", status.tag());
+            assert_eq!(field(&fields, "status"), &Val::text(status.tag()));
+            assert_eq!(field(&fields, "written"), &Val::U64(3));
+            assert_eq!(field(&fields, "write_errors"), &Val::U64(2));
+            assert_eq!(field(&fields, "no_op"), &Val::Bool(false));
+        }
+        // The counts are the report's, not constants: other values, and the no-op flag set.
+        let r: Result<FakeReport, ApplyError> = Ok(FakeReport { status: ApplyStatus::AppliedVerified, written: 0, errors: 7, no_op: true });
+        let (_, fields) = judge_apply(&r, ApplyError::tag);
+        assert_eq!(field(&fields, "written"), &Val::U64(0));
+        assert_eq!(field(&fields, "write_errors"), &Val::U64(7));
+        assert_eq!(field(&fields, "no_op"), &Val::Bool(true));
+    }
+
+    #[test]
+    fn judge_apply_records_a_refusal_as_failed_with_its_closed_tag_not_its_text() {
+        let r: Result<FakeReport, ApplyError> = Err(ApplyError::StalePlan { what: "digest" });
+        let (outcome, fields) = judge_apply(&r, ApplyError::tag);
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(fields, vec![("error", Val::text(ApplyError::StalePlan { what: "digest" }.tag()))]);
+    }
+
+    /// A real report is judged through the same function a restore's is (`ApplyDiag` on both).
+    #[test]
+    fn a_real_transplant_report_is_judged_by_its_status() {
+        let w = world();
+        let f = fixture(&w, true);
+        let r = apply_planned(&w, &f);
+        let rep = r.as_ref().expect("applies");
+        let (outcome, fields) = judge_apply(&r, ApplyError::tag);
+        assert_eq!(outcome, rep.status.diag_outcome());
+        assert_eq!(field(&fields, "written"), &Val::U64(rep.written.len() as u64));
+        assert_eq!(field(&fields, "status"), &Val::text(rep.status.tag()));
+    }
 }
