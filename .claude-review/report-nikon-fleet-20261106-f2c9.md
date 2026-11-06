@@ -262,4 +262,4 @@ The last two Mediums were done at the owner's request: **#17** (`restore-ext` re
 
 ### Third follow-up (run nikon-fleet-remediate-20261106-f1a5)
 
-The nine Lows still deferred were fixed at the owner's request: #61 #63 #111 #123 #130 (library), #68 #86 #150 (GUI), #134 (SFTP login methods). Final state of the pass: **158 fixed, 15 wontfix, 1 false-positive, 0 deferred** (of 175; the 15 wontfix are Lows with a recorded reason). Still unverified, as everywhere in this pass: nothing was run on a camera, a real FTP/SFTP server, or a GUI screen, and the Windows CI is the only Windows check.
+The nine Lows still deferred were fixed at the owner's request: #61 #63 #111 #123 #130 (library), #68 #86 #150 (GUI), #134 (SFTP login methods). Final state of the pass: **159 fixed, 15 wontfix, 1 false-positive, 0 deferred** (of 175; the 15 wontfix are Lows with a recorded reason). Still unverified, as everywhere in this pass: nothing was run on a camera, a real FTP/SFTP server, or a GUI screen, and the Windows CI is the only Windows check.
