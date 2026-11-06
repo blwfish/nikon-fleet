@@ -22,7 +22,7 @@ use nikon_fleet::ops::target::{is_id_fallback, storable_serial};
 use nikon_fleet::ptp_usb::{self, FtpField, FtpProfile};
 use nikon_fleet::settings::{self, Settings};
 
-use crate::menu::{Entry, MenuAction, menus};
+use crate::menu::{Bar, Entry, MenuAction, menus};
 
 /// macOS gets a native menu bar and "Settings…"; elsewhere the menus are drawn in the window.
 const MACOS: bool = cfg!(target_os = "macos");
@@ -34,6 +34,8 @@ use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
 mod check;
+#[cfg(test)]
+mod cli_parity;
 mod guarded;
 mod menu;
 mod firmware_win;
@@ -1211,7 +1213,9 @@ impl FleetApp {
         let mut chosen = None;
         egui::Panel::top("menubar").show_inside(root, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                for m in menus(MACOS) {
+                // This bar is drawn only when there is no native one (see above), so there is no
+                // application menu to hold Settings, About and Quit: the whole layout is here.
+                for m in menus(Bar::InWindow) {
                     ui.menu_button(m.title, |ui| {
                         for entry in &m.entries {
                             match entry {
@@ -2158,8 +2162,13 @@ fn do_discover(scan: &dyn Fn() -> CameraList) -> Evt {
     }
 }
 
+/// The CLI arguments of a discovery.
+fn discover_argv() -> Vec<String> {
+    vec!["discover".to_string(), "--json".to_string()]
+}
+
 fn discover_via(cli: &Path, scan: &dyn Fn() -> CameraList, timeout: Duration) -> Result<DiscoverResult, String> {
-    let argv = vec!["discover".to_string(), "--json".to_string()];
+    let argv = discover_argv();
     let mut notices = Vec::new();
     let (stdout, cli_log) = match run_cli(cli, &argv, None, timeout) {
         Ok(out) => (out.stdout, out.stderr),
@@ -7974,6 +7983,39 @@ mod tests {
             firmware: FwUi::default(),
         };
         (app, cmd_rx, evt_tx, dir)
+    }
+
+    /// Every text the shapes of a frame draw.
+    fn drawn_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+
+    /// The bar drawn when there is no native one (every platform but macOS, and macOS when the
+    /// native bar could not be installed: `native_menu` is `None` here as it is then) has all five
+    /// menus, so Settings (Edit), About (Help) and Quit (File) are reachable. It used to draw the
+    /// native layout, which has none of the three (full-review nikon-fleet-20261105-b7d3#38).
+    #[test]
+    fn the_in_window_menu_bar_has_every_menu_when_there_is_no_native_bar() {
+        let (mut app, _rx, _evt, _dir) = test_app();
+        let ctx = egui::Context::default();
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            // two passes: the first may lay text out before the fonts are ready
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| app.ui_menu_bar(ui));
+            texts = drawn_texts(&out.shapes);
+        }
+        for title in ["File", "Edit", "Camera", "Firmware", "Help"] {
+            assert!(texts.iter().any(|t| t == title), "the menu {title} is not drawn: {texts:?}");
+        }
     }
 
     #[test]

@@ -7,6 +7,11 @@
 //! selection, with values that start with `-`). A selection that names a property the snapshot does
 //! not have, run for real against a missing SDK, stops on that name (a message only the parsed
 //! `--only` / `--allow-raw-code` can produce): it proves the flag reached the command's logic.
+//!
+//! These are the builders that live in the library. The builders that live in the GUI crate
+//! (discover, snapshot, check, the six firmware shapes, and the GUI's wrappers of restore, transplant
+//! and the vendor commands) cannot be reached from here; `gui/src/cli_parity.rs` feeds every one of
+//! them to the same parse-only hook.
 
 use std::collections::BTreeSet;
 use std::path::Path;
