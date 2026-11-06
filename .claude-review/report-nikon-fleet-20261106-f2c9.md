@@ -239,3 +239,15 @@ None.
 - Severity calibration used the pass's rules: exposure × mechanism trustworthiness; no camera was attached, none of the delta ran on hardware, 0 of the 8 stored snapshots carry an `extended` section, and the FTP-list truncation scenario (F08/V80) is unreachable while the camera's limit is 20 and the read cap is 32.
 - Known/deliberate items not counted as findings: the GUI has not been seen on a screen; nothing was run against a camera or a real FTP/SFTP server; FTP port/folder/protocol edits unverified on a camera; SFTP host key reported not checked; Wi-Fi key field unconfirmed.
 - Deferred High/Critical findings would normally get a GitHub issue under the full-review policy; none were filed because this pass was review-only. File them (or run `remediate`) before the 30-day staleness window.
+
+## Remediation (run nikon-fleet-remediate-20261106-a4c7, 2026-11-06)
+
+Targets: all 175 findings (60 High/Medium primary; the 115 Lows were all in files a primary target touches, directly or via a shared constant). Result: **144 fixed** (16 High, 39 Medium, 89 Low), **15 wontfix** and **1 false-positive** (all Low), **15 still deferred** (5 Medium, 10 Low). No High remains open, so no GitHub issues were filed.
+
+Fix commits (each carries `Review-Pass` / `Review-Findings-Closed` trailers; no push): `a11c40b` GUI/MCP, `bd77bf3` raw-USB write core and snapshot data model, `759d876` ftp-test engine, `60d99ff` CLI/worker/views, `bda6dab` restore-extended planner and apply, `26abc60` one snapshots/references directory definition. Ledger entry: `72437e9`.
+
+How it was verified: six cluster agents (Sonnet) in isolated worktrees, each told to prove every new test by mutating the fix and watching it fail; I applied each patch centrally, ran `cargo test --workspace` after every batch (final: 2705 passed, 0 failed, 2 ignored) and re-ran one mutation per cluster myself (0o600 file mode, `skip_extended`, the apply-phase name). One supervisor test (`the_worker_is_gone_and_reaped_after_a_deadline_kill`) failed once under load while other builds ran and passed on every rerun; it is unrelated to these changes.
+
+Still deferred (Medium): 43 (merge GUI restore_ext into RestoreFlow) and 45 (edit I/O off the UI thread) need a GUI sitting; 39 (per-model capability table) and 17 (retention knows `restore-ext`) need an owner decision / small retention change; 30 (what a new FTP profile's network bits should be) needs hardware. Deferred (Low): 61, 63, 68, 73, 86, 111, 123, 130, 134, 150, each with its specific blocker in the ledger.
+
+Unverified, as before: nothing in this remediation was run against a camera, a real FTP/SFTP server, or seen on a GUI screen. In particular the new 0600 file modes, the stricter IPTC decoder (it could reject an unseen real slot header), the byte-property descriptor read before writes, the digest now binding live FTP/IPTC contents, and stop-at-first-failure for extended restore all need the next hardware sitting. The pending-hardware list in memory should gain these.
