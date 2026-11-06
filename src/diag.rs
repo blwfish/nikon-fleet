@@ -1351,7 +1351,7 @@ impl ProcessTrace {
     }
 }
 
-/// Whether process `pid` exists. `None` where this cannot be asked (Windows, today).
+/// Whether process `pid` exists. `None` where the OS cannot say.
 pub fn pid_alive(pid: u32) -> Option<bool> {
     #[cfg(unix)]
     {
@@ -1366,10 +1366,52 @@ pub fn pid_alive(pid: u32) -> Option<bool> {
             _ => None,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows_pid_alive(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         None
+    }
+}
+
+/// Windows: open the process with the least access that can read its exit code and ask whether it is
+/// still active. A pid that no process has is `ERROR_INVALID_PARAMETER`; one that exists but cannot be
+/// opened is `ERROR_ACCESS_DENIED` (it exists). The three calls are declared here rather than pulling in
+/// a Windows bindings crate for them.
+#[cfg(windows)]
+fn windows_pid_alive(pid: u32) -> Option<bool> {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    // SAFETY: plain Win32 calls; the handle is closed on every path that opened it.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(ERROR_INVALID_PARAMETER) => Some(false),
+                Some(ERROR_ACCESS_DENIED) => Some(true),
+                _ => None,
+            };
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        // A process that exited with code 259 reads as active; nothing here can tell it apart.
+        Some(code == STILL_ACTIVE)
     }
 }
 

@@ -8605,6 +8605,8 @@ mod tests {
         vec!["-c".to_string(), script.to_string()]
     }
 
+    // Spawns /bin/sh as the stand-in CLI: unix only (the Windows runner has no /bin/sh).
+    #[cfg(unix)]
     #[test]
     fn a_cli_child_is_one_span_with_its_pid_request_id_and_lengths_and_never_the_stdin_or_the_arguments() {
         use nikon_fleet::diag::{Outcome, Val};
@@ -8642,6 +8644,8 @@ mod tests {
         assert!(!on_disk.contains("hunter2"), "the password must not reach any diagnostics file");
     }
 
+    // Spawns /bin/sh as the stand-in CLI: unix only (the Windows runner has no /bin/sh).
+    #[cfg(unix)]
     #[test]
     fn a_cli_child_that_exits_non_zero_or_overruns_is_failed_or_timeout_with_the_reason() {
         use nikon_fleet::diag::{Outcome, Val};
