@@ -52,7 +52,7 @@ camera is unknown (a write whose data went out and whose reply never came; an ap
 | cli | `command` (top) | `name`, the subcommand clap matched |
 | gui | `gui` (process), `gui_cmd` (top), `cli_child` (top) | `cmd` (a closed list), `program`, `argc`, `timeout_ms`, `child_pid`, `request_id`, `exit_code`, `stdin_len`, output lengths |
 | mcp | `server` (process), `tool_call` (top), `worker_call` (top), `kill_worker` (top) | `tool`, `worker_op`, `deadline_ms`, `queue_wait_ms`, `child_pid`, `phase`, `cause`, `request_id` |
-| usb | `ptp_<op code>` (leaf, one per PTP transaction), `usb_scan`, `usb_reset` | `op`, `txid`, `p0`..`p4`, `phase` (`command_sent`, `data_sent`), `response`, `data_len`, `data_hash`, `reply_len`, `reply_hash`; `usb_scan`: `cameras`, `unreadable`, `enumeration_error` (ends `failed` if the bus could not be listed or a device on it could not be read; a device whose descriptor will not read is counted in `unreadable`); `usb_reset`: `devices`, `reset`, `open_failed`, `reset_failed`, `enumeration_failed` (ends `failed` if any body was not reset) |
+| usb | `ptp_<op code>` (leaf, one per PTP transaction), `usb_scan`, `usb_reset` | `op`, `txid`, `p0`..`p4`, `phase` (`command_sent`, `data_sent`), `response`, `data_len`, `data_hash`, `reply_len`, `reply_hash` (`data_hash`/`reply_hash` are omitted for FTP-profile payloads, `0x90EE` and `0x90ED`); `usb_scan`: `cameras`, `unreadable`, `enumeration_error` (ends `failed` if the bus could not be listed or a device on it could not be read; a device whose descriptor will not read is counted in `unreadable`); `usb_reset`: `devices`, `reset`, `open_failed`, `reset_failed`, `enumeration_failed` (ends `failed` if any body was not reset) |
 | maid_sdk | `sdk_load`, `initialize_sdk`, `enum_devices` (with `attempt`), `connect_device`, `disconnect_device` (all top); `read_cap` (leaf); `write_cap` (top) | `cap`, `kind`, `value_hash` (or `value_unhashable` if the value could not be serialised), `code`, `capabilities`, `attempts` (`enum_devices`), `data_type`, `placeholder` (the type has no decoder), `values_missing` and `array_code` (an enum read whose options list could not be had); a failure carries `error_kind` (a closed tag) and, for an SDK call, `call` and `code`; a load failure also `load_error` (the loader's reason) |
 | lock | `camera_lock_held` (top, open for the whole hold); event `lock_refused` | `reason` |
 | snapshot | `capture_snapshot`, `restore_point`, `check`, `save_new`, `capture_reads` | `gate_waived`; `capture_reads`: `read_ok`, `read_err`, `skipped_no_get`, `unknown_schema` (ends `failed` only if reads were attempted and none came back; some unreadable properties are normal) |
@@ -77,7 +77,8 @@ A parent that starts a child process sets `NIKON_FLEET_REQUEST_ID=<pid>-<n>` and
 Payload bytes, passwords, argument lists, file contents, URLs, and error text from places where it can embed any of those. SDK
 errors are recorded as typed fields (`error_kind`, `call`, `code`), never as their `Display` text.
 Instead: lengths, a short hash (`data_hash`, `value_hash`, `plan_digest`), the host of a URL, closed tags. An FTP profile
-carries a password; only its length and hash reach a diagnostics file. There is no regex scrubbing anywhere: the rule is that
+carries a password; only its length reaches a diagnostics file, no hash either (a 64-bit hash of a blob that is mostly known structure
+plus a short password would let whoever holds the file test password guesses offline). There is no regex scrubbing anywhere: the rule is that
 the bytes are never stored. Tests check this for the PTP layer, the GUI's `cli_child` (stdin data) and the URL host.
 
 ## Limits worth knowing

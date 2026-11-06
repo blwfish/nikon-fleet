@@ -122,12 +122,12 @@ const OP_VENDOR_PROP_READ: u16 = 0x943B;
 const OP_FTP_SETUP: u16 = 0x90E8;
 const FTP_SETUP_DATA: [u8; 3] = [0x01, 0x00, 0x00];
 
-/// `0x90EE` — FTP profile write. Two params, both `0` in every captured
-/// instance. Whether the first is a profile slot is **unconfirmed**: no
-/// capture or USB test ever varied it, so every write here lands wherever
-/// `[0, 0]` points and this module does not offer a way to choose another
-/// slot. See `docs/nx-field-session-2026-07-09.md`'s field table for the
-/// data blob.
+/// `0x90EE` — FTP profile write. Two params; NX Field only ever sent `[0, 0]`. Experiments since
+/// (`docs/nx-field-ftp-profile-session-2026-07-10.md`, section 5): `(n, 0)` replaces stored profile `n`
+/// and moves it to the front, `(count, 1)` adds a new profile at the front, anything else did nothing,
+/// stalled the pipe or (slot `0xFFFFFFFF`) hung the camera. [`classify_ftp_write`] allows only those two
+/// forms. The encoder path ([`PtpUsbSession::write_ftp_profile_with`]) still sends the fixed
+/// `[0, 0]`. See `docs/nx-field-session-2026-07-09.md`'s field table for the data blob.
 const OP_FTP_PROFILE_WRITE: u16 = 0x90EE;
 const FTP_PROFILE_WRITE_PARAMS: [u32; 2] = [0, 0];
 
@@ -141,8 +141,8 @@ const OP_FTP_PROFILE_INFO: u16 = 0x90EB;
 /// the `0x90EB` reply; the data-in phase is the profile blob in the same
 /// layout `0x90EE` writes. Confirmed offline from the 2026-07-09 Z 9 captures
 /// (a 325-byte read, then a byte-identical 325-byte write; 317-byte reads
-/// byte-identical to the 317-byte write before them); **not yet run over USB
-/// on any camera**. A bare `0x90ED` with no param stalls the pipe.
+/// byte-identical to the 317-byte write before them) and run over USB on two Z 9s and a Z6III
+/// (2026-11-05). A bare `0x90ED` with no param stalls the pipe, and so does a slot at or past the stored count.
 const OP_FTP_PROFILE_READ: u16 = 0x90ED;
 
 /// `0x944C` — NX Field sends `0x944C(0x90ED, 0)` before opening the FTP screen
@@ -168,6 +168,13 @@ pub const STRING_PROPS: [(u16, &str); 3] = [(0xD072, "Artist"), (0xD073, "Copyri
 /// separate session, and restored byte for byte, with a 37-character value refused. Artist and
 /// copyright writes have not been run on any of them. The Z 8 and other bodies are not listed.
 pub const STRING_PROP_WRITE_MODELS: &[&str] = &["Z 9", "Z6_3", "Z 5"];
+
+/// The properties of [`STRING_PROPS`] whose USB write was actually run on the models in
+/// [`STRING_PROP_WRITE_MODELS`]: only the image comment (`0xD090`). Artist (`0xD072`) and Copyright
+/// (`0xD073`) writes were never run on any body, so they need `force_unconfirmed_model` like an
+/// unconfirmed model does. The gate is the pair (property, model); a test keeps this list inside
+/// [`STRING_PROPS`].
+pub const STRING_PROP_WRITE_CONFIRMED_PROPS: &[u16] = &[0xD090];
 
 /// The slot `0x90EB` reports when the camera has no *active* FTP profile.
 /// **Not** "no profile stored": on 2026-11-05 a Z9 that the owner says holds
@@ -419,14 +426,18 @@ pub enum PtpUsbError {
     FtpFieldControlChar { field: &'static str },
     #[error(
         "FTP profile write may or may not have taken effect: the 0x90EE data had already been sent when \
-         this failed ({cause}). Check it in the camera's menu (or with `vendor-read-ftp`, not yet tried on a \
-         camera); repeating the write is idempotent"
+         this failed ({cause}). Check it in the camera's menu (or with `vendor-read-ftp --slot 0`, from a new \
+         session; the written profile moves to the front); repeating a replace is idempotent"
     )]
     FtpWriteIndeterminate { cause: Box<PtpUsbError> },
+    #[error("FTP profile write 0x90EE({slot}, {param2}) refused before anything was written: {why}")]
+    FtpWriteRefused { slot: u32, param2: u32, why: FtpWriteRefusal },
     #[error("camera model {0:?} is not in this module's confirmed-safe list for vendor writes; wire format may not match")]
     UnconfirmedModel(String),
     #[error("property {propcode:#06x} is not one of the string properties this writes ({allowed}); nothing was sent")]
     PropWriteUnsupported { propcode: u16, allowed: String },
+    #[error("{}", prop_write_unconfirmed_text(*.propcode, .model))]
+    PropWriteUnconfirmed { propcode: u16, model: String },
     #[error(
         "property {propcode:#06x} is read-only on this camera right now (descriptor get/set flag {get_set:#04x}); \
          the camera makes some properties writable only in some states. Nothing was written"
@@ -439,6 +450,30 @@ pub enum PtpUsbError {
          this failed ({cause}). Read it back with `vendor-get-prop`; repeating the write is idempotent"
     )]
     PropWriteIndeterminate { propcode: u16, cause: Box<PtpUsbError> },
+}
+
+/// Whether the data phase of `op` carries an FTP profile (so a password). Diagnostics record the length
+/// of such a payload and nothing else about it: not the bytes, and not a hash either.
+fn op_payload_holds_a_secret(op: u16) -> bool {
+    matches!(op, OP_FTP_PROFILE_WRITE | OP_FTP_PROFILE_READ)
+}
+
+/// The name [`STRING_PROPS`] gives `propcode`, or its hex code when it is not one of them.
+fn string_prop_name(propcode: u16) -> String {
+    STRING_PROPS
+        .iter()
+        .find(|(c, _)| *c == propcode)
+        .map_or_else(|| format!("{propcode:#06x}"), |(_, n)| (*n).to_string())
+}
+
+fn prop_write_unconfirmed_text(propcode: u16, model: &str) -> String {
+    format!(
+        "writing {} ({propcode:#06x}) was never run on any camera (only {} writes were confirmed, on {:?}); \
+         pass --force-unconfirmed-model to try it on this {model:?}",
+        string_prop_name(propcode),
+        STRING_PROP_WRITE_CONFIRMED_PROPS.iter().map(|c| string_prop_name(*c)).collect::<Vec<_>>().join(", "),
+        STRING_PROP_WRITE_MODELS,
+    )
 }
 
 impl PtpUsbError {
@@ -1042,7 +1077,8 @@ const FTP_CREDENTIAL_MAX_BYTES: usize = 64; // generous; real usernames/password
 /// How a field's value is laid out on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FtpEncoding {
-    /// `[u32 length in bytes, no null][ascii content]`.
+    /// `[u32 length in bytes, no null][content]`. The encoder writes ASCII only; the decoder reads
+    /// UTF-8 (see `FtpBlobReader::utf8_u32_len`). The name is historical.
     AsciiU32Len,
     /// `[u8 length in UTF-16 units incl. null][utf16le content + null]`.
     Utf16U8Len,
@@ -1173,8 +1209,9 @@ pub const FTP_PROFILE_FIELDS: [FtpFieldSpec; 6] = [
 
 /// Fields for an `0x90EE` FTP profile write. All required; see the module
 /// docs for which structural bytes are opaque-but-fixed instead, and
-/// [`FTP_PROFILE_FIELDS`] for each field's limit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`FTP_PROFILE_FIELDS`] for each field's limit. `Debug` hides the password and the
+/// 5 GHz field (probably a Wi-Fi password): it shows their lengths only.
+#[derive(Clone, PartialEq, Eq)]
 pub struct FtpProfile {
     /// Human-readable profile name shown in camera menus, e.g. `"CLAUDE"`.
     pub profile_name: String,
@@ -1190,6 +1227,20 @@ pub struct FtpProfile {
     pub port: u16,
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for FtpProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FtpProfile")
+            .field("profile_name", &self.profile_name)
+            .field("ssid_24ghz", &self.ssid_24ghz)
+            .field("ssid_5ghz", &format_args!("<{} byte(s) hidden>", self.ssid_5ghz.len()))
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &format_args!("<{} byte(s) hidden>", self.password.len()))
+            .finish()
+    }
 }
 
 impl FtpProfile {
@@ -1360,6 +1411,62 @@ pub fn encode_ftp_profile_with(profile: &FtpProfile, network: &FtpCameraNetwork)
 // none. The raw bytes are always available to the caller.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// What `0x90EE(slot, param2)` does, for the two forms a camera has accepted (Z 9, 2026-07-10/11,
+/// `docs/nx-field-ftp-profile-session-2026-07-10.md` section 5): a second parameter of `0` replaces the
+/// profile in `slot` and moves it to the front of the list; `1` with `slot` equal to the stored count
+/// adds a new profile at the front. Nothing else is known to work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtpWriteKind {
+    Replace,
+    Add,
+}
+
+/// Why [`classify_ftp_write`] refused a `0x90EE(slot, param2)`: each is a form that, on a Z 9, either
+/// did nothing (`0x201F`), stalled the USB pipe, or hung the camera's network stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum FtpWriteRefusal {
+    #[error(
+        "the second parameter is {param2:#x}; only 0 (replace the slot) and 1 (add at the end) were ever accepted by a \
+         camera, other values were answered 0x201F"
+    )]
+    UnknownParam2 { param2: u32 },
+    #[error("slot 0xFFFFFFFF hung a camera's network stack until it was power-cycled")]
+    SlotHangsCamera,
+    #[error(
+        "replacing slot {slot} needs a stored profile there, but the camera holds {count} (slots 0..{count}); a write \
+         one past the end stalled the USB pipe. To add a profile use slot {count} with second parameter 1"
+    )]
+    ReplaceSlotNotStored { slot: u32, count: u32 },
+    #[error(
+        "adding a profile is 0x90EE({count}, 1), slot = the stored count; slot {slot} with second parameter 1 was \
+         never tried (slot {count} adds, a slot below it with 0 replaces)"
+    )]
+    AddNotAtCount { slot: u32, count: u32 },
+}
+
+/// Decide whether `0x90EE(slot, param2)` is one of the two forms known to work. With `count` (the
+/// stored profile count `0x90EB` reports) every rule is applied; with `None` only the rules that need
+/// no camera state, so a caller can refuse before any I/O. A count-independent refusal wins over
+/// a count-dependent one, and an unknown second parameter over the hang slot.
+pub fn classify_ftp_write(slot: u32, param2: u32, count: Option<u32>) -> Result<FtpWriteKind, FtpWriteRefusal> {
+    let kind = match param2 {
+        0 => FtpWriteKind::Replace,
+        1 => FtpWriteKind::Add,
+        other => return Err(FtpWriteRefusal::UnknownParam2 { param2: other }),
+    };
+    if slot == u32::MAX {
+        return Err(FtpWriteRefusal::SlotHangsCamera);
+    }
+    if let Some(count) = count {
+        match kind {
+            FtpWriteKind::Replace if slot >= count => return Err(FtpWriteRefusal::ReplaceSlotNotStored { slot, count }),
+            FtpWriteKind::Add if slot != count => return Err(FtpWriteRefusal::AddNotAtCount { slot, count }),
+            _ => {}
+        }
+    }
+    Ok(kind)
+}
+
 /// What `0x90EB` returns: the camera's identity and where its FTP profile
 /// is. Layout (57–59 bytes; **inferred from five replies in three body
 /// states, not documented**): `u16 0x00c8`, `u32 count`, `u32 0x14`,
@@ -1438,46 +1545,31 @@ impl<'a> FtpBlobReader<'a> {
         Ok(())
     }
 
-    /// `[u8 count incl. null][utf16le]`; count 0 is the empty string with no
-    /// further bytes. A non-empty string must end in the null.
+    /// A PTP string through [`decode_ptp_string`], strictly: any anomaly is an error at the string's
+    /// first byte, so a garbled string never reaches a decoded profile.
     fn ptp_string(&mut self, what: &'static str) -> Result<PtpString, PtpUsbError> {
-        let at = self.pos;
-        let chars = usize::from(self.u8(what)?);
-        let bytes = self.take(what, chars * 2)?;
-        let mut units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        let mut anomalies = Vec::new();
-        if !units.is_empty() {
-            if units.last() == Some(&0) {
-                units.pop();
-            } else {
-                anomalies.push(StringAnomaly::MissingTerminator);
+        match decode_ptp_string(&self.data[self.pos..]) {
+            Err(StringFrameFault::NoCountByte) => Err(self.bad(what, "needs 1 byte(s) but only 0 remain")),
+            Err(StringFrameFault::Truncated { needed, available }) => {
+                self.pos += 1; // the count byte was read
+                Err(self.bad(what, format!("needs {needed} byte(s) but only {available} remain")))
             }
-        }
-        if units.contains(&0) {
-            anomalies.push(StringAnomaly::EmbeddedNul);
-        }
-        let mut text = String::with_capacity(units.len());
-        for decoded in char::decode_utf16(units) {
-            match decoded {
-                Ok(c) => text.push(c),
-                Err(_) => {
-                    text.push(char::REPLACEMENT_CHARACTER);
-                    if !anomalies.contains(&StringAnomaly::UnpairedSurrogate) {
-                        anomalies.push(StringAnomaly::UnpairedSurrogate);
-                    }
+            Ok((string, used)) => {
+                if !string.anomalies.is_empty() {
+                    let tags: Vec<&str> = string.anomalies.iter().map(|a| a.tag()).collect();
+                    return Err(self.bad(what, format!("string is not well-formed ({})", tags.join(", "))));
                 }
+                self.pos += used;
+                Ok(string)
             }
         }
-        if !anomalies.is_empty() {
-            let tags: Vec<&str> = anomalies.iter().map(|a| a.tag()).collect();
-            self.pos = at;
-            return Err(self.bad(what, format!("string is not well-formed ({})", tags.join(", "))));
-        }
-        Ok(PtpString { text, anomalies })
     }
 
-    /// `[u32 length in bytes][ascii]`, no null. Non-ASCII is an error.
-    fn ascii_u32_len(&mut self, what: &'static str) -> Result<String, PtpUsbError> {
+    /// `[u32 length in bytes][bytes]`, no null, read as UTF-8. The length is in bytes, so the framing
+    /// carries any octets; no capture has non-ASCII content, and UTF-8 is assumed by analogy with the
+    /// IPTC fields of the same shape. A field that is not valid UTF-8 is an error naming the field
+    /// (the raw bytes stay available to the caller), not a lossy guess.
+    fn utf8_u32_len(&mut self, what: &'static str) -> Result<String, PtpUsbError> {
         let at = self.pos;
         let len = self.u32(what)? as usize;
         if len > self.data.len() - self.pos {
@@ -1485,11 +1577,13 @@ impl<'a> FtpBlobReader<'a> {
             return Err(self.bad(what, format!("declares {len} byte(s) but only {} remain", self.data.len() - at - 4)));
         }
         let bytes = self.take(what, len)?;
-        if !bytes.is_ascii() {
-            self.pos = at;
-            return Err(self.bad(what, "contains non-ASCII bytes"));
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Ok(text.to_string()),
+            Err(e) => {
+                self.pos = at + 4 + e.valid_up_to();
+                Err(self.bad(what, "is not valid UTF-8"))
+            }
         }
-        Ok(String::from_utf8(bytes.to_vec()).expect("checked ASCII"))
     }
 }
 
@@ -1513,8 +1607,9 @@ pub fn parse_ftp_profile_info(data: &[u8]) -> Result<FtpProfileInfo, PtpUsbError
 /// An FTP profile as read back from the camera by `0x90ED`. Every byte of
 /// the blob is accounted for: the fields the encoder writes, the one it does
 /// not model ([`Self::folder`]), and the structural bytes the decoder
-/// verified against literals.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// verified against literals. `Debug` hides the password and the 5 GHz field
+/// (lengths only), so a `{:?}` of this or of anything holding it cannot leak them.
+#[derive(Clone, PartialEq, Eq)]
 pub struct DecodedFtpProfile {
     pub profile_name: String,
     /// The two UTF-16 strings after the name. All-zero date-time shape
@@ -1577,14 +1672,41 @@ pub struct DecodedFtpProfile {
     pub ipv6_fields: [String; 3],
 }
 
+impl std::fmt::Debug for DecodedFtpProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodedFtpProfile")
+            .field("profile_name", &self.profile_name)
+            .field("timestamps", &self.timestamps)
+            .field("camera_network", &self.camera_network)
+            .field("ssid_24ghz", &self.ssid_24ghz)
+            .field("ssid24_kind", &self.ssid24_kind)
+            .field("ssid24_lead", &self.ssid24_lead)
+            .field("ssid_5ghz", &format_args!("<{} byte(s) hidden>", self.ssid_5ghz.len()))
+            .field("ssid5_kind", &self.ssid5_kind)
+            .field("host", &self.host)
+            .field("folder", &self.folder)
+            .field("username", &self.username)
+            .field("password", &format_args!("<{} byte(s) hidden>", self.password.len()))
+            .field("ftp_port", &self.ftp_port)
+            .field("option_flags", &self.option_flags)
+            .field("second_port", &self.second_port)
+            .field("ipv6_fields", &self.ipv6_fields)
+            .finish()
+    }
+}
+
 impl DecodedFtpProfile {
     /// The [`FtpProfile`] the encoder would need to write this profile back,
     /// when it can: not possible if [`Self::folder`] is non-empty, or
     /// [`Self::option_flags`] is not the encoder's `0x0005`, or
     /// [`Self::ftp_port`] is not the 21 it hard-codes, or [`Self::ssid5_kind`]
-    /// is not `04`, or [`Self::ssid24_kind`] is not `01`, since the encoder has
-    /// no way to carry any of them. `FtpProfile.port` receives
-    /// [`Self::second_port`] (where the encoder writes it).
+    /// is not `04`, or [`Self::ssid24_kind`] is not `01`, or [`Self::ssid24_lead`]
+    /// is not `03`, or the camera address, the two timestamps or the three IPv6
+    /// fields are not the encoder's captured placeholders, or one of the four
+    /// text fields the encoder writes as ASCII is not ASCII, since the encoder has
+    /// no way to carry any of them and a re-encode would silently change the
+    /// profile. `FtpProfile.port` receives [`Self::second_port`] (where the
+    /// encoder writes it).
     /// The SFTP option bit (`0x0008`). Confirmed against the camera's menu on
     /// one profile; see [`Self::option_flags`].
     pub fn is_sftp(&self) -> bool {
@@ -1592,7 +1714,19 @@ impl DecodedFtpProfile {
     }
 
     pub fn as_encodable(&self) -> Option<FtpProfile> {
-        (self.folder.is_empty() && self.option_flags == 0x0005 && self.ftp_port == 21 && self.ssid5_kind == FTP_TAG_SSID_5GHZ[0] && self.ssid24_kind == FTP_TAG_SSID_24GHZ[2] && self.ssid24_lead == FTP_TAG_SSID_24GHZ[0])
+        let placeholder_timestamps = self.timestamps.iter().all(|t| t == FTP_TEMPLATE_TIMESTAMP_PLACEHOLDER);
+        let placeholder_ipv6 = self.ipv6_fields.iter().all(|t| t == FTP_IPV6_PLACEHOLDER);
+        let ascii = [&self.ssid_24ghz, &self.ssid_5ghz, &self.username, &self.password].iter().all(|f| f.is_ascii());
+        (self.folder.is_empty()
+            && self.option_flags == 0x0005
+            && self.ftp_port == 21
+            && self.ssid5_kind == FTP_TAG_SSID_5GHZ[0]
+            && self.ssid24_kind == FTP_TAG_SSID_24GHZ[2]
+            && self.ssid24_lead == FTP_TAG_SSID_24GHZ[0]
+            && self.camera_network == FtpCameraNetwork::CAPTURED
+            && placeholder_timestamps
+            && placeholder_ipv6
+            && ascii)
             .then(|| FtpProfile {
             profile_name: self.profile_name.clone(),
             ssid_24ghz: self.ssid_24ghz.clone(),
@@ -1637,7 +1771,7 @@ pub fn decode_ftp_profile(blob: &[u8]) -> Result<DecodedFtpProfile, PtpUsbError>
     }
     let ssid24_lead = tag24[0];
     let ssid24_kind = tag24[2];
-    let ssid_24ghz = r.ascii_u32_len("2.4 GHz SSID")?;
+    let ssid_24ghz = r.utf8_u32_len("2.4 GHz SSID")?;
     let tag_at = r.pos;
     let tag5 = r.take("5 GHz SSID tag", 2)?;
     if tag5[1] != FTP_TAG_SSID_5GHZ[1] {
@@ -1645,7 +1779,7 @@ pub fn decode_ftp_profile(blob: &[u8]) -> Result<DecodedFtpProfile, PtpUsbError>
         return Err(r.bad("5 GHz SSID tag", format!("expected xx {:02x}, found {}", FTP_TAG_SSID_5GHZ[1], hex_bytes(tag5))));
     }
     let ssid5_kind = tag5[0];
-    let ssid_5ghz = r.ascii_u32_len("5 GHz SSID")?;
+    let ssid_5ghz = r.utf8_u32_len("5 GHz SSID")?;
     r.expect("host tag", &[FTP_TAG_HOST])?;
     let host = r.ptp_string("host")?.text;
     let folder = r.ptp_string("folder")?.text;
@@ -1653,15 +1787,15 @@ pub fn decode_ftp_profile(blob: &[u8]) -> Result<DecodedFtpProfile, PtpUsbError>
     // empty `folder` string (count 0) and `15 00` is the FTP port, 21. It is
     // a u16 here because a profile read on 2026-11-05 carried `16 00` (22).
     let ftp_port = r.u16("FTP port")?;
-    let username = r.ascii_u32_len("username")?;
-    let password = r.ascii_u32_len("password")?;
+    let username = r.utf8_u32_len("username")?;
+    let password = r.utf8_u32_len("password")?;
     let option_flags = r.u16("option flags")?;
     let second_port = r.u16("second port")?;
     r.expect("port-section padding", &FTP_PORT_SECTION_PAD)?;
-    let ipv6_a = r.ascii_u32_len("IPv6 field 1")?;
+    let ipv6_a = r.utf8_u32_len("IPv6 field 1")?;
     r.expect("IPv6 separator", &[FTP_IPV6_FIELD1_SEPARATOR])?;
-    let ipv6_b = r.ascii_u32_len("IPv6 field 2")?;
-    let ipv6_c = r.ascii_u32_len("IPv6 field 3")?;
+    let ipv6_b = r.utf8_u32_len("IPv6 field 2")?;
+    let ipv6_c = r.utf8_u32_len("IPv6 field 3")?;
     r.expect("blob trailer", &[FTP_BLOB_TRAILER])?;
     if r.pos != blob.len() {
         return Err(r.bad("blob end", format!("{} unexpected byte(s) after the trailer", blob.len() - r.pos)));
@@ -1714,10 +1848,10 @@ struct Reply {
 
 /// What a successful FTP-profile write tells you — and what it does not.
 ///
-/// `RESP_OK` is the only acknowledgement there is: the camera answered OK to
-/// the `0x90EE` data. Nothing reads the profile back (no read op is known),
-/// so this is "the camera accepted the blob", not "the profile now holds
-/// these values".
+/// `RESP_OK` is the only acknowledgement this receipt carries: the camera answered OK to
+/// the `0x90EE` data. It is "the camera accepted the blob", not "the profile now holds
+/// these values". The profile can be read back (`0x90ED`);
+/// [`PtpUsbSession::write_ftp_profile_blob_verified`] does it and returns [`FtpWriteVerification`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FtpWriteReceipt {
     /// The parameters of the `0x90EE` response (none seen in any capture).
@@ -1728,12 +1862,94 @@ pub struct FtpWriteReceipt {
     pub reply_matched_command: bool,
 }
 
-/// The profile bytes of an FTP-profile read, with the decode attempted on
-/// them. The raw bytes are kept whether or not the decode worked.
+/// The result of reading a just-written FTP profile back. **Never run on hardware as one step**: the
+/// pieces are (a write then `vendor-read-ftp --slot 0` in a separate process returned what was sent, Z 9,
+/// 2026-11-05) but a read inside the same session as the write is not. It relies on two facts seen
+/// on a Z 9 only: a successful `0x90EE` moves the written profile to slot 0 (replace and add alike), and
+/// the count rises by one on an add and stays on a replace.
+///
+/// The comparison is of decoded profiles, not bytes: the camera re-serialises an empty folder
+/// (`00` comes back `01 00 00`) when option bit `0x04` is clear, so the lengths can differ while the
+/// profile is the same. A [`Mismatch`](Self::Mismatch) does not say which side is wrong: it can also mean a
+/// camera that does not move the profile to the front.
 #[derive(Debug)]
+pub enum FtpWriteVerification {
+    /// Slot 0 decodes to exactly the profile that was sent, and the count is what the write should leave.
+    Verified { count_after: u32 },
+    /// The read-back worked but is not what the write should have left. `differing_fields` names the
+    /// fields of slot 0 that differ (never their values: they include the password); empty when only
+    /// the count is off.
+    Mismatch { count_after: u32, count_expected: u32, differing_fields: Vec<&'static str> },
+    /// Slot 0 was read but its bytes do not decode in a layout this decoder knows.
+    ReadBackUndecodable { error: PtpUsbError },
+    /// The read-back itself failed (a refused or timed-out operation, a stalled pipe); the write is
+    /// neither confirmed nor contradicted. The session is poisoned if the transport failed.
+    ReadBackFailed { error: PtpUsbError },
+}
+
+impl FtpWriteVerification {
+    pub fn is_verified(&self) -> bool {
+        matches!(self, FtpWriteVerification::Verified { .. })
+    }
+}
+
+/// A guarded FTP-profile write with its read-back; see [`PtpUsbSession::write_ftp_profile_blob_verified`].
+#[derive(Debug)]
+pub struct FtpWriteOutcome {
+    pub receipt: FtpWriteReceipt,
+    pub kind: FtpWriteKind,
+    /// The stored profile count `0x90EB` reported in the write's own session, before the write.
+    pub count_before: u32,
+    pub verification: FtpWriteVerification,
+}
+
+/// The fields of `want` that differ in `got`, by name. Both sides are destructured without `..`, so
+/// adding a field to [`DecodedFtpProfile`] without deciding how to compare it does not compile.
+fn ftp_profile_differences(want: &DecodedFtpProfile, got: &DecodedFtpProfile) -> Vec<&'static str> {
+    let DecodedFtpProfile {
+        profile_name,
+        timestamps,
+        camera_network,
+        ssid_24ghz,
+        ssid24_kind,
+        ssid24_lead,
+        ssid_5ghz,
+        ssid5_kind,
+        host,
+        folder,
+        username,
+        password,
+        ftp_port,
+        option_flags,
+        second_port,
+        ipv6_fields,
+    } = want;
+    let mut differing = Vec::new();
+    macro_rules! cmp {
+        ($($f:ident),*) => { $( if *$f != got.$f { differing.push(stringify!($f)); } )* };
+    }
+    cmp!(
+        profile_name, timestamps, camera_network, ssid_24ghz, ssid24_kind, ssid24_lead, ssid_5ghz, ssid5_kind, host,
+        folder, username, password, ftp_port, option_flags, second_port, ipv6_fields
+    );
+    differing
+}
+
+/// The profile bytes of an FTP-profile read, with the decode attempted on
+/// them. The raw bytes are kept whether or not the decode worked. `Debug` shows the raw
+/// length, not the bytes (they hold the password).
 pub struct FtpProfileBlob {
     pub raw: Vec<u8>,
     pub decoded: Result<DecodedFtpProfile, PtpUsbError>,
+}
+
+impl std::fmt::Debug for FtpProfileBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FtpProfileBlob")
+            .field("raw", &format_args!("<{} byte(s) hidden>", self.raw.len()))
+            .field("decoded", &self.decoded)
+            .finish()
+    }
 }
 
 /// What [`PtpUsbSession::read_ftp_profile`] found.
@@ -1840,16 +2056,81 @@ impl StringAnomaly {
             StringAnomaly::EmbeddedNul => "embedded_nul",
         }
     }
+
+    /// What is wrong, as a sentence fragment for the strict decoders' errors.
+    fn describe(self) -> &'static str {
+        match self {
+            StringAnomaly::UnpairedSurrogate => "an unpaired UTF-16 surrogate",
+            StringAnomaly::MissingTerminator => "a non-empty string must end in a NUL unit",
+            StringAnomaly::EmbeddedNul => "an embedded NUL unit before the end",
+        }
+    }
 }
 
 /// A PTP string (ISO 15740 §3.2.2): a character count `N` (terminating NUL
 /// included; 0 means an empty string with no further bytes), then `N`
 /// UTF-16LE code units.
+///
+/// `anomalies` is non-empty only where the caller chose to be lenient:
+/// DeviceInfo, which must still describe a body whose strings are odd. The strict
+/// sites (the FTP blob, the `0x90EB` reply, property values) reject any anomaly,
+/// so a `PtpString` they return always has `anomalies` empty. All of them decode
+/// through [`decode_ptp_string`]; they differ only in what they do with its verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtpString {
     /// Decoded without the terminating NUL; lossy where `anomalies` says so.
     pub text: String,
     pub anomalies: Vec<StringAnomaly>,
+}
+
+/// Why [`decode_ptp_string`] could not frame a string: the bytes ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringFrameFault {
+    /// Not even the count byte.
+    NoCountByte,
+    /// The count byte promises `needed` bytes of UTF-16 units; `available` follow it.
+    Truncated { needed: usize, available: usize },
+}
+
+/// THE decoder of the PTP string wire form (`[u8 count incl. NUL][count x UTF-16LE]`): the one place
+/// the framing, the terminator, the embedded-NUL and the surrogate rules live. Returns the string
+/// with every anomaly it has (in the fixed order missing terminator, embedded NUL, unpaired
+/// surrogate) and the number of bytes consumed. It never decides whether an anomaly is fatal: the
+/// lenient site (DeviceInfo) keeps them on the value, the strict ones (the FTP blob, property
+/// values) refuse any. Count 0 is the empty string with no further bytes; a count of 1 is the NUL alone.
+fn decode_ptp_string(data: &[u8]) -> Result<(PtpString, usize), StringFrameFault> {
+    let Some((&count, rest)) = data.split_first() else { return Err(StringFrameFault::NoCountByte) };
+    let needed = usize::from(count) * 2;
+    if needed > rest.len() {
+        return Err(StringFrameFault::Truncated { needed, available: rest.len() });
+    }
+    let mut units: Vec<u16> = rest[..needed].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let mut anomalies = Vec::new();
+    if !units.is_empty() {
+        if units.last() == Some(&0) {
+            units.pop();
+        } else {
+            anomalies.push(StringAnomaly::MissingTerminator);
+        }
+    }
+    if units.contains(&0) {
+        anomalies.push(StringAnomaly::EmbeddedNul);
+    }
+    let mut text = String::with_capacity(units.len());
+    let mut lossy = false;
+    for decoded in char::decode_utf16(units) {
+        match decoded {
+            Ok(c) => text.push(c),
+            Err(_) => {
+                lossy = true;
+                text.push(char::REPLACEMENT_CHARACTER);
+            }
+        }
+    }
+    if lossy {
+        anomalies.push(StringAnomaly::UnpairedSurrogate);
+    }
+    Ok((PtpString { text, anomalies }, 1 + needed))
 }
 
 /// The ISO 15740 DeviceInfo dataset (response data of operation `0x1001`),
@@ -1899,10 +2180,6 @@ impl<'a> DeviceInfoReader<'a> {
         Ok(bytes)
     }
 
-    fn u8(&mut self, field: &'static str) -> Result<u8, PtpUsbError> {
-        Ok(self.take(field, 1)?[0])
-    }
-
     fn u16(&mut self, field: &'static str) -> Result<u16, PtpUsbError> {
         Ok(u16::from_le_bytes(self.take(field, 2)?.try_into().expect("take(2) returns 2 bytes")))
     }
@@ -1923,36 +2200,21 @@ impl<'a> DeviceInfoReader<'a> {
         Ok(bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
     }
 
+    /// Lenient: the anomalies stay on the returned value (see [`decode_ptp_string`]).
     fn string(&mut self, field: &'static str) -> Result<PtpString, PtpUsbError> {
-        let chars = usize::from(self.u8(field)?);
-        let bytes = self.take(field, chars * 2)?;
-        let mut units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        let mut anomalies = Vec::new();
-        if !units.is_empty() {
-            if units.last() == Some(&0) {
-                units.pop();
-            } else {
-                anomalies.push(StringAnomaly::MissingTerminator);
+        match decode_ptp_string(&self.data[self.pos..]) {
+            Ok((string, used)) => {
+                self.pos += used;
+                Ok(string)
+            }
+            Err(StringFrameFault::NoCountByte) => {
+                Err(self.malformed(field, DeviceInfoFault::Truncated { needed: 1, available: 0 }))
+            }
+            Err(StringFrameFault::Truncated { needed, available }) => {
+                self.pos += 1; // the count byte was read
+                Err(self.malformed(field, DeviceInfoFault::Truncated { needed, available }))
             }
         }
-        if units.contains(&0) {
-            anomalies.push(StringAnomaly::EmbeddedNul);
-        }
-        let mut text = String::with_capacity(units.len());
-        let mut lossy = false;
-        for decoded in char::decode_utf16(units) {
-            match decoded {
-                Ok(c) => text.push(c),
-                Err(_) => {
-                    lossy = true;
-                    text.push(char::REPLACEMENT_CHARACTER);
-                }
-            }
-        }
-        if lossy {
-            anomalies.push(StringAnomaly::UnpairedSurrogate);
-        }
-        Ok(PtpString { text, anomalies })
     }
 }
 
@@ -2092,6 +2354,9 @@ pub struct PtpUsbSession<T: BulkTransport = rusb::DeviceHandle<GlobalContext>> {
     data_phase_started: bool,
     /// Containers of an unknown kind skipped over the session's life.
     unrecognized_containers: u32,
+    /// Event containers that arrived on the bulk pipe and were skipped (events belong on the
+    /// interrupt endpoint, which is never opened, so any here is unexpected).
+    event_containers: u32,
     /// Held for the session's life (dropped after the interface is released);
     /// `None` only for the test constructor.
     _camera_lock: Option<CameraLock>,
@@ -2181,6 +2446,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
             usb_warnings: Vec::new(),
             data_phase_started: false,
             unrecognized_containers: 0,
+            event_containers: 0,
             _camera_lock: camera_lock,
             diag: crate::diag::global(),
         }
@@ -2202,6 +2468,11 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// How many containers of an unknown kind this session has skipped.
     pub fn unrecognized_container_count(&self) -> u32 {
         self.unrecognized_containers
+    }
+
+    /// How many Event containers this session has skipped on the bulk pipe.
+    pub fn event_container_count(&self) -> u32 {
+        self.event_containers
     }
 
     /// Write one whole container, checking that the pipe took all of it, and
@@ -2333,8 +2604,10 @@ impl<T: BulkTransport> PtpUsbSession<T> {
                     ("response", crate::diag::Val::Hex(u64::from(reply.code))),
                     ("reply_len", crate::diag::Val::len(reply.data.len())),
                 ];
-                // A hash of nothing identifies nothing: only when the camera sent data.
-                if !reply.data.is_empty() {
+                // A hash of nothing identifies nothing: only when the camera sent data. And none for a
+                // profile read: its blob holds the password, and a short hash of a low-entropy secret
+                // inside a mostly known structure lets whoever holds the file test guesses offline.
+                if !reply.data.is_empty() && !op_payload_holds_a_secret(op) {
                     extra.push(("reply_hash", crate::diag::Val::hash(&reply.data)));
                 }
                 span.finish_with(outcome, &extra);
@@ -2365,7 +2638,9 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         }
         if let Some(data) = data_out {
             fields.push(("data_len", Val::len(data.len())));
-            fields.push(("data_hash", Val::hash(data)));
+            if !op_payload_holds_a_secret(op) {
+                fields.push(("data_hash", Val::hash(data)));
+            }
         }
         // The operation code is part of the name so the report only collapses runs of the *same*
         // operation, never a close, an open and a read into one line.
@@ -2445,7 +2720,11 @@ impl<T: BulkTransport> PtpUsbSession<T> {
                     reply.code = container.code;
                     return Ok(reply);
                 }
-                CONTAINER_EVENT => continue, // shouldn't arrive on the bulk pipe (the interrupt endpoint is never opened); ignore defensively
+                CONTAINER_EVENT => {
+                    // Shouldn't arrive on the bulk pipe (the interrupt endpoint is never opened):
+                    // skipped, but counted.
+                    self.event_containers += 1;
+                }
                 other => {
                     // An unrecognized container kind is a protocol violation
                     // (or a misparse — see read_container's own truncation/
@@ -2601,7 +2880,12 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// [`PtpUsbError::PropWriteIndeterminate`]; a camera that *answers* non-OK is a definite refusal.
     /// The camera's length limit for each property is not known here: nothing is truncated by this
     /// code, and a camera that truncates shows up as `verified == false` with the read-back text.
-    /// Models outside [`STRING_PROP_WRITE_MODELS`] are refused unless `force_unconfirmed_model`.
+    /// Models outside [`STRING_PROP_WRITE_MODELS`], and properties outside
+    /// [`STRING_PROP_WRITE_CONFIRMED_PROPS`] (Artist and Copyright: never run on any body), are
+    /// refused unless `force_unconfirmed_model`. Text is refused before anything is sent if it has a
+    /// character above U+00FF (the camera keeps one byte per character) or any `char::is_control`
+    /// character, which includes U+007F and the C1 range U+0080..=U+009F even though those are
+    /// inside Latin-1.
     pub fn set_string_property(
         &mut self,
         propcode: u16,
@@ -2612,8 +2896,13 @@ impl<T: BulkTransport> PtpUsbSession<T> {
             let allowed = STRING_PROPS.iter().map(|(c, n)| format!("{c:#06x} {n}")).collect::<Vec<_>>().join(", ");
             return Err(PtpUsbError::PropWriteUnsupported { propcode, allowed });
         }
-        if !force_unconfirmed_model && !STRING_PROP_WRITE_MODELS.contains(&self.model()) {
-            return Err(PtpUsbError::UnconfirmedModel(self.model().to_string()));
+        if !force_unconfirmed_model {
+            if !STRING_PROP_WRITE_MODELS.contains(&self.model()) {
+                return Err(PtpUsbError::UnconfirmedModel(self.model().to_string()));
+            }
+            if !STRING_PROP_WRITE_CONFIRMED_PROPS.contains(&propcode) {
+                return Err(PtpUsbError::PropWriteUnconfirmed { propcode, model: self.model().to_string() });
+            }
         }
         let bad = |why: String| PtpUsbError::PropValueBad { propcode, why };
         // Observed on a Z 9 (2026-11-05): the camera keeps only the LOW BYTE of each UTF-16 unit of
@@ -2633,6 +2922,10 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         // PropCode u16, DataType u16 (0xFFFF = string), GetSet u8: 5 bytes before anything variable.
         if desc.data.len() < 5 {
             return Err(bad(format!("descriptor is {} byte(s), too short to hold the get/set flag", desc.data.len())));
+        }
+        let echoed = u16::from_le_bytes([desc.data[0], desc.data[1]]);
+        if echoed != propcode {
+            return Err(bad(format!("the descriptor is for property {echoed:#06x}, not the one asked for")));
         }
         let data_type = u16::from_le_bytes([desc.data[2], desc.data[3]]);
         if data_type != 0xFFFF {
@@ -2762,6 +3055,76 @@ impl<T: BulkTransport> PtpUsbSession<T> {
 
     /// `0x90E8` setup, then `0x90EE(params)` with `blob` as its data-out
     /// phase. Shared by the encoder-built write and the raw-blob write.
+    /// `0x90E8` setup then `0x90EB`: the stored count and the selected slot, read-only. The reply
+    /// flag is false when either reply did not match its command (tolerated, see [`TxidCheck`]).
+    fn read_ftp_info_step(&mut self) -> Result<(FtpProfileInfo, bool), PtpUsbError> {
+        let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
+        Self::require_ok(OP_FTP_SETUP, setup.code)?;
+        let info_reply = self.transact(OP_FTP_PROFILE_INFO, &[], None, TxidCheck::Unchecked)?;
+        Self::require_ok(OP_FTP_PROFILE_INFO, info_reply.code)?;
+        if info_reply.data_containers == 0 {
+            return Err(PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_INFO });
+        }
+        let info = parse_ftp_profile_info(&info_reply.data)?;
+        Ok((info, setup.deviations.is_empty() && info_reply.deviations.is_empty()))
+    }
+
+    /// The write every caller that chooses its own slot goes through: the model gate, the blob must
+    /// decode, `(slot, param2)` must be a form [`classify_ftp_write`] knows (count-independent rules
+    /// before any I/O), then the stored count is read **in this session** and the rules that need it are
+    /// applied, so the count cannot change between the check and the write. Returns what was
+    /// decoded from the blob so the caller can read it back.
+    fn write_ftp_guarded(
+        &mut self,
+        slot: u32,
+        param2: u32,
+        blob: &[u8],
+        force_unconfirmed_model: bool,
+    ) -> Result<(FtpWriteReceipt, FtpWriteKind, u32, DecodedFtpProfile), PtpUsbError> {
+        if !force_unconfirmed_model && !ftp_write_confirmed(&self.model) {
+            return Err(PtpUsbError::UnconfirmedModel(self.model.clone()));
+        }
+        let expected = decode_ftp_profile(blob)?;
+        let refuse = |why| PtpUsbError::FtpWriteRefused { slot, param2, why };
+        classify_ftp_write(slot, param2, None).map_err(refuse)?;
+        let (info, info_matched) = self.read_ftp_info_step()?;
+        let kind = classify_ftp_write(slot, param2, Some(info.count)).map_err(refuse)?;
+        let mut receipt = self.send_ftp_blob([slot, param2], blob)?;
+        receipt.reply_matched_command &= info_matched;
+        Ok((receipt, kind, info.count, expected))
+    }
+
+    /// Read slot 0 back after a successful write and compare; see [`FtpWriteVerification`].
+    fn verify_ftp_write(&mut self, expected: &DecodedFtpProfile, kind: FtpWriteKind, count_before: u32) -> FtpWriteVerification {
+        let count_expected = match kind {
+            FtpWriteKind::Replace => count_before,
+            FtpWriteKind::Add => count_before.saturating_add(1),
+        };
+        let readout = match self.read_ftp_profile_slot(Some(0)) {
+            Ok(r) => r,
+            // Slot 0 does not exist: the camera now holds nothing, which is a finding, not a failed read.
+            Err(PtpUsbError::FtpSlotOutOfRange { count, .. }) => {
+                return FtpWriteVerification::Mismatch { count_after: count, count_expected, differing_fields: Vec::new() };
+            }
+            Err(error) => return FtpWriteVerification::ReadBackFailed { error },
+        };
+        let count_after = readout.info.count;
+        let Some(blob) = readout.profile else {
+            return FtpWriteVerification::ReadBackFailed { error: PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_READ } };
+        };
+        match blob.decoded {
+            Err(error) => FtpWriteVerification::ReadBackUndecodable { error },
+            Ok(got) => {
+                let differing_fields = ftp_profile_differences(expected, &got);
+                if differing_fields.is_empty() && count_after == count_expected {
+                    FtpWriteVerification::Verified { count_after }
+                } else {
+                    FtpWriteVerification::Mismatch { count_after, count_expected, differing_fields }
+                }
+            }
+        }
+    }
+
     fn send_ftp_blob(&mut self, params: [u32; 2], blob: &[u8]) -> Result<FtpWriteReceipt, PtpUsbError> {
         let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
         Self::require_ok(OP_FTP_SETUP, setup.code)?;
@@ -2779,10 +3142,14 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// Write `blob` (a profile in the `0x90ED`/`0x90EE` layout, for instance
     /// one read from another camera) with `0x90EE(slot, param2)`, unchanged.
     /// The blob must decode ([`decode_ftp_profile`]), so a garbled one never
-    /// reaches the camera. **What the two parameters mean is partly unknown**:
-    /// every capture used `[0, 0]`, and on a Z 9 `[0, 0]` replaced the only
-    /// stored profile (slot 0) instead of adding one. Same model gate as
-    /// [`Self::write_ftp_profile_with`].
+    /// reaches the camera. **What the two parameters mean is partly unknown**, so only
+    /// the two forms a camera has accepted are sent ([`classify_ftp_write`]): `(n, 0)` replaces the
+    /// stored profile `n` and `(count, 1)` adds one; anything else is
+    /// [`PtpUsbError::FtpWriteRefused`] with a typed [`FtpWriteRefusal`]. The stored count is read
+    /// in this same session first (`0x90E8`, `0x90EB`, then the write's own `0x90E8`, `0x90EE`; the
+    /// extra read-only pair has not been run ahead of a write on hardware). Same model gate as
+    /// [`Self::write_ftp_profile_with`]. `Ok` is the camera's OK and nothing more; for a read-back use
+    /// [`Self::write_ftp_profile_blob_verified`].
     pub fn write_ftp_profile_blob(
         &mut self,
         slot: u32,
@@ -2790,11 +3157,40 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         blob: &[u8],
         force_unconfirmed_model: bool,
     ) -> Result<FtpWriteReceipt, PtpUsbError> {
-        if !force_unconfirmed_model && !ftp_write_confirmed(&self.model) {
-            return Err(PtpUsbError::UnconfirmedModel(self.model.clone()));
-        }
-        decode_ftp_profile(blob)?;
-        self.send_ftp_blob([slot, param2], blob)
+        self.write_ftp_guarded(slot, param2, blob, force_unconfirmed_model).map(|(receipt, ..)| receipt)
+    }
+
+    /// [`Self::write_ftp_profile_blob`], then a read-back in the same session: `0x90E8`, `0x90EB`,
+    /// `0x90ED(0)` and a comparison of the decoded profile with the one sent (see
+    /// [`FtpWriteVerification`] for exactly what is and is not established, and that this
+    /// read-back has not been run on hardware inside the write's session). A write that fails
+    /// is the same `Err` as for [`Self::write_ftp_profile_blob`]; the read-back's own failure is
+    /// reported in the outcome, not as an `Err`, because the write did succeed.
+    pub fn write_ftp_profile_blob_verified(
+        &mut self,
+        slot: u32,
+        param2: u32,
+        blob: &[u8],
+        force_unconfirmed_model: bool,
+    ) -> Result<FtpWriteOutcome, PtpUsbError> {
+        let (receipt, kind, count_before, expected) = self.write_ftp_guarded(slot, param2, blob, force_unconfirmed_model)?;
+        let verification = self.verify_ftp_write(&expected, kind, count_before);
+        Ok(FtpWriteOutcome { receipt, kind, count_before, verification })
+    }
+
+    /// [`Self::write_ftp_profile_with`]'s profile, written as a guarded replace of slot 0
+    /// (`0x90EE(0, 0)`, what the encoder path has always sent) with the read-back of
+    /// [`Self::write_ftp_profile_blob_verified`]. A camera holding no profile refuses the replace
+    /// ([`FtpWriteRefusal::ReplaceSlotNotStored`]) instead of stalling.
+    pub fn write_ftp_profile_verified(
+        &mut self,
+        profile: &FtpProfile,
+        network: &FtpCameraNetwork,
+        force_unconfirmed_model: bool,
+    ) -> Result<FtpWriteOutcome, PtpUsbError> {
+        let blob = encode_ftp_profile_with(profile, network)?;
+        let [slot, param2] = FTP_PROFILE_WRITE_PARAMS;
+        self.write_ftp_profile_blob_verified(slot, param2, &blob, force_unconfirmed_model)
     }
 
     /// Read the camera's FTP profile: `0x90E8` (the same fixed 3-byte setup
@@ -2830,20 +3226,20 @@ impl<T: BulkTransport> PtpUsbSession<T> {
                 KNOWN_MODELS
             ));
         }
-        let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
-        Self::require_ok(OP_FTP_SETUP, setup.code)?;
-
-        let info_reply = self.transact(OP_FTP_PROFILE_INFO, &[], None, TxidCheck::Unchecked)?;
-        Self::require_ok(OP_FTP_PROFILE_INFO, info_reply.code)?;
-        if info_reply.data_containers == 0 {
-            return Err(PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_INFO });
-        }
-        let info = parse_ftp_profile_info(&info_reply.data)?;
-        let mut matched = setup.deviations.is_empty() && info_reply.deviations.is_empty();
+        let (info, mut matched) = self.read_ftp_info_step()?;
 
         let wanted = match slot {
             Some(n) if n >= info.count => return Err(PtpUsbError::FtpSlotOutOfRange { slot: n, count: info.count }),
             Some(n) => Some(n),
+            // The active slot gets the same bound as an explicit one: `0x90ED(count)` stalls the pipe,
+            // and a camera holding nothing (count 0) can still report slot 0.
+            None if info.has_active_profile() && info.slot >= info.count => {
+                warnings.push(format!(
+                    "0x90EB reports active slot {} but only {} profile(s) are stored; 0x90ED was not sent (it stalls the pipe past the end)",
+                    info.slot, info.count
+                ));
+                None
+            }
             None => info.has_active_profile().then_some(info.slot),
         };
         let profile = if let Some(wanted) = wanted {
@@ -3034,23 +3430,18 @@ pub fn read_vendor_property_report_locked(
 /// end in the NUL, and surrogates must pair. The text is returned as the camera holds it, so
 /// trailing spaces from a fixed-width field are kept, not trimmed. The error says what was wrong.
 pub fn decode_ptp_string_value(bytes: &[u8]) -> Result<String, String> {
-    let Some((&count, rest)) = bytes.split_first() else {
-        return Err("no bytes (a PTP string needs at least the count byte)".to_string());
+    let length_error = |needed: usize, follow: usize| {
+        Err(format!("count byte says {} unit(s) = {needed} byte(s), but {follow} byte(s) follow it", needed / 2))
     };
-    let count = usize::from(count);
-    if rest.len() != count * 2 {
-        return Err(format!("count byte says {count} unit(s) = {} byte(s), but {} byte(s) follow it", count * 2, rest.len()));
+    match decode_ptp_string(bytes) {
+        Err(StringFrameFault::NoCountByte) => Err("no bytes (a PTP string needs at least the count byte)".to_string()),
+        Err(StringFrameFault::Truncated { needed, available }) => length_error(needed, available),
+        Ok((_, used)) if used != bytes.len() => length_error(used - 1, bytes.len() - 1),
+        Ok((string, _)) => match string.anomalies.first() {
+            Some(anomaly) => Err(anomaly.describe().to_string()),
+            None => Ok(string.text),
+        },
     }
-    let mut units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-    if !units.is_empty() {
-        if units.pop() != Some(0) {
-            return Err("a non-empty string must end in a NUL unit".to_string());
-        }
-    }
-    if units.contains(&0) {
-        return Err("an embedded NUL unit before the end".to_string());
-    }
-    String::from_utf16(&units).map_err(|_| "an unpaired UTF-16 surrogate".to_string())
 }
 
 /// Encode `text` as a PTP string value: `[u8 count incl. NUL][UTF-16LE units][NUL]`. The empty
@@ -3153,6 +3544,31 @@ pub fn write_ftp_profile_blob_locked(
 ) -> Result<FtpWriteReceipt, PtpUsbError> {
     let mut session = PtpUsbSession::open_locked(lock, serial)?;
     session.write_ftp_profile_blob(slot, param2, blob, force_unconfirmed_model)
+}
+
+/// [`PtpUsbSession::write_ftp_profile_blob_verified`] for a caller already holding the [`CameraLock`].
+pub fn write_ftp_profile_blob_verified_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    slot: u32,
+    param2: u32,
+    blob: &[u8],
+    force_unconfirmed_model: bool,
+) -> Result<FtpWriteOutcome, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.write_ftp_profile_blob_verified(slot, param2, blob, force_unconfirmed_model)
+}
+
+/// [`PtpUsbSession::write_ftp_profile_verified`] for a caller already holding the [`CameraLock`].
+pub fn write_ftp_profile_verified_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    profile: &FtpProfile,
+    network: &FtpCameraNetwork,
+    force_unconfirmed_model: bool,
+) -> Result<FtpWriteOutcome, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.write_ftp_profile_verified(profile, network, force_unconfirmed_model)
 }
 
 /// [`PtpUsbSession::read_ftp_profile`] for a caller already holding the
@@ -4787,8 +5203,9 @@ mod tests {
         let (mut s, _t) = session(vec![event, weird, weird2, resp(RESP_OK)], "Z 9");
         let r = unchecked(&mut s, 0x1001).unwrap();
         assert_eq!(r.code, RESP_OK);
-        assert_eq!(r.unrecognized_containers, 2, "the event is not counted, the two strays are");
+        assert_eq!(r.unrecognized_containers, 2, "the event is not an unrecognized container, the two strays are");
         assert_eq!(s.unrecognized_container_count(), 2);
+        assert_eq!(s.event_container_count(), 1, "the skipped event is counted on its own");
     }
 
     #[test]
@@ -5425,7 +5842,7 @@ mod tests {
         let e = d.snapshot().pop().unwrap();
         assert_eq!(e.outcome, Some(Outcome::Ok));
         assert_eq!(field(&e, "data_len"), Some(&Val::Len(payload.len() as u64)));
-        assert_eq!(field(&e, "data_hash"), Some(&Val::hash(payload)));
+        assert!(field(&e, "data_hash").is_none(), "an FTP profile holds a password: its length only, no hash");
         assert_eq!(field(&e, "phase"), Some(&Val::text("data_sent")));
         assert_eq!((field(&e, "p0"), field(&e, "p1")), (Some(&Val::Hex(0)), Some(&Val::Hex(1))));
         let on_disk: String = std::fs::read_dir(dir.path())
@@ -5605,8 +6022,11 @@ mod tests {
     }
     /// descriptor, current value, set, read-back.
     fn set_script(get_set: u8, previous: &str, set_reply: u16, read_back: &str) -> Vec<Step> {
+        set_script_for(0xD090, get_set, previous, set_reply, read_back)
+    }
+    fn set_script_for(propcode: u16, get_set: u8, previous: &str, set_reply: u16, read_back: &str) -> Vec<Step> {
         vec![
-            data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(0xD090, 0xFFFF, get_set)),
+            data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(propcode, 0xFFFF, get_set)),
             resp(RESP_OK),
             data_c(OP_GET_DEVICE_PROP_VALUE, &prop_str(previous)),
             resp(RESP_OK),
@@ -5665,8 +6085,9 @@ mod tests {
         }
         // Each allowed code is accepted, and the write command carries exactly that code.
         for (code, _) in STRING_PROPS {
-            let (mut s, t) = session(set_script(1, "", RESP_OK, "x"), "Z 9");
-            assert!(s.set_string_property(code, "x", false).unwrap().verified, "{code:#x}");
+            let (mut s, t) = session(set_script_for(code, 1, "", RESP_OK, "x"), "Z 9");
+            let force = !STRING_PROP_WRITE_CONFIRMED_PROPS.contains(&code);
+            assert!(s.set_string_property(code, "x", force).unwrap().verified, "{code:#x}");
             assert_eq!(sent_ops(&t)[2], (CONTAINER_COMMAND, OP_SET_DEVICE_PROP_VALUE, le(u32::from(code))), "{code:#x}");
         }
     }
@@ -6703,15 +7124,19 @@ mod tests {
     #[test]
     fn write_ftp_profile_blob_sends_the_bytes_unchanged_under_the_given_params() {
         let blob = hex::decode_hex(ftp_blob_port22_hex());
-        let (mut s, t) = session(vec![resp(RESP_OK), resp(RESP_OK)], "Z 9");
+        // Two stored profiles, so slot 1 exists: the count is read first, in the same session.
+        let (mut s, t) = session(blob_write_script(2), "Z 9");
         s.write_ftp_profile_blob(1, 0, &blob, false).unwrap();
         assert_eq!(
             t.sent(),
             vec![
                 (CONTAINER_COMMAND, OP_FTP_SETUP, 0, vec![]),
                 (CONTAINER_DATA, OP_FTP_SETUP, 0, FTP_SETUP_DATA.to_vec()),
-                (CONTAINER_COMMAND, OP_FTP_PROFILE_WRITE, 1, [le(1), le(0)].concat()),
-                (CONTAINER_DATA, OP_FTP_PROFILE_WRITE, 1, blob),
+                (CONTAINER_COMMAND, OP_FTP_PROFILE_INFO, 1, vec![]),
+                (CONTAINER_COMMAND, OP_FTP_SETUP, 2, vec![]),
+                (CONTAINER_DATA, OP_FTP_SETUP, 2, FTP_SETUP_DATA.to_vec()),
+                (CONTAINER_COMMAND, OP_FTP_PROFILE_WRITE, 3, [le(1), le(0)].concat()),
+                (CONTAINER_DATA, OP_FTP_PROFILE_WRITE, 3, blob),
             ]
         );
     }
@@ -6945,5 +7370,735 @@ mod tests {
         );
         let out = s.read_ftp_profile().unwrap();
         assert_eq!(out.warnings.len(), 1);
+    }
+
+
+    // ══ remediation E1: string decoders, write gates, FTP write guard and read-back ═════════════
+
+    // ── the string write gate (b7d3#76, #15) ─────────────────────────────
+
+    #[test]
+    fn string_write_gate_lists_are_pinned_literally() {
+        // Dropping an entry, renaming "Z6_3" (the real Z6III string) or adding an unconfirmed body each
+        // changes what a camera is allowed to receive: the lists are contract, so they are spelled out.
+        assert_eq!(STRING_PROP_WRITE_MODELS, ["Z 9", "Z6_3", "Z 5"]);
+        assert_eq!(STRING_PROP_WRITE_CONFIRMED_PROPS, [0xD090]);
+    }
+
+    #[test]
+    fn string_write_gate_lists_stay_inside_the_registries_they_draw_on() {
+        for m in STRING_PROP_WRITE_MODELS {
+            assert!(sdk_model_name(m).is_some(), "{m:?} is write-confirmed but not in KNOWN_MODELS");
+            assert!(KNOWN_MODELS.contains(m), "{m:?}");
+        }
+        for c in STRING_PROP_WRITE_CONFIRMED_PROPS {
+            assert!(STRING_PROPS.iter().any(|(p, _)| p == c), "{c:#x} is write-confirmed but not a string property");
+        }
+    }
+
+    #[test]
+    fn artist_and_copyright_writes_need_the_force_flag_on_every_model_and_send_nothing_without_it() {
+        for model in STRING_PROP_WRITE_MODELS {
+            for code in [0xD072u16, 0xD073] {
+                let (mut s, t) = session(set_script(1, "a", RESP_OK, "b"), model);
+                let err = s.set_string_property(code, "b", false).unwrap_err();
+                assert!(
+                    matches!(&err, PtpUsbError::PropWriteUnconfirmed { propcode, model: m } if *propcode == code && m == model),
+                    "{model} {code:#x}: {err:?}"
+                );
+                assert!(t.sent().is_empty(), "{model} {code:#x}: nothing may be sent");
+                let text = err.to_string();
+                assert!(text.contains("never run") && text.contains("--force-unconfirmed-model"), "{text}");
+                let (mut s, _t) = session(set_script_for(code, 1, "a", RESP_OK, "b"), model);
+                assert!(s.set_string_property(code, "b", true).unwrap().verified, "{model} {code:#x} forced");
+            }
+        }
+    }
+
+    #[test]
+    fn the_model_is_checked_before_the_property_so_the_error_names_the_real_cause() {
+        let (mut s, _t) = session(vec![], "Z 8");
+        assert!(matches!(s.set_string_property(0xD072, "x", false), Err(PtpUsbError::UnconfirmedModel(m)) if m == "Z 8"));
+    }
+
+    #[test]
+    fn a_descriptor_for_another_property_is_refused_before_any_write() {
+        // The echoed PropCode (first two descriptor bytes) must be the one asked for.
+        let (mut s, t) = session(vec![data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(0xD072, 0xFFFF, 1)), resp(RESP_OK)], "Z 9");
+        let err = s.set_string_property(0xD090, "x", false).unwrap_err();
+        assert!(matches!(&err, PtpUsbError::PropValueBad { propcode: 0xD090, why } if why.contains("0xd072")), "{err:?}");
+        assert_eq!(t.sent().len(), 1, "only the descriptor read went out");
+    }
+
+    #[test]
+    fn a_descriptor_of_exactly_five_bytes_is_enough_and_four_is_not() {
+        // PropCode u16, DataType u16, GetSet u8: the get/set flag is the fifth byte.
+        let five = vec![0x90, 0xD0, 0xFF, 0xFF, 0x01];
+        let (mut s, _t) = session(
+            vec![
+                data_c(OP_GET_DEVICE_PROP_DESC, &five),
+                resp(RESP_OK),
+                data_c(OP_GET_DEVICE_PROP_VALUE, &prop_str("old")),
+                resp(RESP_OK),
+                resp(RESP_OK),
+                data_c(OP_GET_DEVICE_PROP_VALUE, &prop_str("new")),
+                resp(RESP_OK),
+            ],
+            "Z 9",
+        );
+        assert!(s.set_string_property(0xD090, "new", false).unwrap().verified);
+        let (mut s, _t) = session(vec![data_c(OP_GET_DEVICE_PROP_DESC, &five[..4]), resp(RESP_OK)], "Z 9");
+        assert!(matches!(s.set_string_property(0xD090, "new", false), Err(PtpUsbError::PropValueBad { .. })));
+    }
+
+    #[test]
+    fn a_set_command_that_never_left_the_host_is_not_indeterminate() {
+        // The FTP twin is `a_write_that_never_got_its_data_out_is_not_indeterminate`. Writes: descriptor
+        // command (16 bytes), value command (16), then the 0x1016 command, which the pipe takes 5 bytes of.
+        let (mut s, _t) = session(set_script(1, "old", RESP_OK, "new"), "Z 9");
+        s.handle.0.borrow_mut().write_caps = VecDeque::from([16, 16, 5]);
+        let err = s.set_string_property(0xD090, "new", false).unwrap_err();
+        assert!(matches!(err, PtpUsbError::ShortWrite { written: 5, expected: 16 }), "{err:?}");
+    }
+
+    #[test]
+    fn latin1_c1_and_delete_controls_are_refused_and_the_neighbours_are_not() {
+        // char::is_control covers U+007F and U+0080..=U+009F, all inside the Latin-1 range the camera keeps.
+        for control in ['\u{7f}', '\u{80}', '\u{85}', '\u{9f}'] {
+            let text = format!("a{control}b");
+            assert!(encode_ptp_string_value(&text).is_err(), "{control:?}");
+            let (mut s, t) = session(vec![], "Z 9");
+            let err = s.set_string_property(0xD090, &text, false).unwrap_err();
+            assert!(matches!(err, PtpUsbError::PropValueBad { .. }), "{control:?}: {err:?}");
+            assert!(t.sent().is_empty(), "{control:?}");
+        }
+        for fine in ['\u{7e}', '\u{a0}', '\u{ff}'] {
+            assert!(encode_ptp_string_value(&fine.to_string()).is_ok(), "{fine:?}");
+        }
+    }
+
+    // ── one PTP string decoder, three consumers (b7d3#35, #83) ───────────
+
+    /// Wire inputs for the string decoders: (name, bytes, text, anomalies, bytes consumed).
+    fn string_wire_cases() -> Vec<(&'static str, Vec<u8>, &'static str, Vec<StringAnomaly>, usize)> {
+        use StringAnomaly::*;
+        vec![
+            ("empty by count 0", vec![0], "", vec![], 1),
+            ("empty by NUL alone", vec![1, 0, 0], "", vec![], 3),
+            ("ordinary", vec![3, b'a', 0, b'b', 0, 0, 0], "ab", vec![], 7),
+            ("non-BMP pair", vec![3, 0x3D, 0xD8, 0xF7, 0xDC, 0, 0], "\u{1F4F7}", vec![], 7),
+            ("missing terminator", vec![2, b'a', 0, b'b', 0], "ab", vec![MissingTerminator], 5),
+            ("embedded NUL", vec![3, b'a', 0, 0, 0, 0, 0], "a\0", vec![EmbeddedNul], 7),
+            ("unpaired surrogate", vec![2, 0x3D, 0xD8, 0, 0], "\u{FFFD}", vec![UnpairedSurrogate], 5),
+            ("missing terminator and embedded NUL", vec![2, 0, 0, b'a', 0], "\0a", vec![MissingTerminator, EmbeddedNul], 5),
+            ("all three", vec![3, 0, 0, 0x3D, 0xD8, b'x', 0], "\0\u{FFFD}x", vec![MissingTerminator, EmbeddedNul, UnpairedSurrogate], 7),
+        ]
+    }
+
+    #[test]
+    fn the_canonical_decoder_reports_text_anomalies_in_a_fixed_order_and_bytes_used() {
+        for (name, bytes, text, anomalies, used) in string_wire_cases() {
+            let (s, n) = decode_ptp_string(&bytes).unwrap_or_else(|f| panic!("{name}: {f:?}"));
+            assert_eq!((s.text.as_str(), &s.anomalies, n), (text, &anomalies, used), "{name}");
+            // Bytes after the string are not consumed by it.
+            let mut longer = bytes.clone();
+            longer.extend_from_slice(&[0xEE, 0xEE]);
+            assert_eq!(decode_ptp_string(&longer).unwrap().1, used, "{name} + trailing");
+        }
+    }
+
+    #[test]
+    fn the_three_consumers_agree_on_every_wire_case_and_differ_only_in_strictness() {
+        for (name, bytes, text, anomalies, used) in string_wire_cases() {
+            // DeviceInfo keeps the anomalies on the value and always advances.
+            let mut di = DeviceInfoReader { data: &bytes, pos: 0 };
+            let lenient = di.string("f").unwrap();
+            assert_eq!((lenient.text.as_str(), &lenient.anomalies, di.pos), (text, &anomalies, used), "{name} lenient");
+            // The FTP blob reader and the property-value decoder refuse any anomaly, and agree on the text otherwise.
+            let mut fr = FtpBlobReader { data: &bytes, pos: 0 };
+            let ftp = fr.ptp_string("f");
+            let value = decode_ptp_string_value(&bytes);
+            if anomalies.is_empty() {
+                let ftp = ftp.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!((ftp.text.as_str(), &ftp.anomalies, fr.pos), (text, &Vec::new(), used), "{name} ftp");
+                assert_eq!(value.as_deref(), Ok(text), "{name} value");
+            } else {
+                match ftp {
+                    Err(PtpUsbError::FtpBlobMalformed { what: "f", offset: 0, detail }) => {
+                        for a in &anomalies {
+                            assert!(detail.contains(a.tag()), "{name}: {detail}");
+                        }
+                    }
+                    other => panic!("{name}: the FTP reader must refuse at the string's first byte, got {other:?}"),
+                }
+                assert_eq!(fr.pos, 0, "{name}: a refused string leaves the cursor at its start");
+                let msg = value.expect_err(name);
+                assert!(msg.contains(anomalies[0].describe()), "{name}: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_truncated_string_is_refused_by_all_three_with_the_same_numbers() {
+        // Count byte promises 3 units (6 bytes); 2 follow.
+        let bytes = [3u8, b'a', 0];
+        let mut di = DeviceInfoReader { data: &bytes, pos: 0 };
+        assert!(matches!(
+            di.string("f"),
+            Err(PtpUsbError::DeviceInfoMalformed { offset: 1, fault: DeviceInfoFault::Truncated { needed: 6, available: 2 }, .. })
+        ));
+        let mut fr = FtpBlobReader { data: &bytes, pos: 0 };
+        assert!(matches!(
+            fr.ptp_string("f"),
+            Err(PtpUsbError::FtpBlobMalformed { offset: 1, detail, .. }) if detail == "needs 6 byte(s) but only 2 remain"
+        ));
+        let msg = decode_ptp_string_value(&bytes).unwrap_err();
+        assert!(msg.contains("says 3 unit(s) = 6 byte(s)") && msg.contains("2 byte(s) follow"), "{msg}");
+        // No bytes at all: no count byte.
+        let mut di = DeviceInfoReader { data: &[], pos: 0 };
+        assert!(matches!(
+            di.string("f"),
+            Err(PtpUsbError::DeviceInfoMalformed { offset: 0, fault: DeviceInfoFault::Truncated { needed: 1, available: 0 }, .. })
+        ));
+        assert!(matches!(FtpBlobReader { data: &[], pos: 0 }.ptp_string("f"), Err(PtpUsbError::FtpBlobMalformed { offset: 0, .. })));
+        assert!(decode_ptp_string_value(&[]).is_err());
+    }
+
+    #[test]
+    fn the_value_decoder_wants_the_exact_length_while_the_framed_readers_leave_the_rest() {
+        let exact = [2u8, b'a', 0, 0, 0];
+        assert_eq!(decode_ptp_string_value(&exact).as_deref(), Ok("a"));
+        let mut longer = exact.to_vec();
+        longer.push(0);
+        assert!(decode_ptp_string_value(&longer).is_err(), "one stray byte after the string is not a value");
+        let mut fr = FtpBlobReader { data: &longer, pos: 0 };
+        assert_eq!(fr.ptp_string("f").unwrap().text, "a");
+        assert_eq!(fr.pos, 5, "the stray byte stays for the next field");
+    }
+
+    /// The reference profile blob with its profile-name string (offset 2, `07 "CLAUDE" 00`) patched.
+    fn reference_blob_with_name_unit(unit: usize, value: u16) -> Vec<u8> {
+        let mut blob = hex::decode_hex(reference_ftp_blob_hex());
+        assert_eq!(blob[2], 7, "fixture: the name is 6 characters and a NUL");
+        let at = 3 + unit * 2;
+        blob[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        blob
+    }
+
+    #[test]
+    fn a_profile_whose_name_string_is_garbled_is_refused_and_so_never_reaches_the_camera() {
+        for (what, blob, tag) in [
+            ("embedded NUL", reference_blob_with_name_unit(2, 0), "embedded_nul"),
+            ("unpaired surrogate", reference_blob_with_name_unit(1, 0xD800), "unpaired_surrogate"),
+            ("missing terminator", reference_blob_with_name_unit(6, u16::from(b'x')), "missing_terminator"),
+        ] {
+            let err = decode_ftp_profile(&blob).unwrap_err();
+            assert!(
+                matches!(&err, PtpUsbError::FtpBlobMalformed { what: "profile name", offset: 2, detail } if detail.contains(tag)),
+                "{what}: {err:?}"
+            );
+            // And the write path, which relies on the decoder, sends nothing.
+            let (mut s, t) = session(vec![], "Z 9");
+            assert!(matches!(s.write_ftp_profile_blob(0, 0, &blob, false), Err(PtpUsbError::FtpBlobMalformed { .. })), "{what}");
+            assert!(t.sent().is_empty(), "{what}");
+        }
+        // The same string, well formed, decodes (the patch helper is not what breaks it).
+        assert_eq!(decode_ftp_profile(&reference_blob_with_name_unit(2, u16::from(b'A'))).unwrap().profile_name, "CLAUDE");
+    }
+
+    #[test]
+    fn the_0x90eb_device_name_is_held_to_the_same_string_rules() {
+        let mut info = ftp_info_bytes(1, 0, "Z_9_0000000");
+        assert!(parse_ftp_profile_info(&info).is_ok());
+        let name_unit_at = 2 + 4 + 4 + 4 + 16 + 1; // first unit of the name
+        info[name_unit_at..name_unit_at + 2].copy_from_slice(&0xD800u16.to_le_bytes());
+        assert!(matches!(
+            parse_ftp_profile_info(&info),
+            Err(PtpUsbError::FtpBlobMalformed { what: "info device name", .. })
+        ));
+    }
+
+    // ── non-ASCII text fields (b7d3#42) ──────────────────────────────────
+
+    /// `blob` with the `[u32 len][old]` field replaced by `[u32 len][new]`.
+    fn replace_u32_field(blob: &[u8], old: &str, new: &[u8]) -> Vec<u8> {
+        let mut needle = le(old.len() as u32);
+        needle.extend_from_slice(old.as_bytes());
+        let at = blob.windows(needle.len()).position(|w| w == needle).unwrap_or_else(|| panic!("{old:?} not in the fixture"));
+        let mut out = blob[..at].to_vec();
+        out.extend_from_slice(&le(new.len() as u32));
+        out.extend_from_slice(new);
+        out.extend_from_slice(&blob[at + needle.len()..]);
+        out
+    }
+
+    #[test]
+    fn non_ascii_text_in_the_four_length_prefixed_fields_decodes_and_is_not_re_encodable() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let base = decode_ftp_profile(&blob).unwrap();
+        let japanese = "ネット-\u{e9}";
+        for (field, old) in [
+            ("2.4 GHz SSID", base.ssid_24ghz.clone()),
+            ("5 GHz SSID", base.ssid_5ghz.clone()),
+            ("username", base.username.clone()),
+            ("password", base.password.clone()),
+        ] {
+            let patched = replace_u32_field(&blob, &old, japanese.as_bytes());
+            let d = decode_ftp_profile(&patched).unwrap_or_else(|e| panic!("{field}: {e}"));
+            let got = match field {
+                "2.4 GHz SSID" => &d.ssid_24ghz,
+                "5 GHz SSID" => &d.ssid_5ghz,
+                "username" => &d.username,
+                _ => &d.password,
+            };
+            assert_eq!(got, japanese, "{field}");
+            assert_eq!(d.profile_name, base.profile_name, "{field}: nothing else moved");
+            assert!(d.as_encodable().is_none(), "{field}: the encoder writes these fields as ASCII only");
+            // A copy of such a profile sends the camera's own bytes, unchanged.
+            let (mut s, t) = session(blob_write_script(1), "Z 9");
+            s.write_ftp_profile_blob(0, 0, &patched, false).unwrap();
+            assert_eq!(t.sent().last().unwrap().3, patched, "{field}");
+            // The masked display counts bytes, so a 3-byte character shows as three asterisks.
+            assert_eq!(d.with_secrets_masked().password.len(), d.password.len());
+        }
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_are_refused_naming_the_field_and_the_first_bad_byte() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let ssid = decode_ftp_profile(&blob).unwrap().ssid_24ghz;
+        let start = blob.windows(4 + ssid.len()).position(|w| w[4..] == *ssid.as_bytes()).unwrap();
+        // 0xE9 alone is Latin-1 "é", not UTF-8.
+        for (bytes, valid_up_to) in [(&[0xE9u8][..], 0usize), (&b"ab\xE9"[..], 2), (&b"a\xE3\x83"[..], 1)] {
+            let patched = replace_u32_field(&blob, &ssid, bytes);
+            match decode_ftp_profile(&patched) {
+                Err(PtpUsbError::FtpBlobMalformed { what: "2.4 GHz SSID", offset, detail }) => {
+                    assert_eq!(offset, start + 4 + valid_up_to, "{bytes:?}");
+                    assert!(detail.contains("not valid UTF-8"), "{detail}");
+                }
+                other => panic!("{bytes:?}: {other:?}"),
+            }
+        }
+    }
+
+    // ── the FTP write guard (b7d3#06, #45) ───────────────────────────────
+
+    /// Replies for a guarded blob write over `count` stored profiles: setup, info, setup, write.
+    fn blob_write_script(count: u32) -> Vec<Step> {
+        vec![resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(count, 0, "Z_9_0000000")), resp(RESP_OK), resp(RESP_OK), resp(RESP_OK)]
+    }
+
+    /// Replies for one `read_ftp_profile_slot(Some(0))`: setup, info (count), profile.
+    fn read_back_script(count: u32, blob: &[u8]) -> Vec<Step> {
+        vec![
+            resp(RESP_OK),
+            data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(count, 0, "Z_9_0000000")),
+            resp(RESP_OK),
+            data_c(OP_FTP_PROFILE_READ, blob),
+            resp(RESP_OK),
+        ]
+    }
+
+    fn ops_sent(t: &ScriptedTransport) -> Vec<u16> {
+        t.sent().iter().filter(|(kind, ..)| *kind == CONTAINER_COMMAND).map(|(_, op, ..)| *op).collect()
+    }
+
+    #[test]
+    fn classify_ftp_write_pins_both_sides_of_each_boundary() {
+        use FtpWriteKind::*;
+        use FtpWriteRefusal::*;
+        // Replace needs slot < count: 2 of 3 yes; 3 and 4 no.
+        assert_eq!(classify_ftp_write(2, 0, Some(3)), Ok(Replace));
+        assert_eq!(classify_ftp_write(3, 0, Some(3)), Err(ReplaceSlotNotStored { slot: 3, count: 3 }));
+        assert_eq!(classify_ftp_write(4, 0, Some(3)), Err(ReplaceSlotNotStored { slot: 4, count: 3 }));
+        assert_eq!(classify_ftp_write(0, 0, Some(1)), Ok(Replace));
+        assert_eq!(classify_ftp_write(0, 0, Some(0)), Err(ReplaceSlotNotStored { slot: 0, count: 0 }));
+        // Add needs slot == count: 2 and 4 of 3 no; 3 yes. An empty camera adds at 0.
+        assert_eq!(classify_ftp_write(3, 1, Some(3)), Ok(Add));
+        assert_eq!(classify_ftp_write(2, 1, Some(3)), Err(AddNotAtCount { slot: 2, count: 3 }));
+        assert_eq!(classify_ftp_write(4, 1, Some(3)), Err(AddNotAtCount { slot: 4, count: 3 }));
+        assert_eq!(classify_ftp_write(0, 1, Some(0)), Ok(Add));
+        // The second parameter: 0 and 1 yes, 2 and the hang value no, wherever the slot is.
+        assert_eq!(classify_ftp_write(0, 2, Some(3)), Err(UnknownParam2 { param2: 2 }));
+        assert_eq!(classify_ftp_write(3, 2, Some(3)), Err(UnknownParam2 { param2: 2 }));
+        assert_eq!(classify_ftp_write(0, u32::MAX, None), Err(UnknownParam2 { param2: u32::MAX }));
+        // The hang slot is refused for both forms and for any count, even the absurd count that would equal it.
+        for param2 in [0, 1] {
+            assert_eq!(classify_ftp_write(u32::MAX, param2, None), Err(SlotHangsCamera));
+            assert_eq!(classify_ftp_write(u32::MAX, param2, Some(u32::MAX)), Err(SlotHangsCamera));
+            assert_eq!(classify_ftp_write(u32::MAX - 1, param2, None).is_ok(), true, "state-free rules only");
+        }
+        // Without a count only the state-free rules apply: slot 99 is not judged.
+        assert_eq!(classify_ftp_write(99, 0, None), Ok(Replace));
+        assert_eq!(classify_ftp_write(99, 1, None), Ok(Add));
+        // An unknown second parameter outranks the hang slot.
+        assert_eq!(classify_ftp_write(u32::MAX, 7, None), Err(UnknownParam2 { param2: 7 }));
+    }
+
+    #[test]
+    fn a_state_free_refusal_sends_nothing_at_all() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        for (slot, param2) in [(0, 2), (0, u32::MAX), (u32::MAX, 0), (u32::MAX, 1)] {
+            let (mut s, t) = session(blob_write_script(3), "Z 9");
+            let err = s.write_ftp_profile_blob(slot, param2, &blob, false).unwrap_err();
+            assert!(matches!(&err, PtpUsbError::FtpWriteRefused { slot: sl, param2: p, .. } if (*sl, *p) == (slot, param2)), "{err:?}");
+            assert!(t.sent().is_empty(), "({slot}, {param2}) must be refused before any I/O");
+        }
+    }
+
+    #[test]
+    fn a_slot_the_count_does_not_allow_is_refused_after_the_count_read_and_before_the_write() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        for (slot, param2, count) in [(3u32, 0u32, 3u32), (4, 0, 3), (0, 0, 0), (2, 1, 3), (4, 1, 3)] {
+            let (mut s, t) = session(blob_write_script(count), "Z 9");
+            let err = s.write_ftp_profile_blob(slot, param2, &blob, false).unwrap_err();
+            assert!(matches!(err, PtpUsbError::FtpWriteRefused { .. }), "({slot}, {param2}) of {count}: {err:?}");
+            assert_eq!(ops_sent(&t), vec![OP_FTP_SETUP, OP_FTP_PROFILE_INFO], "({slot}, {param2}) of {count}: only the count was read");
+            let text = err.to_string();
+            assert!(text.contains("refused before anything was written"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_two_known_forms_are_sent_unchanged_after_the_count_read() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        for (slot, param2, count) in [(0u32, 0u32, 1u32), (2, 0, 3), (3, 1, 3), (0, 1, 0)] {
+            let (mut s, t) = session(blob_write_script(count), "Z 9");
+            s.write_ftp_profile_blob(slot, param2, &blob, false).unwrap();
+            assert_eq!(
+                ops_sent(&t),
+                vec![OP_FTP_SETUP, OP_FTP_PROFILE_INFO, OP_FTP_SETUP, OP_FTP_PROFILE_WRITE],
+                "the write keeps its own 0x90E8 immediately before it"
+            );
+            let sent = t.sent();
+            let write = sent.iter().find(|(k, op, ..)| *k == CONTAINER_COMMAND && *op == OP_FTP_PROFILE_WRITE).unwrap();
+            assert_eq!(write.3, [le(slot), le(param2)].concat());
+        }
+    }
+
+    #[test]
+    fn a_failed_count_read_stops_before_the_write() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        let (mut s, t) = session(vec![resp(RESP_OK), resp(0x2002)], "Z 9");
+        assert!(matches!(
+            s.write_ftp_profile_blob(0, 0, &blob, false),
+            Err(PtpUsbError::OperationFailed { op: OP_FTP_PROFILE_INFO, .. })
+        ));
+        assert!(!ops_sent(&t).contains(&OP_FTP_PROFILE_WRITE));
+    }
+
+    #[test]
+    fn a_reply_that_did_not_match_during_the_count_read_clears_the_matched_flag() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        let mut steps = blob_write_script(1);
+        steps[0] = resp_id(RESP_OK, 41);
+        let (mut s, _t) = session(steps, "Z 9");
+        assert!(!s.write_ftp_profile_blob(0, 0, &blob, false).unwrap().reply_matched_command);
+    }
+
+    // ── read-back verification (e5a3#04) ─────────────────────────────────
+
+    fn verified_script(count_before: u32, count_after: u32, written: &[u8], read_back: &[u8]) -> Vec<Step> {
+        let _ = written;
+        let mut steps = blob_write_script(count_before);
+        steps.extend(read_back_script(count_after, read_back));
+        steps
+    }
+
+    #[test]
+    fn a_replace_that_reads_back_identical_with_the_same_count_is_verified() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        let (mut s, t) = session(verified_script(2, 2, &blob, &blob), "Z 9");
+        let out = s.write_ftp_profile_blob_verified(1, 0, &blob, false).unwrap();
+        assert_eq!((out.kind, out.count_before), (FtpWriteKind::Replace, 2));
+        assert!(matches!(out.verification, FtpWriteVerification::Verified { count_after: 2 }), "{:?}", out.verification);
+        assert!(out.verification.is_verified());
+        assert_eq!(
+            ops_sent(&t),
+            vec![
+                OP_FTP_SETUP, OP_FTP_PROFILE_INFO, OP_FTP_SETUP, OP_FTP_PROFILE_WRITE, // the guarded write
+                OP_FTP_SETUP, OP_FTP_PROFILE_INFO, OP_FTP_PROFILE_READ,                // the read-back
+            ]
+        );
+        let sent = t.sent();
+        let read = sent.iter().find(|(k, op, ..)| *k == CONTAINER_COMMAND && *op == OP_FTP_PROFILE_READ).unwrap();
+        assert_eq!(read.3, le(0), "the written profile is looked for at the front, slot 0");
+    }
+
+    #[test]
+    fn an_add_is_verified_only_when_the_count_rose_by_one() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        let (mut s, _t) = session(verified_script(2, 3, &blob, &blob), "Z 9");
+        let out = s.write_ftp_profile_blob_verified(2, 1, &blob, false).unwrap();
+        assert_eq!(out.kind, FtpWriteKind::Add);
+        assert!(matches!(out.verification, FtpWriteVerification::Verified { count_after: 3 }), "{:?}", out.verification);
+        // The profile is right but the count did not move: not verified, and the fields list is empty.
+        for after in [2u32, 4] {
+            let (mut s, _t) = session(verified_script(2, after, &blob, &blob), "Z 9");
+            let out = s.write_ftp_profile_blob_verified(2, 1, &blob, false).unwrap();
+            assert!(
+                matches!(&out.verification, FtpWriteVerification::Mismatch { count_after, count_expected: 3, differing_fields }
+                    if *count_after == after && differing_fields.is_empty()),
+                "after {after}: {:?}",
+                out.verification
+            );
+            assert!(!out.verification.is_verified());
+        }
+        // A replace whose count changed is a mismatch too.
+        let (mut s, _t) = session(verified_script(2, 3, &blob, &blob), "Z 9");
+        let out = s.write_ftp_profile_blob_verified(0, 0, &blob, false).unwrap();
+        assert!(matches!(out.verification, FtpWriteVerification::Mismatch { count_after: 3, count_expected: 2, .. }));
+    }
+
+    #[test]
+    fn a_read_back_that_differs_names_the_fields_and_never_their_values() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        let other = replace_u32_field(&blob, "pass1234", b"hunter22");
+        let (mut s, _t) = session(verified_script(1, 1, &blob, &other), "Z 9");
+        let out = s.write_ftp_profile_blob_verified(0, 0, &blob, false).unwrap();
+        match &out.verification {
+            FtpWriteVerification::Mismatch { differing_fields, count_after: 1, count_expected: 1 } => {
+                assert_eq!(differing_fields, &["password"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        let shown = format!("{:?}", out.verification);
+        assert!(!shown.contains("hunter22") && !shown.contains("pass1234"), "{shown}");
+    }
+
+    #[test]
+    fn every_field_of_a_decoded_profile_is_compared() {
+        let want = decode_ftp_profile(&hex::decode_hex(reference_ftp_blob_hex())).unwrap();
+        assert!(ftp_profile_differences(&want, &want.clone()).is_empty());
+        type Mutate = fn(&mut DecodedFtpProfile);
+        let cases: [(&str, Mutate); 16] = [
+            ("profile_name", |d| d.profile_name.push('x')),
+            ("timestamps", |d| d.timestamps[1].push('x')),
+            ("camera_network", |d| d.camera_network.prefix_len ^= 1),
+            ("ssid_24ghz", |d| d.ssid_24ghz.push('x')),
+            ("ssid24_kind", |d| d.ssid24_kind ^= 1),
+            ("ssid24_lead", |d| d.ssid24_lead ^= 3),
+            ("ssid_5ghz", |d| d.ssid_5ghz.push('x')),
+            ("ssid5_kind", |d| d.ssid5_kind ^= 2),
+            ("host", |d| d.host.push('x')),
+            ("folder", |d| d.folder.push('x')),
+            ("username", |d| d.username.push('x')),
+            ("password", |d| d.password.push('x')),
+            ("ftp_port", |d| d.ftp_port ^= 1),
+            ("option_flags", |d| d.option_flags ^= 0x10),
+            ("second_port", |d| d.second_port ^= 1),
+            ("ipv6_fields", |d| d.ipv6_fields[2].push('x')),
+        ];
+        for (name, mutate) in cases {
+            let mut got = want.clone();
+            mutate(&mut got);
+            assert_eq!(ftp_profile_differences(&want, &got), [name], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_camera_that_reserialises_the_empty_folder_still_verifies() {
+        // Seen on a Z 9: with option bit 0x04 clear the single 00 folder byte comes back as 01 00 00.
+        let blob = hex::decode_hex(ftp_blob_317_hex());
+        let mut longer = blob.clone();
+        let at = 153; // the folder string, offset documented by `the_331_blob_is_the_317_blob_plus_the_folder_string_and_flag_byte`
+        assert_eq!(longer[at], 0x00);
+        longer.splice(at..=at, [0x01, 0x00, 0x00]);
+        assert_ne!(longer.len(), blob.len());
+        assert_eq!(decode_ftp_profile(&longer).unwrap(), decode_ftp_profile(&blob).unwrap());
+        let (mut s, _t) = session(verified_script(1, 1, &blob, &longer), "Z 9");
+        assert!(s.write_ftp_profile_blob_verified(0, 0, &blob, false).unwrap().verification.is_verified());
+    }
+
+    #[test]
+    fn an_undecodable_read_back_and_a_failed_one_are_reported_apart_from_a_mismatch() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        let mut garbled = blob.clone();
+        garbled[0] = 0;
+        let (mut s, _t) = session(verified_script(1, 1, &blob, &garbled), "Z 9");
+        let out = s.write_ftp_profile_blob_verified(0, 0, &blob, false).unwrap();
+        assert!(matches!(
+            out.verification,
+            FtpWriteVerification::ReadBackUndecodable { error: PtpUsbError::FtpBlobMalformed { what: "blob header", .. } }
+        ));
+        // The camera refuses to read slot 0 back (0x201F).
+        let mut steps = blob_write_script(1);
+        steps.extend([resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(1, 0, "Z_9_0000000")), resp(RESP_OK), resp(0x201F)]);
+        let (mut s, _t) = session(steps, "Z 9");
+        let out = s.write_ftp_profile_blob_verified(0, 0, &blob, false).unwrap();
+        assert!(matches!(
+            out.verification,
+            FtpWriteVerification::ReadBackFailed { error: PtpUsbError::OperationFailed { op: OP_FTP_PROFILE_READ, .. } }
+        ));
+        // A transport fault in the read-back: the write still succeeded, so this is not an Err.
+        let mut steps = blob_write_script(1);
+        steps.push(Step::Err(rusb::Error::Timeout));
+        let (mut s, _t) = session(steps, "Z 9");
+        let out = s.write_ftp_profile_blob_verified(0, 0, &blob, false).unwrap();
+        assert!(matches!(out.verification, FtpWriteVerification::ReadBackFailed { error: PtpUsbError::Usb(rusb::Error::Timeout) }));
+        assert!(s.poisoned.is_some());
+        // The camera now claims to hold nothing: a finding about the profile list, not a read failure.
+        let (mut s, _t) = session(verified_script(1, 0, &blob, &blob), "Z 9");
+        let out = s.write_ftp_profile_blob_verified(0, 0, &blob, false).unwrap();
+        assert!(matches!(
+            out.verification,
+            FtpWriteVerification::Mismatch { count_after: 0, count_expected: 1, ref differing_fields } if differing_fields.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_refused_or_failed_write_is_an_err_and_attempts_no_read_back() {
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        let mut steps = blob_write_script(1);
+        steps[4] = resp(0x2002); // the write itself is refused
+        let (mut s, t) = session(steps, "Z 9");
+        let err = s.write_ftp_profile_blob_verified(0, 0, &blob, false).unwrap_err();
+        assert!(matches!(err, PtpUsbError::OperationFailed { op: OP_FTP_PROFILE_WRITE, .. }), "{err:?}");
+        assert_eq!(ops_sent(&t).last(), Some(&OP_FTP_PROFILE_WRITE));
+        // Data sent, reply lost: the usual indeterminate error, and the poisoned session is not asked to read.
+        let mut steps = blob_write_script(1);
+        steps[4] = Step::Err(rusb::Error::Timeout);
+        let (mut s, t) = session(steps, "Z 9");
+        assert!(matches!(
+            s.write_ftp_profile_blob_verified(0, 0, &blob, false),
+            Err(PtpUsbError::FtpWriteIndeterminate { .. })
+        ));
+        assert_eq!(ops_sent(&t).last(), Some(&OP_FTP_PROFILE_WRITE));
+        // A guard refusal is the same typed Err as for the plain write.
+        let (mut s, _t) = session(blob_write_script(1), "Z 9");
+        assert!(matches!(s.write_ftp_profile_blob_verified(5, 0, &blob, false), Err(PtpUsbError::FtpWriteRefused { .. })));
+    }
+
+    #[test]
+    fn the_encoder_path_with_read_back_replaces_slot_zero_and_refuses_an_empty_camera() {
+        let profile = valid_profile();
+        let blob = encode_ftp_profile(&profile).unwrap();
+        let (mut s, t) = session(verified_script(1, 1, &blob, &blob), "Z 9");
+        let out = s.write_ftp_profile_verified(&profile, &FtpCameraNetwork::CAPTURED, false).unwrap();
+        assert!(out.verification.is_verified(), "{:?}", out.verification);
+        let sent = t.sent();
+        let write = sent.iter().find(|(k, op, ..)| *k == CONTAINER_COMMAND && *op == OP_FTP_PROFILE_WRITE).unwrap();
+        assert_eq!(write.3, [le(0), le(0)].concat());
+        // Nothing stored: 0x90EE(0, 0) would be a write one past the end.
+        let (mut s, t) = session(blob_write_script(0), "Z 9");
+        let err = s.write_ftp_profile_verified(&profile, &FtpCameraNetwork::CAPTURED, false).unwrap_err();
+        assert!(matches!(err, PtpUsbError::FtpWriteRefused { why: FtpWriteRefusal::ReplaceSlotNotStored { slot: 0, count: 0 }, .. }), "{err:?}");
+        assert!(!ops_sent(&t).contains(&OP_FTP_PROFILE_WRITE));
+        // An encoding error and the model gate still come before any I/O.
+        let mut bad = profile.clone();
+        bad.ssid_24ghz = "caf\u{e9}".into();
+        let (mut s, t) = session(vec![], "Z 9");
+        assert!(matches!(s.write_ftp_profile_verified(&bad, &FtpCameraNetwork::CAPTURED, false), Err(PtpUsbError::FtpFieldNotAscii { .. })));
+        let (mut s, _t2) = session(vec![], "Z 5");
+        assert!(matches!(s.write_ftp_profile_verified(&profile, &FtpCameraNetwork::CAPTURED, false), Err(PtpUsbError::UnconfirmedModel(_))));
+        assert!(t.sent().is_empty());
+    }
+
+    // ── reading the active slot (b7d3#61) ────────────────────────────────
+
+    #[test]
+    fn the_default_read_never_sends_0x90ed_for_a_slot_the_camera_does_not_hold() {
+        // Reported active slot s with count c: the read is sent only when s < c.
+        for (count, slot, sent) in [(0u32, 0u32, false), (1, 0, true), (1, 1, false), (3, 2, true), (3, 3, false), (3, 4, false)] {
+            let blob = hex::decode_hex(ftp_blob_317_hex());
+            let (mut s, t) = session(
+                vec![
+                    resp(RESP_OK),
+                    data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(count, slot, "Z_9_0000000")),
+                    resp(RESP_OK),
+                    data_c(OP_FTP_PROFILE_READ, &blob),
+                    resp(RESP_OK),
+                ],
+                "Z 9",
+            );
+            let out = s.read_ftp_profile().unwrap();
+            assert_eq!(ops_sent(&t).contains(&OP_FTP_PROFILE_READ), sent, "count {count} slot {slot}");
+            assert_eq!(out.profile.is_some(), sent, "count {count} slot {slot}");
+            assert_eq!(out.warnings.is_empty(), sent, "count {count} slot {slot}: the skipped read is explained: {:?}", out.warnings);
+        }
+    }
+
+    // ── as_encodable (b7d3#62, #92) ──────────────────────────────────────
+
+    #[test]
+    fn as_encodable_needs_every_condition_and_each_one_alone_refuses() {
+        let base = decode_ftp_profile(&hex::decode_hex(reference_ftp_blob_hex())).unwrap();
+        let p = base.as_encodable().expect("the reference blob is re-encodable");
+        assert_eq!(encode_ftp_profile(&p).unwrap(), hex::decode_hex(reference_ftp_blob_hex()), "and it re-encodes byte for byte");
+        type Mutate = fn(&mut DecodedFtpProfile);
+        let breakers: [(&str, Mutate); 14] = [
+            ("folder", |d| d.folder = "x".into()),
+            ("option_flags", |d| d.option_flags = 0x0001),
+            ("ftp_port", |d| d.ftp_port = 22),
+            ("ssid5_kind", |d| d.ssid5_kind = 0x06),
+            ("ssid24_kind", |d| d.ssid24_kind = 0x30),
+            ("ssid24_lead", |d| d.ssid24_lead = 0x00),
+            ("camera_network address", |d| d.camera_network.ipv4 = [10, 0, 0, 1]),
+            ("camera_network prefix", |d| d.camera_network.prefix_len = 16),
+            ("timestamp 1", |d| d.timestamps[0] = "20260101T000000".into()),
+            ("ipv6 field 3", |d| d.ipv6_fields[2] = "::1".into()),
+            ("non-ASCII 2.4 GHz SSID", |d| d.ssid_24ghz = "\u{e9}".into()),
+            ("non-ASCII 5 GHz field", |d| d.ssid_5ghz = "\u{e9}".into()),
+            ("non-ASCII username", |d| d.username = "\u{e9}".into()),
+            ("non-ASCII password", |d| d.password = "\u{e9}".into()),
+        ];
+        for (name, mutate) in breakers {
+            let mut d = base.clone();
+            mutate(&mut d);
+            assert!(d.as_encodable().is_none(), "{name} alone must make the profile not encodable");
+        }
+        // Differences the encoder does carry stay encodable: the second port and the text.
+        let mut d = base.clone();
+        d.second_port = 3128;
+        d.host = "other.example".into();
+        assert!(d.as_encodable().is_some());
+    }
+
+    // ── Debug does not print secrets (b7d3#65) ───────────────────────────
+
+    #[test]
+    fn debug_output_of_profile_types_hides_the_password_and_the_5ghz_field() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let decoded = decode_ftp_profile(&blob).unwrap();
+        let (password, five) = (decoded.password.clone(), decoded.ssid_5ghz.clone());
+        let readout = FtpProfileReadout {
+            info: parse_ftp_profile_info(&ftp_info_bytes(1, 0, "Z_9_0000000")).unwrap(),
+            profile: Some(FtpProfileBlob { raw: blob.clone(), decoded: Ok(decoded.clone()) }),
+            warnings: vec![],
+            reply_matched_command: true,
+        };
+        let encodable = decoded.as_encodable().unwrap();
+        for (what, shown) in [
+            ("DecodedFtpProfile", format!("{decoded:?}")),
+            ("FtpProfile", format!("{encodable:?}")),
+            ("FtpProfileBlob", format!("{:?}", readout.profile.as_ref().unwrap())),
+            ("FtpProfileReadout", format!("{readout:?}")),
+            ("alternate form", format!("{decoded:#?}")),
+        ] {
+            assert!(!shown.contains(&password), "{what} printed the password: {shown}");
+            assert!(!shown.contains(&five), "{what} printed the 5 GHz field: {shown}");
+            assert!(!shown.contains(&hex_bytes(password.as_bytes())), "{what}");
+            assert!(shown.contains("CLAUDE") && shown.contains("byte(s) hidden"), "{what} still shows the rest: {shown}");
+        }
+        let blob_shown = format!("{:?}", readout.profile.as_ref().unwrap());
+        assert!(blob_shown.contains(&format!("{} byte(s) hidden", blob.len())), "{blob_shown}");
+    }
+
+    // ── diagnostics: no hash of a profile payload (b7d3#47) ──────────────
+
+    #[test]
+    fn a_profile_read_records_its_length_but_no_hash_while_other_replies_keep_theirs() {
+        use crate::diag::Val;
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let (mut s, _t, d, _dir) = recorded(vec![data_c(OP_FTP_PROFILE_READ, &blob), resp(RESP_OK)], "Z 9");
+        s.transact(OP_FTP_PROFILE_READ, &[0], None, TxidCheck::Unchecked).unwrap();
+        let e = d.snapshot().pop().unwrap();
+        assert_eq!(field(&e, "reply_len"), Some(&Val::Len(blob.len() as u64)));
+        assert!(field(&e, "reply_hash").is_none(), "the blob holds the password");
+        // A string property is not secret: its hash is still recorded.
+        let (mut s, _t, d, _dir) = recorded(vec![resp(RESP_OK)], "Z 9");
+        s.transact(OP_SET_DEVICE_PROP_VALUE, &[0xD090], Some(&[1, 0, 0]), TxidCheck::Enforce).unwrap();
+        let e = d.snapshot().pop().unwrap();
+        assert_eq!(field(&e, "data_hash"), Some(&Val::hash(&[1, 0, 0])));
     }
 }

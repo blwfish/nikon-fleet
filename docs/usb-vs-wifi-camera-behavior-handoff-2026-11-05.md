@@ -636,6 +636,8 @@ The Z5 has no FTP profile operations, but the standard property operations work 
   Z5 was not in the list), read back in the same session and a separate one, then `"(c)2024 Brian L Wong"` written back and
   read from the camera byte-identical to the bytes saved beforehand. A 37-character value was refused with
   `InvalidDevicePropFormat` (`0x201B`) and left the value byte-identical: the same limit and refusal as the Z9 and Z6III.
-- The Z5 is now in `STRING_PROP_WRITE_MODELS` (Z9, Z6III, Z5). The Z8 is not: it has never been tried.
+- The Z5 is now in `STRING_PROP_WRITE_MODELS` (Z9, Z6III, Z5). The Z8 is not: it has never been tried. The gate is the pair
+  (property, model): only the image comment (`0xD090`) is in `STRING_PROP_WRITE_CONFIRMED_PROPS`, so an Artist or Copyright write needs
+  `--force-unconfirmed-model` on every body until one is run (`PtpUsbError::PropWriteUnconfirmed`).
 - Still not done on any body: artist and copyright writes; whether the Z5 and Z6III keep only the low byte of each
   character (the writer refuses text above U+00FF); IPTC.

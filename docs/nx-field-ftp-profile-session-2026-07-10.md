@@ -146,14 +146,6 @@ raw blob. Dry run unless `--send`. It refuses a slot at or past the stored count
 `--allow-create`. Camera: the same one as above, two stored profiles at the start. Raw blobs come from
 `--out`.
 
-Gates (added 2026-11-05, matching the Rust write path): the file must pass the strict decoder (the
-same checks as `decode_ftp_profile`, trailing bytes included), the camera's GetDeviceInfo model must be
-`Z 9` or `Z6_3` (`--force-unconfirmed-model` overrides), and the `0x90E8` setup and `0x90EB` info must be
-answered OK before `0x90EE` is sent. Reads refuse a slot at or past the stored count. A refused or
-failed write exits 1, a write whose reply never arrived exits 4. `--out` creates its file 0600 and
-refuses to overwrite. The model gate assumes PTP/IP `GetDeviceInfo` reports the same model string as
-over USB (`Z 9`, `Z6_3`); that has not been checked on a camera.
-
 | Call | Reply | Effect (read back over a fresh connection) |
 |---|---|---|
 | `0x90EE(1, 0)` with the profile already in slot 1 | `0x2001` | that profile is now slot 0; the old slot 0 is slot 1 |
@@ -310,6 +302,34 @@ again. Results, Z9:
 - Porting the PTP/IP client into the Rust tool (something like `vendor-read-ftp --wifi IP`). The USB
   commands already cover read, add, replace, and (through `vendor-probe-op`) delete; there is no
   dedicated delete command, and `vendor-probe-op` is deliberately restricted to a fixed op list.
+
+## 8. What the Rust library now enforces (2026-11-05, not run on hardware)
+
+Everything above came from experiments; `src/ptp_usb.rs` now turns the safe part of it into a gate and a read-back.
+
+- **Only two write forms are sent.** `write_ftp_profile_blob` (and its `_locked` form) accepts `0x90EE(n, 0)` with `n` below the
+  stored count (replace) and `0x90EE(count, 1)` (add). Everything else is `PtpUsbError::FtpWriteRefused` with a typed
+  `FtpWriteRefusal`: a second parameter other than 0 or 1 (`UnknownParam2`), slot `0xFFFFFFFF` (`SlotHangsCamera`), a replace
+  of a slot that is not stored (`ReplaceSlotNotStored`), an add at any slot but the count (`AddNotAtCount`; `(n < count, 1)` was
+  never tried). The stored count is read **in the write's own session** (`0x90E8`, `0x90EB`, then the write's own `0x90E8`,
+  `0x90EE`), so the count cannot change between the check and the write. That read-only pair ahead of a write has not been
+  run on a camera. `write_ftp_profile` (encoder path, fixed `[0, 0]`) is unchanged and unguarded; the read-back variants below
+  route it through the guard.
+- **Read-back.** `write_ftp_profile_blob_verified` / `write_ftp_profile_verified` (and `_locked` forms) read slot 0 back after the
+  write (`0x90E8`, `0x90EB`, `0x90ED(0)`) and compare the decoded profile, field by field, with the one sent, and the count
+  with `count_before` (+1 for an add). The result is `FtpWriteVerification`: `Verified`, `Mismatch` (names of the differing
+  fields, never values), `ReadBackUndecodable`, `ReadBackFailed`. It depends on two Z 9 facts from section 5 and 6: a successful
+  write moves the profile to slot 0, and an add raises the count by one. **A mismatch on a body that does not move the profile to
+  the front would be a false alarm; on the Z6III this is untested.** The comparison is of decoded profiles, not bytes, because
+  the camera re-serialises an empty folder (handoff doc, the option-flags table). The read-back inside the write's session is
+  untested; reading slot 0 in a separate process after a write was done by hand.
+- **Non-ASCII text.** The u32-length fields (both SSID fields, username, password, the IPv6 placeholders) are read as UTF-8, so a
+  profile with a Japanese SSID decodes, displays and can be copied with `vendor-write-ftp-blob`. No capture contains non-ASCII
+  content; UTF-8 is assumed by analogy with the IPTC fields of the same shape. Bytes that are not UTF-8 (for example a Latin-1
+  SSID) are still refused, naming the field and the first bad byte, and the raw bytes remain available. The encoder still writes
+  these fields as ASCII only, so `as_encodable()` is `None` for such a profile.
+- **Artist and Copyright** writes (`vendor-set-string 0xD072/0xD073`) now need `--force-unconfirmed-model` like an unconfirmed
+  model: only the image comment was ever written.
 
 ## Credentials
 

@@ -198,18 +198,22 @@ class Reader:
             raise self.bad(what, f"string is not well-formed ({', '.join(faults)})")
         return text
 
-    def ascii_u32_len(self, what):
-        """`[u32 length in bytes][ascii]`, no null.  The length is checked against the bytes left."""
+    def utf8_u32_len(self, what):
+        """`[u32 length in bytes][bytes]`, no null, read as UTF-8 (as the Rust decoder does: the length
+        is in bytes, so the framing carries any octets; UTF-8 is assumed by analogy with the IPTC
+        fields of the same shape). A field that is not valid UTF-8 is an error naming the field, at
+        the offset of the first bad byte, not a lossy guess.  The length is checked against the bytes left."""
         at = self.pos
         n = self.u32(what)
         if n > len(self.data) - self.pos:
             self.pos = at
             raise self.bad(what, f"declares {n} byte(s) but only {len(self.data) - at - 4} remain")
         raw = self.take(what, n)
-        if not raw.isascii():
-            self.pos = at
-            raise self.bad(what, "contains non-ASCII bytes")
-        return raw.decode("ascii")
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            self.pos = at + 4 + e.start
+            raise self.bad(what, "is not valid UTF-8")
 
 
 def decode_ftp_profile(blob):
@@ -231,27 +235,27 @@ def decode_ftp_profile(blob):
         r.pos = tag_at
         raise r.bad("2.4 GHz SSID tag", f"expected 03|00 00 xx 00, found {tag24.hex()}")
     d["ssid24_lead"], d["ssid24_kind"] = tag24[0], tag24[2]
-    d["ssid_24ghz"] = r.ascii_u32_len("2.4 GHz SSID")
+    d["ssid_24ghz"] = r.utf8_u32_len("2.4 GHz SSID")
     tag_at = r.pos
     tag5 = r.take("5 GHz SSID tag", 2)
     if tag5[1] != SSID5_TAG_BYTE1:
         r.pos = tag_at
         raise r.bad("5 GHz SSID tag", f"expected xx {SSID5_TAG_BYTE1:02x}, found {tag5.hex()}")
     d["ssid5_kind"] = tag5[0]
-    d["ssid_5ghz"] = r.ascii_u32_len("5 GHz SSID")
+    d["ssid_5ghz"] = r.utf8_u32_len("5 GHz SSID")
     r.expect("host tag", bytes([HOST_TAG]))
     d["host"] = r.ptp_string("host")
     d["folder"] = r.ptp_string("folder")
     d["ftp_port"] = r.u16("FTP port")
-    d["username"] = r.ascii_u32_len("username")
-    d["password"] = r.ascii_u32_len("password")
+    d["username"] = r.utf8_u32_len("username")
+    d["password"] = r.utf8_u32_len("password")
     d["option_flags"] = r.u16("option flags")
     d["second_port"] = r.u16("second port")
     r.expect("port-section padding", PORT_SECTION_PAD)
-    ipv6_a = r.ascii_u32_len("IPv6 field 1")
+    ipv6_a = r.utf8_u32_len("IPv6 field 1")
     r.expect("IPv6 separator", bytes([IPV6_SEPARATOR]))
-    ipv6_b = r.ascii_u32_len("IPv6 field 2")
-    ipv6_c = r.ascii_u32_len("IPv6 field 3")
+    ipv6_b = r.utf8_u32_len("IPv6 field 2")
+    ipv6_c = r.utf8_u32_len("IPv6 field 3")
     d["ipv6_fields"] = [ipv6_a, ipv6_b, ipv6_c]
     r.expect("blob trailer", bytes([BLOB_TRAILER]))
     if r.pos != len(r.data):
