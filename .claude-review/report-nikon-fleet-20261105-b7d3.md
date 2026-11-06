@@ -146,3 +146,23 @@ No hardware was exercised (by instruction), so every claim about camera behaviou
 ## Dispositions
 This pass was review-only: every finding is recorded `deferred` with the reason "not yet remediated (review-only pass)". High findings normally also get a GitHub issue; **none was filed**, because filing is an outward-facing action outside this task's constraints (no push, no PR). The seven code/interface High findings and the four test-pass High findings need an issue each, or a fix, at the owner's call.
 
+
+## Remediation (2026-11-05, run `nikon-fleet-remediate-20261105-0dea`)
+
+Scope: all High and Medium findings of this pass and the older deferred High/Medium findings, plus Lows in the same files; then triage of the Lows no cluster touched. Review-only before; this pass changed code. Nothing pushed.
+
+**Result:** 12 High: 11 fixed, 1 still deferred (`e5a3#04`, see below). 51 Medium: 45 fixed, 6 deferred (`b7d3#44`, `b7d3#45`, `e5a3#36`, `d1a7#R17`, `9c4d#24`, `9c4d#31`). 66 Low: 25 fixed, 9 wontfix (three of them obsolete or taste), 32 still deferred, each with its reason in the ledger. Full workspace run after the last commit: 31 suites, 2224 passed, 0 failed. Every new test was mutation-checked by the agent that wrote it; a few mutants that survived led to more tests (reported per cluster).
+
+**Fix commits** (local master, in order): `f6ac342` transplant, `bff6cb4` firmware ingest, `314e911` Python probe, `e5aeb1e` GUI, `ab4ff9f` ops/SDK spans, `fb23f9c` ptp_usb decoder/gates/verified write, `69d6431` diagnostics core, `89dd419` vendor CLI, `d50ca27` probe, `4753086` exit status/watchdog/supervisor, `aeb430c` set-string exit 4 + supervisor tags, `77ee1c7` readout notes (#43), `dbd1ae1` signal-handler errno.
+
+**Not verified / needs a bench:**
+- The verified write (`write_ftp_profile_blob_verified`) and `vendor-write-ftp-blob`'s exit 4 on a non-confirming read-back have never run on a camera. They assume "a successful 0x90EE moves the profile to slot 0 and an add raises the count by one" (Z 9 only). On a Z6III that does not move the profile, a correct write would exit 4.
+- UTF-8 FTP profile text (#42) is an assumption by analogy with IPTC; no capture has non-ASCII.
+- The watchdog/worker teardown ordering changes (#08/#79/#09) are tested with the real binary and unit tests, not against a hanging `DisconnectDevice`. The MCP supervisor's grace is now 14 s (was 3 s): a hung teardown delays the tool's answer by up to 14 s.
+- The native macOS menu bar (#38/#39) is tested as data and through the in-window bar only.
+- `vendor-probe-op` now needs `--force-unconfirmed-model` on a Z 5 or any body outside the FTP-write list, and a named `--allow-destructive-op` for 0x90EA/0x90EF.
+- `vendor-write-ftp-blob --slot COUNT` needs `--param2 1` (the 2026-11-05 Z 9 experiment: `(count,0)` stalls and stores nothing).
+
+**Left deferred on purpose:** `e5a3#04` (High; the read-back above must run on a Z 9 and a Z6III, and the encoder path `vendor-write-ftp` still has no read-back; issue already filed), and the structural ones: `#44` (entry-point choreography across four binaries), `#45` (typed FTP layout spec for a byte-exact encoder), `R17` (explicit `--serial id-N` with two same-model bodies: a flag decision), `9c4d#24/#31` (policy tables / model registry, and they change plan JSON), `e5a3#36` (needs the second Z 9 attached). The 32 deferred Lows are listed in the ledger with what each needs; none is a safety finding.
+
+**Low triage of the untouched Lows:** `74a6#01` and `13f8#01` wontfix (the Python/Tk GUI they were about was removed in `e0a58e8`); `d5ce#34` wontfix (taste); `9c4d#53` (undo command omits `--data-dir`), `9c4d#56` (three model lists), `1f6c#19` (untrusted-text marking), `c5e2#N02`, `c5e2#N04` stay deferred; `c5e2#N05` fixed.
