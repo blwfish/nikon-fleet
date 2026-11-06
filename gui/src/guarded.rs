@@ -438,7 +438,7 @@ pub(crate) fn draw_applied_outcome<R: AppliedReport>(
             extra(ui, report);
             if let Some(rp) = report.restore_point() {
                 let offer = undo_offer(target, data_dir, outcome);
-                chosen = draw_restore_point(ui, rp, offer.as_ref(), report.undo_set(), data_dir, busy);
+                chosen = draw_restore_point(ui, rp, offer.as_ref(), report.undo_set(), report.undo_kind(), data_dir, busy);
             }
             draw_log(ui, id, cli_log);
         }

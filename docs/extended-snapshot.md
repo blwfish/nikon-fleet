@@ -84,7 +84,9 @@ Order: strings, IPTC, switches, FTP (the preset switch comes after the presets).
 action and the hash of what would be written, so a body that changed under a reviewed plan is refused (exit 5), and a
 plan whose overwritten value changed is stale even when the count of changes is the same. Apply writes the restore point
 first, as a snapshot with no MAID properties and the extended section as it was (label `restore-ext`); restoring from
-it undoes the restore. Status: verified only if every write's read-back matched and the body, read again, matches the
+it undoes the restore. The report names it as `restore_point: {file, label}` (the shape the MAID restore uses) and gives
+`undo_set`, the categories with a write that was tried (an FTP rebuild that failed part-way counts: it may have emptied
+the list); restoring the restore point with `--only` = `undo_set` puts back just those. Status: verified only if every write's read-back matched and the body, read again, matches the
 snapshot for every item written; indeterminate (exit 4) if any write's data may have gone out and the reply failed.
 
 Skips (each a typed reason, never silent): the snapshot has no value (an older snapshot, a body without it); the body
@@ -100,7 +102,22 @@ byte for byte), FTP adds and deletes on Z 9 and Z6III.
 **Not yet run on hardware through `restore-extended`:** the IPTC slots and the FTP rebuild (delete-all then reversed
 adds, and that the list ends in the snapshot's order), and `EnableCopyright` on a Z 9 or Z6III (the gate allows only
 the Z 5 until then). The `0xD060` preset switch is allowed on a Z6III only (a Z 9 refused it while its presets were
-empty). Surfaces: the CLI only; the MCP and the GUI do not offer it yet.
+empty).
+
+**Surfaces.** The same plan / digest / apply operation is offered three ways, none of them a second implementation:
+
+| surface | how |
+|---|---|
+| CLI | `restore-extended` (above) |
+| MCP | `restore_extended_plan` (read-only) and `restore_extended_apply` (only with `--enable-writes`), each a worker operation (`restore-extended-plan` / `restore-extended-apply`, `src/worker_cmd.rs`). Raw USB, no SDK: the worker takes the camera lock and a raw session itself, so there is no bundle or schema to validate and no SDK disconnect to hang. `only` names categories. The plan and the result carry no passwords. Undo: plan and apply the returned restore point with `only` = `undo_set` |
+| GUI | Camera > Restore Owner Data…, `gui/src/restore_ext.rs`: the guarded plan / confirm / apply flow every write window shares, run as the CLI subprocess (`gui_argv::restore_extended_argv`). Four category checkboxes (a change withdraws the plan), a plan list per category (write old → new, skip with the reason in words, same), a confirmation that says when the FTP list is rebuilt, and the result with an Undo button that opens the window on the restore point |
+
+What is tested without a camera: the argv through the real CLI parser (`tests/gui_argv_cli.rs`, `gui/src/cli_parity.rs`);
+the worker's refusals and its camera-busy answer through the real binary (`tests/worker_cli.rs`); the MCP tools
+registered, gated and sending the right worker argv (`mcp/tests/stdio.rs`); the GUI reading the library's own
+serialised plan and report (not hand-written JSON), the state machine, and every stage drawing. **Not run on hardware:**
+the worker operations against a body, and the GUI window against a body (the CLI path under both is the one verified on
+the Z 5).
 
 ## Not done
 
@@ -116,4 +133,3 @@ empty). Surfaces: the CLI only; the MCP and the GUI do not offer it yet.
   Selecting a preset (`0xD060`) was `AccessDenied` while every preset was empty; not retried with a preset in use.
 - **Other bodies.** A Z 9, a Z6III and a Z 5 have been captured with this section (CLI and worker identical on each).
   A second Z 9 would show whether the section differs between bodies of one model.
-- **MCP and GUI surfaces for the restore.**

@@ -40,7 +40,7 @@ use crate::extended::{
     Extended, ExtendedSink, FtpState, IptcState, PropState, ReadFrom, hex_decode, prop_key, read_extended,
 };
 use crate::iptc::{IptcRecord, decode_iptc_slot};
-use crate::ops::apply::{ApplyError, ApplyStatus, require_confirmation};
+use crate::ops::apply::{ApplyError, ApplyStatus, RestorePoint, require_confirmation};
 use crate::ptp_usb::{
     BYTE_PROP_WRITE_MODELS, BYTE_PROPS, IPTC_WRITE_CONFIRMED_MODELS, PtpUsbError, STRING_PROPS,
     STRING_PROP_WRITE_CONFIRMED_PROPS, STRING_PROP_WRITE_MODELS, check_string_write_gate, decode_ftp_profile,
@@ -440,6 +440,19 @@ fn digest(source_bytes: &[u8], target_serial: &str, only: Option<&BTreeSet<Categ
     sha(&serde_json::to_vec(&doc).expect("a Value always serialises"))
 }
 
+/// The undo as a command that can be pasted and run: restore the restore point with the report's `undo_set` as
+/// `--only`. `None` when there is nothing to undo. `data_dir` is named when the restore point is not in the default.
+pub fn undo_command(restore_point_file: &str, undo_set: &[String], data_dir: Option<&str>) -> Option<String> {
+    if undo_set.is_empty() {
+        return None;
+    }
+    let only: String = undo_set.iter().map(|c| format!(" --only {c}")).collect();
+    let dir = data_dir
+        .map(|d| if d.contains(char::is_whitespace) { format!(" --data-dir \"{d}\"") } else { format!(" --data-dir {d}") })
+        .unwrap_or_default();
+    Some(format!("nikon-fleet{dir} restore-extended {restore_point_file}{only}"))
+}
+
 /// A refusal before anything is written.
 #[derive(Debug)]
 pub enum Refusal {
@@ -596,9 +609,13 @@ pub struct ExtendedApplyReport {
     pub status: ApplyStatus,
     pub no_op: bool,
     pub plan_digest: String,
-    /// The snapshot file holding the body as it was before the first write; restore from it to undo.
+    /// The snapshot holding the body as it was before the first write; restore from it to undo. The same shape as the
+    /// MAID restore's, so a client reads both alike.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub restore_point: Option<String>,
+    pub restore_point: Option<RestorePoint>,
+    /// The categories an undo puts back: every one with a write that was tried (a write that failed part-way, an FTP
+    /// rebuild above all, may have changed the body). Pass them as `only` when restoring from the restore point.
+    pub undo_set: Vec<String>,
     pub results: Vec<ItemResult>,
     /// Items written that the body, read again afterwards, still shows as different from the snapshot.
     pub still_differing: Vec<String>,
@@ -633,7 +650,7 @@ impl ExtendedApplyReport {
             out.push_str(&format!("{why}; nothing could be checked\n"));
         }
         if let Some(rp) = &self.restore_point {
-            out.push_str(&format!("restore point: {rp} (restore from it with `restore-extended` to undo)\n"));
+            out.push_str(&format!("restore point: {} (restore from it with `restore-extended` to undo)\n", rp.file));
         }
         out.push_str(&format!("status: {:?}\n", self.status));
         out
@@ -745,6 +762,15 @@ fn execute_ftp<S: ExtendedSink + ?Sized>(sink: &mut S, blobs: &[Vec<u8>], live_c
     ItemOutcome::Written { verified: all_verified }
 }
 
+/// The categories with a write that was tried, in apply order. One that was never attempted changed nothing.
+fn undo_categories(results: &[ItemResult]) -> Vec<String> {
+    Category::ALL
+        .iter()
+        .filter(|c| results.iter().any(|r| r.category == **c && !matches!(r.outcome, ItemOutcome::NotAttempted { .. })))
+        .map(|c| c.tag().to_string())
+        .collect()
+}
+
 fn status_of(results: &[ItemResult], still_differing: &[String], after_failed: bool) -> ApplyStatus {
     if results.iter().any(|r| matches!(r.outcome, ItemOutcome::Indeterminate { .. })) {
         return ApplyStatus::Indeterminate;
@@ -786,6 +812,7 @@ pub fn apply_extended_restore<S: ExtendedSink + ?Sized>(
             no_op: true,
             plan_digest: now_digest,
             restore_point: None,
+            undo_set: Vec::new(),
             results: Vec::new(),
             still_differing: Vec::new(),
             after_read_failed: None,
@@ -828,7 +855,8 @@ pub fn apply_extended_restore<S: ExtendedSink + ?Sized>(
         status,
         no_op: false,
         plan_digest: now_digest,
-        restore_point: Some(rp_file),
+        restore_point: Some(RestorePoint { file: rp_file, label: "restore-ext".to_string() }),
+        undo_set: undo_categories(&results),
         results,
         still_differing,
         after_read_failed,
@@ -1097,7 +1125,7 @@ mod tests {
         let (mut b, f) = drifted();
         let before = b.extended();
         let report = apply(&mut b, &f, None).unwrap();
-        let name = report.restore_point.expect("a restore point");
+        let name = report.restore_point.expect("a restore point").file;
         let rp = Snapshot::load_from_file(f.dir.path().join(&name)).unwrap();
         assert_eq!(rp.extended.as_ref(), Some(&before), "the extended section as it was before any write");
         assert_eq!(rp.label.as_deref(), Some("restore-ext"));
@@ -1112,7 +1140,7 @@ mod tests {
     #[test]
     fn restore_points_of_restore_points_do_not_grow_their_file_names() {
         let (mut b, f) = drifted();
-        let first = apply(&mut b, &f, None).unwrap().restore_point.unwrap();
+        let first = apply(&mut b, &f, None).unwrap().restore_point.unwrap().file;
         let mut name = first.clone();
         let mut dir = f.dir;
         for round in 0..4 {
@@ -1121,7 +1149,7 @@ mod tests {
             let fx = Fixture { snap, bytes, dir: tempfile::tempdir().unwrap(), name: name.clone() };
             // Alternate the body so every round has something to restore.
             b.props.insert(0xD072, ptp_string(&format!("round {round}")).unwrap());
-            let next = apply(&mut b, &fx, None).unwrap().restore_point.expect("a restore point");
+            let next = apply(&mut b, &fx, None).unwrap().restore_point.expect("a restore point").file;
             assert!(next.len() <= first.len() + 8, "round {round}: {} then {}", first.len(), next.len());
             name = next;
             dir = fx.dir;
@@ -1404,5 +1432,73 @@ mod tests {
         b.model = "Z 9".into();
         b.serial = "anything".into();
         assert!(build_extended_restore_plan(&mut b, &input(&f, &t, None)).is_ok(), "a snapshot with no serial is not evidence of another body");
+    }
+
+    #[test]
+    fn a_category_name_is_trimmed_and_case_folded_and_nothing_else_is_accepted() {
+        // Pinned on purpose: unlike a MAID property name (` Copyright` is refused there), a category comes from a
+        // closed list of four, so a stray space or capital is forgiven. Anything else is refused whole.
+        for ok in ["strings", "Strings", " STRINGS ", "\tftp\n"] {
+            assert!(Category::parse(ok).is_ok(), "{ok:?}");
+        }
+        assert_eq!(Category::parse(" Iptc ").unwrap(), Category::Iptc);
+        for bad in ["", " ", "string", "switch", "all", "ftp,iptc", "Copyright", "0xd072"] {
+            assert!(Category::parse(bad).is_err(), "{bad:?}");
+        }
+        for c in Category::ALL {
+            assert_eq!(Category::parse(c.tag()).unwrap(), c, "every tag round-trips");
+        }
+    }
+
+    #[test]
+    fn the_report_names_the_restore_point_like_the_maid_restore_does_and_the_categories_an_undo_puts_back() {
+        // Shape: `restore_point` is {file, label}, `undo_set` a list of category tags, both in the JSON a client reads.
+        let (mut b, f) = drifted();
+        let report = apply(&mut b, &f, None).unwrap();
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["restore_point"]["label"], "restore-ext");
+        assert!(v["restore_point"]["file"].as_str().unwrap().ends_with(".json"), "{v}");
+        // The fixture drifts a string, an IPTC preset and the FTP list, and no switch: `switches` must not be in the set.
+        assert_eq!(v["undo_set"], serde_json::json!(["strings", "iptc", "ftp"]), "only the categories that were written, in apply order: {v}");
+
+        // Nothing to change: no restore point, nothing to undo (the boundary: zero, not "all").
+        let none = apply(&mut b, &f, None).unwrap();
+        assert!(none.no_op && none.restore_point.is_none() && none.undo_set.is_empty());
+        let v = serde_json::to_value(&none).unwrap();
+        assert!(v.get("restore_point").is_none() && v["undo_set"] == serde_json::json!([]), "{v}");
+
+        // A rebuild that failed part-way may have emptied the list: ftp is in the undo set although it did not succeed.
+        let (mut b, f) = drifted();
+        b.fail.push("ftp_add:0".to_string());
+        let report = apply(&mut b, &f, None).unwrap();
+        assert_eq!(report.status, ApplyStatus::Failed);
+        assert!(report.undo_set.contains(&"ftp".to_string()), "{:?}", report.undo_set);
+    }
+
+    #[test]
+    fn an_item_that_was_never_attempted_does_not_put_its_category_in_the_undo_set() {
+        let r = |category, outcome| ItemResult { id: "x".into(), label: "x".into(), category, outcome };
+        let results = vec![
+            r(Category::Strings, ItemOutcome::Written { verified: true }),
+            r(Category::Iptc, ItemOutcome::NotAttempted { because: "earlier".into() }),
+            r(Category::Ftp, ItemOutcome::Failed { message: "m".into() }),
+        ];
+        assert_eq!(undo_categories(&results), ["strings", "ftp"]);
+        assert!(undo_categories(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_undo_command_names_the_restore_point_and_each_category_and_is_none_for_an_empty_set() {
+        let set = ["strings".to_string(), "ftp".to_string()];
+        assert_eq!(undo_command("rp.json", &set, None).unwrap(), "nikon-fleet restore-extended rp.json --only strings --only ftp");
+        assert_eq!(
+            undo_command("rp.json", &set[..1], Some("/my data")).unwrap(),
+            "nikon-fleet --data-dir \"/my data\" restore-extended rp.json --only strings"
+        );
+        assert_eq!(undo_command("rp.json", &[], None), None, "nothing to undo is not a command that restores everything");
+        // The command it prints parses back to exactly the categories it names.
+        for tag in set {
+            assert!(Category::parse(&tag).is_ok());
+        }
     }
 }

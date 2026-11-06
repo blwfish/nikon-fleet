@@ -42,6 +42,7 @@ mod guarded;
 mod menu;
 mod firmware_win;
 mod restore;
+mod restore_ext;
 
 use check::{CheckRequest, CheckUi, CheckView};
 use guarded::{
@@ -51,6 +52,7 @@ use guarded::{
 use nikon_fleet::gui_argv;
 use firmware_win::FwUi;
 use restore::{RestoreApplyJson, RestorePlanJson, RestoreRequest, RestoreUi, SourceView, UndoOffer};
+use restore_ext::{ExtApplyJson, ExtPlanJson, ExtRestoreRequest, ExtRestoreUi};
 
 // This GUI is a thin front end over the `nikon-fleet` CLI and the `nikon_fleet`
 // library. Everything that touches a camera (discover, snapshot, the vendor ops)
@@ -133,6 +135,7 @@ enum Cmd {
 enum PlanJob {
     Transplant(TransplantRequest),
     Restore(RestoreRequest),
+    RestoreExt(ExtRestoreRequest),
 }
 
 /// An apply to run, by flow: the request and the digest and summary of the plan that was confirmed.
@@ -140,18 +143,21 @@ enum PlanJob {
 enum ApplyJob {
     Transplant { request: TransplantRequest, digest: String, summary: String },
     Restore { request: RestoreRequest, digest: String, summary: String },
+    RestoreExt { request: ExtRestoreRequest, digest: String, summary: String },
 }
 
 /// A plan that came back, by flow.
 enum PlannedEvt {
     Transplant { request: TransplantRequest, result: Result<(PlanJson, String), String> },
     Restore { request: RestoreRequest, result: Result<(RestorePlanJson, String, SourceView), String> },
+    RestoreExt { request: ExtRestoreRequest, result: Result<(ExtPlanJson, String), String> },
 }
 
 /// An apply that ended, by flow.
 enum AppliedEvt {
     Transplant { request: TransplantRequest, outcome: ApplyOutcome },
     Restore { request: RestoreRequest, outcome: ApplyOutcome<RestoreApplyJson> },
+    RestoreExt { request: ExtRestoreRequest, outcome: ApplyOutcome<ExtApplyJson> },
 }
 
 impl PlanJob {
@@ -166,6 +172,10 @@ impl PlanJob {
                 let result = restore::do_restore_plan(data_dir, &request);
                 PlannedEvt::Restore { request, result }
             }
+            PlanJob::RestoreExt(request) => {
+                let result = restore_ext::do_ext_plan(data_dir, &request);
+                PlannedEvt::RestoreExt { request, result }
+            }
         })
     }
 
@@ -174,6 +184,7 @@ impl PlanJob {
         Evt::Planned(match self {
             PlanJob::Transplant(request) => PlannedEvt::Transplant { request, result: Err(why) },
             PlanJob::Restore(request) => PlannedEvt::Restore { request, result: Err(why) },
+            PlanJob::RestoreExt(request) => PlannedEvt::RestoreExt { request, result: Err(why) },
         })
     }
 }
@@ -189,6 +200,10 @@ impl ApplyJob {
                 let outcome = restore::do_restore_apply(data_dir, &request, &digest, &summary);
                 AppliedEvt::Restore { request, outcome }
             }
+            ApplyJob::RestoreExt { request, digest, summary } => {
+                let outcome = restore_ext::do_ext_apply(data_dir, &request, &digest, &summary);
+                AppliedEvt::RestoreExt { request, outcome }
+            }
         })
     }
 
@@ -197,6 +212,7 @@ impl ApplyJob {
         Evt::Applied(match self {
             ApplyJob::Transplant { request, .. } => AppliedEvt::Transplant { request, outcome: no_cli(message) },
             ApplyJob::Restore { request, .. } => AppliedEvt::Restore { request, outcome: no_cli(message) },
+            ApplyJob::RestoreExt { request, .. } => AppliedEvt::RestoreExt { request, outcome: no_cli(message) },
         })
     }
 }
@@ -206,6 +222,7 @@ impl PlannedEvt {
         let (what, summary, error) = match self {
             PlannedEvt::Transplant { result, .. } => ("Plan", result.as_ref().ok().map(|(p, _)| p.summary.clone()), result.as_ref().err()),
             PlannedEvt::Restore { result, .. } => ("Restore plan", result.as_ref().ok().map(|(p, _, _)| p.summary.clone()), result.as_ref().err()),
+            PlannedEvt::RestoreExt { result, .. } => ("Owner-data restore plan", result.as_ref().ok().map(|(p, _)| p.summary.clone()), result.as_ref().err()),
         };
         match (summary, error) {
             (Some(summary), _) => Status::new(Level::Info, format!("{what}: {summary}")),
@@ -218,6 +235,7 @@ impl PlannedEvt {
         match self {
             PlannedEvt::Transplant { request, result } => app.transplant.plan_arrived(request, result),
             PlannedEvt::Restore { request, result } => app.restore.plan_arrived(request, result),
+            PlannedEvt::RestoreExt { request, result } => app.restore_ext.plan_arrived(request, result),
         }
     }
 }
@@ -227,6 +245,7 @@ impl AppliedEvt {
         match self {
             AppliedEvt::Transplant { outcome, .. } => applied_status_of("Transplant", outcome),
             AppliedEvt::Restore { outcome, .. } => applied_status_of("Restore", outcome),
+            AppliedEvt::RestoreExt { outcome, .. } => applied_status_of("Owner-data restore", outcome),
         }
     }
 
@@ -235,6 +254,7 @@ impl AppliedEvt {
         match self {
             AppliedEvt::Transplant { outcome, .. } => outcome.may_have_written(),
             AppliedEvt::Restore { outcome, .. } => outcome.may_have_written(),
+            AppliedEvt::RestoreExt { outcome, .. } => outcome.may_have_written(),
         }
     }
 
@@ -242,6 +262,7 @@ impl AppliedEvt {
         match self {
             AppliedEvt::Transplant { request, outcome } => app.transplant.applied(request, outcome),
             AppliedEvt::Restore { request, outcome } => app.restore.applied(request, outcome),
+            AppliedEvt::RestoreExt { request, outcome } => app.restore_ext.applied(request, outcome),
         }
     }
 }
@@ -699,6 +720,7 @@ struct FleetApp {
     vendor_write_result: String,
     transplant: TransplantUi,
     restore: RestoreUi,
+    restore_ext: ExtRestoreUi,
     check: CheckUi,
     firmware: FwUi,
 }
@@ -753,6 +775,7 @@ impl FleetApp {
             vendor_write_result: String::new(),
             transplant: TransplantUi::default(),
             restore: RestoreUi::default(),
+            restore_ext: ExtRestoreUi::default(),
             check: CheckUi::default(),
             firmware: FwUi::default(),
         };
@@ -808,6 +831,7 @@ impl FleetApp {
     fn use_settings_data_dir(&mut self) {
         self.transplant.data_dir_changed();
         self.restore.data_dir_changed();
+        self.restore_ext.data_dir_changed();
         self.check.data_dir_changed();
         self.firmware.data_dir_changed();
         if self.cmd_tx.send(Cmd::SetDataDir(self.settings.data_dir_or_err())).is_err() {
@@ -867,6 +891,7 @@ impl FleetApp {
         self.status = Status::new(Level::Error, "The worker thread has stopped; restart the app.");
         self.transplant.worker_lost();
         self.restore.worker_lost();
+        self.restore_ext.worker_lost();
         self.check.worker_lost();
     }
 
@@ -1004,6 +1029,7 @@ impl eframe::App for FleetApp {
         self.drop_stale_confirmation();
         self.transplant.sync(&self.cameras);
         self.restore.sync(&self.cameras);
+        self.restore_ext.sync(&self.cameras);
         self.check.sync(&self.cameras);
         self.poll_firmware(ctx);
         self.handle_native_menu(ctx);
@@ -1015,6 +1041,7 @@ impl eframe::App for FleetApp {
         self.ui_vendor_ops(ctx);
         self.ui_transplant(ctx);
         self.ui_restore(ctx);
+        self.ui_restore_ext(ctx);
         self.ui_check(ctx);
         self.ui_firmware(ctx);
         self.ui_sidebar(root);
@@ -1174,6 +1201,7 @@ impl FleetApp {
             | MenuAction::Preferences
             | MenuAction::Transplant
             | MenuAction::Restore
+            | MenuAction::RestoreExtended
             | MenuAction::Check
             | MenuAction::VendorOps
             | MenuAction::Firmware
@@ -1198,6 +1226,7 @@ impl FleetApp {
             }
             MenuAction::Transplant => self.transplant.open = true,
             MenuAction::Restore => self.restore.open = true,
+            MenuAction::RestoreExtended => self.restore_ext.open = true,
             MenuAction::Check => self.check.open = true,
             MenuAction::VendorOps => self.vendor_ops_open = true,
             MenuAction::Firmware => self.firmware.open = true,
@@ -1947,9 +1976,11 @@ fn evt_outcome(evt: &Evt) -> nikon_fleet::diag::Outcome {
         | Evt::Vendor { result: Err(_), .. }
         | Evt::Checked { result: Err(_), .. }
         | Evt::Planned(PlannedEvt::Transplant { result: Err(_), .. })
-        | Evt::Planned(PlannedEvt::Restore { result: Err(_), .. }) => Outcome::Failed,
+        | Evt::Planned(PlannedEvt::Restore { result: Err(_), .. })
+        | Evt::Planned(PlannedEvt::RestoreExt { result: Err(_), .. }) => Outcome::Failed,
         Evt::Applied(AppliedEvt::Transplant { outcome, .. }) => judged(outcome),
         Evt::Applied(AppliedEvt::Restore { outcome, .. }) => judged(outcome),
+        Evt::Applied(AppliedEvt::RestoreExt { outcome, .. }) => judged(outcome),
         Evt::Cameras(_)
         | Evt::Listing(_)
         | Evt::Done(_)
@@ -3201,6 +3232,10 @@ trait AppliedReport: serde::de::DeserializeOwned {
     fn restore_point(&self) -> Option<&RestorePointJson>;
     /// The properties an undo of this apply puts back.
     fn undo_set(&self) -> &[String];
+    /// What `undo_set` names: properties, unless the report is of an extended restore (categories).
+    fn undo_kind(&self) -> restore::UndoKind {
+        restore::UndoKind::Properties
+    }
 }
 
 impl AppliedReport for ApplyJson {
@@ -8196,6 +8231,7 @@ mod tests {
             vendor_write_result: String::new(),
             transplant: TransplantUi::default(),
             restore: RestoreUi::default(),
+            restore_ext: ExtRestoreUi::default(),
             check: CheckUi::default(),
             firmware: FwUi::default(),
         };

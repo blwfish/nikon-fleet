@@ -21,6 +21,7 @@ pub(crate) enum MenuAction {
     Discover,
     Transplant,
     Restore,
+    RestoreExtended,
     Check,
     VendorOps,
     Firmware,
@@ -29,7 +30,7 @@ pub(crate) enum MenuAction {
 
 impl MenuAction {
     #[cfg(test)]
-    pub(crate) const ALL: [MenuAction; 11] = [
+    pub(crate) const ALL: [MenuAction; 12] = [
         MenuAction::Export,
         MenuAction::Import,
         MenuAction::Quit,
@@ -37,6 +38,7 @@ impl MenuAction {
         MenuAction::Discover,
         MenuAction::Transplant,
         MenuAction::Restore,
+        MenuAction::RestoreExtended,
         MenuAction::Check,
         MenuAction::VendorOps,
         MenuAction::Firmware,
@@ -53,6 +55,7 @@ impl MenuAction {
             MenuAction::Discover => "Discover Cameras",
             MenuAction::Transplant => "Transplant…",
             MenuAction::Restore => "Restore…",
+            MenuAction::RestoreExtended => "Restore Owner Data…",
             MenuAction::Check => "Check Against Reference…",
             MenuAction::VendorOps => "Vendor Ops…",
             MenuAction::Firmware => "Firmware Archive…",
@@ -129,6 +132,7 @@ fn in_window_layout() -> Vec<Menu> {
                 Separator,
                 Item(MenuAction::Transplant),
                 Item(MenuAction::Restore),
+                Item(MenuAction::RestoreExtended),
                 Item(MenuAction::Check),
                 Separator,
                 Item(MenuAction::VendorOps),
@@ -196,6 +200,7 @@ pub(crate) mod native {
             | MenuAction::Import
             | MenuAction::Transplant
             | MenuAction::Restore
+            | MenuAction::RestoreExtended
             | MenuAction::Check
             | MenuAction::VendorOps
             | MenuAction::Firmware
@@ -318,10 +323,11 @@ mod tests {
             MenuAction::VendorOps => 8,
             MenuAction::Firmware => 9,
             MenuAction::About => 10,
+            MenuAction::RestoreExtended => 11,
         };
         let mut seen: Vec<usize> = MenuAction::ALL.iter().map(|a| n(*a)).collect();
         seen.sort();
-        assert_eq!(seen, (0..11).collect::<Vec<_>>());
+        assert_eq!(seen, (0..12).collect::<Vec<_>>());
     }
 
     #[test]
@@ -416,6 +422,7 @@ mod tests {
             (MenuAction::Discover, "Discover Cameras", "Discover Cameras"),
             (MenuAction::Transplant, "Transplant…", "Transplant…"),
             (MenuAction::Restore, "Restore…", "Restore…"),
+            (MenuAction::RestoreExtended, "Restore Owner Data…", "Restore Owner Data…"),
             (MenuAction::Check, "Check Against Reference…", "Check Against Reference…"),
             (MenuAction::VendorOps, "Vendor Ops…", "Vendor Ops…"),
             (MenuAction::Firmware, "Firmware Archive…", "Firmware Archive…"),

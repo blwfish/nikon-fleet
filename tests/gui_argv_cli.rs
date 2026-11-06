@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Output;
 
-use nikon_fleet::gui_argv::{restore_argv, transplant_argv};
+use nikon_fleet::gui_argv::{restore_argv, restore_extended_argv, transplant_argv};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use serde_json::json;
 
@@ -73,6 +73,38 @@ fn every_shape_of_restore_argv_is_accepted_by_the_real_parser() {
         let out = parse_only(&argv);
         assert!(out.status.success(), "{what}: the real parser rejected {argv:?}: {}", stderr(&out));
     }
+}
+
+#[test]
+fn every_shape_of_restore_extended_argv_is_accepted_by_the_real_parser() {
+    let d = tempfile::tempdir().unwrap();
+    let snap = write_snapshot(d.path());
+    let dir = d.path().to_str().unwrap();
+    let only = set(&["strings", "ftp"]);
+    for (what, argv) in [
+        ("plan", restore_extended_argv(dir, "1", None, None, &snap)),
+        ("plan, limited", restore_extended_argv(dir, "1", Some(&only), None, &snap)),
+        ("apply", restore_extended_argv(dir, "1", None, Some(("abc123", "Z 9 1: restore-extended from a.json: 3 would change")), &snap)),
+        ("apply, limited", restore_extended_argv(dir, "1", Some(&only), Some(("abc123", "s")), &snap)),
+        ("dashes", restore_extended_argv(dir, "-1", None, Some(("-d", "-s: --x")), &snap)),
+    ] {
+        let argv = argv.unwrap();
+        let out = parse_only(&argv);
+        assert!(out.status.success(), "{what}: the real parser rejected {argv:?}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn a_category_in_restore_extended_argv_reaches_the_commands_logic() {
+    // Parse-only proves the flag is accepted; this proves the value reaches `Category::parse`: a made-up category is
+    // refused by name, before any camera is touched.
+    let d = tempfile::tempdir().unwrap();
+    let snap = write_snapshot(d.path());
+    let dir = d.path().to_str().unwrap();
+    let argv = restore_extended_argv(dir, "1", Some(&set(&["nope"])), None, &snap).unwrap();
+    let out = run(d.path(), &argv);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("not a category"), "{}", stderr(&out));
 }
 
 #[test]

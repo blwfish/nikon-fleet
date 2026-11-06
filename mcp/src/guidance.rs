@@ -20,7 +20,7 @@ pub const WRITE_TOPICS: &[&str] = &["apply"];
 /// session that changes what the tools can do.
 pub fn capability_statement(enable_writes: bool) -> String {
     let writes = if enable_writes {
-        "Camera writes are ENABLED in this session: transplant_apply and restore_apply exist."
+        "Camera writes are ENABLED in this session: transplant_apply, restore_apply and restore_extended_apply exist."
     } else {
         "Camera writes are DISABLED in this session: there are no apply tools, so cameras can be read and compared but not changed."
     };
@@ -185,6 +185,23 @@ pub fn notes() -> Vec<Note> {
         )
         .tags(&["restore"])
         .addresses(&["undo", "put it back", "revert", "roll back", "restore point", "undo_set"]),
+        Note::new(
+            "restoring-owner-strings-iptc-ftp",
+            d,
+            Medium,
+            Tactic,
+            "restore_plan does not touch Artist, Copyright, Image comment, IPTC presets or FTP profiles: restore_extended_plan / restore_extended_apply do.",
+        )
+        .detail(
+            "A snapshot's `extended` section is restored by its own pair of tools, over raw USB, with the same plan, digest and summary rules as restore_plan / restore_apply. \
+             The plan lists one item per string, IPTC preset, switch and FTP list: same, write (old -> new), skip (a typed reason: the snapshot has no value, the body lacks it, \
+             a model the write is not confirmed on, ...) or not_selected. `only` names categories (strings, iptc, switches, ftp), not properties. \
+             Passwords are never in a plan or a result; a changed profile is reported as changed. The FTP list is rebuilt whole (delete everything, add the snapshot's profiles), \
+             so a failure part-way leaves it partial: the restore point (a snapshot labelled restore-ext) holds the original: plan and apply it with `only` = the result's `undo_set` (categories) to restore it. \
+             A snapshot taken with --no-extended, or before the section existed, is refused as snapshot_has_no_extended.",
+        )
+        .tags(&["restore", "extended"])
+        .addresses(&["restore artist", "restore copyright", "restore ftp profiles", "restore iptc", "snapshot_has_no_extended", "not_this_body", "owner strings"]),
         Note::new(
             "old-snapshots",
             d,

@@ -63,10 +63,33 @@ pub fn restore_argv(
     confirmed: Option<(&str, &str)>,
     snapshot: &str,
 ) -> Result<Vec<String>, ArgvError> {
+    restore_like_argv("restore", data_dir, serial, only, confirmed, snapshot)
+}
+
+/// `restore-extended`: the same line with `--only=CATEGORY` (strings, iptc, switches, ftp) in place of a property
+/// name. `only` is `None` for every category; `Some` of nothing is an error, for the same reason.
+pub fn restore_extended_argv(
+    data_dir: &str,
+    serial: &str,
+    only: Option<&BTreeSet<String>>,
+    confirmed: Option<(&str, &str)>,
+    snapshot: &str,
+) -> Result<Vec<String>, ArgvError> {
+    restore_like_argv("restore-extended", data_dir, serial, only, confirmed, snapshot)
+}
+
+fn restore_like_argv(
+    command: &str,
+    data_dir: &str,
+    serial: &str,
+    only: Option<&BTreeSet<String>>,
+    confirmed: Option<(&str, &str)>,
+    snapshot: &str,
+) -> Result<Vec<String>, ArgvError> {
     if only.is_some_and(BTreeSet::is_empty) {
         return Err(ArgvError::EmptySelection);
     }
-    let mut argv = guarded("restore", data_dir, serial, confirmed);
+    let mut argv = guarded(command, data_dir, serial, confirmed);
     argv.extend(only.into_iter().flatten().map(|n| format!("--only={n}")));
     argv.extend(["--".to_string(), snapshot.to_string()]);
     let chars: usize = argv.iter().map(|a| a.chars().count() + 1).sum();
@@ -116,6 +139,18 @@ mod tests {
                 "--allow-raw-code=kNkMAIDCapability_A", "--allow-raw-code=kNkMAIDCapability_B", "--", "/d/snapshots/a.json"
             ]
         );
+    }
+
+    #[test]
+    fn the_extended_restore_is_the_same_line_with_its_own_command_and_categories() {
+        let only = set(&["ftp", "strings"]);
+        assert_eq!(
+            restore_extended_argv("/d", "S1", Some(&only), None, "/d/snapshots/a.json").unwrap(),
+            ["--data-dir=/d", "restore-extended", "--json", "--serial=S1", "--dry-run", "--only=ftp", "--only=strings", "--", "/d/snapshots/a.json"]
+        );
+        let apply = restore_extended_argv("/d", "S1", None, Some(("dig", "-a: 1")), "f").unwrap();
+        assert_eq!(apply, ["--data-dir=/d", "restore-extended", "--json", "--serial=S1", "--expect-digest=dig", "--expect-summary=-a: 1", "--", "f"]);
+        assert_eq!(restore_extended_argv("/d", "S", Some(&BTreeSet::new()), None, "f"), Err(ArgvError::EmptySelection));
     }
 
     #[test]

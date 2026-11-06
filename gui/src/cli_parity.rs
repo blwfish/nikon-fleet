@@ -29,6 +29,8 @@ use nikon_fleet::vendor_argv::{vendor_read_argv, vendor_write_ftp_argv};
 use crate::check::{CheckRequest, check_argv};
 use crate::firmware_win::FwOp;
 use crate::restore::{RestoreRequest, restore_argv};
+use crate::restore_ext::{ExtRestoreRequest, ext_argv};
+use nikon_fleet::ops::restore_extended::Category;
 use crate::{CameraRow, TransplantRequest, discover_argv, parse_discover, snapshot_argv, transplant_argv};
 
 /// The CLI binary built from this tree, next to the test executable's profile directory.
@@ -152,6 +154,16 @@ fn all_shapes(dir: &Path) -> Vec<(String, Vec<String>)> {
     add("restore apply", restore_argv(dir, &restore(None), Some(("abc123", "Z 9 1: restore from a.json: 3 would change; only: all"))).unwrap());
     add("restore apply, dashed summary", restore_argv(dir, &restore(Some(&["kNkMAIDCapability_A"])), Some(("-d", "-s: --x"))).unwrap());
 
+    let ext = |only: Option<&[Category]>| ExtRestoreRequest {
+        source_file: "snap.json".into(),
+        target: camera(),
+        only: only.map(|o| o.iter().copied().collect()),
+    };
+    add("restore-extended plan", ext_argv(Path::new(dir), &ext(None), None).unwrap());
+    add("restore-extended plan, limited", ext_argv(Path::new(dir), &ext(Some(&[Category::Strings, Category::Ftp])), None).unwrap());
+    add("restore-extended apply", ext_argv(Path::new(dir), &ext(None), Some(("abc123", "Z 9 1: restore-extended from a.json: 3 would change"))).unwrap());
+    add("restore-extended apply, dashed summary", ext_argv(Path::new(dir), &ext(Some(&[Category::Iptc])), Some(("-d", "-s: --x"))).unwrap());
+
     let transplant = |optins: &[&str]| TransplantRequest {
         source_body: ("Z6_3".into(), "SRC".into()),
         source_file: "snap.json".into(),
@@ -208,7 +220,7 @@ fn the_shapes_cover_every_cli_command_the_gui_runs() {
     let (_d, cases) = shapes();
     let covered: BTreeSet<String> = cases.iter().map(|(_, a)| command_of(a)).collect();
     let expected: BTreeSet<String> = [
-        "discover", "snapshot", "check", "restore", "transplant", "vendor-read", "vendor-write-ftp", "firmware latest",
+        "discover", "snapshot", "check", "restore", "restore-extended", "transplant", "vendor-read", "vendor-write-ftp", "firmware latest",
         "firmware browse", "firmware add", "firmware fetch", "firmware pin", "firmware rollback",
     ]
     .iter()

@@ -369,6 +369,32 @@ pub struct RestoreApplyArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct RestoreExtendedPlanArgs {
+    /// Snapshot file name in snapshots/ of the same body to restore from. It must hold an `extended` section.
+    pub source: String,
+    /// USB serial of the body. Must be the snapshot's own serial.
+    pub serial: String,
+    /// Restore only these categories: `strings` (Artist, Copyright, Image comment), `iptc` (the presets), `switches`
+    /// (EnableCopyright, preset select) or `ftp` (the whole profile list). Default: all.
+    #[serde(default)]
+    #[schemars(schema_with = "strings_schema")]
+    pub only: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RestoreExtendedApplyArgs {
+    pub source: String,
+    pub serial: String,
+    #[serde(default)]
+    #[schemars(schema_with = "strings_schema")]
+    pub only: Option<Vec<String>>,
+    /// The plan's `digest`, copied from the restore_extended_plan result.
+    pub plan_digest: String,
+    /// The plan's `summary`, copied from the restore_extended_plan result.
+    pub summary: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct GuidanceArgs {
     /// "strategy" (an overview, or one topic in full), "tactics" (the topics, or one in full) or "find" (search by problem).
     pub operation: String,
@@ -436,6 +462,17 @@ pub mod ops_args {
     }
     pub fn restore_apply(a: &RestoreApplyArgs) -> Vec<String> {
         let mut v = strs(&["restore-apply", "--serial", &a.serial, "--source", &a.source]);
+        v.extend(flag_each("--only", &a.only));
+        v.extend(strs(&["--digest", &a.plan_digest, "--summary", &a.summary]));
+        v
+    }
+    pub fn restore_extended_plan(a: &RestoreExtendedPlanArgs) -> Vec<String> {
+        let mut v = strs(&["restore-extended-plan", "--serial", &a.serial, "--source", &a.source]);
+        v.extend(flag_each("--only", &a.only));
+        v
+    }
+    pub fn restore_extended_apply(a: &RestoreExtendedApplyArgs) -> Vec<String> {
+        let mut v = strs(&["restore-extended-apply", "--serial", &a.serial, "--source", &a.source]);
         v.extend(flag_each("--only", &a.only));
         v.extend(strs(&["--digest", &a.plan_digest, "--summary", &a.summary]));
         v
@@ -558,6 +595,7 @@ impl FleetMcp {
         if !cfg.enable_writes {
             router.remove_route("transplant_apply");
             router.remove_route("restore_apply");
+            router.remove_route("restore_extended_apply");
         }
         let notes = guidance::notes();
         let instructions = notes::render_instructions(
@@ -900,6 +938,55 @@ impl FleetMcp {
             .camera_call(CallKind::Apply, ops_args::restore_apply(&p.0), self.cfg.deadlines.apply, None, &meta, &peer, &ctx.ct)
             .await)
     }
+
+    #[tool(
+        name = "restore_extended_plan",
+        description = "Work out what putting a snapshot's owner strings (Artist, Copyright, Image comment), IPTC presets, copyright/preset switches and FTP profiles \
+                       back on the same body would do, by reading the body over raw USB. Writes nothing. The MAID restore_plan does not cover these. \
+                       `only` limits it to categories (strings, iptc, switches, ftp). Returns a `digest` and `summary` that restore_extended_apply must echo. \
+                       Each `items` entry is same, write (old -> new), skip (with a typed reason) or not_selected. Passwords never appear in a plan or a result: \
+                       a changed FTP profile is reported as changed, with no value. The FTP list is rebuilt whole (everything stored is deleted, then the snapshot's profiles are added).",
+        annotations(read_only_hint = true)
+    )]
+    async fn restore_extended_plan(
+        &self,
+        p: Parameters<RestoreExtendedPlanArgs>,
+        meta: RequestMetaObject,
+        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(refused) = empty_only(&p.0.only) {
+            return Ok(refused);
+        }
+        Ok(self
+            .camera_call(CallKind::Read, ops_args::restore_extended_plan(&p.0), self.cfg.deadlines.plan, None, &meta, &peer, &ctx.ct)
+            .await)
+    }
+
+    #[tool(
+        name = "restore_extended_apply",
+        description = "WRITES TO THE CAMERA. Applies a restore_extended_plan over raw USB: stores a restore point (a snapshot labelled restore-ext, holding the body's \
+                       extended section as it was), writes strings, IPTC, switches, then the FTP list, reads the body again and reports anything still different. \
+                       Needs the plan's `plan_digest` and `summary` copied unchanged; refuses `stale_plan` if the body or snapshot changed since. \
+                       `status` is applied_verified, applied_unverified, failed (also an error result, still carrying the whole report), indeterminate or not_applied, as for restore_apply. \
+                       An FTP rebuild that fails part-way leaves the list partial: the restore point holds the original, and restoring from it with this tool puts it back. \
+                       To undo, restore_extended_plan then restore_extended_apply the returned restore point with `only` = `undo_set` (categories). Not every write is confirmed on every body: a skip names the reason.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false)
+    )]
+    async fn restore_extended_apply(
+        &self,
+        p: Parameters<RestoreExtendedApplyArgs>,
+        meta: RequestMetaObject,
+        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(refused) = empty_only(&p.0.only) {
+            return Ok(refused);
+        }
+        Ok(self
+            .camera_call(CallKind::Apply, ops_args::restore_extended_apply(&p.0), self.cfg.deadlines.apply, None, &meta, &peer, &ctx.ct)
+            .await)
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1140,6 +1227,21 @@ mod status_and_selection_tests {
         let r = empty_only(&Some(vec![])).expect("an empty list is refused");
         assert_eq!(r.is_error, Some(true));
         assert_eq!(r.structured_content.as_ref().unwrap()["error"]["tag"], json!("empty_selection"));
+    }
+
+    #[test]
+    fn the_extended_restore_argv_names_the_worker_ops_and_carries_the_selection_and_the_confirmation() {
+        let plan = RestoreExtendedPlanArgs { serial: "S".into(), source: "snap.json".into(), only: Some(vec!["ftp".into(), "iptc".into()]) };
+        assert_eq!(
+            ops_args::restore_extended_plan(&plan),
+            ["restore-extended-plan", "--serial", "S", "--source", "snap.json", "--only", "ftp", "--only", "iptc"]
+        );
+        let apply = RestoreExtendedApplyArgs { serial: "S".into(), source: "snap.json".into(), only: None, plan_digest: "D".into(), summary: "T".into() };
+        assert_eq!(
+            ops_args::restore_extended_apply(&apply),
+            ["restore-extended-apply", "--serial", "S", "--source", "snap.json", "--digest", "D", "--summary", "T"],
+            "no `only` is no flag at all, which the worker reads as every category"
+        );
     }
 
     #[test]

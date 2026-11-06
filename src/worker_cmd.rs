@@ -152,6 +152,33 @@ pub enum WorkerOp {
         #[arg(long)]
         summary: String,
     },
+    /// Dry-run restoring a snapshot's owner strings, IPTC presets, switches and FTP profiles onto the same body
+    /// (raw USB, no SDK). Reads the body; writes nothing.
+    RestoreExtendedPlan {
+        #[arg(long)]
+        serial: String,
+        /// Snapshot name inside the data directory's snapshots/ (a name, not a path).
+        #[arg(long)]
+        source: String,
+        /// Restore only this category (strings, iptc, switches, ftp). Repeatable; default is all.
+        #[arg(long = "only", value_name = "CATEGORY")]
+        only: Vec<String>,
+    },
+    /// Apply a planned extended restore: restore point, writes, read-back. WRITES TO THE CAMERA.
+    RestoreExtendedApply {
+        #[arg(long)]
+        serial: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long = "only", value_name = "CATEGORY")]
+        only: Vec<String>,
+        /// The plan's digest, copied from the plan result.
+        #[arg(long)]
+        digest: String,
+        /// The plan's summary line, copied from the plan result.
+        #[arg(long)]
+        summary: String,
+    },
 }
 
 /// What the worker does with the camera session once the result is out.
@@ -176,8 +203,12 @@ impl Teardown {
             | WorkerOp::TransplantPlan { .. }
             | WorkerOp::RestorePlan { .. } => Teardown::ExitAfterResult,
             WorkerOp::TransplantApply { .. } | WorkerOp::RestoreApply { .. } => Teardown::Disconnect,
-            // No camera session at all.
-            WorkerOp::Selftest { .. } | WorkerOp::ListCameras => Teardown::Disconnect,
+            // No camera session at all, or no SDK session: the extended restore is raw USB, so there is no
+            // `DisconnectDevice` to hang and nothing to skip.
+            WorkerOp::Selftest { .. }
+            | WorkerOp::ListCameras
+            | WorkerOp::RestoreExtendedPlan { .. }
+            | WorkerOp::RestoreExtendedApply { .. } => Teardown::Disconnect,
         }
     }
 }
@@ -232,6 +263,10 @@ pub fn run(data_dir: &Path, bundle: &Path, schema: &Path, args: &WorkerArgs) -> 
             only,
             Some((digest.as_str(), summary.as_str())),
         ),
+        WorkerOp::RestoreExtendedPlan { serial, source, only } => op_restore_extended(&mut em, data_dir, serial, source, only, None),
+        WorkerOp::RestoreExtendedApply { serial, source, only, digest, summary } => {
+            op_restore_extended(&mut em, data_dir, serial, source, only, Some((digest.as_str(), summary.as_str())))
+        }
     }
 }
 
@@ -605,6 +640,97 @@ fn op_transplant(
     })
 }
 
+/// The stored snapshot a plan or an apply is about: its path, its bytes (the digest covers them) and its parse.
+/// A name, not a path; one that cannot be read is an error result, never a plan.
+fn load_source(snapshots: &Path, source_name: &str) -> Result<(std::path::PathBuf, Vec<u8>, Snapshot), Outcome> {
+    let source_path = resolve_existing(snapshots, source_name).map_err(|e| Outcome::err(e.tag(), e.to_string(), None))?;
+    let source_bytes = std::fs::read(&source_path)
+        .map_err(|e| Outcome::err("source_unreadable", format!("{}: {e}", source_path.display()), None))?;
+    let source = std::str::from_utf8(&source_bytes)
+        .map_err(|e| e.to_string())
+        .and_then(|t| Snapshot::from_json(t).map_err(|e| e.to_string()))
+        .map_err(|e| Outcome::err("source_unreadable", format!("{}: {e}", source_path.display()), None))?;
+    Ok((source_path, source_bytes, source))
+}
+
+/// `restore-extended-plan` (confirmation `None`) and `restore-extended-apply` (`Some((digest, summary))`): the
+/// owner strings, IPTC presets, switches and FTP profiles of a snapshot. Raw USB only: no SDK is opened, so there
+/// is no bundle or schema to validate and no SDK session to tear down. One raw session reads the body, plans and
+/// (for an apply) writes, so the plan an apply recomputes is of the body it just read.
+#[allow(clippy::too_many_arguments)]
+fn op_restore_extended(
+    em: &mut Emitter<File>,
+    data_dir: &Path,
+    serial: &str,
+    source_name: &str,
+    only_names: &[String],
+    confirmation: Option<(&str, &str)>,
+) -> i32 {
+    use nikon_fleet::ops::restore_extended::{
+        Category, ExtendedApplyRequest, ExtendedRestoreInput, apply_extended_restore, build_extended_restore_plan,
+    };
+    progress(em, "starting");
+    if let Some((digest, summary)) = confirmation {
+        if let Err(e) = require_confirmation(digest, summary) {
+            return finish(em, Outcome::err(e.tag(), e.to_string(), None));
+        }
+    }
+    if let Err(e) = nikon_fleet::ops::target::require_usb_serial(serial) {
+        return finish(em, Outcome::err(e.tag(), e.to_string(), None));
+    }
+    let snapshots = snapshots_dir(data_dir);
+    let (source_path, source_bytes, snapshot) = match load_source(&snapshots, source_name) {
+        Ok(s) => s,
+        Err(o) => return finish(em, o),
+    };
+    let only: Option<BTreeSet<Category>> = if only_names.is_empty() {
+        None
+    } else {
+        match only_names.iter().map(|c| Category::parse(c)).collect::<Result<_, _>>() {
+            Ok(set) => Some(set),
+            Err(e) => return finish(em, Outcome::err("unknown_category", e, None)),
+        }
+    };
+    let name = source_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // The snapshot's own camera identity, as the CLI does; a serial that is not the snapshot's is refused against
+    // the live body by the library (`not_this_body`).
+    let mut target = snapshot.camera.clone();
+    target.serial = serial.to_string();
+    let input = ExtendedRestoreInput { source: &snapshot, source_bytes: &source_bytes, source_name: &name, target: &target, only: only.as_ref() };
+
+    let lock = match nikon_fleet::camera_lock::CameraLock::acquire() {
+        Ok(l) => l,
+        Err(e) => return finish(em, Outcome::err(e.tag(), e.to_string(), None)),
+    };
+    let mut session = match nikon_fleet::ptp_usb::PtpUsbSession::open_locked(lock, Some(serial)) {
+        Ok(s) => s,
+        Err(e) => return finish(em, Outcome::err(e.tag(), e.to_string(), None)),
+    };
+    progress(em, "connected");
+    let outcome = match confirmation {
+        None => {
+            progress(em, "planning");
+            match build_extended_restore_plan(&mut session, &input) {
+                Ok(report) => Outcome::ok_report(&report),
+                Err(e) => Outcome::err(e.tag(), e.to_string(), None),
+            }
+        }
+        Some((digest, summary)) => {
+            let captured_at = match now() {
+                Ok(t) => t,
+                Err(o) => return finish(em, o),
+            };
+            let req = ExtendedApplyRequest { input, snapshots_dir: &snapshots, expected_digest: digest, expected_summary: summary, captured_at };
+            match apply_extended_restore(&mut session, &req, &mut apply_progress(em)) {
+                Ok(report) => Outcome::ok_report(&report),
+                Err(e) => Outcome::err(e.tag(), e.to_string(), None),
+            }
+        }
+    };
+    finish(em, outcome)
+    // `session` drops here, after the result line was written and flushed: it releases the interface and the lock.
+}
+
 /// `restore-plan` (confirmation `None`) and `restore-apply` (`Some((digest, summary))`).
 #[allow(clippy::too_many_arguments)]
 fn op_restore(
@@ -626,20 +752,9 @@ fn op_restore(
         }
     }
     let snapshots = snapshots_dir(data_dir);
-    let source_path = match resolve_existing(&snapshots, source_name) {
-        Ok(p) => p,
-        Err(e) => return finish(em, Outcome::err(e.tag(), e.to_string(), None)),
-    };
-    let source_bytes = match std::fs::read(&source_path) {
-        Ok(b) => b,
-        Err(e) => return finish(em, Outcome::err("source_unreadable", format!("{}: {e}", source_path.display()), None)),
-    };
-    let source = match std::str::from_utf8(&source_bytes)
-        .map_err(|e| e.to_string())
-        .and_then(|t| Snapshot::from_json(t).map_err(|e| e.to_string()))
-    {
+    let (source_path, source_bytes, source) = match load_source(&snapshots, source_name) {
         Ok(s) => s,
-        Err(e) => return finish(em, Outcome::err("source_unreadable", format!("{}: {e}", source_path.display()), None)),
+        Err(o) => return finish(em, o),
     };
     let only: Option<BTreeSet<String>> = if only_names.is_empty() {
         None
@@ -759,6 +874,15 @@ mod tests {
                 Teardown::Disconnect,
             ),
             (WorkerOp::ListCameras, Teardown::Disconnect),
+            // Raw USB: no SDK session, so the SDK's disconnect cannot hang; classified on purpose, not by default.
+            (
+                WorkerOp::RestoreExtendedPlan { serial: s("123"), source: s("a.json"), only: vec![] },
+                Teardown::Disconnect,
+            ),
+            (
+                WorkerOp::RestoreExtendedApply { serial: s("123"), source: s("a.json"), only: vec![], digest: s("d"), summary: s("s") },
+                Teardown::Disconnect,
+            ),
             (
                 WorkerOp::Selftest { fail: false, hang_after_result: false, exit_code: 0, exit_now: false, teardown_limit_ms: None },
                 Teardown::Disconnect,

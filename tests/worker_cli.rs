@@ -368,6 +368,8 @@ fn plan_and_apply_report_camera_busy_without_loading_the_sdk() {
         vec!["check", "--serial", "0000003023668"],
         vec!["restore-plan", "--serial", "0000003023668", "--source", &src],
         vec!["restore-apply", "--serial", "0000003023668", "--source", &src, "--digest", "d", "--summary", "s"],
+        vec!["restore-extended-plan", "--serial", "0000003023668", "--source", &src],
+        vec!["restore-extended-apply", "--serial", "0000003023668", "--source", &src, "--digest", "d", "--summary", "s"],
     ] {
         let mut w = spawn(&global, &op, &env);
         let r = w.read();
@@ -469,6 +471,63 @@ fn restore_ops_refuse_a_serial_that_cannot_name_a_body_before_the_sdk() {
         let mut w = spawn(&g(d.path()), &op, &[]);
         assert_eq!(err_tag(&w.read()), "no_usb_serial", "{op:?}");
     }
+}
+
+// ── restore-extended-plan / restore-extended-apply: raw USB, what is refused before any camera ──
+
+#[test]
+fn the_extended_restore_ops_refuse_what_needs_no_camera_before_touching_one() {
+    let (d, src) = data_dir_with_source();
+    // An unsafe or missing source name.
+    for (name, tag) in [("../source.json", "unsafe_name"), ("a/b.json", "unsafe_name"), ("", "unsafe_name"), ("nope.json", "not_found")] {
+        let mut w = spawn(&g(d.path()), &["restore-extended-plan", "--serial", "0000003023668", "--source", name], &[]);
+        let r = w.read();
+        assert_eq!(err_tag(&r), tag, "{name:?}");
+        assert_eq!(r.progress, ["starting"], "{name:?}");
+    }
+    // A category that does not exist: a closed vocabulary, not a property name.
+    for bad in ["Nope", "string", "all", "", "Copyright", "ftp,iptc"] {
+        let mut w = spawn(&g(d.path()), &["restore-extended-plan", "--serial", "0000003023668", "--source", &src, "--only", bad], &[]);
+        let r = w.read();
+        assert_eq!(err_tag(&r), "unknown_category", "{bad:?}");
+        assert_eq!(r.progress, ["starting"], "{bad:?}");
+    }
+    // One bad category among good ones fails the whole selection.
+    let mut w = spawn(
+        &g(d.path()),
+        &["restore-extended-plan", "--serial", "0000003023668", "--source", &src, "--only", "strings", "--only", "nope"],
+        &[],
+    );
+    assert_eq!(err_tag(&w.read()), "unknown_category");
+    // A serial that names no body.
+    let mut w = spawn(&g(d.path()), &["restore-extended-plan", "--serial", "id-3", "--source", &src], &[]);
+    assert_eq!(err_tag(&w.read()), "no_usb_serial");
+}
+
+#[test]
+fn restore_extended_apply_demands_the_confirmation_and_checks_the_rest_even_with_one() {
+    let (d, src) = data_dir_with_source();
+    for (digest, summary) in [("", "s"), ("  ", "s"), ("d", ""), ("d", "   ")] {
+        let mut w = spawn(
+            &g(d.path()),
+            &["restore-extended-apply", "--serial", "0000003023668", "--source", &src, "--digest", digest, "--summary", summary],
+            &[],
+        );
+        let r = w.read();
+        assert_eq!(err_tag(&r), "missing_confirmation", "{digest:?}/{summary:?}");
+        assert_eq!(r.progress, ["starting"]);
+    }
+    let with = |serial: &str, source: &str, only: &[&str]| {
+        let mut v = vec!["restore-extended-apply", "--serial", serial, "--source", source, "--digest", "d", "--summary", "s"];
+        for o in only {
+            v.extend(["--only", o]);
+        }
+        let mut w = spawn(&g(d.path()), &v, &[]);
+        err_tag(&w.read())
+    };
+    assert_eq!(with("0000003023668", "../x", &[]), "unsafe_name");
+    assert_eq!(with("0000003023668", &src, &["nope"]), "unknown_category");
+    assert_eq!(with("id-3", &src, &[]), "no_usb_serial");
 }
 
 // ── list-cameras ──

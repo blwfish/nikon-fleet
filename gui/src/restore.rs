@@ -730,10 +730,19 @@ pub(crate) fn restore_report_lines(r: &RestoreApplyJson) -> Vec<(Level, String)>
     out
 }
 
+/// What an undo's set names: the properties of a restore, or the categories of an extended restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UndoKind {
+    Properties,
+    Categories,
+}
+
 /// Everything needed to undo an apply: the restore point it made, the properties that put back what
 /// it changed, the body, and the data directory the restore point is in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UndoOffer {
+    /// Which window the undo opens, and what `undo_set` names.
+    pub kind: UndoKind,
     /// The restore point, a file name in `snapshots/` of `data_dir`.
     pub restore_point: String,
     pub undo_set: Vec<String>,
@@ -754,6 +763,7 @@ pub(crate) fn undo_offer<R: AppliedReport>(target: &CameraRow, data_dir: Option<
         return None;
     }
     Some(UndoOffer {
+        kind: report.undo_kind(),
         restore_point: point.file.clone(),
         undo_set: report.undo_set().to_vec(),
         target: target.clone(),
@@ -1068,9 +1078,14 @@ pub(crate) fn draw_restore_point(
     restore_point: &RestorePointJson,
     offer: Option<&UndoOffer>,
     undo_set: &[String],
+    kind: UndoKind,
     data_dir: Option<&Path>,
     busy: bool,
 ) -> Option<AppliedAction> {
+    let (noun, nouns) = match kind {
+        UndoKind::Properties => ("propert(ies)", "properties"),
+        UndoKind::Categories => ("categor(ies)", "categories"),
+    };
     let mut chosen = None;
     ui.separator();
     ui.label(egui::RichText::new("Restore point").strong());
@@ -1093,7 +1108,7 @@ pub(crate) fn draw_restore_point(
                         chosen = Some(AppliedAction::Undo(offer.clone()));
                     }
                 });
-                ui.label(format!("puts back {} propert(ies) from the restore point.", offer.undo_set.len()));
+                ui.label(format!("puts back {} {noun} from the restore point.", offer.undo_set.len()));
             });
         }
         (None, true) => {
@@ -1106,7 +1121,11 @@ pub(crate) fn draw_restore_point(
     // A command only where there is one: more names than fit on a command line are a sentence, and
     // a sentence is not offered as something to paste.
     let dir = data_dir.and_then(Path::to_str);
-    match nikon_fleet::ops::restore::undo_command_exact(&restore_point.file, undo_set, dir) {
+    let command = match kind {
+        UndoKind::Properties => nikon_fleet::ops::restore::undo_command_exact(&restore_point.file, undo_set, dir),
+        UndoKind::Categories => nikon_fleet::ops::restore_extended::undo_command(&restore_point.file, undo_set, dir),
+    };
+    match command {
         Some(command) => {
             ui.label("The same from a terminal:");
             ui.horizontal_wrapped(|ui| {
@@ -1118,13 +1137,13 @@ pub(crate) fn draw_restore_point(
         }
         None if !undo_set.is_empty() => {
             ui.label(
-                egui::RichText::new(format!("{} properties are too many for a command line: use Undo… above.", undo_set.len())).weak(),
+                egui::RichText::new(format!("{} {nouns} are too many for a command line: use Undo… above.", undo_set.len())).weak(),
             );
         }
         None => {}
     }
     if !undo_set.is_empty() {
-        egui::CollapsingHeader::new(format!("Properties an undo puts back ({})", undo_set.len()))
+        egui::CollapsingHeader::new(format!("{} an undo puts back ({})", if kind == UndoKind::Properties { "Properties" } else { "Categories" }, undo_set.len()))
             .id_salt("undo_set")
             .show(ui, |ui| ui.label(names_list(undo_set)));
     }
@@ -1343,7 +1362,10 @@ impl FleetApp {
         match action {
             AppliedAction::View(file) => self.open_snapshot(ctx, &file, false, false),
             AppliedAction::Copy(text) => ctx.copy_text(text),
-            AppliedAction::Undo(offer) => self.start_undo(offer),
+            AppliedAction::Undo(offer) => match offer.kind {
+                UndoKind::Properties => self.start_undo(offer),
+                UndoKind::Categories => self.start_undo_ext(offer),
+            },
         }
     }
 
@@ -2236,6 +2258,7 @@ mod tests {
     #[test]
     fn an_undo_opens_the_restore_point_limited_to_the_undo_set_and_plans_it_without_writing() {
         let offer = UndoOffer {
+            kind: UndoKind::Properties,
             restore_point: "2026-10-27T172600Z_Z_9_T1_pre-restore.json".into(),
             undo_set: vec!["kNkMAIDCapability_B".into(), "kNkMAIDCapability_A".into()],
             target: target(),
@@ -2350,7 +2373,7 @@ mod tests {
     #[test]
     fn the_undo_button_plans_through_the_worker_and_waits_while_the_camera_is_busy() {
         let (mut app, cmd_rx, _evt_tx, dir) = test_app();
-        let offer = UndoOffer { restore_point: "rp.json".into(), undo_set: vec!["kNkMAIDCapability_A".into()], target: target(), data_dir: dir.path().to_path_buf() };
+        let offer = UndoOffer { kind: UndoKind::Properties, restore_point: "rp.json".into(), undo_set: vec!["kNkMAIDCapability_A".into()], target: target(), data_dir: dir.path().to_path_buf() };
         app.pending = 1;
         app.start_undo(offer.clone());
         assert!(cmd_rx.try_recv().is_err(), "a camera operation is running");
@@ -2567,6 +2590,7 @@ mod tests {
     #[test]
     fn widening_an_undo_to_everything_is_said_in_the_confirmation() {
         let offer = UndoOffer {
+            kind: UndoKind::Properties,
             restore_point: FILE.into(),
             undo_set: vec![world().targets[0].0.clone()],
             target: target(),
@@ -2676,6 +2700,7 @@ mod tests {
     #[test]
     fn an_undo_whose_camera_changed_is_withdrawn_with_a_notice_and_never_becomes_a_full_restore() {
         let offer = UndoOffer {
+            kind: UndoKind::Properties,
             restore_point: "rp.json".into(),
             undo_set: vec!["kNkMAIDCapability_A".into(), "kNkMAIDCapability_B".into()],
             target: target(),
@@ -2722,7 +2747,7 @@ mod tests {
     #[test]
     fn an_undo_is_refused_in_another_data_directory_than_the_one_its_restore_point_is_in() {
         let (mut app, cmd_rx, _evt_tx, dir) = test_app();
-        let mut offer = UndoOffer { restore_point: "rp.json".into(), undo_set: vec!["kNkMAIDCapability_A".into()], target: target(), data_dir: dir.path().to_path_buf() };
+        let mut offer = UndoOffer { kind: UndoKind::Properties, restore_point: "rp.json".into(), undo_set: vec!["kNkMAIDCapability_A".into()], target: target(), data_dir: dir.path().to_path_buf() };
         app.start_undo(offer.clone());
         assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::Plan(PlanJob::Restore(_)))), "the same directory plans");
         let (mut app, cmd_rx, _evt_tx, _dir) = test_app();

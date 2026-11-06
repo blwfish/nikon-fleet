@@ -41,6 +41,11 @@ case "$op" in
     echo '{"type":"result","ok":false,"error":{"tag":"camera_busy","message":"held by another process"}}' >&3 ;;
   transplant-plan)
     echo '{"type":"result","ok":true,"data":{"digest":"abc","summary":"s"}}' >&3 ;;
+  restore-extended-plan)
+    echo '{"type":"result","ok":true,"data":{"digest":"xyz","summary":"s","would_change":1,"items":[]}}' >&3 ;;
+  restore-extended-apply)
+    p plan_verified; p restore_point_written; p writing
+    echo '{"type":"result","ok":true,"data":{"status":"applied_verified","undo_set":["strings"]}}' >&3 ;;
   transplant-apply)
     p plan_verified; p restore_point_written; p writing
     case "$*" in *slow*) echo yes > "$2/writing-emitted"; sleep 8; echo done > "$2/apply-finished" ;; esac
@@ -282,7 +287,7 @@ fn seed_snapshot(dir: &Path, file: &str, model: &str, serial: &str, label: &str,
     s.save_to_file(snaps.join(file)).unwrap();
 }
 
-const READ_ONLY_TOOLS: [&str; 11] = [
+const READ_ONLY_TOOLS: [&str; 12] = [
     "capture_snapshot",
     "check_against_reference",
     "diff_snapshots",
@@ -292,6 +297,7 @@ const READ_ONLY_TOOLS: [&str; 11] = [
     "list_cameras",
     "list_references",
     "list_snapshots",
+    "restore_extended_plan",
     "restore_plan",
     "transplant_plan",
 ];
@@ -302,7 +308,7 @@ const READ_ONLY_TOOLS: [&str; 11] = [
 fn without_enable_writes_the_apply_tools_are_absent_and_a_direct_call_is_refused() {
     let mut s = Server::start(&[]);
     assert_eq!(s.tool_names(), READ_ONLY_TOOLS);
-    for tool in ["transplant_apply", "restore_apply"] {
+    for tool in ["transplant_apply", "restore_apply", "restore_extended_apply"] {
         let r = s.call(tool, json!({"source": "a.json", "serial": "S", "plan_digest": "d", "summary": "s"}));
         assert_eq!(r["error"]["code"], json!(-32602), "{tool}: {r}");
         assert!(r["result"].is_null());
@@ -314,8 +320,10 @@ fn without_enable_writes_the_apply_tools_are_absent_and_a_direct_call_is_refused
 fn with_enable_writes_both_apply_tools_are_registered_and_marked_destructive() {
     let mut s = Server::start(&["--enable-writes"]);
     let names = s.tool_names();
-    assert_eq!(names.len(), 13);
-    assert!(names.contains(&"transplant_apply".to_string()) && names.contains(&"restore_apply".to_string()));
+    assert_eq!(names.len(), 15);
+    for apply in ["transplant_apply", "restore_apply", "restore_extended_apply"] {
+        assert!(names.contains(&apply.to_string()), "{apply}");
+    }
     let list = s.request("tools/list", json!({}));
     for t in list["result"]["tools"].as_array().unwrap() {
         let name = t["name"].as_str().unwrap();
@@ -340,6 +348,13 @@ fn an_empty_only_list_is_refused_by_both_restore_tools_before_any_worker_runs() 
     );
     assert!(is_error(&apply), "{apply}");
     assert_eq!(structured(&apply)["error"]["tag"], json!("empty_selection"));
+    let ext_plan = s.call("restore_extended_plan", json!({"serial": "0000003023668", "source": "snap.json", "only": []}));
+    assert_eq!(structured(&ext_plan)["error"]["tag"], json!("empty_selection"), "{ext_plan}");
+    let ext_apply = s.call(
+        "restore_extended_apply",
+        json!({"serial": "0000003023668", "source": "snap.json", "only": [], "plan_digest": "d", "summary": "s"}),
+    );
+    assert_eq!(structured(&ext_apply)["error"]["tag"], json!("empty_selection"), "{ext_apply}");
     assert!(s.log("args.log").is_empty(), "no worker was started: {}", s.log("args.log"));
 }
 
@@ -516,6 +531,21 @@ fn apply_arguments_reach_the_worker_with_the_digest_and_summary_unchanged() {
     );
     assert_eq!(structured(&r)["status"], json!("applied_verified"), "{r}");
     assert!(s.log("args.log").contains("transplant-apply --serial S --source a.json --allow-raw-code WBAutoType --digest D1 --summary Z 9 S: 3 properties"));
+}
+
+#[test]
+fn the_extended_restore_tools_reach_the_worker_as_their_own_operations_with_categories_and_the_confirmation() {
+    let mut s = Server::start(&["--enable-writes"]);
+    let r = s.call("restore_extended_plan", json!({"source": "a.json", "serial": "S", "only": ["ftp", "strings"]}));
+    assert!(!is_error(&r), "{r}");
+    assert!(s.log("args.log").contains("restore-extended-plan --serial S --source a.json --only ftp --only strings"), "{}", s.log("args.log"));
+    let r = s.call("restore_extended_apply", json!({"source": "a.json", "serial": "S", "plan_digest": "D1", "summary": "Z 9 S: 3 items"}));
+    assert_eq!(structured(&r)["status"], json!("applied_verified"), "{r}");
+    assert!(
+        s.log("args.log").contains("restore-extended-apply --serial S --source a.json --digest D1 --summary Z 9 S: 3 items"),
+        "no `only` is no flag, which the worker reads as every category: {}",
+        s.log("args.log")
+    );
 }
 
 #[test]
@@ -715,6 +745,8 @@ fn input_schemas_are_plain_json_schema() {
     assert_eq!(req("diff_snapshots"), ["a", "b"]);
     assert_eq!(req("restore_apply"), ["plan_digest", "serial", "source", "summary"]);
     assert_eq!(req("transplant_apply"), ["plan_digest", "serial", "source", "summary"]);
+    assert_eq!(req("restore_extended_apply"), ["plan_digest", "serial", "source", "summary"]);
+    assert_eq!(req("restore_extended_plan"), ["serial", "source"]);
     assert_eq!(req("get_usage_guidance"), ["operation"]);
     assert_eq!(req("list_snapshots"), Vec::<String>::new(), "every argument of list_snapshots is optional");
     let gs = list["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == json!("get_snapshot")).unwrap();
