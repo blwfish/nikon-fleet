@@ -96,6 +96,18 @@ reach", and the hint says so. It tests the server side only; whether the camera 
 tested. Plain FTP only (the profile has no known FTPS setting). The SFTP host key is reported (`SHA256:…`), not checked.
 SFTP logs in with a password only.
 
+**SFTP login, in order.** Before any password is sent the test asks the server which login methods it offers (the standard
+SSH "none" probe) and keeps that list. Then it tries the password. If the server refuses it: a server that listed
+`password` gets `login_refused` (a wrong user name or password); a server that did not gets `login_method_not_offered`
+(the message names what it does offer, for example `keyboard-interactive` or `publickey`, and the hint says this test
+cannot sign in to it, not that the profile is wrong); a server that accepted the password but wants a further method
+(partial success) gets `other` with the methods it names; a server that listed nothing gets the plain `login_refused`,
+since an empty list says nothing about passwords. If the probe itself is accepted the server asks for no authentication:
+the login passes, the step detail says so, and no password is sent. The list from the password refusal is not used to
+decide (russh's own server leaves out the method just tried). The decision is made from the typed method list only
+(`refused_password` in `src/ftp_test.rs`), never from message text. In the JSON the step's `kind` can now be
+`login_method_not_offered` (a new value; the GUI shows the message and hint it is given).
+
 Clients: `suppaftp` without TLS for FTP, `russh` and `russh-sftp` (pure Rust, no libssh2 or OpenSSL) for SFTP, driven by a
 current-thread tokio runtime the test creates for itself. About 60 crates are new to the project.
 
@@ -116,4 +128,10 @@ current-thread tokio runtime the test creates for itself. About 60 crates are ne
   address announcements, what they list for a login that may write but not read) is unknown.
 - How an SFTP server that offers only keys, or one that disconnects during the handshake, is reported by `russh`: the
   kinds were set from the library's documented errors and from the test servers, not from real ones.
+- The SFTP login-method probe (above) is **unverified against a real SFTP server**. It was exercised only against russh's
+  own server configured to offer a password only, keyboard-interactive only, publickey only, nothing, partial success,
+  and no authentication. A real server may answer the "none" probe differently (OpenSSH lists its methods and does not
+  list `none`; another may drop the connection on the probe). russh's client reports a connection that closed during
+  authentication as a refusal with an empty list, so a dropped connection cannot be told from "no methods": the password
+  is then still tried, the send fails, and the step reports a failed login (never a wrong password).
 - Whether a real SFTP server answers STAT with a file type. The SFTP folder step now asks the server what the path is (a STAT, nothing is listed) and falls back to opening and reading the folder only when the answer carries no file type bits; the first path is tested against a stand-in server only. A write-only upload folder passes the STAT path (it needs no listing right) but would fail the fallback, which lists the folder.

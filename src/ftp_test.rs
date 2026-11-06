@@ -156,6 +156,9 @@ pub enum FailKind {
     /// The SSH key exchange failed.
     HandshakeFailed,
     LoginRefused,
+    /// SFTP only: the server's own list of login methods does not include a password, which is the only way this
+    /// test signs in. The message names what the server does offer.
+    LoginMethodNotOffered,
     FolderMissing,
     PermissionDenied,
     /// The server said it cannot serve this connection now (FTP 421: too many users, shutting down, ...).
@@ -179,6 +182,7 @@ impl FailKind {
             FailKind::NotThisProtocol => "Something answered but it is not an FTP/SFTP server of the kind chosen. Check the protocol and port.",
             FailKind::HandshakeFailed => "The SSH handshake failed. The server may require key types or ciphers this test does not offer; the message says what it reported.",
             FailKind::LoginRefused => "The server refused this user name and password. Check both; the password is not shown here.",
+            FailKind::LoginMethodNotOffered => "This test can only sign in with a password and the server does not offer password login (the message lists what it does offer). That does not show the profile is wrong; this test cannot sign in to this server. Unverified against a real server.",
             FailKind::FolderMissing => "The folder does not exist or this user cannot enter it. Check the spelling and capitals; it is relative to the login directory unless it starts with /.",
             FailKind::PermissionDenied => "This user is not allowed to do that in the folder (the test file could not be written, read or deleted). The camera needs to write there.",
             FailKind::ServerUnavailable => "The server is there but would not serve this connection just now (it may be full, shutting down, or limiting logins). Try again later; this is not a mistake in the profile.",
@@ -816,6 +820,33 @@ fn ssh_failure(e: &russh::Error) -> Failure {
     fail(kind, format!("{e}"))
 }
 
+/// What a refused SFTP password means, decided from typed data only: the methods the server listed when it was asked
+/// (`offered`, before the password was sent), and from the refusal itself whether more authentication is needed
+/// (`partial_success`) and what the server says to go on with (`next`). No message text is read.
+///
+/// - the password was accepted but the server wants a further method: [`FailKind::Other`] (this test cannot do the rest),
+///   naming `next`;
+/// - "password" among `offered`: a wrong user name or password ([`FailKind::LoginRefused`]);
+/// - otherwise, with at least one method listed: [`FailKind::LoginMethodNotOffered`], naming them;
+/// - nothing listed at all (an empty list says nothing about passwords): the plain refusal, as before.
+///
+/// The "none" entry some servers list is not a login method and is left out of what is named. `next` is not used to
+/// decide whether a password is taken: russh's own server leaves out the method just tried.
+fn refused_password(offered: &russh::MethodSet, next: &russh::MethodSet, partial_success: bool) -> Failure {
+    use russh::MethodKind as M;
+    let names = |set: &russh::MethodSet| -> Vec<&'static str> { set.iter().filter(|m| **m != M::None).map(<&'static str>::from).collect() };
+    if partial_success {
+        let next = names(next);
+        let more = if next.is_empty() { "a further method".to_string() } else { format!("a further method (the server lists: {})", next.join(", ")) };
+        return fail(FailKind::Other, format!("the server accepted the password but wants {more}; this test can only send a password"));
+    }
+    let named = names(offered);
+    if named.is_empty() || offered.contains(&M::Password) {
+        return fail(FailKind::LoginRefused, "the server did not accept that user name and password (SFTP here tries a password only)");
+    }
+    fail(FailKind::LoginMethodNotOffered, format!("the server does not offer password login; it offers: {} (SFTP here tries a password only)", named.join(", ")))
+}
+
 async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder, host_key: &mut Option<String>, left_behind: &mut Option<String>) {
     use russh_sftp::client::SftpSession;
     let t = req.step_timeout;
@@ -859,17 +890,12 @@ async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder,
     *host_key = seen.lock().ok().and_then(|k| k.clone());
     rec.ok(Step::Handshake, host_key.clone().map_or("done".to_string(), |k| format!("host key {k}")));
 
-    // login
-    match within(t, "logging in", handle.authenticate_password(req.username.as_str(), req.password.as_str())).await {
-        Ok(Ok(russh::client::AuthResult::Success)) => rec.ok(Step::Login, format!("accepted {:?}", req.username)),
-        Ok(Ok(russh::client::AuthResult::Failure { .. })) => {
-            // The methods the server lists in its refusal are not used: russh's own server leaves out the one just
-            // tried, so the list cannot say whether the server takes a password at all (it would need a separate
-            // "none" request, not checked against a real server).
-            rec.fail(Step::Login, fail(FailKind::LoginRefused, "the server did not accept that user name and password (SFTP here tries a password only)"));
-            rec.skip_rest();
-            return;
-        }
+    // login: first ask which methods the server offers (the standard "none" probe, before any password is sent), then
+    // try the password. The list in a refusal of the password itself is not used: russh's own server leaves out the
+    // method just tried, so it cannot say whether a password is taken at all.
+    let offered = match within(t, "asking which login methods the server offers", handle.authenticate_none(req.username.as_str())).await {
+        Ok(Ok(russh::client::AuthResult::Success)) => None,
+        Ok(Ok(russh::client::AuthResult::Failure { remaining_methods, .. })) => Some(remaining_methods),
         Ok(Err(e)) => {
             rec.fail(Step::Login, ssh_failure(&e));
             rec.skip_rest();
@@ -880,6 +906,27 @@ async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder,
             rec.skip_rest();
             return;
         }
+    };
+    match offered {
+        None => rec.ok(Step::Login, format!("accepted {:?} (the server asked for no authentication; no password was sent)", req.username)),
+        Some(offered) => match within(t, "logging in", handle.authenticate_password(req.username.as_str(), req.password.as_str())).await {
+            Ok(Ok(russh::client::AuthResult::Success)) => rec.ok(Step::Login, format!("accepted {:?}", req.username)),
+            Ok(Ok(russh::client::AuthResult::Failure { remaining_methods, partial_success })) => {
+                rec.fail(Step::Login, refused_password(&offered, &remaining_methods, partial_success));
+                rec.skip_rest();
+                return;
+            }
+            Ok(Err(e)) => {
+                rec.fail(Step::Login, ssh_failure(&e));
+                rec.skip_rest();
+                return;
+            }
+            Err(f) => {
+                rec.fail(Step::Login, f);
+                rec.skip_rest();
+                return;
+            }
+        },
     }
 
     // sftp subsystem
@@ -1737,6 +1784,7 @@ mod tests {
             FailKind::NotThisProtocol,
             FailKind::HandshakeFailed,
             FailKind::LoginRefused,
+            FailKind::LoginMethodNotOffered,
             FailKind::FolderMissing,
             FailKind::PermissionDenied,
             FailKind::ServerUnavailable,
@@ -1753,6 +1801,7 @@ mod tests {
                 FailKind::NotThisProtocol => "protocol",
                 FailKind::HandshakeFailed => "handshake",
                 FailKind::LoginRefused => "user name and password",
+                FailKind::LoginMethodNotOffered => "does not offer password login",
                 FailKind::FolderMissing => "folder",
                 FailKind::PermissionDenied => "not allowed",
                 FailKind::ServerUnavailable => "would not serve",
@@ -1809,6 +1858,14 @@ mod tests {
         oversize_read: bool,
         /// Answer STAT with a file type (a folder, a file, or no such file). Off: the answer carries a size and no type.
         report_types: bool,
+        /// The login methods the server lists and honours (its russh `methods`). A password is only checked when
+        /// `Password` is among them, as a real server would.
+        methods: &'static [russh::MethodKind],
+        /// Accept the "none" probe: a server that asks for no authentication.
+        accept_none: bool,
+        /// Answer a correct password with "accepted, but more authentication is needed" (partial success), offering
+        /// `methods` as the way on.
+        partial_after_password: bool,
     }
 
     #[derive(Default)]
@@ -1832,9 +1889,18 @@ mod tests {
     impl russh::server::Handler for SshConn {
         type Error = anyhow::Error;
 
+        async fn auth_none(&mut self, _user: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if self.b.accept_none { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+        }
+
         async fn auth_password(&mut self, user: &str, password: &str) -> Result<russh::server::Auth, Self::Error> {
-            Ok(if user == self.b.user && password == self.b.pass {
-                russh::server::Auth::Accept
+            let offered = self.b.methods.contains(&russh::MethodKind::Password);
+            Ok(if offered && user == self.b.user && password == self.b.pass {
+                if self.b.partial_after_password {
+                    russh::server::Auth::Reject { proceed_with_methods: Some(russh::MethodSet::from(&[russh::MethodKind::KeyboardInteractive][..])), partial_success: true }
+                } else {
+                    russh::server::Auth::Accept
+                }
             } else {
                 russh::server::Auth::Reject { proceed_with_methods: None, partial_success: false }
             })
@@ -2003,6 +2069,7 @@ mod tests {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 tx.send(listener.local_addr().unwrap().port()).unwrap();
                 let config = Arc::new(russh::server::Config {
+                    methods: russh::MethodSet::from(server.b.methods),
                     auth_rejection_time: Duration::from_millis(0),
                     auth_rejection_time_initial: Some(Duration::from_millis(0)),
                     keys: vec![russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519).unwrap()],
@@ -2017,7 +2084,7 @@ mod tests {
     }
 
     fn good_sftp() -> SftpBehaviour {
-        SftpBehaviour { user: "fleet", pass: "s3cret!", dirs: vec!["incoming", "incoming/raw"], deny_write: false, corrupt_read: false, deny_delete: false, oversize_read: false, report_types: true }
+        SftpBehaviour { user: "fleet", pass: "s3cret!", dirs: vec!["incoming", "incoming/raw"], deny_write: false, corrupt_read: false, deny_delete: false, oversize_read: false, report_types: true, methods: &[russh::MethodKind::Password], accept_none: false, partial_after_password: false }
     }
 
     #[test]
@@ -2135,6 +2202,112 @@ mod tests {
         let r = run_test(&TestRequest { password: "wrong".into(), ..request(fake_sftp(good_sftp()).port, Protocol::Sftp) });
         let StepOutcome::Failed { message, .. } = &r.failure().unwrap().outcome else { panic!() };
         assert!(message.contains("did not accept that user name and password") && message.contains("password only"), "{message}");
+    }
+
+    fn login_of(r: &TestReport) -> (FailKind, String, String) {
+        let StepOutcome::Failed { kind, message, hint, .. } = &r.steps[3].outcome else { panic!("the login did not fail: {}", r.to_text()) };
+        assert_eq!(r.steps[3].step, Step::Login);
+        (*kind, message.clone(), hint.clone())
+    }
+
+    #[test]
+    fn a_wrong_password_on_a_server_that_offers_a_password_is_login_refused_whatever_else_it_offers() {
+        use russh::MethodKind as M;
+        for methods in [&[M::Password][..], &[M::Password, M::KeyboardInteractive][..], &[M::PublicKey, M::KeyboardInteractive, M::Password][..]] {
+            let srv = fake_sftp(SftpBehaviour { methods: Box::leak(methods.to_vec().into_boxed_slice()), ..good_sftp() });
+            let r = run_test(&TestRequest { password: "wrong".into(), ..request(srv.port, Protocol::Sftp) });
+            let (kind, message, hint) = login_of(&r);
+            assert_eq!(kind, FailKind::LoginRefused, "{methods:?}: {message}");
+            assert!(message.contains("did not accept that user name and password"), "{message}");
+            assert!(hint.contains("user name and password"), "{hint}");
+            assert!(outcomes(&r)[4..].iter().all(|(_, o)| o == "skipped"), "{:?}", outcomes(&r));
+        }
+    }
+
+    #[test]
+    fn a_server_that_does_not_offer_a_password_is_login_method_not_offered_and_names_what_it_offers() {
+        use russh::MethodKind as M;
+        // the right user and password: the refusal is not about them, and the report must not say it is
+        for (methods, named) in [
+            (&[M::KeyboardInteractive][..], "keyboard-interactive"),
+            (&[M::PublicKey][..], "publickey"),
+            (&[M::PublicKey, M::KeyboardInteractive][..], "publickey, keyboard-interactive"),
+        ] {
+            let srv = fake_sftp(SftpBehaviour { methods: Box::leak(methods.to_vec().into_boxed_slice()), ..good_sftp() });
+            let r = run_test(&request(srv.port, Protocol::Sftp));
+            assert!(!r.ok);
+            assert_eq!(outcomes(&r)[3], (Step::Login, "failed:login_method_not_offered".to_string()), "{}", r.to_text());
+            let (_, message, hint) = login_of(&r);
+            assert!(message.contains(&format!("it offers: {named} ")), "{message}");
+            assert!(!message.contains("did not accept that user name"), "{message}");
+            assert!(!message.contains("none"), "the 'none' entry is not a login method and is not named: {message}");
+            assert!(hint.contains("does not offer password login") && hint.contains("Unverified"), "{hint}");
+            assert!(outcomes(&r)[4..].iter().all(|(_, o)| o == "skipped"), "{:?}", outcomes(&r));
+            assert!(!serde_json::to_string(&r).unwrap().contains("s3cret!"));
+        }
+    }
+
+    #[test]
+    fn a_server_that_asks_for_no_authentication_is_accepted_without_sending_the_password() {
+        // the password given is wrong on purpose: it would be refused if it were sent
+        let srv = fake_sftp(SftpBehaviour { accept_none: true, methods: &[russh::MethodKind::KeyboardInteractive], ..good_sftp() });
+        let r = run_test(&TestRequest { password: "wrong".into(), ..request(srv.port, Protocol::Sftp) });
+        assert!(r.ok, "{}", r.to_text());
+        let StepOutcome::Ok { detail } = &r.steps[3].outcome else { panic!() };
+        assert!(detail.contains("accepted") && detail.contains("asked for no authentication") && detail.contains("no password was sent"), "{detail}");
+        assert!(!serde_json::to_string(&r).unwrap().contains("wrong"), "the password is not in the report");
+    }
+
+    #[test]
+    fn a_server_that_lists_no_methods_and_then_drops_the_connection_is_never_reported_as_a_refused_password() {
+        // russh's own server closes the connection after a probe answered with an empty list, and russh's client
+        // reports a connection that closed during authentication as a refusal with an empty list (not as an error), so
+        // an empty list cannot be told from a dropped connection: the password is still tried, the send then fails,
+        // and the report is a failed login that does not blame the user name or password
+        let srv = fake_sftp(SftpBehaviour { methods: &[], ..good_sftp() });
+        let r = run_test(&request(srv.port, Protocol::Sftp));
+        assert!(!r.ok);
+        let (kind, message, _) = login_of(&r);
+        assert_ne!(kind, FailKind::LoginRefused, "{message}");
+        assert!(outcomes(&r)[4..].iter().all(|(_, o)| o == "skipped"), "{:?}", outcomes(&r));
+    }
+
+    #[test]
+    fn a_password_that_is_accepted_but_needs_a_further_method_is_other_and_says_so() {
+        let srv = fake_sftp(SftpBehaviour { partial_after_password: true, ..good_sftp() });
+        let r = run_test(&request(srv.port, Protocol::Sftp));
+        let (kind, message, _) = login_of(&r);
+        assert_eq!(kind, FailKind::Other, "{message}");
+        assert!(message.contains("accepted the password but wants a further method") && message.contains("keyboard-interactive"), "{message}");
+        assert!(!message.contains("did not accept"), "{message}");
+    }
+
+    #[test]
+    fn refused_password_decides_from_the_offered_methods_alone() {
+        use russh::MethodKind as M;
+        let set = |m: &[M]| russh::MethodSet::from(m);
+        let k = |m: &[M], partial: bool| refused_password(&set(m), &set(&[]), partial);
+        // password listed (in any position, with anything else) -> a wrong password
+        assert_eq!(k(&[M::Password], false).kind, FailKind::LoginRefused);
+        assert_eq!(k(&[M::PublicKey, M::Password], false).kind, FailKind::LoginRefused);
+        // password not listed -> not offered, and the others are named in the server's order
+        let f = k(&[M::KeyboardInteractive, M::PublicKey], false);
+        assert_eq!(f.kind, FailKind::LoginMethodNotOffered);
+        assert!(f.message.contains("it offers: keyboard-interactive, publickey "), "{}", f.message);
+        // 'none' is not a login method: left out of the names, and a list of nothing else says nothing
+        let f = k(&[M::None, M::KeyboardInteractive], false);
+        assert_eq!(f.kind, FailKind::LoginMethodNotOffered);
+        assert!(f.message.contains("it offers: keyboard-interactive ") && !f.message.contains("none"), "{}", f.message);
+        assert_eq!(k(&[M::None], false).kind, FailKind::LoginRefused);
+        assert_eq!(k(&[], false).kind, FailKind::LoginRefused);
+        // partial success wins over everything, with or without a list
+        assert_eq!(k(&[M::Password], true).kind, FailKind::Other);
+        assert_eq!(k(&[], true).kind, FailKind::Other);
+        assert!(k(&[], true).message.contains("wants a further method;"), "{}", k(&[], true).message);
+        assert_eq!(k(&[M::KeyboardInteractive], true).kind, FailKind::Other);
+        // what it says to go on with is named from the refusal's own list, not the probe's
+        let f = refused_password(&set(&[M::Password]), &set(&[M::None, M::PublicKey]), true);
+        assert!(f.message.contains("(the server lists: publickey)"), "{}", f.message);
     }
 
     #[test]
