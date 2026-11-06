@@ -229,7 +229,7 @@ enum Cmd {
     /// the camera holds what was sent. In one session it reads the property's descriptor (refusing a
     /// property that is not a read-write string right now) and its current value, which it prints so
     /// the change can be undone. `--dry-run` shows the current value and sends nothing. No other
-    /// property can be written with this. Confirmed over USB on a Z 9, a Z6III and a Z 5 for the image comment only; see the handoff doc. Artist and Copyright have never been written on any body, so they are refused unless `--force-unconfirmed-model` is given.
+    /// property can be written with this. Confirmed over USB on a Z 9, a Z6III and a Z 5 for all three properties (limits 36 characters for Artist and Image comment, 54 for Copyright; one more is refused and leaves the value unchanged); see the handoff doc.
     VendorSetString(VendorSetStringArgs),
     /// Show what each recent nikon-fleet process (CLI, GUI, MCP server) was doing, from the
     /// diagnostics files they leave behind: the operation in flight when one hung or was killed, how
@@ -764,9 +764,7 @@ struct VendorSetStringArgs {
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
     serial: Option<String>,
-    /// Write to a model outside the confirmed list (Z 9, Z6III, Z 5), and write Artist or Copyright:
-    /// only the image comment (0xD090) has been confirmed on any body, so those two are refused
-    /// without this.
+    /// Write to a model outside the confirmed list (Z 9, Z6III, Z 5); it is refused without this.
     #[arg(long)]
     force_unconfirmed_model: bool,
     /// Read and print the current value and what would change, then stop. Sends no write. Runs the

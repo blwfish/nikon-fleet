@@ -639,7 +639,21 @@ The Z5 has no FTP profile operations, but the standard property operations work 
   read from the camera byte-identical to the bytes saved beforehand. A 37-character value was refused with
   `InvalidDevicePropFormat` (`0x201B`) and left the value byte-identical: the same limit and refusal as the Z9 and Z6III.
 - The Z5 is now in `STRING_PROP_WRITE_MODELS` (Z9, Z6III, Z5). The Z8 is not: it has never been tried. The gate is the pair
-  (property, model): only the image comment (`0xD090`) is in `STRING_PROP_WRITE_CONFIRMED_PROPS`, so an Artist or Copyright write needs
-  `--force-unconfirmed-model` on every body until one is run (`PtpUsbError::PropWriteUnconfirmed`).
+  (property, model) (`check_string_write_gate`). Until 2026-11-06 only the image comment (`0xD090`) was in
+  `STRING_PROP_WRITE_CONFIRMED_PROPS`, so Artist and Copyright needed `--force-unconfirmed-model`
+  (`PtpUsbError::PropWriteUnconfirmed`). They were then run on the Z 9, Z6III and Z5 (below) and are in the list now.
 - Still not done on any body: artist and copyright writes; whether the Z5 and Z6III keep only the low byte of each
   character (the writer refuses text above U+00FF); IPTC.
+
+### Artist and Copyright writes on the Z 9, Z6III and Z5 (2026-11-06)
+
+Run with `vendor-set-string --force-unconfirmed-model` (then the gate was widened). On each of the three bodies, for Artist (`0xD072`)
+and Copyright (`0xD073`): a short value, a value of the full width with a Latin-1 `é`, then one character more, then the original
+restored exactly, each followed by a dry-run read of the stored value.
+- **Limits:** Artist 36 characters, Copyright 54, the same on all three. One character more is refused with `InvalidDevicePropFormat`
+  (`0x201B`) and the stored value is unchanged (no truncation). The full-width value is stored and read back identical, `é` included
+  (so the camera keeps the low byte of each character, as it does for the image comment).
+- **Originals restored byte for byte** (Z 9: `Brian L Wong` / `(c)Brian L Wong 2026`; Z5: `Brian L Wong` / `(c)2026`; Z6III: the space-padded
+  leftovers `Artist modified…` to 36 and `Copyright modified…` to 54).
+- The image comment is unchanged by these runs. The Z5 has no FTP profiles and no IPTC (its operation list has no `0x90E8`..`0x90EF` or
+  `0x9413`; `0xD060` is `DevicePropNotSupported`; the owner confirms neither is in its menus).

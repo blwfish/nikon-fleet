@@ -164,17 +164,19 @@ const VENDOR_OP_QUERY_PARAM2: u32 = 0;
 pub const STRING_PROPS: [(u16, &str); 3] = [(0xD072, "Artist"), (0xD073, "Copyright"), (0xD090, "Image comment")];
 
 /// Models [`PtpUsbSession::set_string_property`] accepts without `force_unconfirmed_model`. A USB write
-/// of the image comment (`0xD090`) was confirmed on all three, 2026-11-05: written, read back in a
-/// separate session, and restored byte for byte, with a 37-character value refused. Artist and
-/// copyright writes have not been run on any of them. The Z 8 and other bodies are not listed.
+/// of the image comment (`0xD090`) was confirmed on all three, 2026-11-05, and of Artist (`0xD072`) and
+/// Copyright (`0xD073`) on all three, 2026-11-06: written, read back (in a separate session for the
+/// image comment), restored byte for byte, with a value one character over the limit (36 / 54 / 36)
+/// refused with `InvalidDevicePropFormat` and the stored value unchanged. The Z 8 and other bodies are not listed.
 pub const STRING_PROP_WRITE_MODELS: &[&str] = &["Z 9", "Z6_3", "Z 5"];
 
 /// The properties of [`STRING_PROPS`] whose USB write was actually run on the models in
-/// [`STRING_PROP_WRITE_MODELS`]: only the image comment (`0xD090`). Artist (`0xD072`) and Copyright
-/// (`0xD073`) writes were never run on any body, so they need `force_unconfirmed_model` like an
-/// unconfirmed model does. The gate is the pair (property, model); a test keeps this list inside
-/// [`STRING_PROPS`].
-pub const STRING_PROP_WRITE_CONFIRMED_PROPS: &[u16] = &[0xD090];
+/// [`STRING_PROP_WRITE_MODELS`]: all three now (image comment 2026-11-05; Artist and Copyright on the
+/// Z 9, Z6III and Z 5 2026-11-06). A property in [`STRING_PROPS`] but not in this list would need
+/// `force_unconfirmed_model`, like an unconfirmed model does: the gate is the pair (property, model),
+/// kept as [`check_string_write_gate`] so the mechanism stays tested for the next property or body. A test keeps
+/// this list inside [`STRING_PROPS`].
+pub const STRING_PROP_WRITE_CONFIRMED_PROPS: &[u16] = &[0xD072, 0xD073, 0xD090];
 
 /// The slot `0x90EB` reports when the camera has no *active* FTP profile.
 /// **Not** "no profile stored": on 2026-11-05 a Z9 that the owner says holds
@@ -497,12 +499,25 @@ fn string_prop_name(propcode: u16) -> String {
 
 fn prop_write_unconfirmed_text(propcode: u16, model: &str) -> String {
     format!(
-        "writing {} ({propcode:#06x}) was never run on any camera (only {} writes were confirmed, on {:?}); \
+        "writing {} ({propcode:#06x}) has not been confirmed on a camera (confirmed: {}, on {:?}); \
          pass --force-unconfirmed-model to try it on this {model:?}",
         string_prop_name(propcode),
         STRING_PROP_WRITE_CONFIRMED_PROPS.iter().map(|c| string_prop_name(*c)).collect::<Vec<_>>().join(", "),
         STRING_PROP_WRITE_MODELS,
     )
+}
+
+/// The write gate of `vendor-set-string`: the model must be in `models` (checked first, so the error names
+/// the real cause), then the property in `confirmed`. Both lists are parameters so the mechanism is tested
+/// with lists that differ; the session passes [`STRING_PROP_WRITE_MODELS`] and [`STRING_PROP_WRITE_CONFIRMED_PROPS`].
+fn check_string_write_gate(model: &str, propcode: u16, models: &[&str], confirmed: &[u16]) -> Result<(), PtpUsbError> {
+    if !models.contains(&model) {
+        return Err(PtpUsbError::UnconfirmedModel(model.to_string()));
+    }
+    if !confirmed.contains(&propcode) {
+        return Err(PtpUsbError::PropWriteUnconfirmed { propcode, model: model.to_string() });
+    }
+    Ok(())
 }
 
 impl PtpUsbError {
@@ -3158,12 +3173,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     ) -> Result<StringPropPlan, PtpUsbError> {
         check_string_prop_known(propcode)?;
         if !force_unconfirmed_model {
-            if !STRING_PROP_WRITE_MODELS.contains(&self.model()) {
-                return Err(PtpUsbError::UnconfirmedModel(self.model().to_string()));
-            }
-            if !STRING_PROP_WRITE_CONFIRMED_PROPS.contains(&propcode) {
-                return Err(PtpUsbError::PropWriteUnconfirmed { propcode, model: self.model().to_string() });
-            }
+            check_string_write_gate(self.model(), propcode, STRING_PROP_WRITE_MODELS, STRING_PROP_WRITE_CONFIRMED_PROPS)?;
         }
         let bad = |why: String| PtpUsbError::PropValueBad { propcode, why };
         // Observed on a Z 9 (2026-11-05): the camera keeps only the LOW BYTE of each UTF-16 unit of
@@ -3208,7 +3218,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// The camera's length limit for each property is not known here: nothing is truncated by this
     /// code, and a camera that truncates shows up as `verified == false` with the read-back text.
     /// Models outside [`STRING_PROP_WRITE_MODELS`], and properties outside
-    /// [`STRING_PROP_WRITE_CONFIRMED_PROPS`] (Artist and Copyright: never run on any body), are
+    /// [`STRING_PROP_WRITE_CONFIRMED_PROPS`] (all three today), are
     /// refused unless `force_unconfirmed_model`. Text is refused before anything is sent if it has a
     /// character above U+00FF (the camera keeps one byte per character) or any `char::is_control`
     /// character, which includes U+007F and the C1 range U+0080..=U+009F even though those are
@@ -6711,8 +6721,8 @@ mod tests {
         assert_eq!((plan.propcode, plan.previous.as_str()), (0xD090, "old"));
         let ops: Vec<u16> = sent_ops(&t).iter().filter(|(k, ..)| *k == CONTAINER_COMMAND).map(|(_, op, _)| *op).collect();
         assert_eq!(ops, vec![OP_GET_DEVICE_PROP_DESC, OP_GET_DEVICE_PROP_VALUE], "no 0x1016");
-        // A read-only descriptor, text outside Latin-1, a control character, the model gate and the
-        // unconfirmed property are each refused, as the real write refuses them.
+        // A read-only descriptor, text outside Latin-1, a control character and the model gate are each
+        // refused, as the real write refuses them (the property gate has its own test with lists that differ).
         let (mut s, _t) = session(two(0), "Z 9");
         assert!(matches!(s.plan_string_property(0xD090, "new", false), Err(PtpUsbError::PropNotWritable { .. })));
         for bad in ["\u{65e5}", "a\nb", "a\u{7f}b"] {
@@ -6723,15 +6733,16 @@ mod tests {
         let (mut s, t) = session(vec![], "Z 8");
         assert!(matches!(s.plan_string_property(0xD090, "x", false), Err(PtpUsbError::UnconfirmedModel(_))));
         let (mut s, _t) = session(vec![], "Z 9");
-        assert!(matches!(s.plan_string_property(0xD072, "x", false), Err(PtpUsbError::PropWriteUnconfirmed { propcode: 0xD072, .. })));
         assert!(matches!(s.plan_string_property(0x1234, "x", false), Err(PtpUsbError::PropWriteUnsupported { propcode: 0x1234, .. })));
         assert!(t.sent().is_empty());
-        // Forcing passes the two gates (the descriptor is still read).
-        let (mut s, _t) = session(
-            vec![data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(0xD072, 0xFFFF, 1)), resp(RESP_OK), data_c(OP_GET_DEVICE_PROP_VALUE, &prop_str("")), resp(RESP_OK)],
-            "Z 9",
-        );
-        assert_eq!(s.plan_string_property(0xD072, "x", true).unwrap().propcode, 0xD072);
+        // Artist passes without the force flag (the descriptor is still read), and forcing changes nothing.
+        for force in [false, true] {
+            let (mut s, _t) = session(
+                vec![data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(0xD072, 0xFFFF, 1)), resp(RESP_OK), data_c(OP_GET_DEVICE_PROP_VALUE, &prop_str("")), resp(RESP_OK)],
+                "Z 9",
+            );
+            assert_eq!(s.plan_string_property(0xD072, "x", force).unwrap().propcode, 0xD072, "force={force}");
+        }
     }
 
     #[test]
@@ -8807,7 +8818,7 @@ mod tests {
         // Dropping an entry, renaming "Z6_3" (the real Z6III string) or adding an unconfirmed body each
         // changes what a camera is allowed to receive: the lists are contract, so they are spelled out.
         assert_eq!(STRING_PROP_WRITE_MODELS, ["Z 9", "Z6_3", "Z 5"]);
-        assert_eq!(STRING_PROP_WRITE_CONFIRMED_PROPS, [0xD090]);
+        assert_eq!(STRING_PROP_WRITE_CONFIRMED_PROPS, [0xD072, 0xD073, 0xD090]);
     }
 
     #[test]
@@ -8821,23 +8832,41 @@ mod tests {
         }
     }
 
+    /// Artist and Copyright were run on the Z 9, Z6III and Z 5 (2026-11-06, limits 36 / 54, restored byte for
+    /// byte), so every string property is written without the force flag on every confirmed model.
     #[test]
-    fn artist_and_copyright_writes_need_the_force_flag_on_every_model_and_send_nothing_without_it() {
+    fn every_string_property_is_written_without_force_on_every_confirmed_model() {
         for model in STRING_PROP_WRITE_MODELS {
-            for code in [0xD072u16, 0xD073] {
-                let (mut s, t) = session(set_script(1, "a", RESP_OK, "b"), model);
-                let err = s.set_string_property(code, "b", false).unwrap_err();
-                assert!(
-                    matches!(&err, PtpUsbError::PropWriteUnconfirmed { propcode, model: m } if *propcode == code && m == model),
-                    "{model} {code:#x}: {err:?}"
-                );
-                assert!(t.sent().is_empty(), "{model} {code:#x}: nothing may be sent");
-                let text = err.to_string();
-                assert!(text.contains("never run") && text.contains("--force-unconfirmed-model"), "{text}");
-                let (mut s, _t) = session(set_script_for(code, 1, "a", RESP_OK, "b"), model);
-                assert!(s.set_string_property(code, "b", true).unwrap().verified, "{model} {code:#x} forced");
+            for (code, _) in STRING_PROPS {
+                let (mut s, t) = session(set_script_for(code, 1, "a", RESP_OK, "b"), model);
+                assert!(s.set_string_property(code, "b", false).unwrap().verified, "{model} {code:#x}");
+                assert_eq!(sent_ops(&t)[2], (CONTAINER_COMMAND, OP_SET_DEVICE_PROP_VALUE, le(u32::from(code))), "{model} {code:#x}");
             }
         }
+    }
+
+    /// The (property, model) mechanism, with lists that differ (nothing in the real lists is unconfirmed any
+    /// more): an unlisted property is `PropWriteUnconfirmed` on a listed model, an unlisted model is
+    /// `UnconfirmedModel` first, and a listed pair passes. Each side of each membership test is pinned.
+    #[test]
+    fn the_write_gate_checks_the_model_first_then_the_property() {
+        let models = ["Z 9", "Z 5"];
+        let confirmed = [0xD090u16];
+        assert!(check_string_write_gate("Z 9", 0xD090, &models, &confirmed).is_ok());
+        assert!(check_string_write_gate("Z 5", 0xD090, &models, &confirmed).is_ok());
+        for code in [0xD072u16, 0xD073] {
+            let err = check_string_write_gate("Z 9", code, &models, &confirmed).unwrap_err();
+            assert!(matches!(&err, PtpUsbError::PropWriteUnconfirmed { propcode, model } if *propcode == code && model == "Z 9"), "{err:?}");
+            let text = err.to_string();
+            assert!(text.contains("has not been confirmed") && text.contains("--force-unconfirmed-model"), "{text}");
+        }
+        // an unlisted model fails on the model even for an unconfirmed property
+        for code in [0xD090u16, 0xD072] {
+            assert!(matches!(check_string_write_gate("Z 8", code, &models, &confirmed), Err(PtpUsbError::UnconfirmedModel(m)) if m == "Z 8"));
+        }
+        // empty lists refuse everything
+        assert!(check_string_write_gate("Z 9", 0xD090, &[], &confirmed).is_err());
+        assert!(check_string_write_gate("Z 9", 0xD090, &models, &[]).is_err());
     }
 
     #[test]

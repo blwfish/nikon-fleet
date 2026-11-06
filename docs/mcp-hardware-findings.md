@@ -946,6 +946,15 @@ four normal runs say "exited cleanly" (disconnect 1.5 s). The camera ended on in
 the rate follows camera uptime or power cycles (the Z 9 batch went from 10/20 to 0/10 after a power cycle), and whether the
 MAID `DisconnectDevice` hang depends on the property written.
 
+### The Z 9 did not hang in a fresh sitting (2026-11-06, Z_9_3023668, firmware 5.31)
+
+The same loop, 10 applies alternating 612/613, the day the Z 9 was plugged in again: all 10 `applied_verified`, exit 0, **0 of 10
+reached the watchdog**; every `disconnect_device` span was `ok` in 1.5-1.6 s. Each run took 18.4-19.7 s of wall time (the Z6III: 5.9 s
+for a normal run), and the extra time is not in the disconnect, so it is spent in the SDK start-up and enumeration of this body
+(not investigated). With the earlier Z 9 batch (10 of 20 hung before a power cycle, 0 of 10 after) and the Z6III's 4 of 10, the
+common factor still looks like camera state (uptime or how long it has been on USB), not the property written or the body model; a
+direct test needs a body left on USB for hours and the loop repeated.
+
 ## F13. Still unverified
 
 - Whether `available` / `connected_pid` can be obtained, and what they mean while another process

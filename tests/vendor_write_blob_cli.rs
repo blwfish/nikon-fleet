@@ -61,10 +61,14 @@ fn the_exit_four_advice_does_not_send_the_reader_to_a_camera_they_have_not_tried
 }
 
 #[test]
-fn vendor_set_string_help_says_artist_and_copyright_need_the_force_flag() {
+fn vendor_set_string_help_says_all_three_properties_are_confirmed_and_only_other_models_need_the_force_flag() {
     let help = help_of(&["vendor-set-string"]);
-    assert!(help.contains("Artist and Copyright have never been written on any body"), "{help}");
-    assert!(help.contains("refused without this"), "{help}");
+    // Artist and Copyright were run on the Z 9, Z6III and Z 5 (2026-11-06): the old "never been written" claim is gone.
+    assert!(!help.contains("never been written"), "{help}");
+    assert!(help.contains("for all three properties"), "{help}");
+    // The force flag is now only for a model outside the confirmed list.
+    assert!(help.contains("Write to a model outside the confirmed list (Z 9, Z6III, Z 5)"), "{help}");
+    assert!(!help.contains("and write Artist or Copyright"), "{help}");
     assert!(help.contains("Runs the same checks as the write"), "--dry-run is documented as validating: {help}");
 }
 
