@@ -511,10 +511,13 @@ Exit status: 0 read and printed; 1 any error (camera busy, no such camera, malfo
 
 const VENDOR_WRITE_HELP: &str = "\
 Exit status:
-  0  the camera accepted the profile (see the note printed after it, if any)
-  1  any other error; nothing was sent to the camera unless the message says so
+  0  the camera accepted the profile and a read-back of slot 0 showed exactly what was sent
+  1  any other error, including a write refused before anything was sent (a camera holding no profile
+     refuses the replace of slot 0; use `vendor-write-ftp-blob --slot 0 --param2 1` to add one); nothing
+     was sent to the camera unless the message says so
   2  command-line usage error
-  4  the profile data was sent but the write then failed: the camera MAY have changed.
+  4  the camera MAY have changed: the profile data was sent but the write then failed, or the camera
+     answered OK but the read-back did not match, could not be decoded or could not be read.
      Read the list back before retrying (`vendor-read-ftp --slot 0`, or the camera's menu): a write that
      took effect put its profile at the front, slot 0
   --port is the u16 written AFTER the password (8080 in every profile read from a camera, probably a
@@ -1743,10 +1746,15 @@ fn cmd_vendor_write_ftp_blob(args: &VendorWriteFtpBlobArgs) -> Result<()> {
     if let Some(note) = ftp_receipt_note(&outcome.receipt) {
         eprintln!("{note}");
     }
-    match ftp_blob_unconfirmed(&outcome.verification) {
+    ftp_verification_result(&outcome.verification)
+}
+
+/// `Ok` when the read-back confirmed an FTP-profile write, else the exit-4 error. The camera answered OK, so
+/// this is not a refusal, but nothing shows the profile is what was sent: the same status as a write that failed
+/// after the data went out (the camera MAY have changed).
+fn ftp_verification_result(v: &nikon_fleet::ptp_usb::FtpWriteVerification) -> Result<()> {
+    match ftp_blob_unconfirmed(v) {
         None => Ok(()),
-        // The camera answered OK, so this is not a refusal, but nothing shows the profile is what was sent:
-        // the same status as a write that failed after the data went out (the camera MAY have changed).
         Some(why) => Err(ExitCodeError {
             code: EXIT_WRITE_INDETERMINATE,
             message: format!(
@@ -2547,18 +2555,26 @@ fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
         return Ok(());
     }
 
-    let receipt = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
-        nikon_fleet::ptp_usb::write_ftp_profile_locked(lock, serial, &profile, args.force_unconfirmed_model)
+    // A guarded replace of slot 0 (what this command has always sent) with the read-back of the blob write:
+    // the camera's OK shows little, so only a read-back that matches is a clean finish.
+    let outcome = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        nikon_fleet::ptp_usb::write_ftp_profile_verified_locked(
+            lock,
+            serial,
+            &profile,
+            &nikon_fleet::ptp_usb::FtpCameraNetwork::CAPTURED,
+            args.force_unconfirmed_model,
+        )
     })
         .map_err(|e| match e.downcast::<nikon_fleet::ptp_usb::PtpUsbError>() {
             Ok(e) => vendor_write_error(e),
             Err(other) => other,
         })?;
     println!("{}", ftp_write_success_text(&args.profile_name, &args.username, &args.host, args.port));
-    if let Some(note) = ftp_receipt_note(&receipt) {
+    if let Some(note) = ftp_receipt_note(&outcome.receipt) {
         eprintln!("{note}");
     }
-    Ok(())
+    ftp_verification_result(&outcome.verification)
 }
 
 /// What `vendor-write-ftp` prints for a write the camera answered OK to. `port` is the u16 the encoder
@@ -5616,6 +5632,25 @@ mod tests {
         assert!(undecodable.contains("READ-BACK UNDECODABLE"), "{undecodable}");
         let failed = ftp_blob_outcome_text(&outcome_with(V::ReadBackFailed { error: PtpUsbError::NoDataPhase { op: 0x90ED } }));
         assert!(failed.contains("READ-BACK FAILED") && failed.contains("neither confirmed nor contradicted"), "{failed}");
+    }
+
+    /// The encoder-path write (`vendor-write-ftp`) ends like the blob write: only a verified read-back is exit 0,
+    /// every other verification is exit 4 ("the camera MAY have changed").
+    #[test]
+    fn a_verified_write_is_a_clean_finish_and_every_other_verification_is_exit_4() {
+        use nikon_fleet::ptp_usb::{FtpWriteVerification as V, PtpUsbError};
+        assert!(ftp_verification_result(&V::Verified { count_after: 4 }).is_ok());
+        let others = [
+            V::Mismatch { count_after: 4, count_expected: 4, differing_fields: vec!["host"] },
+            V::Mismatch { count_after: 5, count_expected: 4, differing_fields: vec![] },
+            V::ReadBackUndecodable { error: PtpUsbError::NoDataPhase { op: 0x90ED } },
+            V::ReadBackFailed { error: PtpUsbError::NoDataPhase { op: 0x90ED } },
+        ];
+        for v in &others {
+            let e = ftp_verification_result(v).expect_err("an unconfirmed write is an error");
+            assert_eq!(exit_code_for(&e), 4, "{v:?}");
+            assert!(e.to_string().contains("MAY have changed"), "{e}");
+        }
     }
 
     /// #14: a string write the camera accepted but whose read-back differs (it stored something else) or

@@ -19,10 +19,11 @@ fn vendor_write_ftp_help_documents_every_exit_status_it_can_return() {
     let help = help_of(&["vendor-write-ftp"]);
     assert!(help.contains("Exit status:"), "{help}");
     for line in [
-        "0  the camera accepted the profile",
+        "0  the camera accepted the profile and a read-back of slot 0 showed exactly what was sent",
         "1  any other error",
         "2  command-line usage error",
-        "4  the profile data was sent but the write then failed: the camera MAY have changed",
+        "4  the camera MAY have changed: the profile data was sent but the write then failed, or the camera",
+        "answered OK but the read-back did not match",
     ] {
         assert!(help.contains(line), "{line:?} missing from:\n{help}");
     }
