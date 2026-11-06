@@ -67,8 +67,9 @@ pub struct SnapshotView {
     pub property_count: usize,
     pub page: Page,
     pub properties: Vec<PropertyView>,
-    /// The owner strings and FTP profiles, when the snapshot holds them. For an agent, so secrets are
-    /// always masked here, whatever a person may reveal in a viewer.
+    /// The owner strings and FTP profiles, when the snapshot holds them, on the FIRST page only (`offset` 0): it is the
+    /// same section whatever the page or filter, and a reader walking the properties would otherwise be sent it again
+    /// with every page. For an agent, so secrets are always masked here, whatever a person may reveal in a viewer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extended: Option<crate::ops::render_extended::RenderedExtended>,
 }
@@ -93,7 +94,7 @@ pub fn snapshot_view(s: &Snapshot, name_contains: Option<&str>, offset: usize, l
             .iter()
             .map(|(n, e)| PropertyView { name: (*n).clone(), code: e.code, value: e.value.clone() })
             .collect(),
-        extended: s.extended.as_ref().map(|e| crate::ops::render_extended::render_extended(e, false)),
+        extended: s.extended.as_ref().filter(|_| offset == 0).map(|e| crate::ops::render_extended::render_extended(e, false)),
     }
 }
 
@@ -126,7 +127,7 @@ pub struct DiffView {
 }
 
 pub fn diff_view(d: &Diff, offset: usize, limit: usize) -> DiffView {
-    let total = d.changed.len() + d.only_in_a.len() + d.only_in_b.len() + d.extended.len();
+    let total = d.difference_count();
     let (start, end, page) = window(total, offset, limit);
     let entry = |i: usize| -> DiffEntry {
         if i < d.changed.len() {
@@ -326,6 +327,15 @@ mod tests {
         assert!(json.contains("\"rig\""));
         assert!(!json.contains("hunter2-pass") && !json.contains("wifi-key-xyz"), "an agent must not receive the secrets: {json}");
         assert!(!serde_json::to_string(&snapshot_view(&snap(2), None, 0, 100)).unwrap().contains("extended"), "absent when the snapshot has none");
+
+        // First page only: the section is not repeated with every page of the properties.
+        let first = snapshot_view(&s, None, 0, 1);
+        assert!(first.extended.is_some() && first.page.total == 2 && first.properties.len() == 1);
+        for offset in [1, 2, 100] {
+            let later = snapshot_view(&s, None, offset, 1);
+            assert!(later.extended.is_none(), "offset {offset}");
+        }
+        assert!(snapshot_view(&s, Some("no-such-property"), 0, 10).extended.is_some(), "a filter that matches nothing still starts at offset 0");
     }
 
     #[test]
@@ -348,6 +358,20 @@ mod tests {
         let json = serde_json::to_value(&last.entries[0]).unwrap();
         assert_eq!(json["kind"], "extended");
         assert_eq!(json["difference"], "changed", "the entry's own field does not collide with the tag");
+    }
+
+    #[test]
+    fn the_check_report_count_and_the_diff_view_total_are_the_same_number() {
+        use crate::extended_diff::{ExtendedChange, ExtendedChangeKind};
+        use crate::ops::baseline::GateOutcome;
+        use crate::ops::capture::CaptureStats;
+        let mut d = diff_of(2, 1, 3);
+        d.extended.push(ExtendedChange { item: "E".into(), difference: ExtendedChangeKind::Changed, a: None, b: None });
+        let reference = snap(1);
+        let report = crate::ops::check::CheckReport::new(reference.camera.clone(), &reference, GateOutcome::Passed, CaptureStats::default(), d.clone());
+        assert_eq!(report.differences, 7);
+        assert_eq!(report.differences, diff_view(&d, 0, 100).page.total);
+        assert_eq!(report.differences, d.difference_count());
     }
 
     #[test]

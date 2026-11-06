@@ -45,6 +45,8 @@ pub enum CheckError {
     /// reads: indistinguishable from an interrupted capture, so not compared.
     FirmwareShortfall { shortfall: FirmwareShortfall, stats: CaptureStats },
     Diff(DiffError),
+    /// The reference is an edited copy, not a reading from a camera (see [`require_captured_reference`]).
+    EditedReference,
 }
 
 impl CheckError {
@@ -54,6 +56,7 @@ impl CheckError {
             CheckError::Incomplete { .. } => "capture_incomplete",
             CheckError::FirmwareShortfall { .. } => "firmware_shortfall",
             CheckError::Diff(DiffError::ModelMismatch { .. }) => "model_mismatch",
+            CheckError::EditedReference => "edited_reference",
         }
     }
 }
@@ -75,6 +78,7 @@ impl std::fmt::Display for CheckError {
                  if the same capabilities are missing again, tell the user: the baseline needs re-seeding for the new firmware."
             ),
             CheckError::Diff(e) => write!(f, "{e}"),
+            CheckError::EditedReference => write!(f, "the reference {}", crate::gui_argv::EditedCopyRefused),
         }
     }
 }
@@ -87,13 +91,30 @@ impl CheckError {
         match self {
             CheckError::Incomplete { missing, stats } => Some(incomplete_detail(missing, stats)),
             CheckError::FirmwareShortfall { shortfall, stats } => Some(shortfall_detail(shortfall, stats)),
-            CheckError::NothingReadable { .. } | CheckError::Diff(_) => None,
+            CheckError::NothingReadable { .. } | CheckError::Diff(_) | CheckError::EditedReference => None,
         }
     }
 }
 
+/// A reference must be a reading from a camera: an edited copy is a hand-made file, and a body "matching" it
+/// (or not) says nothing about the camera. `ref set` refuses to promote one; this is the same rule
+/// (`gui_argv::refuse_edited_reference`) applied where a reference is USED, since a file can be placed in
+/// `references/` by hand. The CLI's `check` and the worker's both call it.
+pub fn require_captured_reference(reference: &Snapshot) -> Result<(), CheckError> {
+    crate::gui_argv::refuse_edited_reference(reference).map_err(|_| CheckError::EditedReference)
+}
+
+/// Diff a reference against a live MAID capture. The live capture cannot carry an extended section, so the
+/// reference's own section is left out of the comparison (otherwise every reference captured with one would
+/// show it as an `only_in_a` difference and the gate would fail permanently). The CLI's `check` and the
+/// worker's both compare through this one function, so the decision cannot be made twice.
+pub fn compare_to_live(reference: &Snapshot, live: &Snapshot, schema: &MaidLayerConfig) -> Result<Diff, DiffError> {
+    diff_with_schema(reference, live, &DiffOptions::for_live_maid_capture(), schema)
+}
+
 pub fn check<P: CameraPort + ?Sized>(port: &P, req: &CheckRequest<'_>) -> Result<CheckReport, CheckError> {
     crate::diag::scoped(crate::diag::Subsystem::Snapshot, "check", crate::diag::Class::Top, &[], |_span| {
+        require_captured_reference(req.reference)?;
         let mut live = Snapshot::new(req.live_camera.clone(), Transport::Usb, req.captured_at.clone());
         live.label = Some("live".into());
         let stats = capture(port, req.name_lookup, &mut live);
@@ -107,9 +128,7 @@ pub fn check<P: CameraPort + ?Sized>(port: &P, req: &CheckRequest<'_>) -> Result
         if let Some(shortfall) = firmware_shortfall(&live, &verdict) {
             return Err(CheckError::FirmwareShortfall { shortfall, stats });
         }
-        // The live capture is MAID only; a reference's extended section is not a difference from it.
-        let opts = DiffOptions { skip_extended: true, ..Default::default() };
-        let d = diff_with_schema(req.reference, &live, &opts, req.schema).map_err(CheckError::Diff)?;
+        let d = compare_to_live(req.reference, &live, req.schema).map_err(CheckError::Diff)?;
         Ok(CheckReport::new(req.live_camera.clone(), req.reference, verdict, stats, d))
     })
 }
@@ -118,7 +137,7 @@ impl CheckReport {
     /// The one place this value is built, so the CLI's `check --json` and the worker's `check`
     /// result cannot drift apart.
     pub fn new(camera: Camera, reference: &Snapshot, gate: GateOutcome, stats: CaptureStats, diff: Diff) -> Self {
-        let differences = diff.changed.len() + diff.only_in_a.len() + diff.only_in_b.len() + diff.extended.len();
+        let differences = diff.difference_count();
         CheckReport {
             camera,
             reference_label: reference.label.clone(),
@@ -341,5 +360,64 @@ mod tests {
         }
         let sc = schema();
         assert_eq!(check(&cam, &req(&reference, &names, &sc)).unwrap().differences, 0);
+    }
+
+    fn with_extended(mut reference: Snapshot) -> Snapshot {
+        use crate::extended::{Extended, FtpState, ReadFrom};
+        reference.extended = Some(Extended {
+            read_from: ReadFrom { model: "Z 9".into(), usb_serial: "1".into() },
+            props: Default::default(),
+            iptc: Default::default(),
+            ftp: FtpState::NotOnModel,
+        });
+        reference
+    }
+
+    #[test]
+    fn a_reference_with_an_extended_section_is_not_different_from_a_maid_only_live_capture() {
+        // Every new capture carries an extended section; the live `check` capture never does. If the
+        // section were compared, it would show as an `only_in_a` difference and the gate would fail forever.
+        let (cam, names, reference) = z9();
+        let reference = with_extended(reference);
+        let sc = schema();
+        let r = check(&cam, &req(&reference, &names, &sc)).unwrap();
+        assert_eq!(r.differences, 0, "{:?}", r.diff.extended);
+        assert!(r.diff.extended.is_empty());
+        assert!(r.diff.is_empty());
+    }
+
+    #[test]
+    fn compare_to_live_leaves_the_reference_extended_section_out_and_the_default_options_do_not() {
+        // The CLI's `check` calls compare_to_live (same function as the worker's); pin that it skips the
+        // section, and that the unrestricted diff of the same pair does report it (so the pin is not vacuous).
+        let (_, _, reference) = z9();
+        let reference = with_extended(reference);
+        let mut live = Snapshot::new(z9_camera(), Transport::Usb, "2026-10-27T12:00:00Z".into());
+        for (k, p) in &reference.properties {
+            live.insert(k.clone(), p.code, p.value.clone());
+        }
+        let sc = schema();
+        assert!(compare_to_live(&reference, &live, &sc).unwrap().is_empty());
+        let full = crate::diff::diff(&reference, &live, &DiffOptions::default()).unwrap();
+        assert_eq!(full.extended.len(), 1);
+        assert_eq!(full.difference_count(), 1);
+    }
+
+    #[test]
+    fn an_edited_copy_is_refused_as_a_reference_before_the_camera_is_read() {
+        let (_, names, reference) = z9();
+        let copy = crate::snapshot_edit::copy_for_edit(&reference, "ref.json", Some("copy"), "2026-02-02T00:00:00Z");
+        assert!(copy.is_edited());
+        let sc = schema();
+        // A camera that has nothing: if the capture ran first this would be `NothingReadable`.
+        let err = check(&FakeCamera::new(), &req(&copy, &names, &sc)).unwrap_err();
+        assert!(matches!(err, CheckError::EditedReference), "{err:?}");
+        assert_eq!(err.tag(), "edited_reference");
+        assert!(err.to_string().contains(&crate::gui_argv::EditedCopyRefused.to_string()), "{err}");
+        assert!(err.detail().is_none());
+        // The captured reference it was copied from is accepted by the same call.
+        assert!(require_captured_reference(&reference).is_ok());
+        let (cam, ..) = z9();
+        assert!(check(&cam, &req(&reference, &names, &sc)).is_ok());
     }
 }

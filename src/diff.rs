@@ -61,7 +61,14 @@ pub struct Diff {
 impl Diff {
     /// True when there are no differences.
     pub fn is_empty(&self) -> bool {
-        self.changed.is_empty() && self.only_in_a.is_empty() && self.only_in_b.is_empty() && self.extended.is_empty()
+        self.difference_count() == 0
+    }
+
+    /// The number of differences: property changes, properties on one side only, and extended differences.
+    /// The ONE sum; `CheckReport::differences`, `views::diff_view` and `is_empty` all consume it, so a new
+    /// kind of difference is added here and counted everywhere.
+    pub fn difference_count(&self) -> usize {
+        self.changed.len() + self.only_in_a.len() + self.only_in_b.len() + self.extended.len()
     }
 }
 
@@ -103,6 +110,15 @@ pub struct DiffOptions {
     /// a capture that cannot have one, such as `check`'s live MAID capture: its absent section is not a
     /// difference. Default: false (compare them).
     pub skip_extended: bool,
+}
+
+impl DiffOptions {
+    /// The options for comparing a reference against a live MAID capture (`check`, CLI and worker alike).
+    /// The live capture is MAID only and cannot carry an extended section, so the reference's section is
+    /// not a difference from it. The ONE place that decides this: see `ops::check::compare_to_live`.
+    pub fn for_live_maid_capture() -> Self {
+        DiffOptions { skip_extended: true, ..Default::default() }
+    }
 }
 
 /// Whether two captured property values differ, for the purposes of `diff`.

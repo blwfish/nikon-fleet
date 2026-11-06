@@ -355,6 +355,7 @@ fn transplant_apply_refuses_an_unsafe_source_even_with_a_valid_confirmation() {
 #[test]
 fn plan_and_apply_report_camera_busy_without_loading_the_sdk() {
     let (d, src) = data_dir_with_source();
+    let ext = add_source_with_extended_section(d.path());
     let lock_dir = tempfile::tempdir().unwrap();
     let schema = schema_or_stand_in(lock_dir.path());
     let lock_path = lock_dir.path().join("camera.lock");
@@ -368,8 +369,8 @@ fn plan_and_apply_report_camera_busy_without_loading_the_sdk() {
         vec!["check", "--serial", "0000003023668"],
         vec!["restore-plan", "--serial", "0000003023668", "--source", &src],
         vec!["restore-apply", "--serial", "0000003023668", "--source", &src, "--digest", "d", "--summary", "s"],
-        vec!["restore-extended-plan", "--serial", "0000003023668", "--source", &src],
-        vec!["restore-extended-apply", "--serial", "0000003023668", "--source", &src, "--digest", "d", "--summary", "s"],
+        vec!["restore-extended-plan", "--serial", "0000003023668", "--source", &ext],
+        vec!["restore-extended-apply", "--serial", "0000003023668", "--source", &ext, "--digest", "d", "--summary", "s"],
     ] {
         let mut w = spawn(&global, &op, &env);
         let r = w.read();
@@ -377,6 +378,51 @@ fn plan_and_apply_report_camera_busy_without_loading_the_sdk() {
         assert_eq!(r.progress, ["starting"], "{op:?}");
         assert_eq!(w.finish().0, Some(1));
     }
+}
+
+/// Write `ext.json` beside `source.json`: the same snapshot with an (empty) extended section, the one thing an
+/// extended restore needs from its source before it needs a camera.
+fn add_source_with_extended_section(data_dir: &std::path::Path) -> String {
+    use nikon_fleet::extended::{Extended, FtpState, ReadFrom};
+    let snaps = data_dir.join("snapshots");
+    let mut s = nikon_fleet::snapshot::Snapshot::load_from_file(snaps.join("source.json")).unwrap();
+    s.extended = Some(Extended {
+        read_from: ReadFrom { model: "Z6_3".into(), usb_serial: "SRC".into() },
+        props: Default::default(),
+        iptc: Default::default(),
+        ftp: FtpState::NotOnModel,
+    });
+    s.save_to_file(snaps.join("ext.json")).unwrap();
+    "ext.json".to_string()
+}
+
+#[test]
+fn an_extended_restore_of_a_snapshot_with_no_extended_section_is_refused_before_the_camera_lock_is_taken() {
+    // The lock is held, so any op that reached it would answer `camera_busy`: the refusal comes first.
+    let (d, src) = data_dir_with_source();
+    let lock_dir = tempfile::tempdir().unwrap();
+    let lock_path = lock_dir.path().join("camera.lock");
+    let _held = CameraLock::acquire_at(&lock_path).unwrap();
+    let env = [("NIKON_FLEET_CAMERA_LOCK", lock_path.to_str().unwrap())];
+    for op in [
+        vec!["restore-extended-plan", "--serial", "0000003023668", "--source", &src],
+        vec!["restore-extended-apply", "--serial", "0000003023668", "--source", &src, "--digest", "d", "--summary", "s"],
+    ] {
+        let mut w = spawn(&g(d.path()), &op, &env);
+        let r = w.read();
+        assert_eq!(err_tag(&r), "snapshot_has_no_extended", "{op:?}");
+        assert_eq!(r.progress, ["starting"], "{op:?}");
+    }
+    // The CLI says the same thing, with the refusal exit status, also before it looks for a camera.
+    use nikon_fleet::exit_status::EXIT_REFUSED_BEFORE_WRITE;
+    let o = common::cli(BIN)
+        .args(["--data-dir", d.path().to_str().unwrap(), "restore-extended", "--dry-run"])
+        .arg(&src)
+        .env("NIKON_FLEET_CAMERA_LOCK", lock_path.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(EXIT_REFUSED_BEFORE_WRITE), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("has no extended section"), "{}", String::from_utf8_lossy(&o.stderr));
 }
 
 // ── restore-plan / restore-apply: what is refused before any camera ──
@@ -502,6 +548,39 @@ fn the_extended_restore_ops_refuse_what_needs_no_camera_before_touching_one() {
     // A serial that names no body.
     let mut w = spawn(&g(d.path()), &["restore-extended-plan", "--serial", "id-3", "--source", &src], &[]);
     assert_eq!(err_tag(&w.read()), "no_usb_serial");
+}
+
+/// The CLI's `restore-extended` and the worker's `restore-extended-plan` assemble their input through one function
+/// (`extended_restore_input::prepare`). This runs the same refusals through both real binaries' entry points and
+/// checks that the tag, the message and the exit status agree. Both refuse before opening any camera.
+#[test]
+fn the_cli_and_the_worker_refuse_the_same_extended_restore_selections_the_same_way() {
+    use nikon_fleet::exit_status::EXIT_REFUSED_BEFORE_WRITE;
+    let (d, src) = data_dir_with_source();
+    for bad in ["Nope", "string", "all", "", "ftp,iptc", "Copyright"] {
+        let mut w = spawn(&g(d.path()), &["restore-extended-plan", "--serial", "0000003023668", "--source", &src, "--only", bad], &[]);
+        let r = w.read();
+        let (tag, message) = match &r.end {
+            ReadEnd::Result(Outcome::Err { error, .. }) => (error.tag.clone(), error.message.clone()),
+            other => panic!("{bad:?}: {other:?}"),
+        };
+        assert_eq!(tag, "unknown_category", "{bad:?}");
+
+        let o = common::cli(BIN)
+            .args(["--data-dir", d.path().to_str().unwrap(), "--sdk-bundle", "/nonexistent/sdk", "restore-extended", "--dry-run"])
+            .arg(&src)
+            .args(["--serial", "0000003023668", "--only", bad])
+            .output()
+            .expect("spawn CLI");
+        let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.status.code(), Some(EXIT_REFUSED_BEFORE_WRITE), "{bad:?}: {stderr}");
+        assert!(stderr.contains(&message), "{bad:?}: the CLI must give the worker's message {message:?}, got {stderr}");
+    }
+    // A selection both accept parses identically: neither reports a category error (they go on to need a camera).
+    for good in [["--only", "strings"], ["--only", "FTP"]] {
+        let mut w = spawn(&g(d.path()), &["restore-extended-plan", "--serial", "0000003023668", "--source", &src, good[0], good[1]], &[]);
+        assert_ne!(match &w.read().end { ReadEnd::Result(Outcome::Err { error, .. }) => error.tag.clone(), _ => String::new() }, "unknown_category");
+    }
 }
 
 #[test]

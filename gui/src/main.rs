@@ -21,7 +21,6 @@ use nikon_fleet::ops::plan::planned_would_change;
 use nikon_fleet::ops::render::{self, Row, RowFilter};
 use nikon_fleet::ops::render_extended::{self, RenderedExtended};
 use nikon_fleet::ops::target::{is_id_fallback, storable_serial};
-use nikon_fleet::ptp_usb;
 use nikon_fleet::settings::{self, Settings};
 
 use crate::menu::{Bar, Entry, MenuAction, menus};
@@ -430,15 +429,14 @@ impl SnapListing {
     }
 }
 
-/// Where the snapshots and the references live under the data directory: the one spelling in this crate (the CLI
-/// has its own private copy in `src/main.rs`, and the MCP server a third; a library function both could consume
-/// is what would end that, and is not in this crate to add).
+/// Where the snapshots and the references live under the data directory: the library's one spelling
+/// (`ops::paths`), which the CLI also uses.
 pub(crate) fn snapshots_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("snapshots")
+    nikon_fleet::ops::paths::snapshots_dir(data_dir)
 }
 
 pub(crate) fn references_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("references")
+    nikon_fleet::ops::paths::references_dir(data_dir)
 }
 
 /// List `snapshots/` through the library's `ops::list::list_dir` (the CLI's `ls --json`
@@ -7467,7 +7465,7 @@ mod tests {
             (E::SessionPoisoned { cause: "x".into() }, false),
             (E::UnconfirmedModel("Z 5".into()), false),
             (E::PropNotWritable { propcode: 0xD090, get_set: 0 }, false),
-            (E::FtpWriteRefused { slot: 9, param2: 1, why: ptp_usb::FtpWriteRefusal::SlotHangsCamera }, false),
+            (E::FtpWriteRefused { slot: 9, param2: 1, why: nikon_fleet::ptp_usb::FtpWriteRefusal::SlotHangsCamera }, false),
         ];
         for (err, indeterminate) in errors {
             let kind = write_kind_of_ptp_usb_error(&err);

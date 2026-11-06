@@ -8,6 +8,7 @@ use cli_report::not_written_error;
 // The MCP server's child process; it takes an inherited file descriptor, which Windows has no
 // equivalent of here (fleet-mcp is unix-only too).
 #[cfg(unix)]
+mod extended_restore_input;
 mod worker_cmd;
 
 use std::collections::HashMap;
@@ -45,7 +46,7 @@ use nikon_fleet::maid_layer::MaidLayerConfig;
 use nikon_fleet::ops::cameras::{describe_device, duplicate_models};
 use nikon_fleet::ops::capture::{self as ops_capture, CaptureStats};
 use nikon_fleet::ops::firmware_latest::{LatestReport, ModelSurvey, survey_json, survey_models, watch_models};
-use nikon_fleet::ops::paths::{checked_reference_filename, is_safe_path_component, write_atomic};
+use nikon_fleet::ops::paths::{checked_reference_filename, is_safe_path_component, references_dir, snapshots_dir, write_atomic};
 use nikon_fleet::ops::list::{EntryState, Listing, list_dir};
 use nikon_fleet::ops::labels::{self, Labels};
 use nikon_fleet::ops::render;
@@ -177,6 +178,7 @@ enum Cmd {
     /// computed, or the one named by --expect-digest and --expect-summary. A restore point is written before the first
     /// write; restoring from it undoes the restore. The FTP list is rebuilt by deleting every stored profile and adding
     /// the snapshot's, so use --dry-run first.
+    #[command(after_help = RESTORE_EXTENDED_HELP)]
     RestoreExtended(RestoreExtendedArgs),
 
     /// Copy settings from a snapshot onto a live camera of a possibly
@@ -256,17 +258,22 @@ enum Cmd {
     /// own (a clock, a counter) are set aside. Reads files only; no camera.
     VendorSweepDiff(VendorSweepDiffArgs),
     /// EXPERIMENTAL, read-only. Send `0x9412(<slot>)` (the IPTC profile read, the pair of the write `0x9413`) and print the
-    /// bytes it returns as hex, plus a best-effort split into `[u32 length][UTF-8]` entries. Never sent over USB before
-    /// 2026-11-06. Changes nothing on the camera.
+    /// bytes it returns as hex, plus the 12-byte header and a best-effort split of what follows into
+    /// `[u32 length][UTF-8]` entries. First sent over USB on 2026-11-06 (a Z 9 and a Z6III). Changes nothing on the camera.
     VendorReadIptc(VendorReadIptcArgs),
-    /// EXPERIMENTAL. Write one IPTC slot with `0x9413(<slot>)`. Each `--entry` is one `[u32 length][UTF-8]` entry of the
-    /// data phase, in order (an empty string is an empty entry). The slot is read first and again after, in the same
-    /// session, and both are printed. It changes the camera. Confirmed only on a Z6III by replaying a captured blob; any
-    /// other model needs `--force-unconfirmed-model`. `--dry-run` prints the data phase and sends nothing.
+    /// EXPERIMENTAL. Write one IPTC slot with `0x9413(<slot>)`. The data phase is the 12-byte header every slot carries
+    /// (a Z 9 refused a write without it) followed by one `[u32 length][UTF-8]` entry per `--entry`, in order (an empty
+    /// string is an empty entry); the first entry is the preset's name, then the 14 fields. `--data-hex` sends the
+    /// bytes you give instead, header and all. The slot is read first and again after, in the same session, and both are
+    /// printed; the command exits 4 unless the read-back is exactly what was sent. It changes the camera. A write was
+    /// confirmed on a Z 9 and a Z6III (read back identical, 2026-11-06); any other model needs
+    /// `--force-unconfirmed-model`. `--dry-run` prints the data phase and sends nothing (and checks no model).
     VendorWriteIptc(VendorWriteIptcArgs),
     /// EXPERIMENTAL. Write a one-byte property with the standard `SetDevicePropValue` and read it back: 0xD053
     /// EnableCopyright (0 or 1) or 0xD060 IPTC preset (0..=13; 0 is none, and it changes which IPTC profile the camera
-    /// embeds in photos). The value before is printed so it can be put back. Model-gated like the other writes.
+    /// embeds in photos). The value before is printed so it can be put back. Model-gated like the other writes: a write
+    /// of 0xD053 was confirmed on a Z 5 and of 0xD060 on a Z6III only (`BYTE_PROP_WRITE_MODELS`), anything else needs
+    /// `--force-unconfirmed-model`. Exits 4 unless the read-back is exactly what was written.
     VendorSetByteProp(VendorSetBytePropArgs),
     #[command(after_help = VENDOR_SET_STRING_HELP)]
     /// EXPERIMENTAL. Write one string property (0xD072 Artist, 0xD073 Copyright, 0xD090 Image
@@ -426,7 +433,8 @@ enum EditCmd {
     FtpDelete { file: String, index: usize },
     /// Move an FTP profile so that it ends at position TO; the others shift. (Restoring a reordered list rebuilds it.)
     FtpMove { file: String, from: usize, to: usize },
-    /// Show one FTP profile of an edited copy (the password and the Wi-Fi key are masked unless `--reveal`).
+    /// Show one FTP profile of a stored snapshot, an edited copy or one read from a camera (the password and the Wi-Fi key
+    /// are masked unless `--reveal`). Changes nothing.
     FtpShow {
         file: String,
         index: usize,
@@ -484,13 +492,14 @@ struct FtpFieldArgs {
     /// Read the password from standard input (one trailing newline removed).
     #[arg(long)]
     password_stdin: bool,
-    /// The server's port (21 for FTP, 22 for SFTP by convention).
+    /// The server's port, 1 to 65535 (21 for FTP, 22 for SFTP by convention).
     #[arg(long)]
     port: Option<u16>,
     /// `ftp` or `sftp`.
     #[arg(long, value_parser = ["ftp", "sftp"])]
     protocol: Option<String>,
-    /// The second port (probably a proxy port).
+    /// The second port (probably a proxy port): 0 to 65535. Unlike `--port` (1 to 65535) a 0 is accepted here; what the
+    /// camera does with it is unverified.
     #[arg(long)]
     proxy_port: Option<u16>,
 }
@@ -499,9 +508,7 @@ impl FtpFieldArgs {
     fn to_fields(&self) -> Result<nikon_fleet::ftp_edit::ProfileFields> {
         use nikon_fleet::ftp_edit::{ProfileFields, Protocol};
         let password = if self.password_stdin {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf).context("reading the password from stdin")?;
-            Some(strip_single_trailing_newline(buf))
+            Some(read_password_stdin()?)
         } else {
             self.password.clone()
         };
@@ -694,6 +701,20 @@ A dry run that names a property which cannot be restored (--only) prints its pla
 With --json, a refusal's message leaves out the advice to pass --allow-partial or to use another
 command: a program reading it cannot act on that.";
 
+const RESTORE_EXTENDED_HELP: &str = "\
+Exit status (differs from `restore` in one place: a restore that wrote but whose read-back did not confirm everything
+exits 1 here, where `restore` exits 0 and leaves the verdict to the report's `status`):
+  0  done: a dry run was printed, or an apply whose read-back confirmed every write (`applied_verified`)
+  1  any other error: no camera could be used, or an apply that wrote but did not fully take (the report printed above
+     the message says which items)
+  2  command-line usage error: nothing ran
+  4  a write may or may not have taken effect: read the body again (`snapshot`) before deciding what to do
+  5  the plan no longer matches the body, so nothing was written: --expect-digest was given and the body or the
+     snapshot differs from that plan, or the body changed between this run's own plan and its apply
+  6  refused before it could write anything (also for a dry run): the snapshot has no extended section, --only names
+     something that is not a category, the snapshot is of another body, the body could not be read, or the restore
+     point could not be written";
+
 const DEVICE_INFO_HELP: &str = "\
 Read-only: sends only the standard GetDeviceInfo (0x1001) inside a PTP session and changes nothing
 on the camera. The last line compares the PTP SerialNumber with the USB iSerialNumber:
@@ -737,7 +758,8 @@ Exit status:
      answered OK but the read-back did not match, could not be decoded or could not be read.
      Read the list (`vendor-read-ftp --slot 0`, or the camera's menu) BEFORE retrying: a repeated add
      stores a duplicate, and a repeated replace of a slot above 0 hits whichever profile is there now
-Write rules (Z 9, 2026-11-05; the read-back is not yet verified on a Z6III):
+Write rules (found on a Z 9, 2026-11-05; not re-derived on a Z6III or any other model, though a write is confirmed on
+a Z 9 and a Z6III, `FTP_WRITE_CONFIRMED_MODELS`):
   --slot N --param2 0   replace the stored profile N (N below the count); it moves to the FRONT (slot 0)
                         and the profiles that were in front of it shift down; the count stays
   --slot COUNT --param2 1  add a profile at the FRONT; the count rises by one
@@ -872,13 +894,16 @@ struct VendorOpSupportArgs {
     serial: Option<String>,
 }
 
-/// Hex digits (optional spaces) to bytes, for the probe's `--data`.
+/// Hex digits (whitespace allowed anywhere) to bytes, for the probe's `--data` and the IPTC write's `--data-hex`. The ONE
+/// command-line hex reader: the decoding is `extended::hex_decode`; this adds the whitespace rule and refuses an empty
+/// payload. Empty is refused for both flags, since "no digits" is not a payload anyone means: the probe's way to send no
+/// data phase is to leave `--data` out, and an IPTC slot is blanked with `--entry ''`, not with zero bytes.
 fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     let t: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if t.is_empty() || t.len() % 2 != 0 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("{s:?} is not an even number of hex digits"));
+    if t.is_empty() {
+        return Err(format!("{s:?} holds no hex digits; an empty payload is not accepted (leave the flag out for none)"));
     }
-    Ok((0..t.len()).step_by(2).map(|i| u8::from_str_radix(&t[i..i + 2], 16).expect("hex digits checked")).collect())
+    nikon_fleet::extended::hex_decode(&t).map_err(|e| format!("{s:?} is not an even number of hex digits: {e}"))
 }
 
 #[derive(Args, Debug)]
@@ -942,8 +967,8 @@ struct FtpTestArgs {
     profile: Option<usize>,
     #[arg(long, allow_hyphen_values = true, required_unless_present = "snapshot")]
     host: Option<String>,
-    /// Default: 21 for FTP, 22 for SFTP.
-    #[arg(long)]
+    /// 1 to 65535. Default: 21 for FTP, 22 for SFTP.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
     port: Option<u16>,
     /// `ftp` or `sftp`. Default: ftp.
     #[arg(long, value_parser = ["ftp", "sftp"])]
@@ -1019,13 +1044,14 @@ struct VendorWriteIptcArgs {
     /// One entry of the data phase; repeat the flag, in order. Use `--entry ''` for an empty one.
     #[arg(long = "entry", allow_hyphen_values = true)]
     entries: Vec<String>,
-    /// Send these bytes as the data phase instead of encoding `--entry` values: hex digits, spaces allowed.
+    /// Send these bytes as the data phase instead of encoding `--entry` values, header included: hex digits, spaces allowed,
+    /// not empty.
     #[arg(long, conflicts_with = "entries")]
     data_hex: Option<String>,
     /// Print the data phase and send nothing (nothing is read from the camera either).
     #[arg(long)]
     dry_run: bool,
-    /// Write to a model an IPTC write has not been confirmed on.
+    /// Write to a model outside `IPTC_WRITE_CONFIRMED_MODELS` (a Z 9 and a Z6III are the confirmed ones).
     #[arg(long)]
     force_unconfirmed_model: bool,
     /// Camera serial to target; same rules as vendor-read's --serial.
@@ -1324,14 +1350,6 @@ struct TransplantArgs {
 // Layout helpers
 // ─────────────────────────────────────────────────────────────────────────
 
-fn snapshots_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("snapshots")
-}
-
-fn references_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("references")
-}
-
 /// Where `vendor-sweep` keeps its dumps. Not `snapshots/`: a listing of snapshots must not meet a file that is not one.
 fn sweeps_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("sweeps")
@@ -1465,13 +1483,20 @@ fn print_diff_human(a: &Snapshot, b: &Snapshot, d: &Diff) {
     }
 }
 
-/// Snapshots are addressable by absolute path OR by basename inside snapshots/.
-fn resolve_snapshot_path(data_dir: &Path, p: &Path) -> PathBuf {
+/// A file named on the command line, for the commands that read what an earlier command saved: an absolute path, or a path
+/// that exists as given (relative to the working directory, which therefore wins over `dir` for a name that exists in
+/// both), else the name inside `dir`. The ONE rule: snapshots and sweeps are both resolved by it.
+fn resolve_in_dir(dir: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() || p.exists() {
         p.to_path_buf()
     } else {
-        snapshots_dir(data_dir).join(p)
+        dir.join(p)
     }
+}
+
+/// Snapshots are addressable by absolute path OR by name inside snapshots/ ([`resolve_in_dir`]).
+fn resolve_snapshot_path(data_dir: &Path, p: &Path) -> PathBuf {
+    resolve_in_dir(&snapshots_dir(data_dir), p)
 }
 
 fn cmd_ls(data_dir: &Path, args: &LsArgs) -> Result<()> {
@@ -1636,8 +1661,8 @@ fn cmd_edit(data_dir: &Path, sub: &EditCmd) -> Result<()> {
         EditCmd::FtpMove { file, from, to } => say(&edit_in_place(&snaps, file, |s| edit::ftp_move(s, *from, *to, &now)).map_err(refuse)?),
         EditCmd::FtpShow { file, index, reveal } => {
             let path = nikon_fleet::ops::paths::resolve_existing(&snaps, file).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
-            let mut snap = Snapshot::load_from_file(&path).with_context(|| format!("loading {}", path.display()))?;
-            let v = nikon_fleet::ftp_edit::profile_view(&mut snap, *index).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
+            let snap = Snapshot::load_from_file(&path).with_context(|| format!("loading {}", path.display()))?;
+            let v = nikon_fleet::ftp_edit::profile_view(&snap, *index).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
             let mask = |s: &str| if *reveal { s.to_string() } else { "*".repeat(s.chars().count()) };
             println!("profile {index}: {:?}", v.name);
             println!("  Wi-Fi name {:?}   Wi-Fi key {}", v.wifi_name, mask(&v.wifi_key));
@@ -2152,15 +2177,29 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
     nikon_fleet::process_exit::exit_now(0)
 }
 
+/// What a count of items could not be turned into, and a list read only in part, appended to a status phrase: the one
+/// status line must not say "3 FTP profile(s)" of a list in which one profile will not decode or the camera listed more
+/// than was read.
+fn caveats(undecodable: Option<usize>, what: &str, truncated: bool) -> String {
+    let mut out = String::new();
+    if let Some(n) = undecodable.filter(|&n| n > 0) {
+        out.push_str(&format!(", {n} {what} undecodable"));
+    }
+    if truncated {
+        out.push_str(", read only in part");
+    }
+    out
+}
+
 /// The one status line for the extended section of a capture.
 fn extended_line(s: &nikon_fleet::extended::ExtendedSummary) -> String {
     let ftp = match (s.ftp.as_str(), s.ftp_profiles) {
-        ("read", Some(n)) => format!("{n} FTP profile(s)"),
+        ("read", Some(n)) => format!("{n} FTP profile(s){}", caveats(s.ftp_profiles_undecodable, "profile(s)", s.ftp_truncated)),
         ("not_on_model", _) => "no FTP profiles on this model".to_string(),
         _ => "FTP profiles not read".to_string(),
     };
     let iptc = match (s.iptc.as_str(), s.iptc_presets_in_use) {
-        ("read", Some(n)) => format!("{n} IPTC preset(s) in use"),
+        ("read", Some(n)) => format!("{n} IPTC preset(s) in use{}", caveats(s.iptc_slots_undecodable, "slot(s)", s.iptc_truncated)),
         ("not_on_model", _) => "no IPTC on this model".to_string(),
         _ => "IPTC not read".to_string(),
     };
@@ -2496,41 +2535,107 @@ fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
     out
 }
 
-/// `vendor-get-prop`: one standard-PTP property read, printed as bytes (and as a string when the
-/// bytes are one). Read-only.
+/// An IPTC slot's bytes for a person: the hex, then what they are. A preset-kind record (the 12-byte header, 15 entries) is
+/// shown decoded by the strict decoder (`iptc::decode_iptc_slot`, the one the snapshot viewer uses); a record of another
+/// kind is named with its length; bytes the decoder refuses are split best-effort, with the reason and with nothing
+/// hidden (the unsplit tail is printed).
+fn iptc_text(data: &[u8]) -> String {
+    use nikon_fleet::iptc::{IPTC_FIELDS, IPTC_HEADER_LEN, IptcRecord, decode_iptc_slot};
+    use nikon_fleet::ptp_usb::hex_bytes;
+    let mut out = format!("{} byte(s): {}\n", data.len(), hex_bytes(data));
+    match decode_iptc_slot(data) {
+        Ok(IptcRecord::Preset(p)) => {
+            out.push_str(&format!("  preset name: {:?}\n", p.name));
+            for (field, value) in IPTC_FIELDS.iter().zip(&p.fields) {
+                if !value.is_empty() {
+                    out.push_str(&format!("  {field}: {value:?}\n"));
+                }
+            }
+            if p.is_empty() {
+                out.push_str("  (an empty preset)\n");
+            }
+        }
+        Ok(IptcRecord::Other { kind, body_len }) => {
+            out.push_str(&format!("  a record of kind {kind} ({body_len} byte(s) after the {IPTC_HEADER_LEN}-byte header); its layout is not known\n"));
+        }
+        Err(why) => {
+            out.push_str(&format!("  not a preset this program can decode ({why}); best-effort split of the bytes after the {IPTC_HEADER_LEN}-byte header:\n"));
+            let body = data.get(IPTC_HEADER_LEN..).unwrap_or(data);
+            let (entries, rest) = split_length_prefixed(body);
+            for (i, e) in entries.iter().enumerate() {
+                out.push_str(&format!("  entry {i}: {e:?}\n"));
+            }
+            if !rest.is_empty() {
+                out.push_str(&format!("  {} byte(s) after the last whole entry: {}\n", rest.len(), hex_bytes(rest)));
+            }
+        }
+    }
+    out
+}
+
 fn print_iptc_bytes(data: &[u8]) {
-    println!("{} byte(s): {}", data.len(), nikon_fleet::ptp_usb::hex_bytes(data));
-    let (entries, rest) = split_length_prefixed(data);
-    for (i, e) in entries.iter().enumerate() {
-        println!("  entry {i}: {e:?}");
+    print!("{}", iptc_text(data));
+}
+
+/// Add what a failed camera write was doing to its error. "The camera MAY have changed" goes only on an error the exit
+/// status table says leaves that open (`write_kind_of_ptp_usb_error`: the data was sent and the reply or the check
+/// failed); a refusal before anything was sent says only what was being written.
+fn with_write_context(e: anyhow::Error, doing: String, recheck: &str) -> anyhow::Error {
+    let may_have_changed = e
+        .downcast_ref::<nikon_fleet::ptp_usb::PtpUsbError>()
+        .is_some_and(|p| nikon_fleet::exit_status::write_kind_of_ptp_usb_error(p).code() == EXIT_WRITE_INDETERMINATE);
+    if may_have_changed {
+        e.context(format!("{doing}; if the reply never came the camera MAY have changed: {recheck}"))
+    } else {
+        e.context(doing)
     }
-    if !rest.is_empty() {
-        println!("  {} byte(s) after the last whole entry: {}", rest.len(), nikon_fleet::ptp_usb::hex_bytes(rest));
+}
+
+/// The exit-4 error for a one-byte property write the read-back did not confirm. Names the property that was written
+/// (`BYTE_PROPS`) and says whether the read-back disagreed or could not be done.
+fn byte_prop_unverified(r: &nikon_fleet::ptp_usb::BytePropReceipt) -> Option<ExitCodeError> {
+    if r.verified() {
+        return None;
     }
+    let name = nikon_fleet::ptp_usb::BYTE_PROPS.iter().find(|(c, ..)| *c == r.propcode).map_or("the property", |(_, n, _)| *n);
+    let message = match &r.read_back {
+        Ok(_) => format!("the camera answered OK but {name} reads back as something other than what was written"),
+        Err(_) => format!("the camera answered OK but {name} could not be read back, so the write is neither confirmed nor contradicted"),
+    };
+    Some(ExitCodeError { code: EXIT_WRITE_INDETERMINATE, message })
 }
 
 fn cmd_vendor_set_byte_prop(args: &VendorSetBytePropArgs) -> Result<()> {
     let r = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
         nikon_fleet::ptp_usb::set_byte_property_locked(lock, serial, args.prop, args.value, args.force_unconfirmed_model)
     })
-    .with_context(|| format!("writing property {:#06x} over USB PTP; if the reply never came the camera MAY have changed: read it with vendor-get-prop", args.prop))?;
+    .map_err(|e| with_write_context(e, format!("writing property {:#06x} over USB PTP", args.prop), "read it with vendor-get-prop"))?;
     println!("{:#06x} was {}; wrote {}", r.propcode, nikon_fleet::ptp_usb::hex_bytes(&r.previous), r.written);
     match &r.read_back {
         Ok(b) => println!("read back {}: {}", nikon_fleet::ptp_usb::hex_bytes(b), if r.verified() { "verified" } else { "NOT what was written" }),
         Err(e) => println!("could not be read back: {e}"),
     }
-    if r.verified() {
-        Ok(())
-    } else {
-        Err(ExitCodeError { code: EXIT_WRITE_INDETERMINATE, message: "the camera answered OK but the read-back does not confirm the preset".to_string() }.into())
+    match byte_prop_unverified(&r) {
+        None => Ok(()),
+        Some(e) => Err(e.into()),
     }
+}
+
+/// The exit-4 error for an IPTC slot write whose read-back is not exactly what was sent. The same test as
+/// `extended::iptc_write_verified` (which is crate-private; one test, two copies until that is exported).
+fn iptc_write_unverified(out: &nikon_fleet::ptp_usb::IptcWriteOutcome, sent: &[u8]) -> Option<ExitCodeError> {
+    let message = match &out.after {
+        Ok(after) if after.data == sent => return None,
+        Ok(_) => "the camera answered OK but the slot reads back as something other than what was sent",
+        Err(_) => "the camera answered OK but the slot could not be read back, so the write is neither confirmed nor contradicted",
+    };
+    Some(ExitCodeError { code: EXIT_WRITE_INDETERMINATE, message: message.to_string() })
 }
 
 fn cmd_vendor_write_iptc(args: &VendorWriteIptcArgs) -> Result<()> {
     let entries: Vec<&str> = args.entries.iter().map(String::as_str).collect();
     let data = match &args.data_hex {
-        Some(hex) => nikon_fleet::extended::hex_decode(&hex.split_whitespace().collect::<String>())
-            .map_err(|e| anyhow::anyhow!("--data-hex: {e}"))?,
+        Some(hex) => parse_hex_bytes(hex).map_err(|e| anyhow::anyhow!("--data-hex: {e}"))?,
         None => nikon_fleet::ptp_usb::encode_iptc_entries(&entries),
     };
     println!("data phase for 0x9413({}):", args.slot);
@@ -2541,7 +2646,7 @@ fn cmd_vendor_write_iptc(args: &VendorWriteIptcArgs) -> Result<()> {
     let out = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
         nikon_fleet::ptp_usb::write_iptc_slot_locked(lock, serial, args.slot, &data, args.force_unconfirmed_model)
     })
-    .with_context(|| format!("writing IPTC slot {} (0x9413) over USB PTP; if the reply never came the camera MAY have changed: read the slot again with vendor-read-iptc", args.slot))?;
+    .map_err(|e| with_write_context(e, format!("writing IPTC slot {} (0x9413) over USB PTP", args.slot), "read the slot again with vendor-read-iptc"))?;
     println!("\nbefore:");
     print_iptc_bytes(&out.before.data);
     println!("\n0x9413 answered OK (response params {:?})\n\nafter:", out.response_params);
@@ -2549,7 +2654,10 @@ fn cmd_vendor_write_iptc(args: &VendorWriteIptcArgs) -> Result<()> {
         Ok(after) => print_iptc_bytes(&after.data),
         Err(e) => println!("  could not be read back: {e}"),
     }
-    Ok(())
+    match iptc_write_unverified(&out, &data) {
+        None => Ok(()),
+        Some(e) => Err(e.into()),
+    }
 }
 
 fn cmd_vendor_read_iptc(args: &VendorReadIptcArgs) -> Result<()> {
@@ -2561,18 +2669,11 @@ fn cmd_vendor_read_iptc(args: &VendorReadIptcArgs) -> Result<()> {
         eprintln!("warning: {w}");
     }
     println!("0x9412({}) returned {} byte(s), response params {:?}", args.slot, read.data.len(), read.response_params);
-    println!("{}", nikon_fleet::ptp_usb::hex_bytes(&read.data));
-    let (entries, rest) = split_length_prefixed(&read.data);
-    for (i, e) in entries.iter().enumerate() {
-        println!("entry {i}: {e:?}");
-    }
-    if !rest.is_empty() {
-        println!("{} byte(s) left over after the last whole entry: {}", rest.len(), nikon_fleet::ptp_usb::hex_bytes(rest));
-    }
+    print!("{}", iptc_text(&read.data));
     Ok(())
 }
 
-/// Best-effort split of `[u32 LE length incl. NUL][bytes]` entries (the 0x9413 data-phase shape). Stops at the first entry that
+/// Best-effort split of `[u32 LE length incl. NUL][bytes]` entries (the 0x9413 data-phase shape after its 12-byte header). Stops at the first entry that
 /// does not fit; the unsplit tail is returned so nothing is hidden.
 fn split_length_prefixed(data: &[u8]) -> (Vec<String>, &[u8]) {
     let mut out = Vec::new();
@@ -2613,15 +2714,13 @@ fn cmd_ftp_test(data_dir: &Path, args: &FtpTestArgs) -> Result<()> {
     use nikon_fleet::ftp_test::{TestRequest, run_test};
     let mut req = if let (Some(file), Some(index)) = (&args.snapshot, args.profile) {
         let path = resolve_snapshot_path(data_dir, file);
-        let mut snap = Snapshot::load_from_file(&path).with_context(|| format!("loading {}", path.display()))?;
-        let v = nikon_fleet::ftp_edit::profile_view(&mut snap, index).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
+        let snap = Snapshot::load_from_file(&path).with_context(|| format!("loading {}", path.display()))?;
+        let v = nikon_fleet::ftp_edit::profile_view(&snap, index).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
         TestRequest::from_profile(&v, true, Duration::from_secs(args.timeout))
     } else {
         let protocol = if args.protocol.as_deref() == Some("sftp") { Protocol::Sftp } else { Protocol::Ftp };
         let password = if args.password_stdin {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf).context("reading the password from stdin")?;
-            strip_single_trailing_newline(buf)
+            read_password_stdin()?
         } else {
             args.password.clone().unwrap_or_default()
         };
@@ -2687,13 +2786,10 @@ saved {}",
     Ok(())
 }
 
-/// A sweep named on the command line: the path as given, or else a file name in `<data-dir>/sweeps/`.
+/// A sweep named on the command line: the path as given, or else a name in `<data-dir>/sweeps/` ([`resolve_in_dir`], the
+/// rule snapshots use too).
 fn resolve_sweep_path(data_dir: &Path, given: &Path) -> PathBuf {
-    if given.exists() || given.components().count() > 1 {
-        given.to_path_buf()
-    } else {
-        sweeps_dir(data_dir).join(given)
-    }
+    resolve_in_dir(&sweeps_dir(data_dir), given)
 }
 
 fn cmd_vendor_sweep_diff(data_dir: &Path, args: &VendorSweepDiffArgs) -> Result<()> {
@@ -3178,13 +3274,19 @@ fn strip_single_trailing_newline(s: String) -> String {
     s.strip_suffix('\n').map(str::to_string).unwrap_or(s)
 }
 
+/// The password for `--password-stdin`: all of standard input, one trailing newline removed. The ONE reader
+/// (`ftp-set`/`ftp-add`, `ftp-test` and `vendor-write-ftp` each had their own copy).
+fn read_password_stdin() -> Result<String> {
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf).context("reading the password from stdin")?;
+    Ok(strip_single_trailing_newline(buf))
+}
+
 /// Write an FTP profile via raw USB PTP (`0x90EE`), bypassing the MAID SDK
 /// entirely. See `nikon_fleet::ptp_usb`.
 fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
     let password = if args.password_stdin {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf).context("reading password from stdin")?;
-        strip_single_trailing_newline(buf)
+        read_password_stdin()?
     } else {
         // clap's required_unless_present guarantees this is Some when
         // password_stdin is false.
@@ -3383,9 +3485,11 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
         );
     }
     let reference = Snapshot::load_from_file(&ref_path)?;
+    nikon_fleet::ops::check::require_captured_reference(&reference)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", ref_path.display()))?;
 
-    // The live capture is MAID only; a reference's extended section is not a difference from it.
-    let d = diff_with_schema(&reference, &live, &DiffOptions { skip_extended: true, ..Default::default() }, &schema)?;
+    // The same comparison the MCP worker's `check` makes (the reference's extended section is left out).
+    let d = nikon_fleet::ops::check::compare_to_live(&reference, &live, &schema)?;
     if args.json {
         // The same value the MCP worker's `check` op returns.
         let report = nikon_fleet::ops::check::CheckReport::new(live.camera.clone(), &reference, verdict, stats, d);
@@ -3534,6 +3638,9 @@ fn cmd_firmware_ls(data_dir: &Path, args: &FirmwareLsArgs) -> Result<()> {
 fn cmd_firmware_pin(data_dir: &Path, args: &FirmwarePinArgs) -> Result<()> {
     let snap = Snapshot::load_from_file(&args.snapshot_path)
         .with_context(|| format!("loading {}", args.snapshot_path.display()))?;
+    // The version's canonical snapshot is a reading from a camera, never an edited copy (the rule `ref set` applies).
+    nikon_fleet::gui_argv::refuse_edited_reference(&snap)
+        .map_err(|e| anyhow::anyhow!("{} {e}", args.snapshot_path.display()))?;
 
     if snap.camera.model != args.model {
         bail!(
@@ -4048,7 +4155,7 @@ fn restore_refusal(e: nikon_fleet::ops::restore_flow::RestoreApplyError, json: b
 
 fn cmd_restore_extended(data_dir: &Path, args: &RestoreExtendedArgs) -> Result<()> {
     use nikon_fleet::ops::restore_extended::{
-        Category, ExtendedApplyError, ExtendedApplyRequest, ExtendedRestoreInput, apply_extended_restore, build_extended_restore_plan,
+        ExtendedApplyError, ExtendedApplyRequest, apply_extended_restore, build_extended_restore_plan,
     };
     use nikon_fleet::ptp_usb::PtpUsbSession;
     let refused = |e: &dyn std::fmt::Display| -> anyhow::Error {
@@ -4058,18 +4165,10 @@ fn cmd_restore_extended(data_dir: &Path, args: &RestoreExtendedArgs) -> Result<(
     let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let snapshot = Snapshot::from_json(std::str::from_utf8(&bytes).context("the snapshot is not UTF-8")?)
         .with_context(|| format!("loading {}", path.display()))?;
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let only: Option<std::collections::BTreeSet<Category>> = if args.only.is_empty() {
-        None
-    } else {
-        Some(args.only.iter().map(|c| Category::parse(c)).collect::<Result<_, _>>().map_err(|e| refused(&e))?)
-    };
-    let mut target = snapshot.camera.clone();
-    if let Some(s) = &args.serial {
-        target.serial = s.clone();
-    }
-    let serial = args.serial.clone().or_else(|| Some(snapshot.camera.serial.clone())).filter(|s| !s.is_empty());
-    let input = ExtendedRestoreInput { source: &snapshot, source_bytes: &bytes, source_name: &name, target: &target, only: only.as_ref() };
+    let prepared = extended_restore_input::prepare(snapshot, bytes, &path, args.serial.as_deref(), &args.only).map_err(|e| refused(&e))?;
+    let input = prepared.input();
+    let serial = prepared.session_serial.clone();
+    let captured_at = OffsetDateTime::now_utc().format(&Rfc3339).context("formatting the current time")?;
     let snapshots = snapshots_dir(data_dir);
 
     // One raw session does everything, so the plan an apply recomputes is of the body it just read.
@@ -4090,7 +4189,7 @@ fn cmd_restore_extended(data_dir: &Path, args: &RestoreExtendedArgs) -> Result<(
             snapshots_dir: &snapshots,
             expected_digest: &digest,
             expected_summary: &summary,
-            captured_at: OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+            captured_at: captured_at.clone(),
         };
         let applied = apply_extended_restore(&mut session, &req, &mut |p| {
             if !args.json {
@@ -4942,6 +5041,40 @@ mod tests {
         assert_eq!(resolved, PathBuf::from("here.json"));
     }
 
+    #[test]
+    fn sweeps_and_snapshots_resolve_a_named_file_by_the_same_rule() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        fs::write(tmp.path().join("here.json"), "{}").unwrap();
+        fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/there.json"), "{}").unwrap();
+        let data_dir = tmp.path().join("data");
+        let abs = tmp.path().join("abs.json");
+        let cases: Vec<(PathBuf, &str)> = vec![
+            (PathBuf::from("here.json"), "an existing bare name stays as given (the working directory wins)"),
+            (PathBuf::from("missing.json"), "a missing bare name goes inside the directory"),
+            (PathBuf::from("sub/there.json"), "an existing relative path stays as given"),
+            (PathBuf::from("sub/missing.json"), "a missing multi-component name goes inside the directory too (it used to stay as given for sweeps only)"),
+            (abs.clone(), "an absolute path is never moved"),
+            (PathBuf::from(""), "empty: not an existing file"),
+        ];
+        let rows: Vec<(PathBuf, PathBuf, PathBuf)> = cases
+            .iter()
+            .map(|(p, _)| (resolve_snapshot_path(&data_dir, p), resolve_sweep_path(&data_dir, p), p.clone()))
+            .collect();
+        std::env::set_current_dir(&prev).unwrap();
+        for ((snap, sweep, given), (_, why)) in rows.iter().zip(&cases) {
+            let strip = |p: &PathBuf, dir: &PathBuf| p.strip_prefix(dir).map(|r| r.to_path_buf()).unwrap_or_else(|_| p.clone());
+            assert_eq!(strip(snap, &snapshots_dir(&data_dir)), strip(sweep, &sweeps_dir(&data_dir)), "{given:?}: {why}");
+        }
+        assert_eq!(rows[3].0, snapshots_dir(&data_dir).join("sub/missing.json"));
+        assert_eq!(rows[3].1, sweeps_dir(&data_dir).join("sub/missing.json"));
+        assert_eq!(rows[0].1, PathBuf::from("here.json"));
+        assert_eq!(rows[4].1, abs);
+    }
+
     // ── select_device (the serial rule itself is ops::target's) ──────────
 
     fn dev(id: u32) -> DeviceInfo {
@@ -5638,6 +5771,34 @@ mod tests {
 
         let meta = load_meta(data_dir.path(), "Z 9", "5.31").unwrap();
         assert_eq!(meta.canonical_snapshot_path.as_deref(), Some("snap.json"));
+    }
+
+    #[test]
+    fn cmd_firmware_pin_refuses_an_edited_copy_and_records_nothing() {
+        let data_dir = TempDir::new().unwrap();
+        let bin_path = data_dir.path().join("fw.bin");
+        fs::write(&bin_path, b"v1").unwrap();
+        cmd_firmware_add(data_dir.path(), &firmware_add_args(bin_path, "Z 9", "5.31", false)).unwrap();
+
+        let captured_path = data_dir.path().join("snap.json");
+        write_snapshot(&captured_path, "Z 9", "ABC123");
+        let captured = Snapshot::load_from_file(&captured_path).unwrap();
+        let copy_path = data_dir.path().join("copy.json");
+        nikon_fleet::snapshot_edit::copy_for_edit(&captured, "snap.json", Some("copy"), "2026-02-02T00:00:00Z")
+            .save_to_file(&copy_path)
+            .unwrap();
+
+        let err = cmd_firmware_pin(data_dir.path(), &FirmwarePinArgs {
+            snapshot_path: copy_path, model: "Z 9".into(), version: "5.31".into(),
+        }).unwrap_err();
+        assert!(err.to_string().contains(&nikon_fleet::gui_argv::EditedCopyRefused.to_string()), "{err}");
+        assert_eq!(load_meta(data_dir.path(), "Z 9", "5.31").unwrap().canonical_snapshot_path, None, "nothing was pinned");
+
+        // The captured snapshot it was copied from still pins.
+        cmd_firmware_pin(data_dir.path(), &FirmwarePinArgs {
+            snapshot_path: captured_path, model: "Z 9".into(), version: "5.31".into(),
+        }).unwrap();
+        assert_eq!(load_meta(data_dir.path(), "Z 9", "5.31").unwrap().canonical_snapshot_path.as_deref(), Some("snap.json"));
     }
 
     #[test]
@@ -6508,6 +6669,7 @@ mod tests {
         assert_eq!(parse_hex_bytes("01 aB ff"), Ok(vec![0x01, 0xAB, 0xFF]));
         assert_eq!(parse_hex_bytes("0102"), Ok(vec![1, 2]));
         assert_eq!(parse_hex_bytes(" 0 1 0 2 "), Ok(vec![1, 2]), "whitespace is dropped before pairing");
+        assert_eq!(parse_hex_bytes("01\t02\n03"), Ok(vec![1, 2, 3]), "any whitespace, as split_whitespace took before");
         assert!(parse_hex_bytes("").is_err(), "empty is not a payload");
         assert!(parse_hex_bytes("   ").is_err());
         assert!(parse_hex_bytes("1").is_err(), "odd length");
@@ -6515,6 +6677,179 @@ mod tests {
         assert!(parse_hex_bytes("0x01").is_err(), "no 0x prefix here");
         assert!(parse_hex_bytes("zz").is_err());
         assert!(parse_hex_bytes("0g").is_err());
+        assert!(parse_hex_bytes("+1").is_err(), "a sign is not a hex digit");
+    }
+
+    #[test]
+    fn the_restore_extended_help_documents_each_exit_status_against_the_constants_the_command_exits_with() {
+        let help = Cli::command().find_subcommand("restore-extended").unwrap().clone().render_long_help().to_string();
+        for (code, what) in [
+            (0, "done"),
+            (1, "any other error"),
+            (2, "usage error"),
+            (EXIT_WRITE_INDETERMINATE, "may or may not have taken effect"),
+            (EXIT_STALE_PLAN, "no longer matches"),
+            (EXIT_REFUSED_BEFORE_WRITE, "refused before it could write anything"),
+        ] {
+            let line = help.lines().find(|l| l.trim_start().starts_with(&format!("{code}  "))).unwrap_or_else(|| panic!("no line for exit {code}:\n{help}"));
+            assert!(line.contains(what) || help.contains(what), "exit {code} ({what}): {line}");
+        }
+        assert!(help.contains("exits 1 here, where `restore` exits 0"), "the one difference from `restore` is stated:\n{help}");
+    }
+
+    fn iptc_args(data_hex: Option<&str>, dry_run: bool) -> VendorWriteIptcArgs {
+        VendorWriteIptcArgs {
+            slot: 1,
+            entries: vec![],
+            data_hex: data_hex.map(str::to_string),
+            dry_run,
+            force_unconfirmed_model: false,
+            serial: None,
+        }
+    }
+
+    #[test]
+    fn an_empty_data_hex_is_refused_like_an_empty_probe_data_and_a_real_one_is_accepted_by_a_dry_run() {
+        // The two flags used to disagree: --data accepted nothing empty, --data-hex sent zero bytes to a slot. Both go
+        // through parse_hex_bytes now; a dry run needs no camera, and the refusal comes before one would be opened.
+        for empty in ["", "   ", "\t"] {
+            let e = cmd_vendor_write_iptc(&iptc_args(Some(empty), true)).unwrap_err().to_string();
+            assert!(e.starts_with("--data-hex:") && e.contains("no hex digits"), "{empty:?}: {e}");
+            assert!(parse_hex_bytes(empty).is_err());
+        }
+        assert!(cmd_vendor_write_iptc(&iptc_args(Some("01 00 00 00"), true)).is_ok());
+        let e = cmd_vendor_write_iptc(&iptc_args(Some("0"), true)).unwrap_err().to_string();
+        assert!(e.starts_with("--data-hex:") && e.contains("even number"), "{e}");
+    }
+
+    fn read(data: &[u8]) -> nikon_fleet::ptp_usb::VendorRead {
+        nikon_fleet::ptp_usb::VendorRead { data: data.to_vec(), response_params: vec![], warnings: vec![] }
+    }
+
+    fn iptc_outcome(after: Result<&[u8], ()>) -> nikon_fleet::ptp_usb::IptcWriteOutcome {
+        nikon_fleet::ptp_usb::IptcWriteOutcome {
+            before: read(&[]),
+            response_params: vec![],
+            after: after.map(read).map_err(|()| nikon_fleet::ptp_usb::PtpUsbError::NoDevice),
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn an_iptc_write_exits_4_unless_the_read_back_is_exactly_what_was_sent() {
+        let sent = [1u8, 2, 3];
+        assert!(iptc_write_unverified(&iptc_outcome(Ok(&sent)), &sent).is_none());
+        for (what, out) in [
+            ("a different read-back", iptc_outcome(Ok(&[1, 2, 4]))),
+            ("a longer read-back", iptc_outcome(Ok(&[1, 2, 3, 0]))),
+            ("an empty read-back", iptc_outcome(Ok(&[]))),
+            ("no read-back", iptc_outcome(Err(()))),
+        ] {
+            let e = iptc_write_unverified(&out, &sent).unwrap_or_else(|| panic!("{what} must not pass"));
+            assert_eq!(e.code, EXIT_WRITE_INDETERMINATE, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_byte_property_failure_names_the_property_written_and_whether_it_could_be_read_back() {
+        use nikon_fleet::ptp_usb::BytePropReceipt;
+        let rc = |propcode, written, read_back: Result<Vec<u8>, nikon_fleet::ptp_usb::PtpUsbError>| BytePropReceipt {
+            propcode,
+            previous: vec![0],
+            written,
+            read_back,
+            warnings: vec![],
+        };
+        assert!(byte_prop_unverified(&rc(0xD053, 1, Ok(vec![1]))).is_none());
+        let copyright = byte_prop_unverified(&rc(0xD053, 1, Ok(vec![0]))).unwrap();
+        assert!(copyright.message.contains("EnableCopyright") && !copyright.message.contains("preset"), "{}", copyright.message);
+        let preset = byte_prop_unverified(&rc(0xD060, 3, Ok(vec![4]))).unwrap();
+        assert!(preset.message.contains("IPTCPresetSelect") && preset.message.contains("other than what was written"), "{}", preset.message);
+        let unread = byte_prop_unverified(&rc(0xD060, 3, Err(nikon_fleet::ptp_usb::PtpUsbError::NoDevice))).unwrap();
+        assert!(unread.message.contains("could not be read back") && !unread.message.contains("reads back as something"), "{}", unread.message);
+        assert_eq!((copyright.code, preset.code, unread.code), (EXIT_WRITE_INDETERMINATE, EXIT_WRITE_INDETERMINATE, EXIT_WRITE_INDETERMINATE));
+    }
+
+    #[test]
+    fn may_have_changed_is_said_only_of_an_error_that_leaves_it_open() {
+        use nikon_fleet::ptp_usb::PtpUsbError;
+        let refused: anyhow::Error = PtpUsbError::UnconfirmedModel("Z 8".into()).into();
+        let text = format!("{:#}", with_write_context(refused, "writing X".into(), "read it"));
+        assert!(text.contains("writing X") && !text.contains("MAY have changed"), "a refusal before anything was sent: {text}");
+        let sent: anyhow::Error = PtpUsbError::IptcWriteIndeterminate { cause: Box::new(PtpUsbError::NoDevice) }.into();
+        let text = format!("{:#}", with_write_context(sent, "writing X".into(), "read it"));
+        assert!(text.contains("MAY have changed") && text.contains("read it"), "{text}");
+        // And the exit status still reads through the context.
+        let sent: anyhow::Error = PtpUsbError::IptcWriteIndeterminate { cause: Box::new(PtpUsbError::NoDevice) }.into();
+        assert_eq!(exit_code_for(&with_write_context(sent, "x".into(), "y")), EXIT_WRITE_INDETERMINATE);
+        let anything_else: anyhow::Error = anyhow::anyhow!("not a camera error");
+        assert!(!format!("{:#}", with_write_context(anything_else, "x".into(), "y")).contains("MAY"));
+    }
+
+    #[test]
+    fn the_iptc_view_decodes_a_preset_names_another_kind_and_splits_what_it_cannot_decode_after_the_header() {
+        use nikon_fleet::iptc::{IPTC_FIELDS, IptcPreset, encode_iptc_preset};
+        let mut fields = vec![String::new(); IPTC_FIELDS.len()];
+        fields[4] = "Reno".into();
+        let bytes = encode_iptc_preset(&IptcPreset { name: "Track".into(), fields }).unwrap();
+        let t = iptc_text(&bytes);
+        assert!(t.contains("preset name: \"Track\"") && t.contains("City: \"Reno\""), "{t}");
+        assert!(!t.contains("Caption"), "an empty field is not listed: {t}");
+        // An empty preset is said to be empty, not shown as nothing.
+        let empty = encode_iptc_preset(&IptcPreset { name: String::new(), fields: vec![String::new(); IPTC_FIELDS.len()] }).unwrap();
+        assert!(iptc_text(&empty).contains("an empty preset"));
+        // A record of another kind is named, with its length.
+        let mut other = nikon_fleet::iptc::iptc_preset_header().to_vec();
+        other[6] = 2;
+        other.extend_from_slice(&[9, 9, 9]);
+        assert!(iptc_text(&other).contains("kind 2 (3 byte(s) after the 12-byte header)"), "{}", iptc_text(&other));
+        // Bytes the strict decoder refuses (a 16th entry here) are split AFTER the header, and the reason is given.
+        let mut bad = bytes.clone();
+        bad.extend_from_slice(&[2, 0, 0, 0, b'x', 0]);
+        let t = iptc_text(&bad);
+        assert!(t.contains("not a preset this program can decode") && t.contains("entry 0: \"Track\"") && t.contains("entry 15: \"x\""), "{t}");
+        // Fewer bytes than a header: nothing panics, nothing is hidden.
+        let t = iptc_text(&[1, 2, 3]);
+        assert!(t.contains("3 byte(s): 01 02 03") && t.contains("not a preset"), "{t}");
+    }
+
+    fn summary() -> nikon_fleet::extended::ExtendedSummary {
+        nikon_fleet::extended::ExtendedSummary {
+            props_read: 5,
+            props_not_supported: 1,
+            props_failed: 0,
+            ftp: "read".into(),
+            ftp_profiles: Some(3),
+            ftp_profiles_undecodable: Some(0),
+            ftp_truncated: false,
+            iptc: "read".into(),
+            iptc_presets_in_use: Some(2),
+            iptc_slots_undecodable: Some(0),
+            iptc_truncated: false,
+            dropped: None,
+        }
+    }
+
+    #[test]
+    fn the_extended_status_line_reports_undecodable_and_partial_reads_instead_of_a_clean_count() {
+        let clean = extended_line(&summary());
+        assert!(clean.contains("3 FTP profile(s);") && clean.contains("2 IPTC preset(s) in use\n"), "{clean}");
+        assert!(!clean.contains("undecodable") && !clean.contains("in part"), "{clean}");
+        let mut s = summary();
+        s.ftp_profiles_undecodable = Some(1);
+        assert!(extended_line(&s).contains("3 FTP profile(s), 1 profile(s) undecodable;"), "{}", extended_line(&s));
+        let mut s = summary();
+        s.iptc_slots_undecodable = Some(2);
+        s.iptc_truncated = true;
+        assert!(extended_line(&s).contains("2 IPTC preset(s) in use, 2 slot(s) undecodable, read only in part"), "{}", extended_line(&s));
+        let mut s = summary();
+        s.ftp_truncated = true;
+        assert!(extended_line(&s).contains("3 FTP profile(s), read only in part;"), "{}", extended_line(&s));
+        // A summary from before the counts existed (None) says nothing extra.
+        let mut s = summary();
+        s.ftp_profiles_undecodable = None;
+        s.iptc_slots_undecodable = None;
+        assert_eq!(extended_line(&s), clean);
     }
 
     #[test]

@@ -16,6 +16,17 @@
 
 use std::path::{Path, PathBuf};
 
+/// Where a data directory keeps snapshots. The ONE definition of the layout: the CLI and the worker read it
+/// from here.
+pub fn snapshots_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("snapshots")
+}
+
+/// Where a data directory keeps references (one per body, `reference_filename`).
+pub fn references_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("references")
+}
+
 /// A single plain path component: non-empty, not `.` or `..`, no separators,
 /// no NUL.
 ///
@@ -564,5 +575,13 @@ mod tests {
             write_atomic(&p, b"").unwrap();
             assert_eq!(mode_of(&p), 0o600);
         });
+    }
+
+    #[test]
+    fn the_data_directory_layout_has_one_snapshots_and_one_references_directory() {
+        let d = Path::new("/data");
+        assert_eq!(snapshots_dir(d), Path::new("/data/snapshots"));
+        assert_eq!(references_dir(d), Path::new("/data/references"));
+        assert_ne!(snapshots_dir(d), references_dir(d));
     }
 }

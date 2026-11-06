@@ -47,7 +47,7 @@ use nikon_fleet::sdk::Device;
 use nikon_fleet::snapshot::{Camera, Snapshot};
 use nikon_fleet::transplant::{CodeNameGuard, TransplantOptions, resolve_allow_raw_code};
 
-use super::{enrich_devices, ensure_capabilities_present, open_sdk, references_dir, snapshots_dir};
+use super::{enrich_devices, ensure_capabilities_present, extended_restore_input, open_sdk, references_dir, snapshots_dir};
 
 #[derive(Args, Debug)]
 pub struct WorkerArgs {
@@ -667,7 +667,7 @@ fn op_restore_extended(
     confirmation: Option<(&str, &str)>,
 ) -> i32 {
     use nikon_fleet::ops::restore_extended::{
-        Category, ExtendedApplyRequest, ExtendedRestoreInput, apply_extended_restore, build_extended_restore_plan,
+        ExtendedApplyRequest, apply_extended_restore, build_extended_restore_plan,
     };
     progress(em, "starting");
     if let Some((digest, summary)) = confirmation {
@@ -683,20 +683,14 @@ fn op_restore_extended(
         Ok(s) => s,
         Err(o) => return finish(em, o),
     };
-    let only: Option<BTreeSet<Category>> = if only_names.is_empty() {
-        None
-    } else {
-        match only_names.iter().map(|c| Category::parse(c)).collect::<Result<_, _>>() {
-            Ok(set) => Some(set),
-            Err(e) => return finish(em, Outcome::err("unknown_category", e, None)),
-        }
+    // The same assembly the CLI's `restore-extended` makes (`extended_restore_input`). The worker always has the
+    // serial it was told to act on; a serial that is not the snapshot's is refused against the live body by the
+    // library (`not_this_body`).
+    let prepared = match extended_restore_input::prepare(snapshot, source_bytes, &source_path, Some(serial), only_names) {
+        Ok(p) => p,
+        Err(e) => return finish(em, Outcome::err(e.tag(), e.to_string(), None)),
     };
-    let name = source_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    // The snapshot's own camera identity, as the CLI does; a serial that is not the snapshot's is refused against
-    // the live body by the library (`not_this_body`).
-    let mut target = snapshot.camera.clone();
-    target.serial = serial.to_string();
-    let input = ExtendedRestoreInput { source: &snapshot, source_bytes: &source_bytes, source_name: &name, target: &target, only: only.as_ref() };
+    let input = prepared.input();
 
     let lock = match nikon_fleet::camera_lock::CameraLock::acquire() {
         Ok(l) => l,

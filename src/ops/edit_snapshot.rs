@@ -22,6 +22,10 @@ pub enum EditFileError {
     Snapshot(#[from] SnapshotError),
     #[error("{0}")]
     Refused(#[from] EditRefusal),
+    /// Another writer replaced the file while this edit was being made, so the edit (made on the old content)
+    /// was not written: writing it would have undone theirs.
+    #[error("{file} changed on disk while it was being edited (another editor or process wrote it); nothing was written. Edit it again")]
+    ChangedSinceRead { file: String },
     #[error("the label {label:?} starts a name the MCP server's captures and restore points use and are counted by; choose another")]
     ReservedLabel { label: String },
 }
@@ -32,6 +36,7 @@ impl EditFileError {
             EditFileError::Path(e) => e.tag(),
             EditFileError::Snapshot(e) => e.tag(),
             EditFileError::Refused(e) => e.tag(),
+            EditFileError::ChangedSinceRead { .. } => "changed_since_read",
             EditFileError::ReservedLabel { .. } => "reserved_label",
         }
     }
@@ -64,17 +69,27 @@ pub fn create_edit_copy(snapshots_dir: &Path, source: &Path, label: Option<&str>
 
 /// Apply `edit` to the edited copy `name` in `snapshots_dir` and keep the result, whole or not at all. Nothing is
 /// written when the edit is refused or changes nothing.
+///
+/// Compare-before-replace, not a lock: the file's text is read once, and just before the replace it is read again
+/// and must be identical, else [`EditFileError::ChangedSinceRead`] and nothing is written. That catches a second
+/// editor (the CLI and the GUI can both be open on a copy) that finished writing between this edit's read and its
+/// replace, which would otherwise be silently undone. It does not close the window between that second read and the
+/// rename (microseconds; there is no OS lock here), so two writers racing inside it can still lose one edit.
 pub fn edit_in_place<T>(
     snapshots_dir: &Path,
     name: &str,
     edit: impl FnOnce(&mut Snapshot) -> Result<T, EditRefusal>,
 ) -> Result<T, EditFileError> {
     let path = resolve_existing(snapshots_dir, name)?;
-    let mut snap = Snapshot::load_from_file(&path)?;
+    let text = std::fs::read_to_string(&path).map_err(SnapshotError::Io)?;
+    let mut snap = Snapshot::from_json(&text)?;
     ensure_editable(&snap)?;
     let before = snap.clone();
     let out = edit(&mut snap)?;
     if snap != before {
+        if std::fs::read_to_string(&path).map_err(SnapshotError::Io)? != text {
+            return Err(EditFileError::ChangedSinceRead { file: name.to_string() });
+        }
         snap.save_to_file(&path)?;
     }
     Ok(out)
@@ -208,5 +223,50 @@ mod tests {
             assert_eq!(edit_in_place(&snaps, bad, |_| Ok(())).unwrap_err().tag(), "unsafe_name", "{bad:?}");
         }
         assert_eq!(edit_in_place(&snaps, "ref.json", |_| Ok(())).unwrap_err().tag(), "not_found");
+    }
+
+    #[test]
+    fn an_edit_is_not_written_over_a_file_another_writer_replaced_while_it_was_being_made() {
+        let d = tempfile::tempdir().unwrap();
+        let snaps = d.path().join("snapshots");
+        let src = captured_in(&snaps);
+        let c = create_edit_copy(&snaps, &src, None, NOW).unwrap();
+        // The other writer's edit lands between this edit's read and its replace (the closure runs in that window).
+        let theirs = {
+            let mut s = Snapshot::load_from_file(&c.path).unwrap();
+            set_enum_value(&mut s, VR, 1, "2026-11-06T12:05:00Z").unwrap();
+            s
+        };
+        let e = edit_in_place(&snaps, &c.file, |s| {
+            let r = set_enum_value(s, VR, 0, "2026-11-06T12:10:00Z");
+            theirs.save_to_file(&c.path).unwrap();
+            r
+        })
+        .unwrap_err();
+        assert_eq!(e.tag(), "changed_since_read", "{e}");
+        assert!(e.to_string().contains(&c.file) && e.to_string().contains("nothing was written"), "{e}");
+        let on_disk = Snapshot::load_from_file(&c.path).unwrap();
+        assert_eq!(on_disk, theirs, "the other writer's edit is what is on disk, not undone");
+        assert_eq!(on_disk.properties[VR].value["value_index"], 1);
+        // Run again on the current content and it goes through.
+        edit_in_place(&snaps, &c.file, |s| set_enum_value(s, VR, 0, "2026-11-06T12:10:00Z")).unwrap();
+        assert_eq!(Snapshot::load_from_file(&c.path).unwrap().properties[VR].value["value_index"], 0);
+    }
+
+    #[test]
+    fn a_concurrent_write_does_not_fail_an_edit_that_changes_nothing() {
+        // Nothing is going to be written, so there is nothing to protect: the "no change" result stands.
+        let d = tempfile::tempdir().unwrap();
+        let snaps = d.path().join("snapshots");
+        let src = captured_in(&snaps);
+        let c = create_edit_copy(&snaps, &src, None, NOW).unwrap();
+        let mut other = Snapshot::load_from_file(&c.path).unwrap();
+        set_enum_value(&mut other, VR, 1, NOW).unwrap();
+        edit_in_place(&snaps, &c.file, |s| {
+            other.save_to_file(&c.path).unwrap();
+            set_enum_value(s, VR, 2, NOW) // already 2: no change
+        })
+        .unwrap();
+        assert_eq!(Snapshot::load_from_file(&c.path).unwrap(), other);
     }
 }

@@ -192,19 +192,28 @@ fn the_timeout_range_is_one_to_three_hundred_seconds_inclusive() {
 }
 
 #[test]
-fn a_port_zero_and_an_empty_host_never_pass() {
-    // Whatever the command line decides about these (a usage error, or a failed connect), they are not a pass, and the
-    // run does not panic or hang. The library and the editor refuse port 0 ("1 to 65535"); this pins only that it
-    // cannot succeed.
+fn the_port_range_is_one_to_65535_inclusive_and_an_empty_host_is_a_failed_lookup_not_a_pass() {
+    // Port 0 and 65536 are usage errors (exit 2) before any network step, as `edit ftp-set --port` and the library
+    // treat them ("1 to 65535"); 1 and 65535 are valid ports that nothing here listens on, so they get as far as a
+    // refused connection (exit 1, the report on stdout), which is what shows the range check let them through.
     let d = tempfile::tempdir().unwrap();
-    for args in [
-        vec!["ftp-test", "--host", "127.0.0.1", "--port", "0", "--user", "u", "--no-file-check", "--timeout", "2"],
-        vec!["ftp-test", "--host", "", "--user", "u", "--no-file-check", "--timeout", "2"],
-        vec!["ftp-test", "--host", "127.0.0.1", "--port", "65536", "--user", "u", "--no-file-check", "--timeout", "2"],
-    ] {
-        let o = run(d.path(), &args);
-        assert!(matches!(o.status.code(), Some(1) | Some(2)), "{args:?}: {:?}\n{}\n{}", o.status.code(), out(&o), err(&o));
+    let base = |port: &str| {
+        run(d.path(), &["ftp-test", "--host", "127.0.0.1", "--port", port, "--user", "u", "--no-file-check", "--timeout", "2"])
+    };
+    for bad in ["0", "65536", "-1", "x"] {
+        let o = base(bad);
+        assert_eq!(o.status.code(), Some(2), "--port {bad}: {}\n{}", out(&o), err(&o));
+        assert_eq!(out(&o), "", "a usage error runs nothing: --port {bad}");
     }
+    for ok in ["1", "65535"] {
+        let o = base(ok);
+        assert_eq!(o.status.code(), Some(1), "--port {ok}: {}\n{}", out(&o), err(&o));
+        assert!(out(&o).contains(&format!("127.0.0.1:{ok}")) && out(&o).contains("FAILED   connect"), "--port {ok}: {}", out(&o));
+    }
+    // An empty host is not a usage error today: it fails at the lookup, and never passes.
+    let o = run(d.path(), &["ftp-test", "--host", "", "--user", "u", "--no-file-check", "--timeout", "2"]);
+    assert_eq!(o.status.code(), Some(1), "{}\n{}", out(&o), err(&o));
+    assert!(out(&o).contains("FAILED   look up the host"), "{}", out(&o));
 }
 
 #[test]
