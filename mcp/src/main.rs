@@ -57,11 +57,31 @@ struct Args {
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_termination_signal(sig: libc::c_int) {
-    // Async-signal-safe: one write(2) of the signal number. A failed or short write (a full pipe
-    // can only mean a signal is already pending) cannot be handled or reported from here.
+    report_signal(SIGNAL_PIPE.load(Ordering::Relaxed), sig);
+}
+
+/// Async-signal-safe: one write(2) of the signal number to `fd`. A failed or short write (a full pipe can only
+/// mean a signal is already pending) cannot be handled or reported from here. `errno` is saved and restored:
+/// a handler runs between any two instructions of the interrupted thread, so a failing write(2) here would
+/// otherwise change the `errno` that thread is about to read.
+fn report_signal(fd: libc::c_int, sig: libc::c_int) {
     let byte = sig as u8;
-    let fd = SIGNAL_PIPE.load(Ordering::Relaxed);
-    unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+    unsafe {
+        let errno = errno_location();
+        let saved = *errno;
+        libc::write(fd, (&byte as *const u8).cast(), 1);
+        *errno = saved;
+    }
+}
+
+/// The calling thread's `errno`.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__error()
+}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__errno_location()
 }
 
 /// Route SIGTERM, SIGINT and SIGHUP to a pipe the runtime can wait on. (tokio's `signal` feature
@@ -217,5 +237,20 @@ async fn run(args: Args) -> anyhow::Result<()> {
     match service_failed {
         Some(e) => Err(e.into()),
         None => Ok(()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod signal_tests {
+    use super::*;
+
+    /// The signal handler must leave the interrupted thread's errno alone even when its write fails.
+    #[test]
+    fn the_signal_report_leaves_errno_as_it_found_it() {
+        unsafe {
+            *errno_location() = 77;
+            report_signal(-1, libc::SIGTERM); // EBADF: the write fails and would set errno
+            assert_eq!(*errno_location(), 77);
+        }
     }
 }
