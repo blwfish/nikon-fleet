@@ -520,6 +520,11 @@ fn limit_words(d: Duration) -> String {
 
 /// Resolve `host:port`, with a limit: the system resolver itself has none.
 fn resolve(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>, Failure> {
+    // An empty name is not looked up: the resolver answers it differently on each platform (Windows returns this
+    // computer's own addresses for ":21", so the test would go on to "connect" to itself and wait for the timeout).
+    if host.trim().is_empty() {
+        return Err(fail(FailKind::NameNotFound, "no server name was given"));
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let h = host.to_string();
     std::thread::spawn(move || {
@@ -2034,6 +2039,21 @@ mod tests {
 
     fn mode(permissions: Option<u32>) -> russh_sftp::client::fs::Metadata {
         russh_sftp::protocol::FileAttributes { permissions, ..Default::default() }
+    }
+
+    #[test]
+    fn an_empty_or_blank_server_name_is_never_looked_up_on_any_platform() {
+        for host in ["", " ", "\t\n"] {
+            let f = super::resolve(host, 21, Duration::from_secs(5)).unwrap_err();
+            assert_eq!(f.kind, FailKind::NameNotFound, "{host:?}");
+            assert_eq!(f.message, "no server name was given", "{host:?}: the resolver was not asked");
+        }
+        // a name that is there is looked up as before (no network: an address literal)
+        assert!(super::resolve("127.0.0.1", 21, Duration::from_secs(5)).is_ok());
+        // and the whole test stops at the first step with nothing else attempted
+        let r = run_test(&TestRequest { host: "".into(), ..request(1, Protocol::Ftp) });
+        assert!(!r.ok && outcomes(&r)[0] == (Step::Resolve, "failed:name_not_found".to_string()), "{}", r.to_text());
+        assert!(outcomes(&r)[1..].iter().all(|(_, o)| o == "skipped"));
     }
 
     #[test]
