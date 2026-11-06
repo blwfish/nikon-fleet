@@ -82,6 +82,36 @@ pub struct Snapshot {
     /// present with per-item states otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extended: Option<crate::extended::Extended>,
+    /// Present only in an edited copy (`crate::snapshot_edit`): where it came from and what was changed. A snapshot
+    /// read from a camera has none and is never modified; an edited copy always has one, which is what marks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<DerivedFrom>,
+}
+
+/// Where an edited copy came from, and everything that has been changed in it since. The whole history is kept in
+/// the file, so a copy of a copy still says what differs from the capture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedFrom {
+    /// The snapshot copied, as a file name in `snapshots/` (or wherever it was when copied).
+    pub source_file: String,
+    /// When the source was captured: the lineage survives the source file being renamed or removed.
+    pub source_captured_at: String,
+    pub source_label: Option<String>,
+    /// When this copy was made. The copy keeps the source's `captured_at` (the values were read then), so this is
+    /// what its file name and its place in time are built from.
+    pub created_at: String,
+    pub last_edited_at: String,
+    /// Oldest first; carries over the source's own edits when the source was itself an edited copy.
+    pub edits: Vec<EditRecord>,
+}
+
+/// One change. `item` is a stable key for it; `change` is for a person (nothing branches on it, and it never holds a
+/// password or a key).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditRecord {
+    pub at: String,
+    pub item: String,
+    pub change: String,
 }
 
 #[derive(Debug, Error)]
@@ -200,7 +230,13 @@ impl Snapshot {
             transport,
             properties: BTreeMap::new(),
             extended: None,
+            derived_from: None,
         }
+    }
+
+    /// An edited copy (it carries [`DerivedFrom`]); false for anything read from a camera.
+    pub fn is_edited(&self) -> bool {
+        self.derived_from.is_some()
     }
 
     /// Capability codes present in this snapshot. A capture inserts a property
@@ -276,7 +312,10 @@ impl Snapshot {
         // would otherwise be re-split into path components by Path::join,
         // redirecting the write target into a different directory.
         let label = sanitize_filename_component(self.label.as_deref().unwrap_or("snap"));
-        let ts = self.captured_at.replace(':', "").replace('-', "");
+        // An edited copy keeps its source's `captured_at`, so two copies of one snapshot would share a name: it is named
+        // for when it was made.
+        let when = self.derived_from.as_ref().map_or(self.captured_at.as_str(), |d| d.created_at.as_str());
+        let ts = when.replace(':', "").replace('-', "");
         format!("{model}_{serial}_{label}_{ts}.json")
     }
 }

@@ -77,6 +77,9 @@ pub enum EntryState {
         /// Present only when a references directory was given.
         #[serde(skip_serializing_if = "Option::is_none")]
         is_reference: Option<bool>,
+        /// An edited copy (it carries `derived_from`), not a reading from a camera. Omitted when false.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        edited: bool,
     },
     Unreadable {
         error_kind: &'static str,
@@ -202,6 +205,7 @@ pub fn list_dir(
                 is_reference: refs
                     .as_mut()
                     .map(|r| r.is_reference(&s.camera.model, &s.camera.serial, &bytes)),
+                edited: s.is_edited(),
                 property_count: s.properties.len(),
                 model: s.camera.model,
                 serial: s.camera.serial,
@@ -300,13 +304,31 @@ mod tests {
             EntryState::Ok {
                 model: "Z 9".into(), serial: "2".into(), firmware: "5.31".into(),
                 label: Some("two".into()), captured_at: "2026-10-27T12:00:00Z".into(), property_count: 2,
-                is_reference: None,
+                is_reference: None, edited: false,
             }
         );
         match &l.entries[0].state {
             EntryState::Ok { label, .. } => assert_eq!(label, &None),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn an_edited_copy_is_marked_in_the_listing_and_a_captured_snapshot_is_not() {
+        let d = TempDir::new().unwrap();
+        let captured = snap("Z 9", "1", Some("base"));
+        put(d.path(), "a.json", &captured);
+        let copy = crate::snapshot_edit::copy_for_edit(&captured, "a.json", None, "2026-11-06T12:00:00Z");
+        put(d.path(), "b.json", &copy);
+        let l = list_dir(d.path(), None, None).unwrap();
+        let edited = |i: usize| match &l.entries[i].state {
+            EntryState::Ok { edited, .. } => *edited,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!((edited(0), edited(1)), (false, true));
+        let json = serde_json::to_value(&l.entries[0]).unwrap();
+        assert!(json.get("edited").is_none(), "absent, not false, for a captured snapshot: the JSON a client already reads is unchanged");
+        assert_eq!(serde_json::to_value(&l.entries[1]).unwrap()["edited"], true);
     }
 
     #[test]

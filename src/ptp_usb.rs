@@ -3112,18 +3112,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
             check_string_write_gate(self.model(), propcode, STRING_PROP_WRITE_MODELS, STRING_PROP_WRITE_CONFIRMED_PROPS)?;
         }
         let bad = |why: String| PtpUsbError::PropValueBad { propcode, why };
-        // Observed on a Z 9 (2026-11-05): the camera keeps only the LOW BYTE of each UTF-16 unit of
-        // these strings, so Latin-1 (U+0000..U+00FF) survives and anything above is stored as
-        // something else ("日本" came back as "å,", an emoji as "=÷"). Refuse it rather than send
-        // text the camera will quietly corrupt.
-        if let Some(c) = text.chars().find(|c| u32::from(*c) > 0xFF) {
-            return Err(bad(format!(
-                "{c:?} (U+{:04X}) is outside Latin-1; the camera stores only the low byte of each character in this \
-                 property, so it would hold something else",
-                u32::from(c)
-            )));
-        }
-        let data = encode_ptp_string_value(text).map_err(&bad)?;
+        let data = encode_owner_string(text).map_err(&bad)?;
 
         let desc = self.get_device_prop_desc(propcode)?;
         // PropCode u16, DataType u16 (0xFFFF = string), GetSet u8: 5 bytes before anything variable.
@@ -3929,6 +3918,22 @@ pub fn decode_ptp_string_value(bytes: &[u8]) -> Result<String, String> {
             None => Ok(string.text),
         },
     }
+}
+
+/// The bytes of an owner string (Artist, Copyright, Image comment) as the camera takes them, or why it would not
+/// hold the text. Observed on a Z 9 (2026-11-05): the camera keeps only the LOW BYTE of each UTF-16 unit of these
+/// strings, so Latin-1 (U+0000..U+00FF) survives and anything above is stored as something else ("日本" came back as
+/// "å,", an emoji as "=÷"). Refused rather than sent, so the camera cannot quietly corrupt it. The one check, shared
+/// by the write and by editing a stored snapshot.
+pub fn encode_owner_string(text: &str) -> Result<Vec<u8>, String> {
+    if let Some(c) = text.chars().find(|c| u32::from(*c) > 0xFF) {
+        return Err(format!(
+            "{c:?} (U+{:04X}) is outside Latin-1; the camera stores only the low byte of each character in this \
+             property, so it would hold something else",
+            u32::from(c)
+        ));
+    }
+    encode_ptp_string_value(text)
 }
 
 /// Encode `text` as a PTP string value: `[u8 count incl. NUL][UTF-16LE units][NUL]`. The empty

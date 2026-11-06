@@ -129,6 +129,12 @@ enum Cmd {
     #[command(subcommand)]
     Ref(RefCmd),
 
+    /// Edit a COPY of a stored snapshot: change a setting, an owner string, an IPTC field, or the FTP profile list
+    /// of what will later be restored. A snapshot read from a camera is never edited; `edit copy` makes a copy that
+    /// is, and records where it came from and what changed. Reads and writes files only; no camera.
+    #[command(subcommand)]
+    Edit(EditCmd),
+
     /// Internal: run one operation and report it on an inherited file
     /// descriptor (the MCP server's child process). Not for direct use.
     #[cfg(unix)]
@@ -366,6 +372,55 @@ enum SettingsCmd {
         #[arg(long, conflicts_with = "dir")]
         unset: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum EditCmd {
+    /// Make an editable copy of a stored snapshot (or of a reference) in `snapshots/`. The original is not touched.
+    /// Prints the new file's name; the other `edit` commands take it.
+    Copy {
+        /// The snapshot to copy: a file name in `snapshots/`, or a path.
+        snapshot: PathBuf,
+        /// The copy's label (default: `edit-` and the original's). Not one starting `mcp-`.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Set a setting by name. A choice takes one of the values the snapshot lists for it, a position on a scale takes
+    /// a value on that scale, a number stays a whole number if it is one. The name is as `restore --only` takes it.
+    Set {
+        /// The edited copy, a file name in `snapshots/`.
+        file: String,
+        property: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+    /// Set Artist, Copyright or Image comment (by name or code, e.g. `artist` or `0xD072`).
+    SetString {
+        file: String,
+        item: String,
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+    /// Set EnableCopyright (0 or 1) or the IPTC preset select (0 to 13).
+    SetSwitch {
+        file: String,
+        item: String,
+        value: u8,
+    },
+    /// Set one field of an IPTC preset, or its name (`name`). Slots are numbered from 1.
+    SetIptc {
+        file: String,
+        slot: u32,
+        field: String,
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+    /// Remove an FTP profile from the list. Index 0 is the front of the list, the one the camera uses first.
+    FtpDelete { file: String, index: usize },
+    /// Move an FTP profile so that it ends at position TO; the others shift. (Restoring a reordered list rebuilds it.)
+    FtpMove { file: String, from: usize, to: usize },
+    /// Show where an edited copy came from and every change made in it.
+    Log { file: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1302,10 +1357,11 @@ fn cmd_ls(data_dir: &Path, args: &LsArgs) -> Result<()> {
     warn_skipped_dir_entries(&listing);
     for entry in &listing.entries {
         match &entry.state {
-            EntryState::Ok { model, serial, firmware, label, captured_at, .. } => println!(
-                "{name}\n  {model} {serial}  label={label}  fw={firmware}  {captured_at}",
+            EntryState::Ok { model, serial, firmware, label, captured_at, edited, .. } => println!(
+                "{name}\n  {model} {serial}  label={label}  fw={firmware}  {captured_at}{marker}",
                 name = entry.file,
                 label = label.as_deref().unwrap_or("-"),
+                marker = if *edited { "  [edited copy]" } else { "" },
             ),
             EntryState::Unreadable { error, .. } => println!("{}  (failed to load: {error})", entry.file),
         }
@@ -1385,6 +1441,13 @@ fn set_reference(refs: &Path, snapshot_path: &Path) -> Result<ReferenceSet> {
         std::str::from_utf8(&bytes).with_context(|| format!("loading {}", snapshot_path.display()))?,
     )
     .with_context(|| format!("loading {}", snapshot_path.display()))?;
+    if snap.is_edited() {
+        bail!(
+            "{} is an edited copy, not a reading from a camera, and a reference is what `check` compares a body against: \
+             choose a snapshot that was captured",
+            snapshot_path.display()
+        );
+    }
     let name = checked_reference_filename(&snap.camera.model, &snap.camera.serial).map_err(|e| {
         anyhow::anyhow!(
             "{} cannot be a reference: {e}; the reference file name is built from its camera model and serial",
@@ -1402,6 +1465,64 @@ fn set_reference(refs: &Path, snapshot_path: &Path) -> Result<ReferenceSet> {
     let unchanged = previous.as_deref() == Some(bytes.as_slice());
     write_atomic(&target, &bytes).with_context(|| format!("writing {}", target.display()))?;
     Ok(ReferenceSet { camera: snap.camera, target, replaced, unchanged })
+}
+
+/// `edit …`: see `EditCmd`. An edit that changes nothing says so and writes nothing.
+fn cmd_edit(data_dir: &Path, sub: &EditCmd) -> Result<()> {
+    use nikon_fleet::ops::edit_snapshot::{create_edit_copy, edit_in_place};
+    use nikon_fleet::snapshot_edit as edit;
+    let snaps = snapshots_dir(data_dir);
+    let now = OffsetDateTime::now_utc().format(&Rfc3339).context("formatting the time")?;
+    let say = |a: &edit::Applied| {
+        if a.changed {
+            println!("{}", a.change);
+        } else {
+            println!("no change: {}", a.change);
+        }
+    };
+    let refuse = |e: nikon_fleet::ops::edit_snapshot::EditFileError| anyhow::anyhow!("{e} [{}]", e.tag());
+    match sub {
+        EditCmd::Copy { snapshot, label } => {
+            let source = resolve_snapshot_path(data_dir, snapshot);
+            let c = create_edit_copy(&snaps, &source, label.as_deref(), &now).map_err(refuse)?;
+            println!("{}", c.file);
+        }
+        EditCmd::Set { file, property, value } => {
+            let (name, a) = edit_in_place(&snaps, file, |s| edit::set_property_text(s, property, value, &now)).map_err(refuse)?;
+            println!("{name}");
+            say(&a);
+        }
+        EditCmd::SetString { file, item, text } => {
+            let code = edit::resolve_extended_item(item).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
+            say(&edit_in_place(&snaps, file, |s| edit::set_owner_string(s, code, text, &now)).map_err(refuse)?);
+        }
+        EditCmd::SetSwitch { file, item, value } => {
+            let code = edit::resolve_extended_item(item).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
+            say(&edit_in_place(&snaps, file, |s| edit::set_switch(s, code, *value, &now)).map_err(refuse)?);
+        }
+        EditCmd::SetIptc { file, slot, field, text } => {
+            say(&edit_in_place(&snaps, file, |s| edit::set_iptc_field(s, *slot, field, text, &now)).map_err(refuse)?);
+        }
+        EditCmd::FtpDelete { file, index } => say(&edit_in_place(&snaps, file, |s| edit::ftp_delete(s, *index, &now)).map_err(refuse)?),
+        EditCmd::FtpMove { file, from, to } => say(&edit_in_place(&snaps, file, |s| edit::ftp_move(s, *from, *to, &now)).map_err(refuse)?),
+        EditCmd::Log { file } => {
+            let path = nikon_fleet::ops::paths::resolve_existing(&snaps, file).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
+            let snap = Snapshot::load_from_file(&path).with_context(|| format!("loading {}", path.display()))?;
+            match &snap.derived_from {
+                None => println!("{file} was read from a camera: it has not been edited and cannot be (make a copy with `edit copy`)"),
+                Some(d) => {
+                    println!("{file}: a copy of {} (captured {}{}), made {}, last edited {}", d.source_file, d.source_captured_at, d.source_label.as_ref().map(|l| format!(", label {l:?}")).unwrap_or_default(), d.created_at, d.last_edited_at);
+                    if d.edits.is_empty() {
+                        println!("  no changes yet");
+                    }
+                    for e in &d.edits {
+                        println!("  {}  {}  {}", e.at, e.item, e.change);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_ref(data_dir: &Path, sub: &RefCmd) -> Result<()> {
@@ -4402,6 +4523,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Show(args) => cmd_show(&cli.data_dir, &cli.schema, args),
         Cmd::Rm(args) => cmd_rm(&cli.data_dir, args),
         Cmd::Ref(sub) => cmd_ref(&cli.data_dir, sub),
+        Cmd::Edit(sub) => cmd_edit(&cli.data_dir, sub),
         Cmd::Baseline(sub) => cmd_baseline(sub),
         Cmd::Settings(sub) => cmd_settings(sub),
         #[cfg(unix)]

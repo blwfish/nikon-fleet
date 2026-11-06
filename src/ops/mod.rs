@@ -11,6 +11,7 @@ pub mod cameras;
 pub mod capture;
 pub mod capture_snapshot;
 pub mod check;
+pub mod edit_snapshot;
 pub mod firmware_latest;
 pub mod labels;
 pub mod list;

@@ -28,6 +28,7 @@ pub mod range_value;
 pub mod sdk;
 pub mod settings;
 pub mod snapshot;
+pub mod snapshot_edit;
 pub mod transplant;
 pub(crate) mod value_shape;
 #[cfg(test)]
