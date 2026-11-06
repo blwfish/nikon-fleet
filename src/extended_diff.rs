@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::extended::{Extended, FtpProfileEntry, FtpState};
+use crate::extended::{Extended, FtpProfileEntry, FtpState, IptcState, IptcStore};
+use crate::iptc::{IPTC_FIELDS, IptcRecord};
 use crate::ops::render_extended::{ProfileField, profile_fields, prop_row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +138,64 @@ fn ftp_changes(a: &FtpState, b: &FtpState, out: &mut Vec<ExtendedChange>) {
     }
 }
 
+fn iptc_changes(a: &IptcState, b: &IptcState, out: &mut Vec<ExtendedChange>) {
+    let describe = |s: &IptcState| match s {
+        IptcState::NotRead => "not read".to_string(),
+        IptcState::NotOnModel => "not on this model".to_string(),
+        IptcState::ReadFailed { tag, .. } => format!("not read ({tag})"),
+        IptcState::Read(store) => format!("{} slot(s)", store.slots.len()),
+    };
+    let (IptcState::Read(sa), IptcState::Read(sb)) = (a, b) else {
+        if describe(a) != describe(b) {
+            out.push(change("IPTC presets", ExtendedChangeKind::Changed, Some(describe(a)), Some(describe(b))));
+        }
+        return;
+    };
+    fn by_slot(s: &IptcStore) -> BTreeMap<u32, &crate::extended::IptcSlotEntry> {
+        s.slots.iter().map(|e| (e.slot, e)).collect()
+    }
+    let (ma, mb) = (by_slot(sa), by_slot(sb));
+    let label = |slot: u32, r: &Result<IptcRecord, String>| match r {
+        Ok(IptcRecord::Preset(p)) if !p.name.is_empty() => format!("IPTC preset {slot} {:?}", p.name),
+        _ => format!("IPTC preset {slot}"),
+    };
+    for (slot, ea) in &ma {
+        let Some(eb) = mb.get(slot) else {
+            out.push(change(format!("IPTC slot {slot}"), ExtendedChangeKind::OnlyInA, Some("present".into()), None));
+            continue;
+        };
+        if ea.hex == eb.hex {
+            continue;
+        }
+        match (ea.decode(), eb.decode()) {
+            (Ok(IptcRecord::Preset(pa)), Ok(IptcRecord::Preset(pb))) => {
+                if pa.name != pb.name {
+                    out.push(change(format!("IPTC preset {slot}: name"), ExtendedChangeKind::Changed, Some(format!("{:?}", pa.name)), Some(format!("{:?}", pb.name))));
+                }
+                for ((name, va), vb) in IPTC_FIELDS.iter().zip(&pa.fields).zip(&pb.fields) {
+                    if va != vb {
+                        out.push(change(
+                            format!("{}: {name}", label(*slot, &Ok(IptcRecord::Preset(pb.clone())))),
+                            ExtendedChangeKind::Changed,
+                            Some(format!("{va:?}")),
+                            Some(format!("{vb:?}")),
+                        ));
+                    }
+                }
+            }
+            (ra, rb) => out.push(change(
+                format!("{} (record layout not shown)", label(*slot, &ra).replace("IPTC preset", "IPTC slot")),
+                ExtendedChangeKind::Changed,
+                Some(format!("{} byte(s)", ea.hex.len() / 2)),
+                Some(format!("{} byte(s) {}", eb.hex.len() / 2, if rb.is_err() { "(not decodable)" } else { "" }).trim().to_string()),
+            )),
+        }
+    }
+    for slot in mb.keys().filter(|s| !ma.contains_key(s)) {
+        out.push(change(format!("IPTC slot {slot}"), ExtendedChangeKind::OnlyInB, None, Some("present".into())));
+    }
+}
+
 /// The differences between the two extended sections, in a stable order: properties by code, then FTP.
 pub fn diff_extended(a: Option<&Extended>, b: Option<&Extended>) -> Vec<ExtendedChange> {
     let mut out = Vec::new();
@@ -175,6 +234,7 @@ pub fn diff_extended(a: Option<&Extended>, b: Option<&Extended>) -> Vec<Extended
         }
     }
     ftp_changes(&a.ftp, &b.ftp, &mut out);
+    iptc_changes(&a.iptc, &b.iptc, &mut out);
     out
 }
 
@@ -206,6 +266,7 @@ mod tests {
         Extended {
             read_from: ReadFrom { model: "Z 9".into(), usb_serial: "1".into() },
             props,
+            iptc: Default::default(),
             ftp: FtpState::Read(FtpStore {
                 count: blobs.len() as u32,
                 limit: 20,
@@ -310,5 +371,42 @@ mod tests {
         let d = diff_extended(Some(&a), Some(&b));
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].item, "FTP profiles");
+    }
+
+    #[test]
+    fn iptc_changes_name_the_preset_and_the_field() {
+        use crate::extended::IptcSlotEntry;
+        use crate::iptc::{IptcPreset, encode_iptc_preset};
+        let preset = |name: &str, headline: &str| {
+            let mut fields = vec![String::new(); 14];
+            fields[2] = headline.into();
+            hex_encode(&encode_iptc_preset(&IptcPreset { name: name.into(), fields }).unwrap())
+        };
+        let with = |hexes: &[(u32, String)]| {
+            let mut e = ext("x", &[], None);
+            e.iptc = IptcState::Read(IptcStore {
+                count: hexes.len() as u32,
+                truncated: false,
+                slots: hexes.iter().map(|(slot, hex)| IptcSlotEntry { slot: *slot, hex: hex.clone() }).collect(),
+            });
+            e
+        };
+        let (a, b) = (with(&[(1, preset("A", "old"))]), with(&[(1, preset("A", "new"))]));
+        let d = diff_extended(Some(&a), Some(&b));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].item.ends_with("Headline") && d[0].item.contains("\"A\""), "{:?}", d[0]);
+        assert_eq!((d[0].a.as_deref(), d[0].b.as_deref()), (Some("\"old\""), Some("\"new\"")));
+        assert!(diff_extended(Some(&a), Some(&a.clone())).is_empty());
+        let renamed = diff_extended(Some(&a), Some(&with(&[(1, preset("B", "old"))])));
+        assert_eq!(renamed.len(), 1);
+        assert!(renamed[0].item.ends_with("name"));
+        let more = diff_extended(Some(&a), Some(&with(&[(1, preset("A", "old")), (2, preset("", ""))])));
+        assert!(more.iter().any(|c| c.difference == ExtendedChangeKind::OnlyInB), "{more:?}");
+        // A snapshot from before IPTC against one with it is one entry, not a pile.
+        let mut old = a.clone();
+        old.iptc = IptcState::NotRead;
+        let d = diff_extended(Some(&old), Some(&a));
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].item, "IPTC presets");
     }
 }

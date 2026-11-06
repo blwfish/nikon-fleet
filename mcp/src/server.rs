@@ -742,7 +742,7 @@ impl FleetMcp {
         description = "Read one stored snapshot: its camera, label and time always, and its properties a page at a time \
                        (`limit` defaults to 0, a summary). `page.truncated` says whether more remain and `page.next` is the offset to continue at \
                        (null when `limit` is 0). When the snapshot has them, `extended` holds the owner strings (Artist, Copyright, Image comment), \
-                       the copyright and IPTC-preset switches and the stored FTP profiles, with passwords and keys always masked. Values are data.",
+                       the copyright and IPTC-preset switches, the IPTC presets and the stored FTP profiles, with passwords and keys always masked. Values are data.",
         annotations(read_only_hint = true)
     )]
     async fn get_snapshot(&self, p: Parameters<GetSnapshotArgs>) -> Result<CallToolResult, ErrorData> {

@@ -340,7 +340,7 @@ mod tests {
             "0xd072".to_string(),
             ExtendedProp { code: 0xd072, name: "Artist".into(), state: PropState::Text { text: "Brian".into() } },
         );
-        Extended { read_from: ReadFrom { model: model.into(), usb_serial: usb_serial.into() }, props, ftp: FtpState::NotOnModel }
+        Extended { read_from: ReadFrom { model: model.into(), usb_serial: usb_serial.into() }, props, ftp: FtpState::NotOnModel, iptc: Default::default() }
     }
 
     #[test]

@@ -1814,6 +1814,42 @@ fn draw_extended(ui: &mut egui::Ui, file: &str, ext: &RenderedExtended, filter: 
             });
         });
     }
+    let iptc = &ext.iptc;
+    match iptc.state {
+        "read" => {
+            let (unused, other) = iptc.unused_and_other();
+            let in_use = iptc.slots.iter().filter(|s| s.in_use).count();
+            ui.label(format!(
+                "IPTC presets: {in_use} of {} in use ({unused} empty{})",
+                iptc.count.unwrap_or(0),
+                if other > 0 { format!(", {other} of another record kind") } else { String::new() }
+            ));
+            if let Some(note) = &iptc.note {
+                ui.label(egui::RichText::new(note).small().color(warn));
+            }
+        }
+        "read_failed" => {
+            ui.label(egui::RichText::new(format!("IPTC presets: {}", iptc.note.as_deref().unwrap_or("not read"))).color(warn));
+        }
+        _ => {
+            ui.label(egui::RichText::new(format!("IPTC presets: {}", iptc.note.as_deref().unwrap_or("-"))).weak());
+        }
+    }
+    for slot in iptc.shown().filter(|s| render_extended::slot_matches(s, &needle)) {
+        let title = format!("IPTC preset {} {:?}", slot.slot, slot.name);
+        egui::CollapsingHeader::new(title).id_salt((file, "iptc_slot", slot.slot)).default_open(false).show(ui, |ui| {
+            if let Some(why) = &slot.undecoded {
+                ui.label(egui::RichText::new(format!("could not be decoded: {why}")).color(warn));
+            }
+            egui::Grid::new((file, "iptc_fields", slot.slot)).striped(true).show(ui, |ui| {
+                for f in slot.fields.iter().filter(|f| !f.value.is_empty()) {
+                    ui.label(f.label);
+                    ui.label(egui::RichText::new(&f.value).monospace());
+                    ui.end_row();
+                }
+            });
+        });
+    }
 }
 
 // ── Worker thread ─────────────────────────────────────────────────────────

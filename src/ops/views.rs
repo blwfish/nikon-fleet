@@ -311,6 +311,7 @@ mod tests {
         s.extended = Some(Extended {
             read_from: ReadFrom { model: "Z 9".into(), usb_serial: "1".into() },
             props: Default::default(),
+            iptc: Default::default(),
             ftp: FtpState::Read(FtpStore {
                 count: 1,
                 limit: 20,

@@ -2966,6 +2966,23 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         Ok(VendorRead { data: reply.data, response_params: reply.params, warnings })
     }
 
+    /// `0x9412(0)` (the directory: a u32 count first) and then `0x9412(n)` for `n` in `1..=min(count, max)`. Read-only,
+    /// one transaction per slot. A directory that does not begin with a count is [`PtpUsbError::NoDataPhase`]'s sibling
+    /// problem and is reported as a short read; the first failing slot ends the read with its error.
+    pub fn read_iptc_slots(&mut self, max: u32) -> Result<(u32, Vec<(u32, Vec<u8>)>), PtpUsbError> {
+        let directory = self.read_iptc_slot(0)?;
+        let count = directory
+            .data
+            .get(..4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or(PtpUsbError::NoDataPhase { op: OP_IPTC_READ })?;
+        let mut slots = Vec::new();
+        for n in 1..=count.min(max) {
+            slots.push((n, self.read_iptc_slot(n)?.data));
+        }
+        Ok((count, slots))
+    }
+
     /// EXPERIMENTAL. `0x9412(slot)`, then `0x9413(slot)` with `data`, then `0x9412(slot)` again, in one session: what
     /// the slot held, whether the camera accepted the write, and what it holds now. Nothing is verified or interpreted.
     /// Refused before anything is sent for a model outside [`IPTC_WRITE_CONFIRMED_MODELS`] unless

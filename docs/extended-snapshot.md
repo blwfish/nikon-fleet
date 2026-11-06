@@ -15,7 +15,7 @@ file without it loads as before, and a snapshot with none writes no `extended` k
 | the FTP list header (`0x90EB`: count, limit, active slot, device name) | extracted |
 | FTP profiles past 32 | dropped, with `truncated: true`: the camera reports a limit of 20, a larger count is not trusted |
 | the blob's timestamps, structural tag bytes and IPv6 placeholders | in the stored blob; not in the viewer's table (nothing a person sets) |
-| IPTC fields (`0x9412` read, `0x9413` write) | **not captured yet**: see below |
+| each IPTC slot, `0x9412(n)` for `n` in 1..=count (the directory `0x9412(0)` gives the count) | raw-only: the whole record, hex; decoded when shown by `src/iptc.rs` (name + 14 fields). Slots of another record kind are kept and shown as such |
 
 Each property is recorded in exactly one state: `text`, `bytes`, `undecodable`, `not_supported` (the body answered
 `DevicePropNotSupported`) or `read_failed` (with `PtpUsbError::tag()` and the detail). FTP is `read`, `not_on_model`
@@ -69,12 +69,15 @@ live capture is MAID only, so a reference's section would otherwise show as a di
 - **Restore and transplant do not write the section.** The write paths exist separately (`vendor-set-string`,
   `vendor-write-ftp-blob`, both verified by read-back), but rebuilding a stored FTP list needs a design: a write lands
   at the front and shifts the rest, `0x90EA` deletes everything, and the Z 5 has none of it.
-- **IPTC fields.** `0x9412` works over USB on a Z 9. `0x9412(0)` returned 732 bytes: a u32 count (13) and then 13
-  fixed-size records, each `c9 00` and a u32 kind (`1` for the first ten, `2` for the last three) followed by zeros.
-  `0x9412(1)` returned 72 bytes: `01 00 00 00 c9 00 01 00 00 00` and zeros. That body held no IPTC text, so the field
-  layout is not decoded. Needs one slot with known text (every field labelled with its own name, as in the July
-  Z6III capture). `vendor-read-iptc --slot N` prints the bytes.
-- **IPTC write experiments on the Z 9 (2026-11-06; all empty-slot, baseline restored byte for byte).**
+- **IPTC write is understood but not wired into restore.** Layout (Z 9, confirmed by writing a preset to an empty slot
+  and reading back the same 193 bytes): a 12-byte header `01 00 00 00 c9 00 01 00 00 00 00 00`, then 15 entries
+  `[u32 length incl. NUL][UTF-8][NUL]` (empty: a zero length), the first the preset's name, then Caption, Event ID,
+  Headline, Object name, City, State, Country, Category, Supplemental categories, Byline, Byline title, Writer/editor,
+  Credit, Source. An empty preset is 72 bytes. Slots 1..10 are presets; 11..13 are a 20-byte record of kind 2 whose
+  meaning is unknown. Read from a preset the owner typed in at the camera ("A", one to three characters per field).
+  The Z6III capture notes describe different leading entries (`""` and `"1"`); a Z 9 refused that with `0xA210`, so
+  a Z6III must be read before the layout is called general.
+- **IPTC write experiments on the Z 9 (2026-11-06; empty slot, baseline restored byte for byte).**
   `vendor-write-iptc` writes a slot; `vendor-set-iptc-preset` selects `0xD060`.
   - Slots 1..10 read as 72 bytes (`01 00 00 00 c9 00 01 00 00 00` then zeros); slots 11..13 read as 20 bytes
     (`01 00 00 00 c9 00 02 00 00 00` then zeros): two record types, not one layout.
@@ -83,7 +86,7 @@ live capture is MAID only, so a reference's section would otherwise show as a di
     names: accepted, **ignored** (slot still empty).
   - `0xD060` set to 1: `AccessDenied` (0x200F), though its descriptor says read-write, 0..13. Probably the camera
     only selects or accepts a registered preset, and all thirteen here are empty.
-  - So the write layout is still unknown. The way forward is ground truth: one preset typed in at the camera, then read
-    with `vendor-read-iptc`, then a modified copy written back.
-- **Other bodies.** Only a Z 9 has been captured with this section. Z6III (expect 5 properties, FTP) and Z 5 (expect
-  `not_supported` for the IPTC preset at least, FTP `not_on_model`) still need a run each.
+  - The failed attempt had a 16-byte header, one u32 too many; with the 12-byte header the write is stored.
+  - Selecting a preset (`0xD060`) was `AccessDenied` while every preset was empty; not retried with a preset in use.
+- **Other bodies.** Only a Z 9 has been captured with this section. Z6III (expect 5 properties, FTP, IPTC) and Z 5
+  (expect `not_supported` for the IPTC preset at least, FTP and IPTC `not_on_model`) still need a run each.

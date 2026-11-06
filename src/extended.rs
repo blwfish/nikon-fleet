@@ -19,7 +19,8 @@
 //! | each stored FTP profile (`0x90ED(n)`, `n < count`) | `raw-only`: the whole blob, hex. The decoded fields are derived when shown, by `decode_ftp_profile`, so the password lives in one place only |
 //! | the FTP list header (`0x90EB`: count, limit, active slot, device name) | `extracted` |
 //! | the FTP list beyond [`crate::ptp_usb::FTP_LIST_MAX_READ`] profiles | `dropped-with-reason`: the camera reports a limit of 20; a larger count is a number this code does not trust, and [`FtpStore::truncated`] says so |
-//! | the IPTC fields (`0x9412` read, `0x9413` write) | `dropped-with-reason`: the write is known to work over USB on a Z6III, the read has never been sent over USB, so there is nothing to decode yet (docs/usb-vs-wifi-camera-behavior-handoff-2026-11-05.md) |
+//! | each IPTC slot (`0x9412(n)`, `n` from 1 to the directory's count) | `raw-only`: the whole record, hex. Decoded when shown (`crate::iptc`); a slot of another record kind is kept as such |
+//! | IPTC slots past [`IPTC_READ_MAX`] | `dropped-with-reason`: the count is the camera's and is not trusted past the cap; [`IptcStore::truncated`] says so |
 //!
 //! Passwords are stored (the point is to be able to restore them) and shown masked unless the user
 //! asks; see `DecodedFtpProfile::with_secrets_masked`.
@@ -28,6 +29,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::iptc::{IptcRecord, decode_iptc_slot};
 use crate::ptp_usb::{
     FtpListState, PtpResponseCode, PtpUsbError, PtpUsbSession, decode_ftp_profile,
     decode_ptp_string_value,
@@ -58,6 +60,14 @@ pub const EXTENDED_PROPS: [(u16, &str, PropKind); 5] = [
 /// Models known to have no FTP-profile feature (owner, 2026-11-06: the Z 5 menu has none; its `vendor-read-ftp` times
 /// out on the `0x90E8` setup). Matched against the USB model name. The one place this is decided.
 pub const FTP_ABSENT_MODELS: &[&str] = &["Z 5"];
+
+/// Models known to have no IPTC presets (owner, 2026-11-06: the Z 5 menu has none; its DeviceInfo lists neither `0x9412`
+/// nor `0x9413`). Matched against the USB model name. Unlike the FTP table, DeviceInfo does list these operations on the
+/// bodies that have them (Z 9), so this is a skip for a known case, not the test.
+pub const IPTC_ABSENT_MODELS: &[&str] = &["Z 5"];
+
+/// At most this many IPTC slots are read; the directory's count above it is not trusted ([`IptcStore::truncated`]).
+pub const IPTC_READ_MAX: u32 = 32;
 
 /// Key of a property in [`Extended::props`]: `0xd072`.
 pub fn prop_key(code: u16) -> String {
@@ -119,6 +129,40 @@ pub enum FtpState {
     Read(FtpStore),
 }
 
+/// One IPTC slot as the camera returned it (`0x9412(slot)`): the whole record, hex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IptcSlotEntry {
+    pub slot: u32,
+    pub hex: String,
+}
+
+impl IptcSlotEntry {
+    pub fn decode(&self) -> Result<IptcRecord, String> {
+        decode_iptc_slot(&hex_decode(&self.hex)?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IptcStore {
+    /// The directory's count (`0x9412(0)`'s first u32): how many slots the body says it has, numbered from 1.
+    pub count: u32,
+    /// `count` is above [`IPTC_READ_MAX`], so `slots` is a prefix.
+    pub truncated: bool,
+    pub slots: Vec<IptcSlotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum IptcState {
+    /// The snapshot was taken before IPTC was captured: says nothing about the body.
+    #[default]
+    NotRead,
+    /// The model is in [`IPTC_ABSENT_MODELS`]: not asked.
+    NotOnModel,
+    ReadFailed { tag: String, detail: String },
+    Read(IptcStore),
+}
+
 /// Which body the extended data was read from, checked against the snapshot's camera before it is attached.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadFrom {
@@ -133,6 +177,9 @@ pub struct Extended {
     /// Keyed by [`prop_key`]; every entry of [`EXTENDED_PROPS`] is present, each in one of the [`PropState`]s.
     pub props: BTreeMap<String, ExtendedProp>,
     pub ftp: FtpState,
+    /// Absent in a section written before IPTC was captured, which reads as [`IptcState::NotRead`].
+    #[serde(default)]
+    pub iptc: IptcState,
 }
 
 impl Extended {
@@ -151,7 +198,12 @@ impl Extended {
                 (prop_key(code), ExtendedProp { code: u32::from(code), name: name.to_string(), state })
             })
             .collect();
-        Extended { read_from, props, ftp: FtpState::ReadFailed { tag: tag.to_string(), detail: detail.to_string() } }
+        Extended {
+            read_from,
+            props,
+            ftp: FtpState::ReadFailed { tag: tag.to_string(), detail: detail.to_string() },
+            iptc: IptcState::ReadFailed { tag: tag.to_string(), detail: detail.to_string() },
+        }
     }
 
     /// Whether this was read from the body the snapshot says it is of. Only a mismatch that can be seen
@@ -209,6 +261,8 @@ pub trait ExtendedSource {
     fn identity(&mut self) -> Result<ReadFrom, PtpUsbError>;
     fn prop_bytes(&mut self, code: u16) -> Result<Vec<u8>, PtpUsbError>;
     fn ftp_list(&mut self) -> Result<FtpListState, PtpUsbError>;
+    /// The directory count and the first `max` slots (slot numbers from 1), each slot's bytes as returned.
+    fn iptc_slots(&mut self, max: u32) -> Result<(u32, Vec<(u32, Vec<u8>)>), PtpUsbError>;
 }
 
 impl<T: crate::ptp_usb::BulkTransport> ExtendedSource for PtpUsbSession<T> {
@@ -223,6 +277,10 @@ impl<T: crate::ptp_usb::BulkTransport> ExtendedSource for PtpUsbSession<T> {
 
     fn ftp_list(&mut self) -> Result<FtpListState, PtpUsbError> {
         self.read_ftp_list()
+    }
+
+    fn iptc_slots(&mut self, max: u32) -> Result<(u32, Vec<(u32, Vec<u8>)>), PtpUsbError> {
+        self.read_iptc_slots(max)
     }
 }
 
@@ -287,7 +345,22 @@ pub fn read_extended<S: ExtendedSource + ?Sized>(src: &mut S) -> Extended {
             }
         }
     };
-    Extended { read_from, props, ftp }
+    let iptc = if IPTC_ABSENT_MODELS.contains(&read_from.model.as_str()) {
+        IptcState::NotOnModel
+    } else {
+        match src.iptc_slots(IPTC_READ_MAX) {
+            Ok((count, slots)) => IptcState::Read(IptcStore {
+                count,
+                truncated: count > IPTC_READ_MAX,
+                slots: slots.into_iter().map(|(slot, bytes)| IptcSlotEntry { slot, hex: hex_encode(&bytes) }).collect(),
+            }),
+            Err(e) => {
+                let (tag, detail) = failed(&e);
+                IptcState::ReadFailed { tag, detail }
+            }
+        }
+    };
+    Extended { read_from, props, ftp, iptc }
 }
 
 /// A count of what an [`Extended`] holds, for a capture's result: small enough to put in a JSON result
@@ -304,6 +377,10 @@ pub struct ExtendedSummary {
     pub ftp: String,
     /// How many profiles were stored, when the list was read.
     pub ftp_profiles: Option<usize>,
+    /// `not_read`, `not_on_model`, `read_failed` or `read`.
+    pub iptc: String,
+    /// How many IPTC presets hold text, when the slots were read.
+    pub iptc_presets_in_use: Option<usize>,
     /// Set when the data was read but not kept, and why (a different body than the snapshot's).
     pub dropped: Option<String>,
 }
@@ -316,12 +393,23 @@ impl Extended {
             FtpState::ReadFailed { .. } => ("read_failed", None),
             FtpState::Read(store) => ("read", Some(store.profiles.len())),
         };
+        let (iptc, iptc_presets_in_use) = match &self.iptc {
+            IptcState::NotRead => ("not_read", None),
+            IptcState::NotOnModel => ("not_on_model", None),
+            IptcState::ReadFailed { .. } => ("read_failed", None),
+            IptcState::Read(store) => (
+                "read",
+                Some(store.slots.iter().filter(|s| matches!(s.decode(), Ok(IptcRecord::Preset(p)) if !p.is_empty())).count()),
+            ),
+        };
         ExtendedSummary {
             props_read: count(|s| matches!(s, PropState::Text { .. } | PropState::Bytes { .. } | PropState::Undecodable { .. })),
             props_not_supported: count(|s| matches!(s, PropState::NotSupported)),
             props_failed: count(|s| matches!(s, PropState::ReadFailed { .. })),
             ftp: ftp.to_string(),
             ftp_profiles,
+            iptc: iptc.to_string(),
+            iptc_presets_in_use,
             dropped: None,
         }
     }
@@ -363,6 +451,7 @@ mod tests {
         info: Result<ReadFrom, PtpUsbError>,
         props: BTreeMap<u16, Result<Vec<u8>, PtpUsbError>>,
         ftp: Result<FtpListState, PtpUsbError>,
+        iptc: Result<(u32, Vec<(u32, Vec<u8>)>), PtpUsbError>,
         asked: Vec<String>,
         /// Answer every property read with DevicePropNotSupported.
         not_supported: bool,
@@ -399,6 +488,7 @@ mod tests {
             info: Ok(ReadFrom { model: "Z 9".into(), usb_serial: "0000003023668".into() }),
             props,
             ftp: Ok(list(&[&[1, 2, 3], &[4, 5]], 2, 0)),
+            iptc: Ok((2, vec![(1, vec![1, 2]), (2, vec![3])])),
             asked: vec![],
             not_supported: false,
         }
@@ -419,6 +509,13 @@ mod tests {
             match self.props.get(&code) {
                 Some(Ok(b)) => Ok(b.clone()),
                 _ => Err(PtpUsbError::NoDataPhase { op: 0x1015 }),
+            }
+        }
+        fn iptc_slots(&mut self, _max: u32) -> Result<(u32, Vec<(u32, Vec<u8>)>), PtpUsbError> {
+            self.asked.push("iptc".into());
+            match &self.iptc {
+                Ok(x) => Ok(x.clone()),
+                Err(_) => Err(PtpUsbError::NoDataPhase { op: 0x9412 }),
             }
         }
         fn ftp_list(&mut self) -> Result<FtpListState, PtpUsbError> {
@@ -479,6 +576,37 @@ mod tests {
             f.info = Ok(ReadFrom { model: model.into(), usb_serial: "1".into() });
             assert!(matches!(read_extended(&mut f).ftp, FtpState::Read(_)), "{model:?}");
         }
+    }
+
+    #[test]
+    fn iptc_slots_are_stored_raw_and_a_body_without_iptc_is_not_asked() {
+        let e = read_extended(&mut z9());
+        let IptcState::Read(store) = &e.iptc else { panic!("{:?}", e.iptc) };
+        assert_eq!((store.count, store.truncated), (2, false));
+        assert_eq!(store.slots.iter().map(|s| (s.slot, s.hex.as_str())).collect::<Vec<_>>(), [(1, "0102"), (2, "03")]);
+        for model in IPTC_ABSENT_MODELS {
+            let mut f = z9();
+            f.info = Ok(ReadFrom { model: (*model).into(), usb_serial: "5".into() });
+            assert_eq!(read_extended(&mut f).iptc, IptcState::NotOnModel, "{model}");
+            assert!(!f.asked.iter().any(|a| a == "iptc"));
+        }
+        let mut f = z9();
+        f.iptc = Err(PtpUsbError::NoDataPhase { op: 0x9412 });
+        assert!(matches!(read_extended(&mut f).iptc, IptcState::ReadFailed { .. }));
+        // A count above the cap is a prefix, and exactly the cap is the whole list.
+        let mut f = z9();
+        f.iptc = Ok((IPTC_READ_MAX + 1, vec![(1, vec![1])]));
+        assert!(matches!(&read_extended(&mut f).iptc, IptcState::Read(s) if s.truncated));
+        f.iptc = Ok((IPTC_READ_MAX, vec![(1, vec![1])]));
+        assert!(matches!(&read_extended(&mut f).iptc, IptcState::Read(s) if !s.truncated));
+    }
+
+    #[test]
+    fn a_section_written_before_iptc_existed_loads_as_not_read() {
+        let mut v = serde_json::to_value(read_extended(&mut z9())).unwrap();
+        v.as_object_mut().unwrap().remove("iptc");
+        let e: Extended = serde_json::from_value(v).unwrap();
+        assert_eq!(e.iptc, IptcState::NotRead);
     }
 
     #[test]

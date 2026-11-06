@@ -16,6 +16,7 @@ pub mod firmware_browse;
 pub mod firmware_source;
 #[cfg(feature = "webview")]
 pub mod firmware_webview;
+pub mod iptc;
 pub mod json_out;
 pub mod maid_layer;
 pub mod ops;

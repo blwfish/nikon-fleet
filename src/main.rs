@@ -1803,9 +1803,14 @@ fn extended_line(s: &nikon_fleet::extended::ExtendedSummary) -> String {
         ("not_on_model", _) => "no FTP profiles on this model".to_string(),
         _ => "FTP profiles not read".to_string(),
     };
+    let iptc = match (s.iptc.as_str(), s.iptc_presets_in_use) {
+        ("read", Some(n)) => format!("{n} IPTC preset(s) in use"),
+        ("not_on_model", _) => "no IPTC on this model".to_string(),
+        _ => "IPTC not read".to_string(),
+    };
     let dropped = s.dropped.as_deref().map(|d| format!("; NOT kept: {d}")).unwrap_or_default();
     format!(
-        "  extended: {} propert(ies) read, {} not on this model, {} failed; {ftp}{dropped}\n",
+        "  extended: {} propert(ies) read, {} not on this model, {} failed; {ftp}; {iptc}{dropped}\n",
         s.props_read, s.props_not_supported, s.props_failed
     )
 }

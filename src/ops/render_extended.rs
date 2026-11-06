@@ -8,7 +8,8 @@
 
 use serde::Serialize;
 
-use crate::extended::{Extended, FtpProfileEntry, FtpState, PropState};
+use crate::extended::{Extended, FtpProfileEntry, FtpState, IptcState, PropState};
+use crate::iptc::{IPTC_FIELDS, IptcRecord};
 use crate::ptp_usb::DecodedFtpProfile;
 
 /// Text that must not appear in `Debug` output or serialized data.
@@ -86,11 +87,110 @@ pub struct RenderedFtp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IptcFieldRow {
+    pub label: &'static str,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RenderedIptcSlot {
+    pub slot: u32,
+    /// The preset's name (empty for an unused one or another kind of record).
+    pub name: String,
+    /// A preset with any text in it.
+    pub in_use: bool,
+    /// The record kind when it is not a preset (a Z 9's slots 11..13 are kind 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_kind: Option<u16>,
+    /// Why the slot did not decode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undecoded: Option<String>,
+    pub fields: Vec<IptcFieldRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RenderedIptc {
+    /// `read`, `not_read`, `not_on_model` or `read_failed`.
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    pub slots: Vec<RenderedIptcSlot>,
+}
+
+impl RenderedIptc {
+    /// The slots a person wants to see: those with text, and any that could not be decoded.
+    pub fn shown(&self) -> impl Iterator<Item = &RenderedIptcSlot> {
+        self.slots.iter().filter(|s| s.in_use || s.undecoded.is_some())
+    }
+
+    /// How many slots are preset-kind and empty, and how many are another record kind.
+    pub fn unused_and_other(&self) -> (usize, usize) {
+        let other = self.slots.iter().filter(|s| s.other_kind.is_some()).count();
+        let unused = self.slots.iter().filter(|s| !s.in_use && s.other_kind.is_none() && s.undecoded.is_none()).count();
+        (unused, other)
+    }
+}
+
+pub fn slot_matches(s: &RenderedIptcSlot, needle: &str) -> bool {
+    needle.is_empty()
+        || "iptc".contains(needle)
+        || s.name.to_lowercase().contains(needle)
+        || s.fields.iter().any(|f| f.label.to_lowercase().contains(needle) || f.value.to_lowercase().contains(needle))
+}
+
+fn render_iptc(state: &IptcState) -> RenderedIptc {
+    let empty = |state: &'static str, note: Option<String>| RenderedIptc { state, note, count: None, slots: Vec::new() };
+    match state {
+        IptcState::NotRead => empty("not_read", Some("this snapshot was taken before IPTC was captured".to_string())),
+        IptcState::NotOnModel => empty("not_on_model", Some("this model has no IPTC presets".to_string())),
+        IptcState::ReadFailed { tag, detail } => empty("read_failed", Some(format!("not read: {tag} ({detail})"))),
+        IptcState::Read(store) => RenderedIptc {
+            state: "read",
+            note: store.truncated.then(|| format!("only the first {} of {} slots were read", store.slots.len(), store.count)),
+            count: Some(store.count),
+            slots: store
+                .slots
+                .iter()
+                .map(|entry| match entry.decode() {
+                    Ok(IptcRecord::Preset(p)) => RenderedIptcSlot {
+                        slot: entry.slot,
+                        in_use: !p.is_empty(),
+                        other_kind: None,
+                        undecoded: None,
+                        fields: IPTC_FIELDS.iter().zip(&p.fields).map(|(label, value)| IptcFieldRow { label, value: value.clone() }).collect(),
+                        name: p.name,
+                    },
+                    Ok(IptcRecord::Other { kind, .. }) => RenderedIptcSlot {
+                        slot: entry.slot,
+                        name: String::new(),
+                        in_use: false,
+                        other_kind: Some(kind),
+                        undecoded: None,
+                        fields: Vec::new(),
+                    },
+                    Err(why) => RenderedIptcSlot {
+                        slot: entry.slot,
+                        name: String::new(),
+                        in_use: false,
+                        other_kind: None,
+                        undecoded: Some(why),
+                        fields: Vec::new(),
+                    },
+                })
+                .collect(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RenderedExtended {
     /// The body the data was read from, as `model serial`.
     pub read_from: String,
     pub props: Vec<ExtendedRow>,
     pub ftp: RenderedFtp,
+    pub iptc: RenderedIptc,
 }
 
 impl RenderedExtended {
@@ -189,7 +289,7 @@ pub fn render_extended(e: &Extended, reveal_secrets: bool) -> RenderedExtended {
                 .collect(),
         },
     };
-    RenderedExtended { read_from: format!("{} {}", e.read_from.model, e.read_from.usb_serial).trim().to_string(), props, ftp }
+    RenderedExtended { read_from: format!("{} {}", e.read_from.model, e.read_from.usb_serial).trim().to_string(), props, ftp, iptc: render_iptc(&e.iptc) }
 }
 
 /// A line filter for the extended part: the same rule as the property rows (a case-insensitive
@@ -245,7 +345,36 @@ impl RenderedExtended {
                 }
             }
         }
-        if rows.is_empty() && !ftp_shown {
+        let slots: Vec<&RenderedIptcSlot> = self.iptc.shown().filter(|s| slot_matches(s, needle)).collect();
+        let iptc_shown = needle.is_empty() || !slots.is_empty();
+        if iptc_shown {
+            match self.iptc.state {
+                "read" => {
+                    let (unused, other) = self.iptc.unused_and_other();
+                    let in_use = self.iptc.slots.iter().filter(|s| s.in_use).count();
+                    out.push_str(&format!(
+                        "  IPTC presets: {} of {} in use ({unused} empty{})\n",
+                        in_use,
+                        self.iptc.count.unwrap_or(0),
+                        if other > 0 { format!(", {other} of another record kind") } else { String::new() },
+                    ));
+                    if let Some(note) = &self.iptc.note {
+                        out.push_str(&format!("  note: {note}\n"));
+                    }
+                }
+                _ => out.push_str(&format!("  IPTC presets: {}\n", self.iptc.note.as_deref().unwrap_or("-"))),
+            }
+            for s in slots {
+                out.push_str(&format!("  [{}] {:?}\n", s.slot, s.name));
+                if let Some(why) = &s.undecoded {
+                    out.push_str(&format!("      could not be decoded: {why}\n"));
+                }
+                for f in s.fields.iter().filter(|f| !f.value.is_empty()) {
+                    out.push_str(&format!("      {:<24} {}\n", f.label, f.value));
+                }
+            }
+        }
+        if rows.is_empty() && !ftp_shown && !iptc_shown {
             out.push_str("  (nothing matches the filter)\n");
         }
         out
@@ -287,6 +416,7 @@ mod tests {
         Extended {
             read_from: ReadFrom { model: "Z 9".into(), usb_serial: "123".into() },
             props,
+            iptc: Default::default(),
             ftp: FtpState::Read(FtpStore {
                 count: n,
                 limit: 20,
@@ -375,6 +505,49 @@ mod tests {
         assert!(r.to_text("10.0.0.2").contains("Host"));
         assert!(r.to_text("zzz").contains("nothing matches"));
         assert!(!r.to_text("hunter").contains("Password"), "a secret is not searchable through its mask");
+    }
+
+    #[test]
+    fn iptc_presets_with_text_are_shown_with_their_fields_and_empty_ones_are_counted() {
+        use crate::extended::{IptcSlotEntry, IptcStore};
+        const SLOT: &str = "01000000c90001000000000002000000410002000000430003000000455600020000004800030000004f4e0002000000430002000000530003000000434f0003000000434100030000005343000200000042000300000042540004000000572f45000300000043520003000000534f00";
+        const EMPTY: &str = "01000000c900010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        const KIND2: &str = "01000000c9000200000000000000000000000000";
+        let mut e = ext(vec![]);
+        e.iptc = IptcState::Read(IptcStore {
+            count: 4,
+            truncated: false,
+            slots: vec![
+                IptcSlotEntry { slot: 1, hex: EMPTY.into() },
+                IptcSlotEntry { slot: 2, hex: SLOT.into() },
+                IptcSlotEntry { slot: 3, hex: KIND2.into() },
+                IptcSlotEntry { slot: 4, hex: "0102".into() },
+            ],
+        });
+        let r = render_extended(&e, false);
+        let in_use: Vec<_> = r.iptc.shown().map(|s| s.slot).collect();
+        assert_eq!(in_use, [2, 4], "the preset with text, and the one that did not decode");
+        let s2 = &r.iptc.slots[1];
+        assert_eq!(s2.name, "A");
+        assert_eq!(s2.fields[0], IptcFieldRow { label: "Caption", value: "C".into() });
+        assert_eq!(s2.fields[11], IptcFieldRow { label: "Writer/editor", value: "W/E".into() });
+        assert_eq!(r.iptc.unused_and_other(), (1, 1));
+        let t = r.to_text("");
+        assert!(t.contains("IPTC presets: 1 of 4 in use (1 empty, 1 of another record kind)"), "{t}");
+        assert!(t.contains("[2] \"A\"") && t.contains("Supplemental categories") && t.contains("could not be decoded"), "{t}");
+        assert!(r.to_text("writer").contains("W/E") && !r.to_text("writer").contains("Host"));
+        assert!(!r.to_text("zzz").contains("W/E") && r.to_text("zzz").contains("nothing matches"));
+    }
+
+    #[test]
+    fn iptc_states_without_slots_say_why() {
+        for (state, tag) in [(IptcState::NotRead, "not_read"), (IptcState::NotOnModel, "not_on_model")] {
+            let mut e = ext(vec![]);
+            e.iptc = state;
+            let r = render_extended(&e, false);
+            assert_eq!(r.iptc.state, tag);
+            assert!(r.to_text("").contains("IPTC presets: "), "{tag}");
+        }
     }
 
     #[test]

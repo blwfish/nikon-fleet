@@ -373,6 +373,7 @@ mod tests {
             read_from: ReadFrom { model: "Z 9".into(), usb_serial: "1".into() },
             props,
             ftp: FtpState::NotOnModel,
+            iptc: Default::default(),
         });
         let back = Snapshot::from_json(&snap.to_pretty_json().unwrap()).unwrap();
         assert_eq!(back, snap);
