@@ -71,6 +71,10 @@ pub enum EditRefusal {
     FtpUnavailable { why: String },
     #[error("FTP profile {index} does not exist: the list has {len}")]
     FtpIndex { index: usize, len: usize },
+    #[error("the camera holds at most {limit} FTP profiles and the list has {len}")]
+    FtpListFull { limit: u32, len: usize },
+    #[error("FTP profile {index} cannot be edited: it does not decode ({why})")]
+    FtpProfileUnreadable { index: usize, why: String },
 }
 
 impl EditRefusal {
@@ -92,6 +96,8 @@ impl EditRefusal {
             EditRefusal::NoSuchField { .. } => "no_such_field",
             EditRefusal::FtpUnavailable { .. } => "ftp_unavailable",
             EditRefusal::FtpIndex { .. } => "ftp_index",
+            EditRefusal::FtpListFull { .. } => "ftp_list_full",
+            EditRefusal::FtpProfileUnreadable { .. } => "ftp_profile_unreadable",
         }
     }
 }
@@ -138,7 +144,7 @@ pub fn ensure_editable(snap: &Snapshot) -> Result<(), EditRefusal> {
     if snap.derived_from.is_some() { Ok(()) } else { Err(EditRefusal::NotACopy) }
 }
 
-fn record(snap: &mut Snapshot, now: &str, item: &str, change: &str) {
+pub(crate) fn record(snap: &mut Snapshot, now: &str, item: &str, change: &str) {
     if let Some(d) = snap.derived_from.as_mut() {
         d.edits.push(EditRecord { at: now.to_string(), item: item.to_string(), change: change.to_string() });
         d.last_edited_at = now.to_string();
@@ -146,7 +152,7 @@ fn record(snap: &mut Snapshot, now: &str, item: &str, change: &str) {
 }
 
 /// Record `outcome` if it changed anything, and return it.
-fn finish(snap: &mut Snapshot, now: &str, outcome: Applied) -> Applied {
+pub(crate) fn finish(snap: &mut Snapshot, now: &str, outcome: Applied) -> Applied {
     if outcome.changed {
         record(snap, now, &outcome.item, &outcome.change);
     }
@@ -506,7 +512,7 @@ pub fn set_iptc_field(snap: &mut Snapshot, slot: u32, field: &str, text: &str, n
 
 // ── FTP profile list ─────────────────────────────────────────────────────
 
-fn ftp_store_mut(snap: &mut Snapshot) -> Result<&mut crate::extended::FtpStore, EditRefusal> {
+pub(crate) fn ftp_store_mut(snap: &mut Snapshot) -> Result<&mut crate::extended::FtpStore, EditRefusal> {
     let ext = extended_mut(snap)?;
     match &mut ext.ftp {
         FtpState::Read(store) if store.truncated => Err(EditRefusal::FtpUnavailable {
@@ -519,7 +525,7 @@ fn ftp_store_mut(snap: &mut Snapshot) -> Result<&mut crate::extended::FtpStore, 
 }
 
 /// A profile's name for the log, never its password: its stored name, or its position if the blob does not decode.
-fn profile_label(hex: &str, index: usize) -> String {
+pub(crate) fn profile_label(hex: &str, index: usize) -> String {
     match hex_decode(hex).ok().and_then(|b| decode_ftp_profile(&b).ok()) {
         Some(p) => format!("{:?}", p.profile_name),
         None => format!("#{index} (undecodable)"),
@@ -528,7 +534,7 @@ fn profile_label(hex: &str, index: usize) -> String {
 
 /// Bring the list's own bookkeeping in line with its profiles: slot numbers in order, `count`, and an active slot that
 /// exists (none when the list is empty).
-fn renumber(store: &mut crate::extended::FtpStore) {
+pub(crate) fn renumber(store: &mut crate::extended::FtpStore) {
     for (i, p) in store.profiles.iter_mut().enumerate() {
         p.slot = i as u32;
     }

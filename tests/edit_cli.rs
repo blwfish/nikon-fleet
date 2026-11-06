@@ -215,3 +215,105 @@ fn a_label_that_the_mcp_counts_by_is_refused() {
     let o = run(d.path(), &["edit", "copy", src, "--label", "mcp-x"]);
     assert!(!o.status.success() && err(&o).contains("reserved_label"), "{}", err(&o));
 }
+
+// ── FTP profile fields ──
+
+fn run_with_stdin(data_dir: &Path, args: &[&str], stdin: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = common::cli(BIN)
+        .arg("--data-dir")
+        .arg(data_dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn CLI");
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn a_profile_is_shown_masked_unless_asked_and_its_fields_are_changed_one_at_a_time() {
+    let d = tempfile::tempdir().unwrap();
+    let copy = ok(run(d.path(), &["edit", "copy", captured(d.path())]));
+    let c = copy.as_str();
+    let shown = ok(run(d.path(), &["edit", "ftp-show", c, "0"]));
+    assert!(shown.contains("alpha") && shown.contains("port 21 FTP") && !shown.contains("pw-secret") && !shown.contains("wifi-key-12345"), "{shown}");
+    assert!(shown.contains("password ********"), "{shown}");
+    let revealed = ok(run(d.path(), &["edit", "ftp-show", c, "0", "--reveal"]));
+    assert!(revealed.contains("pw-secret") && revealed.contains("wifi-key-12345"), "{revealed}");
+
+    let said = ok(run(d.path(), &["edit", "ftp-set", c, "0", "--host", "files.example.org", "--port", "22", "--protocol", "sftp", "--folder", "/incoming/raw"]));
+    assert!(said.contains("host, folder, port, protocol changed"), "{said}");
+    let after = ok(run(d.path(), &["edit", "ftp-show", c, "0"]));
+    assert!(after.contains("port 22 SFTP") && after.contains("files.example.org") && after.contains("/incoming/raw"), "{after}");
+    // the others are untouched
+    assert!(ok(run(d.path(), &["edit", "ftp-show", c, "1"])).contains("port 21 FTP"));
+    // a value starting with '-' is a value
+    ok(run(d.path(), &["edit", "ftp-set", c, "0", "--name", "-odd name"]));
+    assert!(ok(run(d.path(), &["edit", "ftp-show", c, "0"])).contains("\"-odd name\""));
+    let log = ok(run(d.path(), &["edit", "log", c]));
+    assert!(log.contains("ftp:edit:0") && !log.contains("pw-secret"), "{log}");
+}
+
+#[test]
+fn the_password_can_come_from_stdin_and_never_appears_in_the_output_or_the_log() {
+    let d = tempfile::tempdir().unwrap();
+    let copy = ok(run(d.path(), &["edit", "copy", captured(d.path())]));
+    let o = run_with_stdin(d.path(), &["edit", "ftp-set", &copy, "0", "--password-stdin"], "from stdin\n");
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!out(&o).contains("from stdin") && !err(&o).contains("from stdin"));
+    assert!(ok(run(d.path(), &["edit", "ftp-show", &copy, "0", "--reveal"])).contains("password from stdin"), "one trailing newline removed, nothing else");
+    assert!(!ok(run(d.path(), &["edit", "log", &copy])).contains("from stdin"));
+    let both = run(d.path(), &["edit", "ftp-set", &copy, "0", "--password", "x", "--password-stdin"]);
+    assert_eq!(both.status.code(), Some(2), "a password two ways is a usage error");
+}
+
+#[test]
+fn a_profile_is_added_and_duplicated_and_the_list_keeps_its_bookkeeping() {
+    let d = tempfile::tempdir().unwrap();
+    let copy = ok(run(d.path(), &["edit", "copy", captured(d.path())]));
+    let c = copy.as_str();
+    ok(run(d.path(), &["edit", "ftp-duplicate", c, "0"]));
+    let snap = load(d.path(), c);
+    let FtpState::Read(store) = &snap.extended.as_ref().unwrap().ftp else { panic!() };
+    assert_eq!((store.count, store.profiles.iter().map(|p| p.slot).collect::<Vec<_>>()), (4, vec![0, 1, 2, 3]));
+    assert!(ok(run(d.path(), &["edit", "ftp-show", c, "1"])).contains("alpha copy"));
+    ok(run(d.path(), &["edit", "ftp-duplicate", c, "0", "--name", "alpha at studio", "--host", "studio.test"]));
+    assert!(ok(run(d.path(), &["edit", "ftp-show", c, "1"])).contains("alpha at studio") && ok(run(d.path(), &["edit", "ftp-show", c, "1"])).contains("studio.test"));
+    ok(run(d.path(), &["edit", "ftp-add", c, "--name", "fresh", "--host", "ftp.fresh.test", "--user", "u", "--password", "p", "--at", "0"]));
+    assert!(ok(run(d.path(), &["edit", "ftp-show", c, "0"])).contains("fresh"));
+    // a new profile needs a name and a server
+    for args in [vec!["edit", "ftp-add", c, "--host", "h"], vec!["edit", "ftp-add", c, "--name", "n"]] {
+        let o = run(d.path(), &args);
+        assert!(!o.status.success() && err(&o).contains("bad_value"), "{args:?}: {}", err(&o));
+    }
+}
+
+#[test]
+fn bad_profile_fields_are_refused_with_the_reason_and_the_file_is_untouched() {
+    let d = tempfile::tempdir().unwrap();
+    let copy = ok(run(d.path(), &["edit", "copy", captured(d.path())]));
+    let bytes = std::fs::read(d.path().join("snapshots").join(&copy)).unwrap();
+    for (args, word) in [
+        (vec!["--port", "0"], "1 to 65535"),
+        (vec!["--wifi-name", "café"], "ASCII"),
+        (vec!["--host", ""], "needs a server"),
+        (vec!["--name", "  "], "needs a name"),
+    ] {
+        let mut full = vec!["edit", "ftp-set", copy.as_str(), "0"];
+        full.extend(&args);
+        let o = run(d.path(), &full);
+        assert!(!o.status.success() && err(&o).contains(word), "{args:?}: {}", err(&o));
+    }
+    assert_eq!(run(d.path(), &["edit", "ftp-set", &copy, "0", "--protocol", "ftps"]).status.code(), Some(2));
+    assert_eq!(run(d.path(), &["edit", "ftp-set", &copy, "0", "--port", "70000"]).status.code(), Some(2));
+    let o = run(d.path(), &["edit", "ftp-set", &copy, "9", "--name", "x"]);
+    assert!(!o.status.success() && err(&o).contains("ftp_index"));
+    assert_eq!(std::fs::read(d.path().join("snapshots").join(&copy)).unwrap(), bytes);
+    // a snapshot read from a camera is refused
+    let o = run(d.path(), &["edit", "ftp-set", "captured.json", "0", "--name", "x"]);
+    assert!(!o.status.success() && err(&o).contains("not_a_copy"));
+}

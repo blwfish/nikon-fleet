@@ -524,7 +524,13 @@ impl FtpEncoding {
 /// Check `value` against `spec` and `encoding`: ASCII-only where the wire form is, no control
 /// characters, and within the limit (in the form's own unit).
 fn validate_field(spec: &FtpFieldSpec, encoding: FtpEncoding, value: &str) -> Result<(), PtpUsbError> {
-    if encoding.encoder_ascii_only() && !value.is_ascii() {
+    validate_field_checking(spec, encoding, value, true)
+}
+
+/// [`validate_field`], with the ASCII-only rule of the form optional. A profile read from a camera may hold more than
+/// the encoder writes (the decoder reads the byte-length form as UTF-8), and writing it back must not refuse it.
+fn validate_field_checking(spec: &FtpFieldSpec, encoding: FtpEncoding, value: &str, require_ascii: bool) -> Result<(), PtpUsbError> {
+    if require_ascii && encoding.encoder_ascii_only() && !value.is_ascii() {
         return Err(PtpUsbError::FtpFieldNotAscii { field: spec.key });
     }
     if value.chars().any(char::is_control) {
@@ -569,6 +575,46 @@ pub(super) fn encode_with(layout: &[FtpLayoutEntry], profile: &FtpProfile, netwo
                 FtpValueKind::NetworkAddress => {
                     let [a, b, c, d] = network.ipv4;
                     out.extend_from_slice(&[d, c, b, a]);
+                }
+            },
+        }
+    }
+    Ok(out)
+}
+
+/// Build the blob for a decoded profile by walking `layout` with EVERY value taken from `d`: the tag bytes the layout
+/// leaves variable, the camera network, the timestamps, the folder, the ports, the option bits and the IPv6 fields as
+/// well as the text fields. So a profile that was read and not changed is written back byte for byte (pinned for the
+/// real blobs by a test), and a field changed on `d` is the only difference. The caller-supplied text fields are held
+/// to their limits and to "no control characters", but not to ASCII where the encoder insists on it for text a
+/// person types: whether new non-ASCII text is acceptable is for the caller to decide, since a profile the camera
+/// itself made can hold some.
+pub(super) fn encode_decoded_with(layout: &[FtpLayoutEntry], d: &DecodedFtpProfile) -> Result<Vec<u8>, PtpUsbError> {
+    let mut out = Vec::new();
+    for entry in layout {
+        match entry.wire {
+            FtpWire::Literal(bytes) => out.extend_from_slice(bytes),
+            FtpWire::Pattern(bytes) => {
+                for b in bytes {
+                    match *b {
+                        FtpTagByte::Exact(x) => out.push(x),
+                        FtpTagByte::Var { slot, .. } => out.push(d.get(slot).into_u8(slot)),
+                    }
+                }
+            }
+            FtpWire::Value { slot, kind, .. } => match kind {
+                FtpValueKind::Text(encoding, source) => {
+                    let text = d.get(slot).into_text(slot);
+                    if let FtpTextSource::Profile(field) = source {
+                        validate_field_checking(field.spec(), encoding, &text, false)?;
+                    }
+                    out.extend_from_slice(&encoding.encode(entry.name, &text)?);
+                }
+                FtpValueKind::U8(_) => out.push(d.get(slot).into_u8(slot)),
+                FtpValueKind::U16(_) => out.extend_from_slice(&d.get(slot).into_u16(slot).to_le_bytes()),
+                FtpValueKind::NetworkAddress => {
+                    let [a, b, c, e] = d.get(slot).into_ipv4(slot);
+                    out.extend_from_slice(&[e, c, b, a]);
                 }
             },
         }

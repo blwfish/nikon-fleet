@@ -1464,6 +1464,13 @@ pub fn encode_ftp_profile(profile: &FtpProfile) -> Result<Vec<u8>, PtpUsbError> 
     encode_ftp_profile_with(profile, &FtpCameraNetwork::CAPTURED)
 }
 
+/// The blob for a profile that was read and may have been edited: every field of `decoded` is written as it is, so an
+/// unchanged profile comes back byte for byte (see `ftp_layout::encode_decoded_with`). Unlike [`encode_ftp_profile`],
+/// which fixes the folder, ports, option bits and camera address, this writes what the profile holds.
+pub fn encode_decoded_ftp_profile(decoded: &DecodedFtpProfile) -> Result<Vec<u8>, PtpUsbError> {
+    ftp_layout::encode_decoded_with(ftp_layout::FTP_LAYOUT, decoded)
+}
+
 /// [`encode_ftp_profile`] with an explicit [`FtpCameraNetwork`].
 pub fn encode_ftp_profile_with(profile: &FtpProfile, network: &FtpCameraNetwork) -> Result<Vec<u8>, PtpUsbError> {
     ftp_layout::encode_with(ftp_layout::FTP_LAYOUT, profile, network)

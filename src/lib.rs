@@ -12,6 +12,7 @@ pub mod exit_status;
 pub mod extended;
 pub mod extended_diff;
 pub mod firmware;
+pub mod ftp_edit;
 pub mod firmware_browse;
 pub mod firmware_source;
 #[cfg(feature = "webview")]

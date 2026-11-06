@@ -419,8 +419,98 @@ enum EditCmd {
     FtpDelete { file: String, index: usize },
     /// Move an FTP profile so that it ends at position TO; the others shift. (Restoring a reordered list rebuilds it.)
     FtpMove { file: String, from: usize, to: usize },
+    /// Show one FTP profile of an edited copy (the password and the Wi-Fi key are masked unless `--reveal`).
+    FtpShow {
+        file: String,
+        index: usize,
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Change fields of one FTP profile; only the fields given change. The camera is not touched.
+    FtpSet {
+        file: String,
+        index: usize,
+        #[command(flatten)]
+        fields: FtpFieldArgs,
+    },
+    /// Add an FTP profile (it needs `--name` and `--host`), starting from the encoder's template; at `--at` (default: the end).
+    FtpAdd {
+        file: String,
+        #[arg(long)]
+        at: Option<usize>,
+        #[command(flatten)]
+        fields: FtpFieldArgs,
+    },
+    /// Copy an FTP profile to the position after it, with its Wi-Fi name and key, login and the rest; `--name` (default:
+    /// the name and " copy") and any other field given are changed in the copy.
+    FtpDuplicate {
+        file: String,
+        index: usize,
+        #[command(flatten)]
+        fields: FtpFieldArgs,
+    },
     /// Show where an edited copy came from and every change made in it.
     Log { file: String },
+}
+
+/// The fields of an FTP profile. A password given with `--password` is visible to other programs on this computer
+/// while the command runs; `--password-stdin` reads it from standard input instead.
+#[derive(Args, Debug, Clone, Default)]
+struct FtpFieldArgs {
+    #[arg(long, allow_hyphen_values = true)]
+    name: Option<String>,
+    /// The Wi-Fi name.
+    #[arg(long, allow_hyphen_values = true)]
+    wifi_name: Option<String>,
+    /// The Wi-Fi key (stored in what the encoder calls the 5 GHz SSID field; probably a passphrase).
+    #[arg(long, allow_hyphen_values = true)]
+    wifi_key: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    host: Option<String>,
+    /// The destination folder on the server (`--folder ""` for none).
+    #[arg(long, allow_hyphen_values = true)]
+    folder: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    user: Option<String>,
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "password_stdin")]
+    password: Option<String>,
+    /// Read the password from standard input (one trailing newline removed).
+    #[arg(long)]
+    password_stdin: bool,
+    /// The server's port (21 for FTP, 22 for SFTP by convention).
+    #[arg(long)]
+    port: Option<u16>,
+    /// `ftp` or `sftp`.
+    #[arg(long, value_parser = ["ftp", "sftp"])]
+    protocol: Option<String>,
+    /// The second port (probably a proxy port).
+    #[arg(long)]
+    proxy_port: Option<u16>,
+}
+
+impl FtpFieldArgs {
+    fn to_fields(&self) -> Result<nikon_fleet::ftp_edit::ProfileFields> {
+        use nikon_fleet::ftp_edit::{ProfileFields, Protocol};
+        let password = if self.password_stdin {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf).context("reading the password from stdin")?;
+            Some(strip_single_trailing_newline(buf))
+        } else {
+            self.password.clone()
+        };
+        Ok(ProfileFields {
+            name: self.name.clone(),
+            wifi_name: self.wifi_name.clone(),
+            wifi_key: self.wifi_key.clone(),
+            host: self.host.clone(),
+            folder: self.folder.clone(),
+            username: self.user.clone(),
+            password,
+            port: self.port,
+            protocol: self.protocol.as_deref().map(|p| if p == "sftp" { Protocol::Sftp } else { Protocol::Ftp }),
+            proxy_port: self.proxy_port,
+        })
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1505,6 +1595,28 @@ fn cmd_edit(data_dir: &Path, sub: &EditCmd) -> Result<()> {
         }
         EditCmd::FtpDelete { file, index } => say(&edit_in_place(&snaps, file, |s| edit::ftp_delete(s, *index, &now)).map_err(refuse)?),
         EditCmd::FtpMove { file, from, to } => say(&edit_in_place(&snaps, file, |s| edit::ftp_move(s, *from, *to, &now)).map_err(refuse)?),
+        EditCmd::FtpShow { file, index, reveal } => {
+            let path = nikon_fleet::ops::paths::resolve_existing(&snaps, file).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
+            let mut snap = Snapshot::load_from_file(&path).with_context(|| format!("loading {}", path.display()))?;
+            let v = nikon_fleet::ftp_edit::profile_view(&mut snap, *index).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
+            let mask = |s: &str| if *reveal { s.to_string() } else { "*".repeat(s.chars().count()) };
+            println!("profile {index}: {:?}", v.name);
+            println!("  Wi-Fi name {:?}   Wi-Fi key {}", v.wifi_name, mask(&v.wifi_key));
+            println!("  server {:?} port {} {}   folder {:?}", v.host, v.port, if v.protocol == nikon_fleet::ftp_edit::Protocol::Sftp { "SFTP" } else { "FTP" }, v.folder);
+            println!("  login {:?}   password {}   second port {}", v.username, mask(&v.password), v.proxy_port);
+        }
+        EditCmd::FtpSet { file, index, fields } => {
+            let f = fields.to_fields()?;
+            say(&edit_in_place(&snaps, file, |s| nikon_fleet::ftp_edit::ftp_set_fields(s, *index, &f, &now)).map_err(refuse)?);
+        }
+        EditCmd::FtpAdd { file, at, fields } => {
+            let f = fields.to_fields()?;
+            say(&edit_in_place(&snaps, file, |s| nikon_fleet::ftp_edit::ftp_add(s, &f, *at, &now)).map_err(refuse)?);
+        }
+        EditCmd::FtpDuplicate { file, index, fields } => {
+            let f = fields.to_fields()?;
+            say(&edit_in_place(&snaps, file, |s| nikon_fleet::ftp_edit::ftp_duplicate(s, *index, None, &f, &now)).map_err(refuse)?);
+        }
         EditCmd::Log { file } => {
             let path = nikon_fleet::ops::paths::resolve_existing(&snaps, file).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
             let snap = Snapshot::load_from_file(&path).with_context(|| format!("loading {}", path.display()))?;
