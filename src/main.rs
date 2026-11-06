@@ -192,17 +192,19 @@ enum Cmd {
 
     /// Read the camera's FTP profile (0x90E8 → 0x90EB → 0x90ED) over raw USB
     /// PTP and decode it. Writes nothing. The sequence is NX Field's own, as
-    /// captured on a Z 9; it has not been run over USB on a camera yet, so
-    /// treat the first run as the test. The password is masked unless
-    /// --show-password is given.
+    /// captured on a Z 9; it works over USB on a Z 9 and a Z6III (2026-11-05).
+    /// The password is masked unless --show-password is given.
     VendorReadFtp(VendorReadFtpArgs),
 
     /// EXPERIMENTAL. Write a profile blob read from a camera (or built to the
     /// same layout) with 0x90EE(slot, param2), byte for byte. It changes the
-    /// camera: slot N < count replaces that stored profile, slot == count
-    /// tries to add one (untested until the 2026-11-05 experiment; see the
-    /// handoff doc). The blob must decode, the slot may not pass the stored
-    /// count, and the camera is read first so the plan can be printed.
+    /// camera. Only two forms are sent: `--slot N --param2 0` (N below the
+    /// stored count) replaces profile N, and `--slot COUNT --param2 1` adds one.
+    /// Either way the written profile lands at the FRONT of the list (slot 0)
+    /// and the others shift down. Anything else is refused before it is sent.
+    /// The camera is read first so the plan can be printed, and the write is
+    /// read back in the same session.
+    #[command(after_help = VENDOR_WRITE_BLOB_HELP)]
     VendorWriteFtpBlob(VendorWriteFtpBlobArgs),
 
     /// EXPERIMENTAL, read-only. Send `0x944C(<op>, 0)` and print what the
@@ -210,7 +212,7 @@ enum Cmd {
     /// interpretation. NX Field sends `0x944C(0x90ED, 0)` before its FTP
     /// screen; that the reply says whether the camera implements `<op>` is a
     /// guess, which this command exists to test. It sends nothing else (no
-    /// setup, no data-out) and one query per run. Never run over USB before.
+    /// setup, no data-out) and one query per run.
     VendorOpSupport(VendorOpSupportArgs),
     /// EXPERIMENTAL, read-only. Read one device property with the standard PTP `GetDevicePropValue`
     /// (0x1015), or its descriptor with `GetDevicePropDesc` (0x1014) via --desc, and print the
@@ -223,7 +225,7 @@ enum Cmd {
     /// the camera holds what was sent. In one session it reads the property's descriptor (refusing a
     /// property that is not a read-write string right now) and its current value, which it prints so
     /// the change can be undone. `--dry-run` shows the current value and sends nothing. No other
-    /// property can be written with this. Confirmed over USB on a Z 9, a Z6III and a Z 5 for the image comment only; see the handoff doc.
+    /// property can be written with this. Confirmed over USB on a Z 9, a Z6III and a Z 5 for the image comment only; see the handoff doc. Artist and Copyright have never been written on any body, so they are refused unless `--force-unconfirmed-model` is given.
     VendorSetString(VendorSetStringArgs),
     /// Show what each recent nikon-fleet process (CLI, GUI, MCP server) was doing, from the
     /// diagnostics files they leave behind: the operation in flight when one hung or was killed, how
@@ -513,7 +515,28 @@ Exit status:
   1  any other error; nothing was sent to the camera unless the message says so
   2  command-line usage error
   4  the profile data was sent but the write then failed: the camera MAY have changed.
-     Check it in the camera's menu (or with `vendor-read-ftp`, not yet tried on a camera) before retrying";
+     Read the list back before retrying (`vendor-read-ftp --slot 0`, or the camera's menu): a write that
+     took effect put its profile at the front, slot 0
+  --port is the u16 written AFTER the password (8080 in every profile read from a camera, probably a
+  proxy port), not the FTP port: the encoder fixes the FTP port at 21.";
+
+const VENDOR_WRITE_BLOB_HELP: &str = "\
+Exit status:
+  0  the camera accepted the profile and a read-back of slot 0 showed exactly what was sent, with the
+     stored count the write should leave (a dry run: the plan was printed)
+  1  any other error, including a write refused before anything was sent (a second parameter other
+     than 0 or 1, a replace of a slot that is not stored, an add at any slot but the count, a model
+     outside the confirmed list); nothing was sent to the camera unless the message says so
+  2  command-line usage error
+  4  the camera MAY have changed: the profile data was sent but the write then failed, or the camera
+     answered OK but the read-back did not match, could not be decoded or could not be read.
+     Read the list (`vendor-read-ftp --slot 0`, or the camera's menu) BEFORE retrying: a repeated add
+     stores a duplicate, and a repeated replace of a slot above 0 hits whichever profile is there now
+Write rules (Z 9, 2026-11-05; the read-back is not yet verified on a Z6III):
+  --slot N --param2 0   replace the stored profile N (N below the count); it moves to the FRONT (slot 0)
+                        and the profiles that were in front of it shift down; the count stays
+  --slot COUNT --param2 1  add a profile at the FRONT; the count rises by one
+  --slot COUNT --param2 0  does NOT add: the camera stalls the USB pipe and stores nothing; refused here";
 
 #[derive(Args, Debug)]
 struct FirmwareBrowseArgs {
@@ -653,15 +676,6 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     Ok((0..t.len()).step_by(2).map(|i| u8::from_str_radix(&t[i..i + 2], 16).expect("hex digits checked")).collect())
 }
 
-/// A `u32` given in decimal or `0x` hex (for the probe's `--param`).
-fn parse_u32_any(s: &str) -> Result<u32, String> {
-    let t = s.trim();
-    match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        Some(hex) => u32::from_str_radix(hex, 16).map_err(|e| format!("invalid hex number {t:?}: {e}")),
-        None => t.parse::<u32>().map_err(|e| format!("invalid number {t:?}: {e}")),
-    }
-}
-
 #[derive(Args, Debug)]
 struct VendorProbeOpArgs {
     /// Operation code to send, e.g. "0x90E9". Must be one of 0x90E9, 0x90EA,
@@ -671,7 +685,7 @@ struct VendorProbeOpArgs {
     /// A parameter to send with the op (up to two; repeat the flag). Decimal
     /// or 0x-prefixed hex. 0xFFFFFFFF is refused: it hung a camera's network
     /// stack when used as a slot number.
-    #[arg(long = "param", value_parser = parse_u32_any)]
+    #[arg(long = "param", value_parser = nikon_fleet::ptp_usb::parse_u32_number)]
     params: Vec<u32>,
     /// Data-out to send with the op, as hex digits (at most 32 bytes), e.g.
     /// "01000000". Without it the op is sent with no data phase at all.
@@ -727,10 +741,14 @@ struct VendorSetStringArgs {
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
     serial: Option<String>,
-    /// Write to a model outside the confirmed list (Z 9, Z6III, Z 5).
+    /// Write to a model outside the confirmed list (Z 9, Z6III, Z 5), and write Artist or Copyright:
+    /// only the image comment (0xD090) has been confirmed on any body, so those two are refused
+    /// without this.
     #[arg(long)]
     force_unconfirmed_model: bool,
-    /// Read and print the current value and what would change, then stop. Sends no write.
+    /// Read and print the current value and what would change, then stop. Sends no write. Runs the
+    /// same checks as the write (property, model, text, whether the property is writable now) and
+    /// fails where it would.
     #[arg(long)]
     dry_run: bool,
 }
@@ -748,12 +766,15 @@ struct VendorReadFtpArgs {
     slot: Option<u32>,
     /// Print the FTP password and the "5 GHz" field (probably a Wi-Fi
     /// password) in clear text instead of asterisks. Without
-    /// --raw the hex dump below also contains it, so --raw masks it too
-    /// unless this is given.
+    /// --show-password the hex dump from --raw is masked too. The other fields
+    /// (profile name, SSIDs, host, username) are always printed as they are, so
+    /// one that happens to hold the same text as the password shows it.
     #[arg(long)]
     show_password: bool,
-    /// Also print the profile blob as hex (password bytes zeroed unless
-    /// --show-password).
+    /// Also print the profile blob as hex. Unless --show-password, every byte
+    /// that spells the password or the "5 GHz" field is zeroed, wherever it
+    /// appears in the blob (also inside another field, or as UTF-16), so the
+    /// dump is not a way around the mask. The length is unchanged.
     #[arg(long)]
     raw: bool,
     /// Save the profile's true raw bytes (password included, unmasked) to this
@@ -768,11 +789,16 @@ struct VendorWriteFtpBlobArgs {
     /// File holding the profile blob (raw bytes) to write.
     #[arg(long)]
     file: PathBuf,
-    /// First 0x90EE parameter (slot). Must be <= the stored profile count.
+    /// First 0x90EE parameter (slot). With --param2 0 it must be below the stored profile count
+    /// (that profile is replaced); with --param2 1 it must equal the count (a profile is added).
+    /// Either way the written profile ends up at the front, slot 0.
     #[arg(long, default_value_t = 0)]
     slot: u32,
-    /// Second 0x90EE parameter; 0 in every capture.
-    #[arg(long, default_value_t = 0)]
+    /// Second 0x90EE parameter. 0 replaces the profile in --slot (the default); 1 adds a new
+    /// profile and needs --slot equal to the stored count. No other value has worked on a camera,
+    /// so any other is refused. Adding is therefore `--slot COUNT --param2 1`; `--slot COUNT`
+    /// alone is refused (on a Z 9 that form stalled the USB pipe and added nothing).
+    #[arg(long, default_value_t = 0, value_parser = nikon_fleet::ptp_usb::parse_u32_number)]
     param2: u32,
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
@@ -780,7 +806,8 @@ struct VendorWriteFtpBlobArgs {
     /// Write even if the model is not in ptp_usb's confirmed list.
     #[arg(long)]
     force_unconfirmed_model: bool,
-    /// Print the plan and exit without writing.
+    /// Read the camera and print the plan, then stop. Applies the same checks as the write (model
+    /// list, the two allowed forms, the stored count) and fails where it would; sends no write.
     #[arg(long)]
     dry_run: bool,
 }
@@ -810,6 +837,9 @@ struct VendorWriteFtpArgs {
     /// FTP server hostname or IP address.
     #[arg(long)]
     host: String,
+    /// The u16 written after the password: 8080 in every profile read from a camera (probably a
+    /// proxy port; the decoder calls it "second port"). It is NOT the FTP port: the encoder fixes
+    /// that at 21, and `--port 2121` does not change it.
     #[arg(long, default_value_t = 21)]
     port: u16,
     #[arg(long)]
@@ -1648,11 +1678,9 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
 /// Read one vendor-only property via raw USB PTP (`0x943B`), bypassing the
 /// MAID SDK entirely — no --sdk-bundle needed. See `nikon_fleet::ptp_usb`.
 fn cmd_vendor_read(args: &VendorReadArgs) -> Result<()> {
-    let read = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
-        .and_then(|(lock, serial)| {
-            nikon_fleet::ptp_usb::read_vendor_property_report_locked(lock, serial.as_deref(), args.propcode)
-                .map_err(anyhow::Error::new)
-        })
+    let read = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        nikon_fleet::ptp_usb::read_vendor_property_report_locked(lock, serial, args.propcode)
+    })
         .with_context(|| format!("reading vendor property 0x{:04x} over USB PTP", args.propcode))?;
     let (stdout, warnings) = vendor_read_output(args.propcode, &read);
     for w in warnings {
@@ -1663,66 +1691,135 @@ fn cmd_vendor_read(args: &VendorReadArgs) -> Result<()> {
 }
 
 /// Write a profile blob byte for byte via `0x90EE(slot, param2)`. EXPERIMENTAL.
+///
+/// The library does the guarding and the read-back in one session each: `plan_ftp_write_locked`
+/// (the model gate, the blob must decode, the two allowed forms, the stored count: read-only; a dry
+/// run stops after it, so it fails exactly where the real write would) and then
+/// `write_ftp_profile_blob_verified_locked`, which repeats those checks with the count read in the
+/// write's own session and reads slot 0 back.
 fn cmd_vendor_write_ftp_blob(args: &VendorWriteFtpBlobArgs) -> Result<()> {
+    use nikon_fleet::ptp_usb::{plan_ftp_write_locked, write_ftp_profile_blob_verified_locked};
     let blob = std::fs::read(&args.file).with_context(|| format!("reading {}", args.file.display()))?;
-    let decoded = nikon_fleet::ptp_usb::decode_ftp_profile(&blob).context("the blob does not decode; refusing to send it")?;
-    // The camera is read first (its own lock acquisition, released before the write) so a slot
-    // past the stored count is refused client-side and the plan names the body.
-    let before = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
-        .and_then(|(lock, serial)| {
-            nikon_fleet::ptp_usb::read_ftp_profile_locked(lock, serial.as_deref(), None).map_err(anyhow::Error::new)
-        })
-        .context("reading the camera's FTP profile count before writing")?;
-    let count = before.info.count;
-    if args.slot > count {
-        bail!("slot {} is past the {count} stored profile(s); the highest slot this will write is {count} (adding one)", args.slot);
-    }
-    let action = if args.slot == count { "ADD a new profile (untested)" } else { "REPLACE the stored profile in that slot" };
-    println!(
-        "{}: {count} stored profile(s). Would {action}: 0x90EE({}, {}) with {} byte(s), profile {:?} ({}:{}, folder {:?}{}).",
-        before.info.device_name.text,
-        args.slot,
-        args.param2,
-        blob.len(),
-        decoded.profile_name,
-        decoded.host,
-        decoded.ftp_port,
-        decoded.folder,
-        if decoded.is_sftp() { ", SFTP" } else { "" }
-    );
+    let plan = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        plan_ftp_write_locked(lock, serial, args.slot, args.param2, &blob, args.force_unconfirmed_model)
+    })
+        .map_err(vendor_write_anyhow_error)?;
+    println!("{}", ftp_blob_plan_text(&plan, args.slot, args.param2, blob.len()));
     if args.dry_run {
         return Ok(());
     }
-    let receipt = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
-        .and_then(|(lock, serial)| {
-            nikon_fleet::ptp_usb::write_ftp_profile_blob_locked(
-                lock,
-                serial.as_deref(),
-                args.slot,
-                args.param2,
-                &blob,
-                args.force_unconfirmed_model,
-            )
-            .map_err(anyhow::Error::new)
-        })
-        .map_err(|e| match e.downcast::<nikon_fleet::ptp_usb::PtpUsbError>() {
-            Ok(e) => vendor_write_error(e),
-            Err(other) => other,
-        })?;
-    println!("Wrote. Read it back with: vendor-read-ftp --slot {}", args.slot);
-    if let Some(note) = ftp_receipt_note(&receipt) {
+    let outcome = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        write_ftp_profile_blob_verified_locked(
+            lock,
+            serial,
+            args.slot,
+            args.param2,
+            &blob,
+            args.force_unconfirmed_model,
+        )
+    })
+        .map_err(vendor_write_anyhow_error)?;
+    println!("{}", ftp_blob_outcome_text(&outcome));
+    if let Some(note) = ftp_receipt_note(&outcome.receipt) {
         eprintln!("{note}");
     }
-    Ok(())
+    match ftp_blob_unconfirmed(&outcome.verification) {
+        None => Ok(()),
+        // The camera answered OK, so this is not a refusal, but nothing shows the profile is what was sent:
+        // the same status as a write that failed after the data went out (the camera MAY have changed).
+        Some(why) => Err(ExitCodeError {
+            code: EXIT_WRITE_INDETERMINATE,
+            message: format!(
+                "the camera answered OK to the write but the read-back did not confirm it ({why}); the camera MAY have \
+                 changed. Read the list with `vendor-read-ftp --slot 0` before deciding whether to repeat the write"
+            ),
+        }
+        .into()),
+    }
+}
+
+/// `vendor_write_error` for an error that may or may not be a [`nikon_fleet::ptp_usb::PtpUsbError`].
+fn vendor_write_anyhow_error(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast::<nikon_fleet::ptp_usb::PtpUsbError>() {
+        Ok(e) => vendor_write_error(e),
+        Err(other) => other,
+    }
+}
+
+/// The plan `vendor-write-ftp-blob` prints before it writes (and all that `--dry-run` prints). What
+/// the camera does with each form is the Z 9 rule of `docs/nx-field-ftp-profile-session-2026-07-10.md`:
+/// the written profile goes to the FRONT, the others shift down.
+fn ftp_blob_plan_text(plan: &nikon_fleet::ptp_usb::FtpWritePlan, slot: u32, param2: u32, blob_len: usize) -> String {
+    use nikon_fleet::ptp_usb::FtpWriteKind;
+    let d = &plan.decoded;
+    let count = plan.count;
+    let what = match plan.kind {
+        FtpWriteKind::Replace if slot == 0 => format!("REPLACE the profile in slot 0 (it stays at the front; the count stays {count})"),
+        FtpWriteKind::Replace => format!(
+            "REPLACE the profile in slot {slot} and move it to the FRONT (slot 0): the {slot} profile(s) now in front of it shift down by one, and the count stays {count}"
+        ),
+        FtpWriteKind::Add => format!(
+            "ADD a new profile at the FRONT (slot 0): the {count} stored profile(s) shift down by one and the count becomes {}",
+            count.saturating_add(1)
+        ),
+    };
+    format!(
+        "{}: {count} stored profile(s). Would {what}: 0x90EE({slot}, {param2}) with {blob_len} byte(s), profile {:?} ({}:{}, folder {:?}{}).",
+        plan.model,
+        d.profile_name,
+        d.host,
+        d.ftp_port,
+        d.folder,
+        if d.is_sftp() { ", SFTP" } else { "" }
+    )
+}
+
+/// What `vendor-write-ftp-blob` prints after a write the camera answered OK to: what the read-back of
+/// slot 0 showed. Field NAMES that differ are listed, never their values (they include the password).
+fn ftp_blob_outcome_text(o: &nikon_fleet::ptp_usb::FtpWriteOutcome) -> String {
+    use nikon_fleet::ptp_usb::FtpWriteVerification as V;
+    let kind = match o.kind {
+        nikon_fleet::ptp_usb::FtpWriteKind::Replace => "a replace",
+        nikon_fleet::ptp_usb::FtpWriteKind::Add => "an add",
+    };
+    let head = format!("The camera accepted the write ({kind}; {} stored profile(s) before it).", o.count_before);
+    match &o.verification {
+        V::Verified { count_after } => format!(
+            "{head}\nRead back: slot 0 holds exactly the profile that was sent, and the camera stores {count_after} profile(s). \
+             A written profile goes to the front of the list; read any other slot with `vendor-read-ftp --slot N`."
+        ),
+        V::Mismatch { count_after, count_expected, differing_fields } => format!(
+            "{head}\nREAD-BACK MISMATCH: the camera now stores {count_after} profile(s) (expected {count_expected}); fields of slot 0 that differ \
+             from what was sent: {}. Either the camera did not take the profile as sent, or this body does not put a written profile at slot 0 \
+             (only a Z 9 is known to). Read the list with `vendor-read-ftp --slot N` before repeating the write.",
+            if differing_fields.is_empty() { "none (only the count is off)".to_string() } else { differing_fields.join(", ") }
+        ),
+        V::ReadBackUndecodable { error } => format!(
+            "{head}\nREAD-BACK UNDECODABLE: slot 0 was read but is not in a layout this decoder knows ({error}). Read the list with `vendor-read-ftp --slot N` before repeating the write."
+        ),
+        V::ReadBackFailed { error } => format!(
+            "{head}\nREAD-BACK FAILED: slot 0 could not be read back ({error}). The write is neither confirmed nor contradicted. Read the list with `vendor-read-ftp --slot 0` from a new session before repeating the write."
+        ),
+    }
+}
+
+/// `None` when the read-back confirmed the write; otherwise a short reason, for the exit-4 message.
+fn ftp_blob_unconfirmed(v: &nikon_fleet::ptp_usb::FtpWriteVerification) -> Option<&'static str> {
+    use nikon_fleet::ptp_usb::FtpWriteVerification as V;
+    match v {
+        V::Verified { .. } => None,
+        V::Mismatch { .. } => Some("slot 0 or the count differs from what the write should leave"),
+        V::ReadBackUndecodable { .. } => Some("slot 0 did not decode"),
+        V::ReadBackFailed { .. } => Some("slot 0 could not be read"),
+    }
 }
 
 /// Ask the camera `0x944C(op, 0)` over raw USB PTP and print the answer verbatim. Read-only in
 /// intent; see `nikon_fleet::ptp_usb::PtpUsbSession::query_vendor_op` for what is unknown.
 fn cmd_vendor_op_support(args: &VendorOpSupportArgs) -> Result<()> {
-    let q = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
-        .and_then(|(lock, serial)| {
-            nikon_fleet::ptp_usb::query_vendor_op_locked(lock, serial.as_deref(), args.op).map_err(anyhow::Error::new)
-        })
+    let q = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        nikon_fleet::ptp_usb::query_vendor_op_locked(lock, serial, args.op)
+    })
         .with_context(|| format!("asking 0x944C about operation 0x{:04x} over USB PTP", args.op))?;
     for w in &q.warnings {
         eprintln!("warning: {w}");
@@ -1797,10 +1894,9 @@ fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
 /// `vendor-get-prop`: one standard-PTP property read, printed as bytes (and as a string when the
 /// bytes are one). Read-only.
 fn cmd_vendor_get_prop(args: &VendorGetPropArgs) -> Result<()> {
-    let read = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
-        .and_then(|(lock, serial)| {
-            nikon_fleet::ptp_usb::get_device_prop_locked(lock, serial.as_deref(), args.prop, args.desc).map_err(anyhow::Error::new)
-        })
+    let read = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        nikon_fleet::ptp_usb::get_device_prop_locked(lock, serial, args.prop, args.desc)
+    })
         .with_context(|| {
             format!(
                 "reading property 0x{:04x} with {} over USB PTP",
@@ -1817,29 +1913,27 @@ fn cmd_vendor_get_prop(args: &VendorGetPropArgs) -> Result<()> {
 
 /// `vendor-set-string`: write one string property and say whether the camera holds it.
 fn cmd_vendor_set_string(args: &VendorSetStringArgs) -> Result<()> {
-    use nikon_fleet::ptp_usb::{decode_ptp_string_value, get_device_prop_locked, set_string_property_locked, PtpUsbError, STRING_PROPS};
-    let name = STRING_PROPS.iter().find(|(c, _)| *c == args.prop).map(|(_, n)| *n);
+    use nikon_fleet::ptp_usb::{plan_string_property_locked, set_string_property_locked, PtpUsbError};
     if args.dry_run {
-        // Refuse a code the write would refuse, even for a dry run: it must not suggest a change that
-        // cannot be made.
-        let Some(name) = name else {
-            let allowed = STRING_PROPS.iter().map(|(c, n)| format!("{c:#06x} {n}")).collect::<Vec<_>>().join(", ");
-            bail!("property {:#06x} is not one of the string properties this writes ({allowed}); nothing was sent", args.prop);
-        };
-        let read = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
-            .and_then(|(lock, serial)| {
-                get_device_prop_locked(lock, serial.as_deref(), args.prop, false).map_err(anyhow::Error::new)
-            })
-            .context("reading the current value over USB PTP")?;
-        let current = decode_ptp_string_value(&read.data).map_err(|e| anyhow::anyhow!("the current value does not decode ({e})"))?;
-        println!("{name} ({:#06x}): currently {current:?}. Would write {:?}. Nothing was sent.", args.prop, args.text);
+        // Everything the real write checks before it sends (the property, the model and property gates,
+        // the text, the descriptor), by the same library function: a dry run must not suggest a change
+        // that cannot be made.
+        let plan = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+            plan_string_property_locked(lock, serial, args.prop, &args.text, args.force_unconfirmed_model)
+        })
+            .map_err(|e| match e.downcast::<PtpUsbError>() {
+                Ok(e) => anyhow::Error::new(e).context("checking the write over USB PTP (dry run: nothing was sent)"),
+                Err(other) => other,
+            })?;
+        for w in &plan.warnings {
+            eprintln!("warning: {w}");
+        }
+        println!("{}", vendor_set_string_dry_run_text(&plan, &args.text));
         return Ok(());
     }
-    let receipt = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
-        .and_then(|(lock, serial)| {
-            set_string_property_locked(lock, serial.as_deref(), args.prop, &args.text, args.force_unconfirmed_model)
-                .map_err(anyhow::Error::new)
-        })
+    let receipt = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        set_string_property_locked(lock, serial, args.prop, &args.text, args.force_unconfirmed_model)
+    })
         .map_err(|e| match e.downcast::<PtpUsbError>() {
             Ok(e @ PtpUsbError::PropWriteIndeterminate { .. }) => anyhow::Error::new(e)
                 .context("the camera may have changed: the value was sent before this failed; read it with vendor-get-prop before deciding whether to repeat the write"),
@@ -1856,11 +1950,25 @@ fn cmd_vendor_set_string(args: &VendorSetStringArgs) -> Result<()> {
     Ok(())
 }
 
+/// The name `STRING_PROPS` gives `propcode`, for messages. One lookup for both `vendor-set-string` texts.
+fn string_prop_label(propcode: u16) -> &'static str {
+    nikon_fleet::ptp_usb::STRING_PROPS.iter().find(|(c, _)| *c == propcode).map(|(_, n)| *n).unwrap_or("?")
+}
+
+/// What `vendor-set-string --dry-run` prints once every check the write makes has passed.
+fn vendor_set_string_dry_run_text(plan: &nikon_fleet::ptp_usb::StringPropPlan, text: &str) -> String {
+    format!(
+        "{} ({:#06x}): currently {:?}. Would write {text:?}. Nothing was sent.",
+        string_prop_label(plan.propcode),
+        plan.propcode,
+        plan.previous
+    )
+}
+
 /// What `vendor-set-string` prints for a write the camera accepted. The previous value is always
 /// on the first line: it is what to write back to undo this.
 fn vendor_set_string_text(r: &nikon_fleet::ptp_usb::PropWriteReceipt) -> String {
-    use nikon_fleet::ptp_usb::STRING_PROPS;
-    let name = STRING_PROPS.iter().find(|(c, _)| *c == r.propcode).map(|(_, n)| *n).unwrap_or("?");
+    let name = string_prop_label(r.propcode);
     let head = format!("{name} ({:#06x}): previous {:?}, sent {:?}.", r.propcode, r.previous, r.written);
     match (&r.read_back, r.verified) {
         (Ok(v), true) => format!("{head}\nRead back {v:?}: the camera holds what was sent."),
@@ -1908,10 +2016,9 @@ fn vendor_op_query_text(q: &nikon_fleet::ptp_usb::VendorOpQuery) -> String {
 /// Read and decode the camera's FTP profile via raw USB PTP. Read-only. See
 /// `nikon_fleet::ptp_usb::PtpUsbSession::read_ftp_profile`.
 fn cmd_vendor_read_ftp(args: &VendorReadFtpArgs) -> Result<()> {
-    let readout = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
-        .and_then(|(lock, serial)| {
-            nikon_fleet::ptp_usb::read_ftp_profile_locked(lock, serial.as_deref(), args.slot).map_err(anyhow::Error::new)
-        })
+    let readout = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        nikon_fleet::ptp_usb::read_ftp_profile_locked(lock, serial, args.slot)
+    })
         .context("reading the FTP profile over USB PTP")?;
     for w in &readout.warnings {
         eprintln!("warning: {w}");
@@ -2001,41 +2108,59 @@ fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: 
         }
     }
     if raw {
-        let mut bytes = p.raw.clone();
-        match (&p.decoded, show_password) {
-            (_, true) => {}
-            (Ok(d), false) => {
-                // Zero the password bytes in the dump: they sit right after
-                // the username, found by searching for the plaintext.
-                for secret in [&d.password, &d.ssid_5ghz] {
-                    if let Some(at) = find_subslice(&bytes, secret.as_bytes()) {
-                        bytes[at..at + secret.len()].fill(0);
-                    }
-                }
-            }
-            (Err(_), false) => {
-                // The password cannot be located in a blob that did not
-                // decode, so nothing is printed rather than something that
-                // might carry it.
-                let _ = write!(
-                    out,
-                    "\nraw dump withheld: the {}-byte profile did not decode, so the password cannot be masked in it. \
-                     Pass --show-password to print the bytes as they are.",
-                    bytes.len()
-                );
-                return out;
-            }
-        }
+        let masked = if show_password {
+            Some(p.raw.clone())
+        } else {
+            // A blob that did not decode has no known password position, so nothing is printed rather
+            // than something that might carry it.
+            p.decoded.as_ref().ok().and_then(|_| mask_ftp_secrets_in_dump(&p.raw))
+        };
+        let Some(bytes) = masked else {
+            let _ = write!(
+                out,
+                "\nraw dump withheld: the {}-byte profile did not decode, so the password cannot be masked in it. \
+                 Pass --show-password to print the bytes as they are.",
+                p.raw.len()
+            );
+            return out;
+        };
         let _ = write!(out, "\nraw ({} bytes): {}", bytes.len(), nikon_fleet::ptp_usb::hex_bytes(&bytes));
     }
     out
 }
 
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
+/// `raw` (a profile blob that decodes) with every byte of its two secrets, the password and the string
+/// the encoder calls the 5 GHz SSID, zeroed. Two layers, because either alone fails:
+/// - by POSITION, from the decoder's own offsets (`decode_ftp_profile_spans`): the real bytes are
+///   zeroed whatever they spell, so a secret that also appears in an earlier field cannot be mistaken
+///   for it. (The content pass below also reaches these bytes, so removing this pass changes no
+///   output today; it stays as the primary mask so that a change to the content pass cannot unmask
+///   the field itself.)
+/// - by CONTENT, every occurrence in the blob, overlapping ones included, in UTF-8 and in UTF-16LE (the
+///   encoding of the profile name and the timestamps): a copy of the secret in another field (a
+///   username equal to the password, a password inside the SSID) must not carry it into the dump.
+///
+/// `None` when `raw` does not decode. The length never changes. An empty secret masks nothing.
+fn mask_ftp_secrets_in_dump(raw: &[u8]) -> Option<Vec<u8>> {
+    let (decoded, spans) = nikon_fleet::ptp_usb::decode_ftp_profile_spans(raw).ok()?;
+    let mut out = raw.to_vec();
+    for span in [&spans.password, &spans.ssid_5ghz] {
+        out[span.clone()].fill(0);
     }
-    hay.windows(needle.len()).position(|w| w == needle)
+    for secret in [&decoded.password, &decoded.ssid_5ghz] {
+        if secret.is_empty() {
+            continue;
+        }
+        let utf16le: Vec<u8> = secret.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        for needle in [secret.as_bytes(), utf16le.as_slice()] {
+            for (at, window) in raw.windows(needle.len()).enumerate() {
+                if window == needle {
+                    out[at..at + needle.len()].fill(0);
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Read the PTP DeviceInfo dataset via raw USB PTP (`0x1001`) and print it with the serial
@@ -2183,6 +2308,17 @@ fn vendor_locked_target(
     Ok((lock, serial))
 }
 
+/// The preamble every raw-USB vendor command shares: take the camera lock, resolve the serial
+/// (`vendor_locked_target`), and run `f` with both. A library error stays a typed
+/// `PtpUsbError` inside the `anyhow::Error`, so callers can still downcast it.
+fn with_vendor_camera<T>(
+    serial: Option<&str>,
+    f: impl FnOnce(CameraLock, Option<&str>) -> Result<T, nikon_fleet::ptp_usb::PtpUsbError>,
+) -> Result<T> {
+    vendor_locked_target(CameraLock::acquire, serial, usb_camera_list)
+        .and_then(|(lock, serial)| f(lock, serial.as_deref()).map_err(anyhow::Error::new))
+}
+
 /// Strip exactly one trailing `\n` (as `echo`/a shell heredoc would add),
 /// not general trailing whitespace — a password could legitimately end in
 /// a space or tab, and this must not silently eat that.
@@ -2237,20 +2373,25 @@ fn cmd_vendor_write_ftp(args: &VendorWriteFtpArgs) -> Result<()> {
         return Ok(());
     }
 
-    let receipt = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
-        .and_then(|(lock, serial)| {
-            nikon_fleet::ptp_usb::write_ftp_profile_locked(lock, serial.as_deref(), &profile, args.force_unconfirmed_model)
-                .map_err(anyhow::Error::new)
-        })
+    let receipt = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        nikon_fleet::ptp_usb::write_ftp_profile_locked(lock, serial, &profile, args.force_unconfirmed_model)
+    })
         .map_err(|e| match e.downcast::<nikon_fleet::ptp_usb::PtpUsbError>() {
             Ok(e) => vendor_write_error(e),
             Err(other) => other,
         })?;
-    println!("Wrote FTP profile {:?} ({}@{}:{})", args.profile_name, args.username, args.host, args.port);
+    println!("{}", ftp_write_success_text(&args.profile_name, &args.username, &args.host, args.port));
     if let Some(note) = ftp_receipt_note(&receipt) {
         eprintln!("{note}");
     }
     Ok(())
+}
+
+/// What `vendor-write-ftp` prints for a write the camera answered OK to. `port` is the u16 the encoder
+/// writes AFTER the password (`DecodedFtpProfile::second_port`), not the FTP port: the encoder fixes
+/// that at 21, so the line must not read like `user@host:port`.
+fn ftp_write_success_text(profile_name: &str, username: &str, host: &str, port: u16) -> String {
+    format!("Wrote FTP profile {profile_name:?} ({username}@{host}; FTP port 21 as the encoder fixes it, second port {port})")
 }
 
 /// A failed `vendor-write-ftp`, worded for the person at the terminal. Most failures are plain
@@ -2269,8 +2410,9 @@ fn vendor_write_error(e: nikon_fleet::ptp_usb::PtpUsbError) -> anyhow::Error {
 }
 
 /// What a successful FTP-profile write cannot promise: the camera answered OK, which is all there is
-/// to go on (nothing reads the profile back). A reply that did not match the command, or that carried
-/// parameters (none seen in any capture), is worth saying so the OK is not over-trusted.
+/// to go on (this path does not read the profile back; `vendor-write-ftp-blob` does). A reply that did not
+/// match the command, or that carried parameters (none seen in any capture), is worth saying so the OK is
+/// not over-trusted.
 fn ftp_receipt_note(r: &nikon_fleet::ptp_usb::FtpWriteReceipt) -> Option<String> {
     let mut notes = Vec::new();
     if !r.reply_matched_command {
@@ -2284,7 +2426,7 @@ fn ftp_receipt_note(r: &nikon_fleet::ptp_usb::FtpWriteReceipt) -> Option<String>
     }
     (!notes.is_empty()).then(|| {
         format!(
-            "note: the camera answered OK, but {}. The OK does not show what the profile now holds: check it in the camera's menu (or with `vendor-read-ftp`, not yet tried on a camera).",
+            "note: the camera answered OK, but {}. The OK does not show what the profile now holds: check it in the camera's menu (or with `vendor-read-ftp --slot 0`: a written profile goes to the front).",
             notes.join(", and ")
         )
     })
@@ -4992,7 +5134,7 @@ mod tests {
 
     fn ftp_readout_with_profile() -> nikon_fleet::ptp_usb::FtpProfileReadout {
         use nikon_fleet::ptp_usb::*;
-        let blob = encode_ftp_profile(&FtpProfile {
+        ftp_readout_for(FtpProfile {
             profile_name: "CLAUDE".into(),
             ssid_24ghz: "nikon-snoop".into(),
             ssid_5ghz: "nikon5ghz".into(),
@@ -5001,7 +5143,11 @@ mod tests {
             username: "fleet".into(),
             password: "s3cretpw".into(),
         })
-        .unwrap();
+    }
+
+    fn ftp_readout_for(profile: nikon_fleet::ptp_usb::FtpProfile) -> nikon_fleet::ptp_usb::FtpProfileReadout {
+        use nikon_fleet::ptp_usb::*;
+        let blob = encode_ftp_profile(&profile).unwrap();
         let mut info = vec![0xc8, 0x00];
         info.extend_from_slice(&7u32.to_le_bytes());
         info.extend_from_slice(&0x14u32.to_le_bytes());
@@ -5055,6 +5201,286 @@ mod tests {
         r.info.slot = 0xff;
         let text = ftp_readout_text(&r, false, false);
         assert!(text.contains("slot none (0xff)") && text.contains("no active FTP profile"), "{text}");
+    }
+
+    /// The bytes of the `raw (N bytes): ...` line of a `vendor-read-ftp --raw` output.
+    fn dump_bytes(text: &str) -> Vec<u8> {
+        let line = text.lines().find(|l| l.starts_with("raw (")).unwrap_or_else(|| panic!("no raw dump in:\n{text}"));
+        let hex = line.split_once("): ").expect("raw line has the byte count").1;
+        hex.split_whitespace().map(|b| u8::from_str_radix(b, 16).expect("hex byte")).collect()
+    }
+
+    fn occurrences(hay: &[u8], needle: &[u8]) -> usize {
+        if needle.is_empty() {
+            return 0;
+        }
+        hay.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+
+    /// A profile whose secrets are the given strings and whose other fields are the defaults of
+    /// `ftp_readout_with_profile`.
+    fn profile_with(f: impl FnOnce(&mut nikon_fleet::ptp_usb::FtpProfile)) -> nikon_fleet::ptp_usb::FtpProfile {
+        let mut p = nikon_fleet::ptp_usb::FtpProfile {
+            profile_name: "CLAUDE".into(),
+            ssid_24ghz: "nikon-snoop".into(),
+            ssid_5ghz: "nikon5ghz".into(),
+            host: "192.168.66.1".into(),
+            port: 8080,
+            username: "fleet".into(),
+            password: "s3cretpw".into(),
+        };
+        f(&mut p);
+        p
+    }
+
+    /// b7d3#01/#75: the masked dump used to zero only the FIRST occurrence of each secret in the blob,
+    /// and the username, SSIDs, host and name all come before the password. Any secret that is equal to,
+    /// or inside, an earlier field was left in the dump. Every case below leaked before.
+    #[test]
+    fn vendor_read_ftp_raw_mask_zeroes_every_copy_of_the_secrets_not_just_the_first() {
+        use nikon_fleet::ptp_usb::decode_ftp_profile_spans;
+        type Edit = fn(&mut nikon_fleet::ptp_usb::FtpProfile);
+        let cases: [(&str, Edit); 11] = [
+            ("username equals the password", |p| {
+                p.username = "samepw".into();
+                p.password = "samepw".into();
+            }),
+            ("password inside the username", |p| {
+                p.username = "xxsamepwxx".into();
+                p.password = "samepw".into();
+            }),
+            ("password inside the 2.4 GHz SSID", |p| {
+                p.ssid_24ghz = "net-samepw-24".into();
+                p.password = "samepw".into();
+            }),
+            ("5 GHz field equals the 2.4 GHz SSID", |p| {
+                p.ssid_24ghz = "shared-net".into();
+                p.ssid_5ghz = "shared-net".into();
+            }),
+            ("5 GHz field inside the host", |p| {
+                p.host = "ftp.wifi5g.example".into();
+                p.ssid_5ghz = "wifi5g".into();
+            }),
+            ("password equals the 5 GHz field and the username", |p| {
+                p.username = "allthree".into();
+                p.ssid_5ghz = "allthree".into();
+                p.password = "allthree".into();
+            }),
+            ("overlapping matches (aa inside aaaa)", |p| {
+                p.username = "aaaa".into();
+                p.password = "aa".into();
+            }),
+            ("password equals the profile name (stored as UTF-16)", |p| {
+                p.profile_name = "Name1".into();
+                p.password = "Name1".into();
+            }),
+            ("password inside the folder-less host and the name", |p| {
+                p.host = "pwhost.example".into();
+                p.profile_name = "my-pwhost".into();
+                p.password = "pwhost".into();
+            }),
+            ("password empty", |p| {
+                p.password = String::new();
+            }),
+            ("both secrets empty", |p| {
+                p.password = String::new();
+                p.ssid_5ghz = String::new();
+            }),
+        ];
+        for (name, edit) in cases {
+            let profile = profile_with(edit);
+            let secrets = [profile.password.clone(), profile.ssid_5ghz.clone()];
+            let r = ftp_readout_for(profile);
+            let raw = r.profile.as_ref().unwrap().raw.clone();
+            let (_, spans) = decode_ftp_profile_spans(&raw).unwrap();
+            let out = ftp_readout_text(&r, false, true);
+            let dump = dump_bytes(&out);
+            assert_eq!(dump.len(), raw.len(), "{name}: the length never changes");
+            assert_eq!(dump[..2], raw[..2], "{name}: structural bytes outside the secrets are kept");
+            for span in [&spans.password, &spans.ssid_5ghz] {
+                assert!(dump[span.clone()].iter().all(|b| *b == 0), "{name}: the field itself is zeroed by position");
+            }
+            for secret in secrets.iter().filter(|s| !s.is_empty()) {
+                let utf16: Vec<u8> = secret.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                assert_eq!(occurrences(&dump, secret.as_bytes()), 0, "{name}: {secret:?} (UTF-8) still in the dump:\n{out}");
+                assert_eq!(occurrences(&dump, &utf16), 0, "{name}: {secret:?} (UTF-16) still in the dump:\n{out}");
+            }
+            // --show-password prints the true bytes.
+            assert_eq!(dump_bytes(&ftp_readout_text(&r, true, true)), raw, "{name}");
+        }
+    }
+
+    #[test]
+    fn vendor_read_ftp_raw_mask_leaves_unrelated_fields_and_an_all_empty_secret_dump_untouched() {
+        // Nothing to mask: the dump is the blob.
+        let p = profile_with(|p| {
+            p.password = String::new();
+            p.ssid_5ghz = String::new();
+        });
+        let r = ftp_readout_for(p);
+        assert_eq!(dump_bytes(&ftp_readout_text(&r, false, true)), r.profile.as_ref().unwrap().raw);
+        // Distinct secrets: only they change; the host, the SSID and the username survive byte for byte.
+        let r = ftp_readout_with_profile();
+        let dump = dump_bytes(&ftp_readout_text(&r, false, true));
+        for kept in ["nikon-snoop", "fleet"] {
+            assert_eq!(occurrences(&dump, kept.as_bytes()), 1, "{kept}");
+        }
+        // The host is a PTP string: UTF-16LE.
+        let host: Vec<u8> = "192.168.66.1".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(occurrences(&dump, &host), 1);
+    }
+
+    /// A run of overlapping copies is zeroed as a whole: "aa" inside "aaa" has matches at 0 and 1, and
+    /// skipping past the first match would leave the last byte of the run, a byte of the password.
+    #[test]
+    fn overlapping_copies_of_a_secret_are_zeroed_as_one_run() {
+        let r = ftp_readout_for(profile_with(|p| {
+            p.username = "aaa".into();
+            p.password = "aa".into();
+        }));
+        let raw = r.profile.as_ref().unwrap().raw.clone();
+        let dump = dump_bytes(&ftp_readout_text(&r, false, true));
+        let at = raw.windows(7).position(|w| w == [3, 0, 0, 0, b'a', b'a', b'a']).expect("the username field");
+        assert_eq!(dump[at + 4..at + 7], [0, 0, 0], "all three bytes of the run, not just the first match");
+        assert_eq!(dump[at..at + 4], raw[at..at + 4], "its length prefix is kept");
+    }
+
+    #[test]
+    fn the_raw_mask_comes_from_the_blob_not_from_the_decoded_copy_that_was_handed_in() {
+        // The masking decodes the raw bytes itself: a readout whose `decoded` side was altered cannot
+        // steer which bytes are zeroed.
+        let mut r = ftp_readout_with_profile();
+        let p = r.profile.as_mut().unwrap();
+        if let Ok(d) = p.decoded.as_mut() {
+            d.password = "not-the-password".into();
+            d.ssid_5ghz = "not-the-5ghz".into();
+        }
+        let dump = dump_bytes(&ftp_readout_text(&r, false, true));
+        assert_eq!(occurrences(&dump, b"s3cretpw"), 0);
+        assert_eq!(occurrences(&dump, b"nikon5ghz"), 0);
+    }
+
+    fn blob_plan(kind: nikon_fleet::ptp_usb::FtpWriteKind, count: u32) -> nikon_fleet::ptp_usb::FtpWritePlan {
+        let blob = nikon_fleet::ptp_usb::encode_ftp_profile(&profile_with(|_| {})).unwrap();
+        nikon_fleet::ptp_usb::FtpWritePlan {
+            model: "Z 9".into(),
+            kind,
+            count,
+            decoded: nikon_fleet::ptp_usb::decode_ftp_profile(&blob).unwrap(),
+            info_replies_matched: true,
+        }
+    }
+
+    /// b7d3#05/#12: the plan must say where the profile ends up and what the count becomes, and must
+    /// not call the add "untested" (it was done on a Z 9 over USB on 2026-11-05).
+    #[test]
+    fn the_blob_plan_names_the_reorder_and_the_count_for_each_form() {
+        use nikon_fleet::ptp_usb::FtpWriteKind::*;
+        let replace = ftp_blob_plan_text(&blob_plan(Replace, 3), 2, 0, 325);
+        assert!(replace.contains("Z 9: 3 stored profile(s). Would REPLACE the profile in slot 2"), "{replace}");
+        assert!(replace.contains("FRONT (slot 0)") && replace.contains("the count stays 3") && replace.contains("0x90EE(2, 0)"), "{replace}");
+        assert!(replace.contains("CLAUDE") && replace.contains("325 byte(s)"), "{replace}");
+        let front = ftp_blob_plan_text(&blob_plan(Replace, 3), 0, 0, 325);
+        assert!(front.contains("REPLACE the profile in slot 0 (it stays at the front"), "{front}");
+        let add = ftp_blob_plan_text(&blob_plan(Add, 3), 3, 1, 325);
+        assert!(add.contains("ADD a new profile at the FRONT (slot 0)") && add.contains("the count becomes 4") && add.contains("0x90EE(3, 1)"), "{add}");
+        for text in [&replace, &front, &add] {
+            assert!(!text.contains("untested"), "{text}");
+        }
+        // The count's u32 edge does not wrap in the sentence.
+        assert!(ftp_blob_plan_text(&blob_plan(Add, u32::MAX), u32::MAX, 1, 1).contains("the count becomes 4294967295"));
+    }
+
+    fn outcome_with(v: nikon_fleet::ptp_usb::FtpWriteVerification) -> nikon_fleet::ptp_usb::FtpWriteOutcome {
+        nikon_fleet::ptp_usb::FtpWriteOutcome {
+            receipt: nikon_fleet::ptp_usb::FtpWriteReceipt { response_params: vec![], reply_matched_command: true },
+            kind: nikon_fleet::ptp_usb::FtpWriteKind::Replace,
+            count_before: 3,
+            verification: v,
+        }
+    }
+
+    #[test]
+    fn the_blob_outcome_reports_the_read_back_and_never_sends_the_reader_to_the_written_slot() {
+        use nikon_fleet::ptp_usb::{FtpWriteVerification as V, PtpUsbError};
+        let verified = ftp_blob_outcome_text(&outcome_with(V::Verified { count_after: 3 }));
+        assert!(verified.contains("slot 0 holds exactly the profile that was sent") && verified.contains("3 profile(s)"), "{verified}");
+        assert!(verified.contains("front of the list"), "{verified}");
+        assert!(!verified.contains("--slot 2") && !verified.contains("Read it back with"), "{verified}");
+        let mismatch = ftp_blob_outcome_text(&outcome_with(V::Mismatch {
+            count_after: 4,
+            count_expected: 3,
+            differing_fields: vec!["host", "password"],
+        }));
+        assert!(mismatch.contains("READ-BACK MISMATCH") && mismatch.contains("4 profile(s) (expected 3)") && mismatch.contains("host, password"), "{mismatch}");
+        let count_only = ftp_blob_outcome_text(&outcome_with(V::Mismatch { count_after: 2, count_expected: 3, differing_fields: vec![] }));
+        assert!(count_only.contains("none (only the count is off)"), "{count_only}");
+        let undecodable = ftp_blob_outcome_text(&outcome_with(V::ReadBackUndecodable {
+            error: PtpUsbError::FtpBlobMalformed { what: "blob header", offset: 0, detail: "x".into() },
+        }));
+        assert!(undecodable.contains("READ-BACK UNDECODABLE"), "{undecodable}");
+        let failed = ftp_blob_outcome_text(&outcome_with(V::ReadBackFailed { error: PtpUsbError::NoDataPhase { op: 0x90ED } }));
+        assert!(failed.contains("READ-BACK FAILED") && failed.contains("neither confirmed nor contradicted"), "{failed}");
+    }
+
+    /// Only a verified read-back is a success; every other result must end the command with the
+    /// "camera MAY have changed" status, or a script reads an unconfirmed write as done.
+    #[test]
+    fn only_a_verified_read_back_is_a_clean_finish() {
+        use nikon_fleet::ptp_usb::{FtpWriteVerification as V, PtpUsbError};
+        assert_eq!(ftp_blob_unconfirmed(&V::Verified { count_after: 1 }), None);
+        let others = [
+            V::Mismatch { count_after: 1, count_expected: 2, differing_fields: vec![] },
+            V::Mismatch { count_after: 2, count_expected: 2, differing_fields: vec!["host"] },
+            V::ReadBackUndecodable { error: PtpUsbError::NoDataPhase { op: 0x90ED } },
+            V::ReadBackFailed { error: PtpUsbError::NoDataPhase { op: 0x90ED } },
+        ];
+        for v in &others {
+            assert!(ftp_blob_unconfirmed(v).is_some(), "{v:?}");
+        }
+        // The status is the documented one.
+        let e: anyhow::Error = ExitCodeError { code: EXIT_WRITE_INDETERMINATE, message: "x".into() }.into();
+        assert_eq!(exit_code_for(&e), 4);
+    }
+
+    #[test]
+    fn the_indeterminate_write_advice_is_not_idempotent_and_points_at_the_front() {
+        let e = vendor_write_error(nikon_fleet::ptp_usb::PtpUsbError::FtpWriteIndeterminate {
+            cause: Box::new(nikon_fleet::ptp_usb::PtpUsbError::NoDataPhase { op: 0x90EE }),
+        });
+        let text = format!("{e:#}");
+        assert!(!text.contains("idempotent"), "{text}");
+        assert!(text.contains("FRONT") && text.contains("duplicate") && text.contains("vendor-read-ftp --slot 0"), "{text}");
+    }
+
+    #[test]
+    fn vendor_write_ftp_success_line_does_not_present_the_second_port_as_the_ftp_port() {
+        let line = ftp_write_success_text("CLAUDE", "user", "ftp.example.com", 2121);
+        assert!(line.contains("second port 2121") && line.contains("FTP port 21"), "{line}");
+        assert!(!line.contains("ftp.example.com:2121"), "{line}");
+    }
+
+    #[test]
+    fn vendor_set_string_dry_run_text_names_the_property_the_current_value_and_the_new_one() {
+        let plan = nikon_fleet::ptp_usb::StringPropPlan { propcode: 0xD090, previous: "old".into(), warnings: vec![], data: vec![] };
+        let text = vendor_set_string_dry_run_text(&plan, "new");
+        assert_eq!(text, "Image comment (0xd090): currently \"old\". Would write \"new\". Nothing was sent.");
+        assert_eq!(string_prop_label(0xD072), "Artist");
+        assert_eq!(string_prop_label(0x1234), "?");
+    }
+
+    #[test]
+    fn parse_hex_bytes_takes_even_runs_of_hex_digits_with_optional_spaces() {
+        assert_eq!(parse_hex_bytes("01 aB ff"), Ok(vec![0x01, 0xAB, 0xFF]));
+        assert_eq!(parse_hex_bytes("0102"), Ok(vec![1, 2]));
+        assert_eq!(parse_hex_bytes(" 0 1 0 2 "), Ok(vec![1, 2]), "whitespace is dropped before pairing");
+        assert!(parse_hex_bytes("").is_err(), "empty is not a payload");
+        assert!(parse_hex_bytes("   ").is_err());
+        assert!(parse_hex_bytes("1").is_err(), "odd length");
+        assert!(parse_hex_bytes("012").is_err(), "odd length");
+        assert!(parse_hex_bytes("0x01").is_err(), "no 0x prefix here");
+        assert!(parse_hex_bytes("zz").is_err());
+        assert!(parse_hex_bytes("0g").is_err());
     }
 
     #[test]

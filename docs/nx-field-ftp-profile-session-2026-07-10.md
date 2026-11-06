@@ -331,6 +331,34 @@ Everything above came from experiments; `src/ptp_usb.rs` now turns the safe part
 - **Artist and Copyright** writes (`vendor-set-string 0xD072/0xD073`) now need `--force-unconfirmed-model` like an unconfirmed
   model: only the image comment was ever written.
 
+### What the CLI does with it (b7d3 remediation, 2026-11-05; the read-back has not been run on a camera)
+
+- **`vendor-write-ftp-blob`** no longer checks the count itself. It asks the library for a plan (`plan_ftp_write_locked`: the model
+  gate, the blob must decode, the two allowed forms, the count read in that session; nothing is written), prints it, and a
+  `--dry-run` stops there, so a dry run now fails exactly where the write would, including on a Z 5. A real write then goes through
+  `write_ftp_profile_blob_verified_locked` (the count is read again in the write's own session) and prints the read-back.
+  The plan and the result say where the profile lands: a replace of slot N moves it to the **front** (slot 0) and shifts the
+  profiles that were in front of it down; an add puts the new profile at the front and raises the count by one. Do not look
+  for the written profile in slot N afterwards. `--slot COUNT` with the default `--param2 0` is refused (the 2026-11-05 Z 9
+  experiment: `0x90EE(1, 0)` at count 1 sent the data, stalled the pipe and added nothing); an add is
+  `--slot COUNT --param2 1`.
+- **Exit status.** 0 is a write whose read-back showed slot 0 equal to what was sent and the count the write should leave.
+  If the data was sent and the write then failed, or the camera answered OK but the read-back did not match, did not decode or
+  could not be read, the status is **4** (the camera MAY have changed). A mismatch on a body that does not put a written
+  profile at slot 0 would be reported the same way (a Z6III is untested). Read the list (`vendor-read-ftp --slot 0`) before
+  repeating the write: a repeated add stores a duplicate and a repeated replace of a slot above 0 hits a different profile,
+  because the first one reordered the list. The old text that called a repeat "idempotent" was wrong for both.
+- **`vendor-read-ftp --raw`** zeroes the password and the 5 GHz field in the hex dump wherever they appear: first by the
+  decoder's own offsets, then every occurrence of their text anywhere in the blob (also as UTF-16, the encoding of the profile
+  name), overlapping copies included. Before this only the first occurrence was zeroed, and a username equal to the password
+  left the real password in the "masked" dump. The decoded field lines still print the profile name, SSIDs, host and username as
+  they are, so a password that is the same text as one of those is visible there.
+- **`vendor-write-ftp --port`** is the u16 written after the password (8080 in every camera blob; the decoder's `second_port`),
+  not the FTP port, which the encoder fixes at 21. The success line says so. The default stays 21 (a change to what is written
+  needs a hardware run); the cameras read so far carry 8080.
+- **`vendor-set-string --dry-run`** runs the same checks as the write (`plan_string_property_locked`: the property, the model and
+  property gates, Latin-1 and control characters, a read-write descriptor) and fails where the write would.
+
 ## Credentials
 
 The FTP login above is a throwaway lab login already recorded in earlier notes. The Pi's own login is
