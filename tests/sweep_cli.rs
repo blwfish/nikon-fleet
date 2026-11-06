@@ -43,7 +43,7 @@ fn dump(label: &str, entries: &[(u16, u8)]) -> SweepDump {
         label: Some(label.into()),
         body: SweepBody { model: "Z 9".into(), usb_serial: "S1".into(), firmware: "C:5.31".into() },
         ranges: vec![CodeRange { lo: 0xD000, hi: 0xD0FF }],
-        counts: SweepCounts { asked: 256, present: entries.len() as u32, not_supported: 256 - entries.len() as u32, refused: 0, failed: 0 },
+        counts: SweepCounts { asked: 256, present: entries.len() as u32, bytes_only: 0, not_supported: 256 - entries.len() as u32, refused: 0, failed: 0 },
         aborted: None,
         device_info_props: vec![],
         entries: entries.iter().map(|(c, v)| (format!("0x{c:04x}"), enum_entry(*c, *v))).collect::<BTreeMap<_, _>>(),

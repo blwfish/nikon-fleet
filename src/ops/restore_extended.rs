@@ -474,6 +474,21 @@ fn ftp_rebuild_refusal(model: &str, stored: usize, write_ok: bool, delete_ok: bo
     None
 }
 
+/// Whether two stored FTP profiles are the same for a restore. Identical bytes are. Otherwise both are decoded and
+/// compared by settings, ignoring the two timestamp fields ([`crate::ptp_usb::DecodedFtpProfile::same_settings`]):
+/// a camera that stamps a profile when it stores one would otherwise make a profile that holds the snapshot's settings
+/// look different, planning a rebuild and reporting the result unverified. A blob that does not decode on either side
+/// falls back to the bytes, which differ: any difference this cannot name is a difference.
+fn ftp_entries_same(a: &crate::extended::FtpProfileEntry, b: &crate::extended::FtpProfileEntry) -> bool {
+    if a.hex == b.hex {
+        return true;
+    }
+    match (a.decode(), b.decode()) {
+        (Ok(x), Ok(y)) => x.same_settings(&y),
+        _ => false,
+    }
+}
+
 fn plan_ftp(source: &Extended, live: &Extended, model: &str, only: Option<&BTreeSet<Category>>, out: &mut Vec<Planned>) {
     let one = |action: ItemAction, fingerprint: &str, work: Option<Work>| Planned { item: item("ftp", "FTP profiles", Category::Ftp, action, fingerprint), work };
     if !selected(only, Category::Ftp) {
@@ -507,7 +522,7 @@ fn plan_ftp(source: &Extended, live: &Extended, model: &str, only: Option<&BTree
     // What would be written AND what the body holds now: a live list that became another list of the same length is a
     // different plan. (Hashed with the rest of the item; the blobs hold passwords and never leave this function as text.)
     let fingerprint = fp(&[&join(&src.profiles), &join(&now.profiles)]);
-    if now.profiles.len() == src.profiles.len() && now.profiles.iter().zip(&src.profiles).all(|(a, b)| a.hex == b.hex) {
+    if now.profiles.len() == src.profiles.len() && now.profiles.iter().zip(&src.profiles).all(|(a, b)| ftp_entries_same(a, b)) {
         out.push(one(ItemAction::Unchanged, &fingerprint, None));
         return;
     }
@@ -527,13 +542,13 @@ fn plan_ftp(source: &Extended, live: &Extended, model: &str, only: Option<&BTree
     }
     let mut blobs = Vec::new();
     for p in &src.profiles {
-        match p.blob() {
-            Ok(b) if decode_ftp_profile(&b).is_ok() => blobs.push(b),
-            _ => {
-                out.push(refuse(SkipKind::ProfileNotDecodable, &format!("the profile in slot {} does not decode", p.slot)));
-                return;
-            }
+        // The reason is kept: the decoder's complaint names a field, an offset and structural bytes, never a value, and
+        // a bad hex string is reported without the characters that were wrong (the blob holds a password).
+        if let Some(why) = p.undecodable_because() {
+            out.push(refuse(SkipKind::ProfileNotDecodable, &format!("the profile in slot {} does not decode ({why})", p.slot)));
+            return;
         }
+        blobs.push(p.blob().expect("a blob that decodes is valid hex"));
     }
     if src.profiles.len() > now.limit as usize {
         out.push(refuse(SkipKind::ListTooLong, "more profiles than the body holds"));
@@ -713,19 +728,27 @@ fn same_body(source: &Snapshot, live: &ReadFrom) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Read the live body and check it is the one the snapshot is of.
-fn read_live<S: crate::extended::ExtendedSource + ?Sized>(session: &mut S, input: &ExtendedRestoreInput<'_>) -> Result<(Extended, Extended), Refusal> {
+/// The camera identity a restore REPORTS and records: the input's target (the snapshot's model and the serial asked
+/// for) with the firmware of the body that is attached now. The snapshot's firmware says what the body ran when it was
+/// captured; a restore point and a plan describe the body as it is, so they must not carry the old string. Empty when
+/// the body's firmware could not be read (recorded as unknown, never filled in from the snapshot).
+fn live_camera(target: &Camera, live_firmware: String) -> Camera {
+    Camera { firmware: live_firmware, ..target.clone() }
+}
+
+/// Read the live body and check it is the one the snapshot is of. The third value is the live body's firmware.
+fn read_live<S: crate::extended::ExtendedSource + ?Sized>(session: &mut S, input: &ExtendedRestoreInput<'_>) -> Result<(Extended, Extended, String), Refusal> {
     let source = input.source.extended.clone().ok_or(Refusal::SnapshotHasNoExtended)?;
     let live = read_extended(session);
     if live.read_from.model.is_empty() {
         let (tag, detail) = match &live.ftp {
-            FtpState::ReadFailed { tag, detail } => (tag.clone(), detail.clone()),
+            FtpState::ReadFailed { tag, detail } => (tag.tag().to_string(), detail.clone()),
             _ => ("unknown".to_string(), String::new()),
         };
         return Err(Refusal::BodyNotReadable { tag, detail });
     }
     same_body(input.source, &live.read_from)?;
-    Ok((source, live))
+    Ok((source, live, session.firmware()))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -743,11 +766,11 @@ pub fn build_extended_restore_plan<S: crate::extended::ExtendedSource + ?Sized>(
     session: &mut S,
     input: &ExtendedRestoreInput<'_>,
 ) -> Result<ExtendedPlanReport, Refusal> {
-    let (source, live) = read_live(session, input)?;
+    let (source, live, live_firmware) = read_live(session, input)?;
     let plan = plan_extended_restore(&source, &live, input.only);
     let n = would_change(&plan);
     Ok(ExtendedPlanReport {
-        camera: input.target.clone(),
+        camera: live_camera(input.target, live_firmware),
         source: input.source_name.to_string(),
         would_change: n,
         summary: summary_text(input.target, input.source_name, n, input.only),
@@ -1079,7 +1102,7 @@ pub fn apply_extended_restore<S: ExtendedSink + ?Sized>(
 ) -> Result<ExtendedApplyReport, ExtendedApplyError> {
     require_confirmation(req.expected_digest, req.expected_summary)?;
     let input = &req.input;
-    let (source, live) = read_live(sink, input)?;
+    let (source, live, live_firmware) = read_live(sink, input)?;
     let plan = plan_extended_restore(&source, &live, input.only);
     let now_digest = digest(input.source_bytes, &input.target.serial, input.only, &plan);
     if now_digest != req.expected_digest.trim() {
@@ -1105,7 +1128,8 @@ pub fn apply_extended_restore<S: ExtendedSink + ?Sized>(
 
     // The restore point: the body as it is, as a snapshot with no MAID properties and the live extended section.
     // Refused first, like the MAID apply's, when the data directory is at its restore-point cap.
-    let mut rp = Snapshot::new(input.target.clone(), Transport::Usb, req.captured_at.clone());
+    // The body as it is now, firmware included: the snapshot's camera record carries the firmware of the capture.
+    let mut rp = Snapshot::new(live_camera(input.target, live_firmware), Transport::Usb, req.captured_at.clone());
     rp.label = Some(RESTORE_POINT_LABEL.to_string());
     rp.extended = Some(live.clone());
     let rp_file = rp.suggested_filename();
@@ -1169,6 +1193,8 @@ mod tests {
     struct Body {
         model: String,
         serial: String,
+        /// What the body's USB descriptor reports now.
+        firmware: String,
         props: BTreeMap<u16, Vec<u8>>,
         iptc: Vec<Vec<u8>>,
         /// Front of the list first, as the camera orders it.
@@ -1221,6 +1247,7 @@ mod tests {
         Body {
             model: model.into(),
             serial: "0000001".into(),
+            firmware: "9.99".into(),
             props,
             iptc: vec![preset("", ""), preset("", ""), vec![1, 0, 0, 0, 0xC9, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
             ftp: vec![profile("one", "password-1"), profile("two", "password-2")],
@@ -1263,6 +1290,9 @@ mod tests {
     }
 
     impl ExtendedSource for Body {
+        fn firmware(&self) -> String {
+            self.firmware.clone()
+        }
         fn identity(&mut self) -> Result<ReadFrom, PtpUsbError> {
             if self.unreadable {
                 return Err(PtpUsbError::NoDevice);
@@ -1286,8 +1316,9 @@ mod tests {
                     device_name: PtpString { text: String::new(), anomalies: vec![] },
                     trailer: 500,
                 },
-                entries: self.ftp.iter().map(|b| FtpListEntry { raw: b.clone(), decoded: None }).collect(),
+                entries: self.ftp.iter().map(|b| FtpListEntry::from_blob(b.clone())).collect(),
                 truncated: false,
+                info_replies: vec![],
             })
         }
         fn iptc_slots(&mut self, _max: u32) -> Result<(u32, Vec<(u32, Vec<u8>)>), PtpUsbError> {
@@ -1455,6 +1486,43 @@ mod tests {
         assert_eq!(back.status, ApplyStatus::AppliedVerified);
         assert_eq!(b.props[&0xD072], ptp_string("Someone else").unwrap());
         assert_eq!(b.ftp, [profile("new", "password-9")]);
+    }
+
+    #[test]
+    fn the_plan_and_the_restore_point_carry_the_live_bodys_firmware_not_the_snapshots() {
+        // The snapshot (and so the input's target) says firmware "1"; the body attached now runs 9.99.
+        let (mut b, f) = drifted();
+        assert_eq!(f.snap.camera.firmware, "1");
+        let plan = plan_of(&mut b, &f, None);
+        assert_eq!(plan.camera.firmware, "9.99", "the plan describes the live body");
+        assert_eq!((plan.camera.model.as_str(), plan.camera.serial.as_str()), ("Z 9", "0000001"), "model and serial are unchanged");
+        let report = apply(&mut b, &f, None).unwrap();
+        let name = report.restore_point.expect("a restore point").file;
+        let rp = Snapshot::load_from_file(f.dir.path().join(&name)).unwrap();
+        assert_eq!(rp.camera.firmware, "9.99", "the restore point is of the live body");
+        assert_eq!((rp.camera.model.as_str(), rp.camera.serial.as_str()), ("Z 9", "0000001"));
+        // The digest and summary bind model and serial only, so a firmware difference does not make a plan stale.
+        assert!(!plan.summary.contains("9.99") && !plan.summary.contains("firmware"), "{}", plan.summary);
+    }
+
+    #[test]
+    fn a_live_body_whose_firmware_is_unknown_is_recorded_unknown_not_as_the_snapshots() {
+        let (mut b, f) = drifted();
+        b.firmware = String::new();
+        let plan = plan_of(&mut b, &f, None);
+        assert_eq!(plan.camera.firmware, "", "empty, not the snapshot's \"1\"");
+        let name = apply(&mut b, &f, None).unwrap().restore_point.expect("a restore point").file;
+        assert_eq!(Snapshot::load_from_file(f.dir.path().join(&name)).unwrap().camera.firmware, "");
+    }
+
+    #[test]
+    fn a_firmware_difference_alone_neither_refuses_nor_stales_the_plan() {
+        // same_body checks model and serial; the firmware of the snapshot and of the body may differ (an update).
+        let (mut b, f) = drifted();
+        let plan = plan_of(&mut b, &f, None);
+        b.firmware = "10.00".into();
+        let report = apply_with(&mut b, &f, None, &plan.digest, &plan.summary).unwrap();
+        assert_eq!(report.status, ApplyStatus::AppliedVerified);
     }
 
     #[test]
@@ -1676,7 +1744,7 @@ mod tests {
         let mut f = fixture(&mut b);
         let e = f.snap.extended.as_mut().unwrap();
         e.iptc = IptcState::NotRead;
-        e.ftp = FtpState::ReadFailed { tag: "t".into(), detail: "d".into() };
+        e.ftp = FtpState::ReadFailed { tag: crate::ptp_usb::PtpUsbErrorKind::NoDevice, detail: "d".into() };
         let plan = plan_of(&mut b, &f, None);
         assert!(matches!(action(&plan, "iptc"), ItemAction::Skip { reason: SkipKind::SnapshotHasNoValue, .. }));
         assert!(matches!(action(&plan, "ftp"), ItemAction::Skip { reason: SkipKind::SnapshotHasNoValue, .. }));
@@ -1810,6 +1878,105 @@ mod tests {
         assert!(!b.log.iter().any(|l| l.starts_with("ftp_add")), "{:?}", b.log);
     }
 
+    /// The blob with the first character of its first timestamp changed (`00000000T000000` -> `10000000T000000`),
+    /// which is all the camera could do to "stamp" a profile; nothing else in it moves.
+    fn with_first_timestamp_changed(blob: &[u8]) -> Vec<u8> {
+        let placeholder: Vec<u8> = crate::ptp_usb::ftp_layout::FTP_TEMPLATE_TIMESTAMP_PLACEHOLDER.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let at = blob.windows(placeholder.len()).position(|w| w == placeholder.as_slice()).expect("the timestamp is in the blob");
+        let mut out = blob.to_vec();
+        out[at] = b'1';
+        assert_ne!(out, blob);
+        assert!(decode_ftp_profile(&out).is_ok(), "still a profile the strict decoder reads");
+        out
+    }
+
+    fn ftp_item(b: &mut Body, f: &Fixture) -> ItemAction {
+        action(&plan_of(b, f, None), "ftp").clone()
+    }
+
+    #[test]
+    fn a_snapshot_profile_that_does_not_decode_is_refused_with_the_decoders_reason_and_no_secret() {
+        let mut b = body("Z 9");
+        let mut f = fixture(&mut b);
+        b.ftp = vec![profile("other", "password-9")];
+        let detail = |b: &mut Body, f: &Fixture| match action(&plan_of(b, f, None), "ftp") {
+            ItemAction::Skip { reason: SkipKind::ProfileNotDecodable, detail } => detail.clone().expect("a detail"),
+            other => panic!("{other:?}"),
+        };
+        let set_hex = |f: &mut Fixture, slot: usize, hex: String| {
+            if let FtpState::Read(s) = &mut f.snap.extended.as_mut().unwrap().ftp {
+                s.profiles[slot].hex = hex;
+            }
+        };
+        // too short to hold the header: the decoder names the field and the offset; the slot is named too
+        set_hex(&mut f, 0, "0102".into());
+        let d = detail(&mut b, &f);
+        assert!(d.contains("slot 0") && d.contains("blob header") && d.contains("byte offset 0"), "{d}");
+        // the second profile cut short: a different reason, for slot 1; the whole blob's content is not in it
+        let whole = profile("two", "password-2");
+        set_hex(&mut f, 0, hex_encode(&profile("one", "password-1")));
+        set_hex(&mut f, 1, hex_encode(&whole[..whole.len() - 3]));
+        let d2 = detail(&mut b, &f);
+        assert!(d2.contains("slot 1") && !d2.contains("blob header"), "{d2}");
+        assert!(!d2.contains("password-2") && !d2.contains(&hex_encode(&whole)), "{d2}");
+        // text that is not hex: said so, without echoing the wrong characters
+        set_hex(&mut f, 1, "4Q7Z".into());
+        let d3 = detail(&mut b, &f);
+        assert!(d3.contains("slot 1") && d3.contains("not valid hex") && !d3.contains('Q') && !d3.contains('Z'), "{d3}");
+    }
+
+    #[test]
+    fn ftp_profiles_that_differ_only_in_their_timestamps_are_unchanged() {
+        let mut b = body("Z 9");
+        let f = fixture(&mut b);
+        // identical
+        assert!(matches!(ftp_item(&mut b, &f), ItemAction::Unchanged));
+        // timestamps only, on one profile and on both
+        b.ftp[0] = with_first_timestamp_changed(&b.ftp[0]);
+        assert!(matches!(ftp_item(&mut b, &f), ItemAction::Unchanged), "one timestamp differs");
+        b.ftp[1] = with_first_timestamp_changed(&b.ftp[1]);
+        assert!(matches!(ftp_item(&mut b, &f), ItemAction::Unchanged), "both differ");
+        // and so nothing is written
+        let report = apply(&mut b, &f, None).unwrap();
+        assert!(report.no_op && report.status == ApplyStatus::AppliedVerified && b.log.is_empty(), "{:?}", b.log);
+    }
+
+    #[test]
+    fn a_real_difference_beside_a_timestamp_difference_is_still_a_difference() {
+        let mut b = body("Z 9");
+        let f = fixture(&mut b);
+        // one real field (the password) different, timestamps also different
+        b.ftp[1] = with_first_timestamp_changed(&profile("two", "password-X"));
+        assert!(matches!(ftp_item(&mut b, &f), ItemAction::Write { .. }));
+        // one real field different alone
+        b.ftp[1] = profile("two", "password-X");
+        assert!(matches!(ftp_item(&mut b, &f), ItemAction::Write { .. }));
+        // the name, the other way the same size of change
+        b.ftp[1] = profile("tw0", "password-2");
+        assert!(matches!(ftp_item(&mut b, &f), ItemAction::Write { .. }));
+        // a different count is a difference whatever the timestamps say
+        let mut b2 = body("Z 9");
+        b2.ftp.pop();
+        assert!(matches!(ftp_item(&mut b2, &f), ItemAction::Write { .. }));
+    }
+
+    #[test]
+    fn an_ftp_blob_that_does_not_decode_on_either_side_is_compared_by_its_bytes() {
+        let a = |hex: &str| crate::extended::FtpProfileEntry { slot: 0, hex: hex.into() };
+        let good = a(&hex_encode(&profile("one", "password-1")));
+        let stamped = a(&hex_encode(&with_first_timestamp_changed(&profile("one", "password-1"))));
+        let junk1 = a("0102");
+        let junk2 = a("0103");
+        assert!(ftp_entries_same(&good, &good));
+        assert!(ftp_entries_same(&good, &stamped), "timestamps only");
+        assert!(ftp_entries_same(&junk1, &junk1), "undecodable but identical bytes");
+        assert!(!ftp_entries_same(&junk1, &junk2), "both undecodable, different bytes");
+        assert!(!ftp_entries_same(&good, &junk1), "snapshot side undecodable");
+        assert!(!ftp_entries_same(&junk1, &good), "body side undecodable");
+        let not_hex = a("zz");
+        assert!(!ftp_entries_same(&good, &not_hex) && ftp_entries_same(&not_hex, &not_hex));
+    }
+
     #[test]
     fn an_empty_body_list_is_filled_without_a_delete() {
         let mut b = body("Z 9");
@@ -1825,6 +1992,7 @@ mod tests {
         // A body whose write is accepted and ignored: the read afterwards still differs.
         struct Ignoring(Body);
         impl ExtendedSource for Ignoring {
+            fn firmware(&self) -> String { self.0.firmware() }
             fn identity(&mut self) -> Result<ReadFrom, PtpUsbError> { self.0.identity() }
             fn prop_bytes(&mut self, c: u16) -> Result<Vec<u8>, PtpUsbError> { self.0.prop_bytes(c) }
             fn ftp_list(&mut self) -> Result<FtpListState, PtpUsbError> { self.0.ftp_list() }
@@ -2496,6 +2664,7 @@ mod tests {
         // The body now lists slots 1..=4; make slot 1 appear twice in what it reports.
         struct DupBody(Body);
         impl ExtendedSource for DupBody {
+            fn firmware(&self) -> String { self.0.firmware() }
             fn identity(&mut self) -> Result<ReadFrom, PtpUsbError> { self.0.identity() }
             fn prop_bytes(&mut self, c: u16) -> Result<Vec<u8>, PtpUsbError> { self.0.prop_bytes(c) }
             fn ftp_list(&mut self) -> Result<FtpListState, PtpUsbError> { self.0.ftp_list() }
@@ -2519,15 +2688,15 @@ mod tests {
         let mut f = fixture(&mut b);
         {
             let e = f.snap.extended.as_mut().unwrap();
-            e.props.get_mut("0xd073").unwrap().state = PropState::ReadFailed { tag: "usb_timeout".into(), detail: "d".into() };
-            e.iptc = IptcState::ReadFailed { tag: "no_device".into(), detail: "d".into() };
+            e.props.get_mut("0xd073").unwrap().state = PropState::ReadFailed { tag: crate::ptp_usb::PtpUsbErrorKind::TransactionTimedOut, detail: "d".into() };
+            e.iptc = IptcState::ReadFailed { tag: crate::ptp_usb::PtpUsbErrorKind::NoDevice, detail: "d".into() };
         }
         let plan = plan_of(&mut b, &f, None);
         let detail = |id: &str| match action(&plan, id) {
             ItemAction::Skip { detail, .. } => detail.clone().unwrap(),
             other => panic!("{id}: {other:?}"),
         };
-        assert!(detail("0xd073").contains("usb_timeout"), "{}", detail("0xd073"));
+        assert!(detail("0xd073").contains("transaction_timed_out"), "{}", detail("0xd073"));
         assert!(detail("iptc").contains("no_device"), "{}", detail("iptc"));
         // The body's side too.
         let mut b2 = body("Z 9");

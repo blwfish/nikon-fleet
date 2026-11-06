@@ -119,6 +119,17 @@ There is no delete-all (`0x90EA`) in this path; it remains reachable only throug
 A body is planned for a rebuild only if the capability table confirms FTP writes on its model, and, when it holds any
 profile, the single delete too.
 
+**Which firmware the plan and the restore point record.** The `camera` of the plan and of the restore point is the
+snapshot's model and the serial asked for, with the firmware of the body that is attached now (its USB descriptor's
+`bcdDevice`, read when the session opened; empty when it could not be read, never filled in from the snapshot). The
+snapshot's firmware says what the body ran when it was captured. The digest and the summary bind model and serial only,
+so a firmware difference alone neither refuses nor stales a plan. Unverified on a camera.
+
+**What counts as an FTP profile "same".** Two stored profiles are the same when their bytes are, or when both decode
+and every field is equal except the two timestamp fields (all-zero placeholders in every capture; not settings). A blob
+that does not decode on either side is compared by its bytes. Any other difference is a difference. Unverified on a
+camera: no body has been seen to stamp a profile.
+
 **A run that wrote nothing.** If every item is `same`, `not selected` or skipped for a routine reason (the snapshot holds
 no value, or the body lacks the feature) it is a verified no-op: `no_op: true`, `applied_verified`, no restore point. If
 any item was skipped for a non-routine reason (a model the write is not confirmed on, a value out of range or outside
@@ -131,7 +142,8 @@ snapshot, a body without it); the body lacks it; the body's current value was un
 (text outside Latin-1, a control character, over 254 characters, a switch above its maximum); a model the write is not
 confirmed on; an IPTC slot of another record kind or one that does not decode (the detail says which side and which); an
 IPTC slot number listed twice; a snapshot slot the body lacks; an FTP list that is truncated, whose recorded count
-disagrees with the profiles held, or that contains an undecodable profile; a live FTP list read only in part; a list
+disagrees with the profiles held, or that contains an undecodable profile (the detail names the slot and the decoder's
+reason: a field and a byte offset, never a value); a live FTP list read only in part; a list
 longer than the body's limit. IPTC slots are independent, so a snapshot that read only a prefix of them still has each slot
 it read restored. Not possible: choosing the active FTP profile (no op that selects one was found). That is not a separate
 plan item: the FTP item's `to` text names the snapshot's active profile and says the camera chooses its own, and the

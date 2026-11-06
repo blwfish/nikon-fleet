@@ -624,7 +624,7 @@ mod tests {
         assert_eq!(row(PropState::Bytes { hex: "01".into() }), RowState::Bytes);
         assert_eq!(row(PropState::Undecodable { hex: "ff".into(), why: "w".into() }), RowState::Undecodable);
         assert_eq!(row(PropState::NotSupported), RowState::NotSupported);
-        assert_eq!(row(PropState::ReadFailed { tag: "t".into(), detail: "d".into() }), RowState::ReadFailed);
+        assert_eq!(row(PropState::ReadFailed { tag: crate::ptp_usb::PtpUsbErrorKind::NoDevice, detail: "d".into() }), RowState::ReadFailed);
     }
 
     #[test]

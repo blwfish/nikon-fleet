@@ -506,6 +506,17 @@ pub struct UsbScan {
     pub enumeration_error: Option<String>,
 }
 
+/// The firmware a body's USB device descriptor reports (`bcdDevice`, decoded). The one place the descriptor's
+/// version is turned into the string a snapshot records: the bus scan and the raw PTP session both use it.
+pub(crate) fn firmware_from_descriptor(desc: &rusb::DeviceDescriptor) -> String {
+    let v = desc.device_version();
+    // rusb splits bcdDevice into (high_byte, upper_nibble, lower_nibble).
+    // Reconstruct the raw BCD u16 so bcd_decode_version handles both
+    // single- and two-digit majors correctly.
+    let raw_bcd: u16 = (v.0 as u16) << 8 | (v.1 as u16) << 4 | (v.2 as u16);
+    bcd_decode_version(raw_bcd)
+}
+
 fn read_usb_identity(device: &rusb::Device<rusb::GlobalContext>) -> Result<UsbCameraInfo, UsbUnreadable> {
     let unreadable = |stage, e: rusb::Error| UsbUnreadable {
         bus: device.bus_number(),
@@ -517,15 +528,10 @@ fn read_usb_identity(device: &rusb::Device<rusb::GlobalContext>) -> Result<UsbCa
     let handle = device.open().map_err(|e| unreadable(UsbStage::Open, e))?;
     let serial = read_usb_string(&handle, desc.serial_number_string_index().unwrap_or(0));
     let product = read_usb_string(&handle, desc.product_string_index().unwrap_or(0));
-    let v = desc.device_version();
-    // rusb splits bcdDevice into (high_byte, upper_nibble, lower_nibble).
-    // Reconstruct the raw BCD u16 so bcd_decode_version handles both
-    // single- and two-digit majors correctly.
-    let raw_bcd: u16 = (v.0 as u16) << 8 | (v.1 as u16) << 4 | (v.2 as u16);
     Ok(UsbCameraInfo {
         product_id: desc.product_id(),
         serial,
-        firmware: bcd_decode_version(raw_bcd),
+        firmware: firmware_from_descriptor(&desc),
         model: model_from_product_string(&product),
     })
 }

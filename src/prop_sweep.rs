@@ -22,7 +22,7 @@
 //! | FormFlag, and the range or enumeration it announces | extracted |
 //! | bytes after the last field | kept (`trailing_hex`) |
 //! | a field the parser cannot read | the parse stops there; the default, the current value and the form flag are kept if read, and `fault` says where. A range is kept only whole; an enumeration keeps the values read before the fault |
-//! | a reply too short to hold the five-byte head | no `desc`; `raw_hex` is kept, the diff says "undecodable", and [`SweepDump::undecoded`] counts it |
+//! | a reply too short to hold the five-byte head | no `desc`; `raw_hex` is kept, the diff says "undecodable", [`SweepCounts::bytes_only`] counts it at the sweep and [`SweepDump::undecoded`] counts it (with the faulted parses) when the dumps are compared |
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -447,6 +447,12 @@ pub enum SweepEntry {
 pub struct SweepCounts {
     pub asked: u32,
     pub present: u32,
+    /// Of `present`: replies whose descriptor could not be parsed at all (too short to hold the five-byte head), kept
+    /// only as `raw_hex`. Not a disposition of its own (`asked` is still `present + not_supported + refused + failed`);
+    /// [`SweepDump::undecoded`] also counts the replies whose parse stopped at a fault. A file written before this was
+    /// counted reads it as 0.
+    #[serde(default)]
+    pub bytes_only: u32,
     pub not_supported: u32,
     pub refused: u32,
     pub failed: u32,
@@ -671,10 +677,11 @@ pub fn sweep<S: SweepSource + ?Sized>(
                 Answer::Desc(data) => {
                     consecutive_failures = 0;
                     counts.present += 1;
-                    entries.insert(
-                        key(code),
-                        SweepEntry::Present { raw_hex: hex_encode(&data), listed_in_device_info: listed.contains(&code), desc: parse_prop_desc(&data, code) },
-                    );
+                    let desc = parse_prop_desc(&data, code);
+                    if desc.is_none() {
+                        counts.bytes_only += 1;
+                    }
+                    entries.insert(key(code), SweepEntry::Present { raw_hex: hex_encode(&data), listed_in_device_info: listed.contains(&code), desc });
                 }
                 Answer::NotSupported => {
                     consecutive_failures = 0;
@@ -1157,7 +1164,7 @@ mod tests {
         f.table.insert(0xD1A2, Err(FailKind::Refuse(0x2019)));
         let d = run(&mut f, &[r(0xD1A2, 0xD1A3), r(0xD1A0, 0xD1A2)]);
         assert_eq!(f.asked, [0xD1A0, 0xD1A1, 0xD1A2, 0xD1A3], "merged, ascending, 0xD1A2 asked once though both ranges name it");
-        assert_eq!(d.counts, SweepCounts { asked: 4, present: 1, not_supported: 2, refused: 1, failed: 0 });
+        assert_eq!(d.counts, SweepCounts { asked: 4, present: 1, bytes_only: 0, not_supported: 2, refused: 1, failed: 0 });
         assert_eq!(d.counts.asked, d.counts.present + d.counts.not_supported + d.counts.refused + d.counts.failed, "every code asked has exactly one disposition");
         assert!(matches!(d.entries["0xd1a0"], SweepEntry::Present { listed_in_device_info: true, .. }));
         assert!(matches!(&d.entries["0xd1a2"], SweepEntry::Refused { code: 0x2019, .. }));
@@ -1166,6 +1173,29 @@ mod tests {
         assert_eq!((d.body.model.as_str(), d.body.firmware.as_str()), ("Z 9", "C:5.31"));
         assert_eq!(d.device_info_props, ["0xd1a0"]);
         assert!(d.aborted.is_none());
+    }
+
+    #[test]
+    fn replies_too_short_to_parse_are_counted_as_bytes_only_at_the_head_boundary() {
+        let mut f = Fake::new();
+        f.table.insert(0xD1A0, Ok(enum_u8(0xD1A0))); // whole: decoded
+        f.table.insert(0xD1A1, Ok(Vec::new())); // empty reply: nothing to parse
+        f.table.insert(0xD1A2, Ok(enum_u8(0xD1A2)[..4].to_vec())); // one byte short of the five-byte head
+        f.table.insert(0xD1A3, Ok(enum_u8(0xD1A3)[..5].to_vec())); // exactly the head: parsed, then faulted at the first value
+        f.table.insert(0xD1A4, Ok(desc_bytes(0xD1A4, 2, 1, &[0], &[1], &[9]))); // a bad form flag: parsed, faulted
+        let d = run(&mut f, &[r(0xD1A0, 0xD1A5)]);
+        assert_eq!(d.counts.present, 5);
+        assert_eq!(d.counts.bytes_only, 2, "the empty and the 4-byte reply; the 5-byte head and the bad flag have a desc, with a fault");
+        assert!(matches!(&d.entries["0xd1a3"], SweepEntry::Present { desc: Some(PropDesc { fault: Some(_), .. }), .. }));
+        assert_eq!(d.undecoded(), 4, "the dump's own count adds the faulted parses; the counter is the narrower, at-the-sweep one");
+        assert_eq!(d.counts.asked, d.counts.present + d.counts.not_supported + d.counts.refused + d.counts.failed, "bytes_only is part of present, not a disposition");
+        // A file written before the counter existed reads it as 0.
+        let mut v = serde_json::to_value(&d).unwrap();
+        v["counts"].as_object_mut().unwrap().remove("bytes_only");
+        assert_eq!(SweepDump::from_json(&v.to_string()).unwrap().counts.bytes_only, 0);
+        // and a clean sweep reports none
+        let clean = run(&mut Fake::new(), &[r(0xD1A0, 0xD1A1)]);
+        assert_eq!(clean.counts.bytes_only, 0);
     }
 
     #[test]

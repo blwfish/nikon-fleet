@@ -2194,15 +2194,20 @@ fn caveats(undecodable: Option<usize>, what: &str, truncated: bool) -> String {
 
 /// The one status line for the extended section of a capture.
 fn extended_line(s: &nikon_fleet::extended::ExtendedSummary) -> String {
-    let ftp = match (s.ftp.as_str(), s.ftp_profiles) {
-        ("read", Some(n)) => format!("{n} FTP profile(s){}", caveats(s.ftp_profiles_undecodable, "profile(s)", s.ftp_truncated)),
-        ("not_on_model", _) => "no FTP profiles on this model".to_string(),
-        _ => "FTP profiles not read".to_string(),
+    use nikon_fleet::extended::SectionState;
+    // Every state is named, so a state added later is a compile error here instead of "not read".
+    let ftp = match (s.ftp, s.ftp_profiles) {
+        (SectionState::Read, Some(n)) => {
+            let why = s.ftp_undecodable_because.as_deref().map(|w| format!(" (first: {w})")).unwrap_or_default();
+            format!("{n} FTP profile(s){}{why}", caveats(s.ftp_profiles_undecodable, "profile(s)", s.ftp_truncated))
+        }
+        (SectionState::NotOnModel, _) => "no FTP profiles on this model".to_string(),
+        (SectionState::Read, None) | (SectionState::NotRead | SectionState::ReadFailed, _) => "FTP profiles not read".to_string(),
     };
-    let iptc = match (s.iptc.as_str(), s.iptc_presets_in_use) {
-        ("read", Some(n)) => format!("{n} IPTC preset(s) in use{}", caveats(s.iptc_slots_undecodable, "slot(s)", s.iptc_truncated)),
-        ("not_on_model", _) => "no IPTC on this model".to_string(),
-        _ => "IPTC not read".to_string(),
+    let iptc = match (s.iptc, s.iptc_presets_in_use) {
+        (SectionState::Read, Some(n)) => format!("{n} IPTC preset(s) in use{}", caveats(s.iptc_slots_undecodable, "slot(s)", s.iptc_truncated)),
+        (SectionState::NotOnModel, _) => "no IPTC on this model".to_string(),
+        (SectionState::Read, None) | (SectionState::NotRead | SectionState::ReadFailed, _) => "IPTC not read".to_string(),
     };
     let dropped = s.dropped.as_deref().map(|d| format!("; NOT kept: {d}")).unwrap_or_default();
     format!(
@@ -2446,9 +2451,11 @@ fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let name = match &e.decoded {
-                    Some(d) => d.profile_name.clone(),
-                    None => format!("(undecodable, {} bytes)", e.raw.len()),
+                let name = match (&e.decoded, &e.undecodable_because) {
+                    (Some(d), _) => d.profile_name.clone(),
+                    // The decoder's reason names a field, an offset and structural bytes, never a value.
+                    (None, Some(why)) => format!("(undecodable, {} bytes: {why})", e.raw.len()),
+                    (None, None) => format!("(undecodable, {} bytes)", e.raw.len()),
                 };
                 if i as u32 == s.info.slot { format!("[{i}] {name} (selected)") } else { format!("[{i}] {name}") }
             })
@@ -2466,6 +2473,14 @@ fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
         }
         if s.undecodable_count() > 0 {
             out.push_str(&format!(" [{} undecodable]", s.undecodable_count()));
+        }
+        for note in s.info_replies.iter().flat_map(|r| r.texts()) {
+            out.push_str(&format!("\n    note: {note}"));
+        }
+        for (i, e) in s.entries.iter().enumerate() {
+            for note in e.reply.texts() {
+                out.push_str(&format!("\n    [{i}] note: {note}"));
+            }
         }
         out
     }
@@ -2770,8 +2785,11 @@ fn cmd_vendor_sweep(data_dir: &Path, args: &VendorSweepArgs) -> Result<()> {
     .context("sweeping property descriptors over USB PTP")?;
     let path = dump.save_new(&sweeps_dir(data_dir)).context("saving the sweep")?;
     let c = dump.counts;
+    // Only said when there is something to say: a reply too short to parse is kept as bytes, and a person reading the
+    // counts should know their `present` is not all decoded.
+    let bytes_only = if c.bytes_only > 0 { format!(" ({} kept only as bytes: too short to decode)", c.bytes_only) } else { String::new() };
     println!(
-        "{}: asked {}, present {}, not supported {}, refused {}, no usable answer {}
+        "{}: asked {}, present {}{bytes_only}, not supported {}, refused {}, no usable answer {}
 saved {}",
         dump.body.model,
         c.asked,
@@ -6819,11 +6837,12 @@ mod tests {
             props_read: 5,
             props_not_supported: 1,
             props_failed: 0,
-            ftp: "read".into(),
+            ftp: nikon_fleet::extended::SectionState::Read,
             ftp_profiles: Some(3),
             ftp_profiles_undecodable: Some(0),
+            ftp_undecodable_because: None,
             ftp_truncated: false,
-            iptc: "read".into(),
+            iptc: nikon_fleet::extended::SectionState::Read,
             iptc_presets_in_use: Some(2),
             iptc_slots_undecodable: Some(0),
             iptc_truncated: false,
@@ -6846,11 +6865,40 @@ mod tests {
         let mut s = summary();
         s.ftp_truncated = true;
         assert!(extended_line(&s).contains("3 FTP profile(s), read only in part;"), "{}", extended_line(&s));
+        // The reason the first one does not decode is on the line, after the count.
+        let mut s = summary();
+        s.ftp_profiles_undecodable = Some(1);
+        s.ftp_undecodable_because = Some("slot 1: blob header at byte offset 0".into());
+        let line = extended_line(&s);
+        assert!(line.contains("3 FTP profile(s), 1 profile(s) undecodable (first: slot 1: blob header at byte offset 0);"), "{line}");
         // A summary from before the counts existed (None) says nothing extra.
         let mut s = summary();
         s.ftp_profiles_undecodable = None;
         s.iptc_slots_undecodable = None;
         assert_eq!(extended_line(&s), clean);
+    }
+
+    #[test]
+    fn the_extended_status_line_names_each_section_state() {
+        use nikon_fleet::extended::SectionState::{NotOnModel, NotRead, Read, ReadFailed};
+        for (state, ftp, iptc) in [
+            (Read, "3 FTP profile(s);", "2 IPTC preset(s) in use\n"),
+            (NotOnModel, "no FTP profiles on this model;", "no IPTC on this model\n"),
+            (ReadFailed, "FTP profiles not read;", "IPTC not read\n"),
+            (NotRead, "FTP profiles not read;", "IPTC not read\n"),
+        ] {
+            let mut s = summary();
+            s.ftp = state;
+            s.iptc = state;
+            let line = extended_line(&s);
+            assert!(line.contains(ftp) && line.contains(iptc), "{state:?}: {line}");
+        }
+        // Read with no count (a summary that did not carry one) is "not read", not "0 profiles".
+        let mut s = summary();
+        s.ftp_profiles = None;
+        s.iptc_presets_in_use = None;
+        let line = extended_line(&s);
+        assert!(line.contains("FTP profiles not read;") && line.contains("IPTC not read\n"), "{line}");
     }
 
     #[test]
@@ -7202,6 +7250,7 @@ mod tests {
             },
             entries,
             truncated: false,
+            info_replies: vec![],
         }
     }
 
@@ -7264,10 +7313,16 @@ mod tests {
         let readout = ftp_readout_with_profile();
         let blob = readout.profile.as_ref().unwrap();
         let decoded = blob.decoded.as_ref().unwrap().clone();
-        let entry = FtpListEntry { raw: blob.raw.clone(), decoded: Some(decoded.clone()) };
+        let decoded_entry = |raw: Vec<u8>, d: nikon_fleet::ptp_usb::DecodedFtpProfile| FtpListEntry {
+            raw,
+            decoded: Some(d),
+            undecodable_because: None,
+            reply: nikon_fleet::ptp_usb::FtpReplyNotes::clean(0x90ED),
+        };
+        let entry = decoded_entry(blob.raw.clone(), decoded.clone());
         let mut other = decoded.clone();
         other.password = "pw-changed-sentinel".into();
-        let changed = FtpListEntry { raw: vec![9; blob.raw.len()], decoded: Some(other) };
+        let changed = decoded_entry(vec![9; blob.raw.len()], other);
         let reply = FtpProbeOutcome::Replied(FtpProbeReply {
             response_code: 0x2001,
             response_params: vec![3],
@@ -7287,7 +7342,7 @@ mod tests {
         assert!(text.contains("profile [0]: ") && text.contains("password"), "{text}");
         assert!(!text.contains("pw-changed-sentinel") && !text.contains(&decoded.password), "no value is printed: {text}");
         // An unchanged list says so, and an undecodable profile is counted.
-        let same = probe_state(1, 0, vec![FtpListEntry { raw: vec![1, 2, 3], decoded: None }]);
+        let same = probe_state(1, 0, vec![FtpListEntry::from_blob(vec![1, 2, 3])]);
         let p = probe_of(
             FtpProbeOutcome::Replied(FtpProbeReply {
                 response_code: 0x2005,
@@ -7301,7 +7356,36 @@ mod tests {
             Ok(same),
         );
         let text = ftp_probe_text(&p);
-        assert!(text.contains("the profile list is unchanged") && text.contains("[1 undecodable]") && text.contains("(undecodable, 3 bytes)"), "{text}");
+        assert!(text.contains("the profile list is unchanged") && text.contains("[1 undecodable]") && text.contains("(undecodable, 3 bytes: "), "{text}");
+        // The reason is the decoder's, with the field and offset; it is printed, with no byte of the blob's content
+        // beyond what the decoder names.
+        let why = FtpListEntry::from_blob(vec![1, 2, 3]).undecodable_because.expect("a reason");
+        assert!(why.contains("blob header") && text.contains(&why), "{why} / {text}");
+    }
+
+    #[test]
+    fn the_probe_text_shows_what_each_list_reply_carried_besides_its_data() {
+        use nikon_fleet::ptp_usb::{FtpListEntry, FtpOpProbe, FtpProbeOutcome, FtpProbeReply, FtpReplyNotes, ReplyDeviation};
+        let mut e = FtpListEntry::from_blob(vec![1, 2, 3]);
+        e.reply = FtpReplyNotes { op: 0x90ED, response_params: vec![7], deviations: vec![ReplyDeviation::TransactionId { got: 31 }], unrecognized_containers: 0 };
+        let mut state = probe_state(1, 0, vec![e]);
+        state.info_replies = vec![FtpReplyNotes { op: 0x90E8, response_params: vec![5], deviations: vec![], unrecognized_containers: 2 }];
+        let reply = FtpProbeOutcome::Replied(FtpProbeReply {
+            response_code: 0x2001,
+            response_params: vec![],
+            data: vec![],
+            data_containers: 0,
+            deviations: vec![],
+            unrecognized_containers: 0,
+        });
+        let p: FtpOpProbe = probe_of(reply, state.clone(), Ok(state));
+        let text = ftp_probe_text(&p);
+        assert!(text.contains("[0] note: ") && text.contains("transaction id 31") && text.contains("[7]"), "{text}");
+        assert!(text.contains("the reply to 0x90e8") && text.contains("[5]") && text.contains("2 container(s)"), "{text}");
+        // a clean list adds no note line
+        let clean = probe_state(1, 0, vec![FtpListEntry::from_blob(vec![1, 2, 3])]);
+        let reply = FtpProbeOutcome::Replied(FtpProbeReply { response_code: 0x2001, response_params: vec![], data: vec![], data_containers: 0, deviations: vec![], unrecognized_containers: 0 });
+        assert!(!ftp_probe_text(&probe_of(reply, clean.clone(), Ok(clean))).contains("note: "));
     }
 
     // ── device-info output ───────────────────────────────────────────────

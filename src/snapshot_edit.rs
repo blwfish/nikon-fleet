@@ -1197,7 +1197,7 @@ mod tests {
         let mut s = edited();
         let e = set_owner_string(&mut s, 0xD090, "note", NOW).unwrap_err();
         assert_eq!(e.tag(), "item_unavailable", "{e}");
-        ext_state(&mut s, 0xD090, PropState::ReadFailed { tag: "x".into(), detail: "y".into() });
+        ext_state(&mut s, 0xD090, PropState::ReadFailed { tag: crate::ptp_usb::PtpUsbErrorKind::NoDevice, detail: "y".into() });
         set_owner_string(&mut s, 0xD090, "note", NOW).unwrap();
         assert!(matches!(&ext(&s).props["0xd090"].state, PropState::Text { text } if text == "note"));
         // not an owner string at all
@@ -1316,7 +1316,7 @@ mod tests {
         assert!(e.tag() == "no_such_field" && e.to_string().contains("Headline"), "{e}");
         assert_eq!(set_iptc_field(&mut s, 1, "headline", "nul\0", NOW).unwrap_err().tag(), "bad_text");
         assert!(!set_iptc_field(&mut s, 1, "headline", "Hello", NOW).unwrap().changed, "the value it already holds");
-        for state in [IptcState::NotRead, IptcState::NotOnModel, IptcState::ReadFailed { tag: "t".into(), detail: "d".into() }] {
+        for state in [IptcState::NotRead, IptcState::NotOnModel, IptcState::ReadFailed { tag: crate::ptp_usb::PtpUsbErrorKind::NoDevice, detail: "d".into() }] {
             s.extended.as_mut().unwrap().iptc = state;
             assert_eq!(set_iptc_field(&mut s, 1, "headline", "x", NOW).unwrap_err().tag(), "item_unavailable");
         }
@@ -1418,7 +1418,7 @@ mod tests {
         }
         let e = ftp_delete(&mut s, 0, NOW).unwrap_err();
         assert!(e.tag() == "ftp_unavailable" && e.to_string().contains("only part"), "{e}");
-        for state in [FtpState::NotOnModel, FtpState::ReadFailed { tag: "t".into(), detail: "d".into() }] {
+        for state in [FtpState::NotOnModel, FtpState::ReadFailed { tag: crate::ptp_usb::PtpUsbErrorKind::NoDevice, detail: "d".into() }] {
             s.extended.as_mut().unwrap().ftp = state;
             assert_eq!(ftp_move(&mut s, 0, 1, NOW).unwrap_err().tag(), "ftp_unavailable");
         }
@@ -1579,7 +1579,7 @@ mod tests {
         let mut s = edited();
         s.extended.as_mut().unwrap().iptc = IptcState::NotOnModel;
         s.extended.as_mut().unwrap().ftp = FtpState::NotOnModel;
-        ext_state(&mut s, 0xD072, PropState::ReadFailed { tag: "t".into(), detail: "d".into() });
+        ext_state(&mut s, 0xD072, PropState::ReadFailed { tag: crate::ptp_usb::PtpUsbErrorKind::NoDevice, detail: "d".into() });
         ext_state(&mut s, 0xD053, PropState::NotSupported);
         let v = owner_view(&s).unwrap();
         assert!(v.iptc.unwrap_err().contains("no IPTC") && v.ftp.unwrap_err().contains("no FTP"));

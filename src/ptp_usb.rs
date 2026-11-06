@@ -604,6 +604,102 @@ fn check_prop_desc(propcode: u16, desc: &[u8], data_type: Option<u16>) -> Result
     Ok(())
 }
 
+/// The closed vocabulary of [`PtpUsbError::tag`]: one kind per error variant, and the wire string of each, in ONE list
+/// (the macro writes the enum, [`Self::tag`], [`Self::from_tag`] and [`Self::ALL`] from it). Stored in snapshots as that
+/// string (`ReadFailed.tag`); a string that is not in the list is refused when a file is read, not carried as text.
+macro_rules! ptp_usb_error_kinds {
+    ($($variant:ident => $tag:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub enum PtpUsbErrorKind {
+            $($variant),+
+        }
+
+        impl PtpUsbErrorKind {
+            /// Every kind, in declaration order.
+            pub const ALL: &'static [PtpUsbErrorKind] = &[$(PtpUsbErrorKind::$variant),+];
+
+            pub fn tag(self) -> &'static str {
+                match self {
+                    $(PtpUsbErrorKind::$variant => $tag),+
+                }
+            }
+
+            /// The kind a wire string names; `None` for a string that names none.
+            pub fn from_tag(tag: &str) -> Option<PtpUsbErrorKind> {
+                match tag {
+                    $($tag => Some(PtpUsbErrorKind::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+ptp_usb_error_kinds! {
+    NoDevice => "no_device",
+    AmbiguousDevice => "ambiguous_device",
+    SerialNotFound => "serial_not_found",
+    DuplicateSerial => "duplicate_serial",
+    BodiesSkipped => "bodies_skipped",
+    Usb => "usb",
+    CameraLock => "camera_lock",
+    NoPtpInterface => "no_ptp_interface",
+    ClaimFailed => "claim_failed",
+    ShortContainer => "short_container",
+    TruncatedContainer => "truncated_container",
+    ShortWrite => "short_write",
+    ContainerTooLarge => "container_too_large",
+    TooManyCommandParams => "too_many_command_params",
+    MisalignedResponseParams => "misaligned_response_params",
+    TransactionTimedOut => "transaction_timed_out",
+    TransactionDataTooLarge => "transaction_data_too_large",
+    SessionPoisoned => "session_poisoned",
+    OpenSessionFailed => "open_session_failed",
+    OperationFailed => "operation_failed",
+    TransactionIdMismatch => "transaction_id_mismatch",
+    UnexpectedDataOp => "unexpected_data_op",
+    NoDataPhase => "no_data_phase",
+    DeviceInfoMalformed => "device_info_malformed",
+    FtpBlobMalformed => "ftp_blob_malformed",
+    FtpInfoMalformed => "ftp_info_malformed",
+    FtpSlotOutOfRange => "ftp_slot_out_of_range",
+    FtpProbeOpNotAllowed => "ftp_probe_op_not_allowed",
+    FtpProbeDataTooLong => "ftp_probe_data_too_long",
+    FtpProbeBadParams => "ftp_probe_bad_params",
+    FtpProbeDestructiveNotConfirmed => "ftp_probe_destructive_not_confirmed",
+    FtpFieldTooLong => "ftp_field_too_long",
+    FtpFieldNotAscii => "ftp_field_not_ascii",
+    FtpFieldControlChar => "ftp_field_control_char",
+    FtpWriteIndeterminate => "ftp_write_indeterminate",
+    FtpWriteRefused => "ftp_write_refused",
+    UnconfirmedModel => "unconfirmed_model",
+    PropWriteUnsupported => "prop_write_unsupported",
+    PropWriteUnconfirmed => "prop_write_unconfirmed",
+    PropNotWritable => "prop_not_writable",
+    PropValueBad => "prop_value_bad",
+    PropWriteIndeterminate => "prop_write_indeterminate",
+    IptcWriteIndeterminate => "iptc_write_indeterminate",
+}
+
+impl std::fmt::Display for PtpUsbErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.tag())
+    }
+}
+
+impl serde::Serialize for PtpUsbErrorKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.tag())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PtpUsbErrorKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        PtpUsbErrorKind::from_tag(&text).ok_or_else(|| serde::de::Error::custom(format!("{text:?} is not a PTP error kind this build knows")))
+    }
+}
+
 impl PtpUsbError {
     /// Raised by a transaction before it put a single byte on the pipe: the session was already unusable,
     /// or the command could not be encoded. Anything else raised by `transact` may follow a command the
@@ -615,54 +711,59 @@ impl PtpUsbError {
         )
     }
 
-    /// Closed machine-readable tag, one per variant. Exhaustive match: a new variant must be given a tag
+    /// Closed machine-readable kind, one per variant. Exhaustive match: a new variant must be given a kind
     /// before this compiles.
-    pub fn tag(&self) -> &'static str {
+    pub fn kind(&self) -> PtpUsbErrorKind {
         match self {
-            PtpUsbError::NoDevice => "no_device",
-            PtpUsbError::AmbiguousDevice(_) => "ambiguous_device",
-            PtpUsbError::SerialNotFound { .. } => "serial_not_found",
-            PtpUsbError::DuplicateSerial { .. } => "duplicate_serial",
-            PtpUsbError::BodiesSkipped { .. } => "bodies_skipped",
-            PtpUsbError::Usb(_) => "usb",
-            PtpUsbError::CameraLock(_) => "camera_lock",
-            PtpUsbError::NoPtpInterface => "no_ptp_interface",
-            PtpUsbError::ClaimFailed { .. } => "claim_failed",
-            PtpUsbError::ShortContainer(_) => "short_container",
-            PtpUsbError::TruncatedContainer { .. } => "truncated_container",
-            PtpUsbError::ShortWrite { .. } => "short_write",
-            PtpUsbError::ContainerTooLarge { .. } => "container_too_large",
-            PtpUsbError::TooManyCommandParams { .. } => "too_many_command_params",
-            PtpUsbError::MisalignedResponseParams(_) => "misaligned_response_params",
-            PtpUsbError::TransactionTimedOut(_) => "transaction_timed_out",
-            PtpUsbError::TransactionDataTooLarge { .. } => "transaction_data_too_large",
-            PtpUsbError::SessionPoisoned { .. } => "session_poisoned",
-            PtpUsbError::OpenSessionFailed(_) => "open_session_failed",
-            PtpUsbError::OperationFailed { .. } => "operation_failed",
-            PtpUsbError::TransactionIdMismatch { .. } => "transaction_id_mismatch",
-            PtpUsbError::UnexpectedDataOp { .. } => "unexpected_data_op",
-            PtpUsbError::NoDataPhase { .. } => "no_data_phase",
-            PtpUsbError::DeviceInfoMalformed { .. } => "device_info_malformed",
-            PtpUsbError::FtpBlobMalformed { .. } => "ftp_blob_malformed",
-            PtpUsbError::FtpInfoMalformed { .. } => "ftp_info_malformed",
-            PtpUsbError::FtpSlotOutOfRange { .. } => "ftp_slot_out_of_range",
-            PtpUsbError::FtpProbeOpNotAllowed { .. } => "ftp_probe_op_not_allowed",
-            PtpUsbError::FtpProbeDataTooLong { .. } => "ftp_probe_data_too_long",
-            PtpUsbError::FtpProbeBadParams { .. } => "ftp_probe_bad_params",
-            PtpUsbError::FtpProbeDestructiveNotConfirmed { .. } => "ftp_probe_destructive_not_confirmed",
-            PtpUsbError::FtpFieldTooLong { .. } => "ftp_field_too_long",
-            PtpUsbError::FtpFieldNotAscii { .. } => "ftp_field_not_ascii",
-            PtpUsbError::FtpFieldControlChar { .. } => "ftp_field_control_char",
-            PtpUsbError::FtpWriteIndeterminate { .. } => "ftp_write_indeterminate",
-            PtpUsbError::FtpWriteRefused { .. } => "ftp_write_refused",
-            PtpUsbError::UnconfirmedModel(_) => "unconfirmed_model",
-            PtpUsbError::PropWriteUnsupported { .. } => "prop_write_unsupported",
-            PtpUsbError::PropWriteUnconfirmed { .. } => "prop_write_unconfirmed",
-            PtpUsbError::PropNotWritable { .. } => "prop_not_writable",
-            PtpUsbError::PropValueBad { .. } => "prop_value_bad",
-            PtpUsbError::PropWriteIndeterminate { .. } => "prop_write_indeterminate",
-            PtpUsbError::IptcWriteIndeterminate { .. } => "iptc_write_indeterminate",
+            PtpUsbError::NoDevice => PtpUsbErrorKind::NoDevice,
+            PtpUsbError::AmbiguousDevice(_) => PtpUsbErrorKind::AmbiguousDevice,
+            PtpUsbError::SerialNotFound { .. } => PtpUsbErrorKind::SerialNotFound,
+            PtpUsbError::DuplicateSerial { .. } => PtpUsbErrorKind::DuplicateSerial,
+            PtpUsbError::BodiesSkipped { .. } => PtpUsbErrorKind::BodiesSkipped,
+            PtpUsbError::Usb(_) => PtpUsbErrorKind::Usb,
+            PtpUsbError::CameraLock(_) => PtpUsbErrorKind::CameraLock,
+            PtpUsbError::NoPtpInterface => PtpUsbErrorKind::NoPtpInterface,
+            PtpUsbError::ClaimFailed { .. } => PtpUsbErrorKind::ClaimFailed,
+            PtpUsbError::ShortContainer(_) => PtpUsbErrorKind::ShortContainer,
+            PtpUsbError::TruncatedContainer { .. } => PtpUsbErrorKind::TruncatedContainer,
+            PtpUsbError::ShortWrite { .. } => PtpUsbErrorKind::ShortWrite,
+            PtpUsbError::ContainerTooLarge { .. } => PtpUsbErrorKind::ContainerTooLarge,
+            PtpUsbError::TooManyCommandParams { .. } => PtpUsbErrorKind::TooManyCommandParams,
+            PtpUsbError::MisalignedResponseParams(_) => PtpUsbErrorKind::MisalignedResponseParams,
+            PtpUsbError::TransactionTimedOut(_) => PtpUsbErrorKind::TransactionTimedOut,
+            PtpUsbError::TransactionDataTooLarge { .. } => PtpUsbErrorKind::TransactionDataTooLarge,
+            PtpUsbError::SessionPoisoned { .. } => PtpUsbErrorKind::SessionPoisoned,
+            PtpUsbError::OpenSessionFailed(_) => PtpUsbErrorKind::OpenSessionFailed,
+            PtpUsbError::OperationFailed { .. } => PtpUsbErrorKind::OperationFailed,
+            PtpUsbError::TransactionIdMismatch { .. } => PtpUsbErrorKind::TransactionIdMismatch,
+            PtpUsbError::UnexpectedDataOp { .. } => PtpUsbErrorKind::UnexpectedDataOp,
+            PtpUsbError::NoDataPhase { .. } => PtpUsbErrorKind::NoDataPhase,
+            PtpUsbError::DeviceInfoMalformed { .. } => PtpUsbErrorKind::DeviceInfoMalformed,
+            PtpUsbError::FtpBlobMalformed { .. } => PtpUsbErrorKind::FtpBlobMalformed,
+            PtpUsbError::FtpInfoMalformed { .. } => PtpUsbErrorKind::FtpInfoMalformed,
+            PtpUsbError::FtpSlotOutOfRange { .. } => PtpUsbErrorKind::FtpSlotOutOfRange,
+            PtpUsbError::FtpProbeOpNotAllowed { .. } => PtpUsbErrorKind::FtpProbeOpNotAllowed,
+            PtpUsbError::FtpProbeDataTooLong { .. } => PtpUsbErrorKind::FtpProbeDataTooLong,
+            PtpUsbError::FtpProbeBadParams { .. } => PtpUsbErrorKind::FtpProbeBadParams,
+            PtpUsbError::FtpProbeDestructiveNotConfirmed { .. } => PtpUsbErrorKind::FtpProbeDestructiveNotConfirmed,
+            PtpUsbError::FtpFieldTooLong { .. } => PtpUsbErrorKind::FtpFieldTooLong,
+            PtpUsbError::FtpFieldNotAscii { .. } => PtpUsbErrorKind::FtpFieldNotAscii,
+            PtpUsbError::FtpFieldControlChar { .. } => PtpUsbErrorKind::FtpFieldControlChar,
+            PtpUsbError::FtpWriteIndeterminate { .. } => PtpUsbErrorKind::FtpWriteIndeterminate,
+            PtpUsbError::FtpWriteRefused { .. } => PtpUsbErrorKind::FtpWriteRefused,
+            PtpUsbError::UnconfirmedModel(_) => PtpUsbErrorKind::UnconfirmedModel,
+            PtpUsbError::PropWriteUnsupported { .. } => PtpUsbErrorKind::PropWriteUnsupported,
+            PtpUsbError::PropWriteUnconfirmed { .. } => PtpUsbErrorKind::PropWriteUnconfirmed,
+            PtpUsbError::PropNotWritable { .. } => PtpUsbErrorKind::PropNotWritable,
+            PtpUsbError::PropValueBad { .. } => PtpUsbErrorKind::PropValueBad,
+            PtpUsbError::PropWriteIndeterminate { .. } => PtpUsbErrorKind::PropWriteIndeterminate,
+            PtpUsbError::IptcWriteIndeterminate { .. } => PtpUsbErrorKind::IptcWriteIndeterminate,
         }
+    }
+
+    /// The wire tag of [`Self::kind`].
+    pub fn tag(&self) -> &'static str {
+        self.kind().tag()
     }
 
     /// What a transaction's diagnostics span records for this error: typed fields, never the `Display`
@@ -882,6 +983,9 @@ struct Candidate {
     /// (`warnings` says which), unlike `serial`, which then holds the topology fallback.
     usb_serial: String,
     model: String,
+    /// The firmware the device descriptor reports (`bcdDevice`, decoded); never empty in practice, since the
+    /// descriptor was read to get here.
+    firmware: String,
     /// Descriptor reads that failed while identifying this body (its serial
     /// or model then fell back to the topology serial / `""`).
     warnings: Vec<String>,
@@ -970,7 +1074,8 @@ fn candidate_devices() -> Enumeration {
         let serial = candidate_serial(&device, &real_serial);
         let model = model_from_product_string(&product);
         let serial_from_topology = real_serial.is_empty();
-        candidates.push(Candidate { device, handle, serial, usb_serial: real_serial, model, warnings, serial_from_topology });
+        let firmware = crate::sdk::firmware_from_descriptor(&desc);
+        candidates.push(Candidate { device, handle, serial, usb_serial: real_serial, model, firmware, warnings, serial_from_topology });
     }
     Enumeration { candidates, skipped }
 }
@@ -1849,6 +1954,14 @@ impl DecodedFtpProfile {
         ftp_layout::encodable_with(ftp_layout::FTP_LAYOUT, self)
     }
 
+    /// Whether `other` holds the same SETTINGS: every field equal except [`Self::timestamps`], which are not settings
+    /// (all-zero placeholders in every capture, so what they would mean if the camera ever filled them in is unknown).
+    /// Every other field, including the ones whose meaning is unknown, still counts as a difference: this is
+    /// `==` with exactly one named exception, so a field added to the struct is compared until someone decides otherwise.
+    pub fn same_settings(&self, other: &DecodedFtpProfile) -> bool {
+        DecodedFtpProfile { timestamps: other.timestamps.clone(), ..self.clone() } == *other
+    }
+
     // `with_secrets_masked` and `secret_texts`, which read the layout's secret flags, are in `ftp_layout`.
 }
 
@@ -1880,8 +1993,12 @@ pub enum ReplyDeviation {
 /// Human text for what a [`TxidCheck::Unchecked`] reply did differently from its command, from the typed deviations
 /// (never from a message): one warning per deviation and one for containers of an unknown kind. Empty for a clean reply.
 fn deviation_warnings(what: &str, reply: &Reply) -> Vec<String> {
-    let mut out: Vec<String> = reply
-        .deviations
+    deviation_texts(what, &reply.deviations, reply.unrecognized_containers)
+}
+
+/// [`deviation_warnings`] from the typed parts, for a record that kept them without the whole reply.
+fn deviation_texts(what: &str, deviations: &[ReplyDeviation], unrecognized_containers: u32) -> Vec<String> {
+    let mut out: Vec<String> = deviations
         .iter()
         .map(|d| match d {
             ReplyDeviation::TransactionId { got } => {
@@ -1890,8 +2007,8 @@ fn deviation_warnings(what: &str, reply: &Reply) -> Vec<String> {
             ReplyDeviation::DataOp { got } => format!("{what}: a data container carried operation code {got:#06x}, not the command's"),
         })
         .collect();
-    if reply.unrecognized_containers > 0 {
-        out.push(format!("{what}: {} container(s) of a kind this module does not know were skipped", reply.unrecognized_containers));
+    if unrecognized_containers > 0 {
+        out.push(format!("{what}: {unrecognized_containers} container(s) of a kind this module does not know were skipped"));
     }
     out
 }
@@ -2059,6 +2176,22 @@ impl FtpReplyNotes {
     /// Nothing worth telling: no response parameters, no deviation, no skipped container.
     pub fn is_empty(&self) -> bool {
         self.response_params.is_empty() && self.deviations.is_empty() && self.unrecognized_containers == 0
+    }
+
+    /// A reply that departed from nothing.
+    pub fn clean(op: u16) -> Self {
+        FtpReplyNotes { op, response_params: Vec::new(), deviations: Vec::new(), unrecognized_containers: 0 }
+    }
+
+    /// One line per thing the reply carried that a clean one does not (empty when [`Self::is_empty`]), from the typed
+    /// fields. Names the operation; no profile content is in any of it.
+    pub fn texts(&self) -> Vec<String> {
+        let what = format!("the reply to {:#06x}", self.op);
+        let mut out = deviation_texts(&what, &self.deviations, self.unrecognized_containers);
+        if !self.response_params.is_empty() {
+            out.push(format!("{what}: the response carried parameter(s) {:?}", self.response_params));
+        }
+        out
     }
 }
 
@@ -2547,6 +2680,8 @@ pub struct PtpUsbSession<T: BulkTransport = rusb::DeviceHandle<GlobalContext>> {
     /// The body's USB `iSerialNumber` descriptor as the device lookup read it (empty: none, or the
     /// read failed — see `usb_warnings`); the test constructor leaves it empty.
     usb_serial: String,
+    /// The `bcdDevice` firmware of the device descriptor, decoded (`"5.31"`); empty for the test constructor.
+    usb_firmware: String,
     /// Descriptor reads that failed while the lookup identified this body.
     usb_warnings: Vec<String>,
     /// Whether the most recent transaction got as far as handing its
@@ -2599,7 +2734,7 @@ impl PtpUsbSession {
         find: impl FnOnce(Option<&str>) -> Result<Candidate, PtpUsbError>,
         serial: Option<&str>,
     ) -> Result<Self, PtpUsbError> {
-        let Candidate { device, handle, model, usb_serial, warnings, .. } = find(serial)?;
+        let Candidate { device, handle, model, usb_serial, firmware, warnings, .. } = find(serial)?;
         let endpoints = find_ptp_endpoints(&device)?;
         claim_with_retry(&handle, endpoints.interface)?;
 
@@ -2613,6 +2748,7 @@ impl PtpUsbSession {
             Some(lock),
         );
         session.usb_serial = usb_serial;
+        session.usb_firmware = firmware;
         session.usb_warnings = warnings;
         session.open_ptp_session()?;
         Ok(session)
@@ -2643,6 +2779,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
             transaction_timeout: TRANSACTION_TIMEOUT,
             poisoned: None,
             usb_serial: String::new(),
+            usb_firmware: String::new(),
             usb_warnings: Vec::new(),
             data_phase_started: false,
             unrecognized_containers: 0,
@@ -3338,6 +3475,13 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         parse_device_info(&reply.data)
     }
 
+    /// The firmware the body's USB device descriptor reported when this session was opened (`bcdDevice`, decoded,
+    /// e.g. `"5.31"`); empty for a session that did not come from a real device. Read at enumeration, so it describes
+    /// the body that is attached now, not any snapshot.
+    pub fn usb_firmware(&self) -> &str {
+        &self.usb_firmware
+    }
+
     /// [`Self::get_device_info`] with the identity the USB lookup read for this body.
     pub fn read_device_info_report(&mut self) -> Result<DeviceInfoReport, PtpUsbError> {
         let dataset = self.get_device_info()?;
@@ -3723,6 +3867,31 @@ pub struct FtpListEntry {
     pub raw: Vec<u8>,
     /// `None` when the blob does not decode.
     pub decoded: Option<DecodedFtpProfile>,
+    /// Why it does not decode: the decoder's own complaint ([`PtpUsbError::FtpBlobMalformed`]'s text: the field, the
+    /// byte offset and the structural bytes it expected or found, never a field's value). `Some` exactly when
+    /// [`Self::decoded`] is `None`.
+    pub undecodable_because: Option<String>,
+    /// What the `0x90ED` reply carried besides the blob: response parameters, deviations from its command, skipped
+    /// containers. Not part of what the camera holds ([`FtpListState::changes_to`] does not compare it).
+    pub reply: FtpReplyNotes,
+}
+
+impl FtpListEntry {
+    /// An entry for a blob, decoded here: [`Self::decoded`] and [`Self::undecodable_because`] are set together, the one
+    /// way they are set. The reply notes are empty (a clean reply).
+    pub fn from_blob(raw: Vec<u8>) -> FtpListEntry {
+        let (decoded, undecodable_because) = match decode_ftp_profile(&raw) {
+            Ok(d) => (Some(d), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+        FtpListEntry { raw, decoded, undecodable_because, reply: FtpReplyNotes::clean(OP_FTP_PROFILE_READ) }
+    }
+
+    /// Whether `other` holds the same profile. What the camera holds (the bytes, and so what they decode to and why
+    /// they do not), not how the reply arrived: a transaction id that differs between two reads is not a change.
+    fn same_profile(&self, other: &FtpListEntry) -> bool {
+        self.raw == other.raw && self.decoded == other.decoded
+    }
 }
 
 impl std::fmt::Debug for FtpListEntry {
@@ -3730,6 +3899,8 @@ impl std::fmt::Debug for FtpListEntry {
         f.debug_struct("FtpListEntry")
             .field("raw", &format_args!("<{} byte(s) hidden>", self.raw.len()))
             .field("decoded", &self.decoded)
+            .field("undecodable_because", &self.undecodable_because)
+            .field("reply", &self.reply)
             .finish()
     }
 }
@@ -3744,6 +3915,9 @@ pub struct FtpListState {
     pub entries: Vec<FtpListEntry>,
     /// `info.count` is above [`FTP_LIST_MAX_READ`], so `entries` is a prefix of the list.
     pub truncated: bool,
+    /// What the `0x90E8` setup and the `0x90EB` info replies carried besides their data (each profile's own reply is
+    /// on its [`FtpListEntry::reply`]). Like those, not compared by [`Self::changes_to`].
+    pub info_replies: Vec<FtpReplyNotes>,
 }
 
 /// A field of the `0x90EB` reply, for [`FtpListChange::Info`].
@@ -3792,7 +3966,9 @@ impl FtpListState {
         self.entries.iter().filter(|e| e.decoded.is_none()).count()
     }
 
-    /// Everything that differs between `self` (before) and `after`; empty exactly when they are equal.
+    /// Everything that differs between `self` (before) and `after`; empty exactly when they hold the same thing: the same
+    /// `0x90EB` fields and the same profile bytes (a reply's transaction id or parameters are how it arrived, not what
+    /// the camera holds, and are not compared).
     pub fn changes_to(&self, after: &FtpListState) -> Vec<FtpListChange> {
         // Destructured without `..`: a new field of the info must be given a comparison to compile.
         let FtpProfileInfo { header, count, limit, slot, guid, device_name, trailer } = &self.info;
@@ -3812,7 +3988,7 @@ impl FtpListState {
         info(self.truncated != after.truncated, FtpInfoField::Truncated);
         for index in 0..self.entries.len().max(after.entries.len()) {
             match (self.entries.get(index), after.entries.get(index)) {
-                (Some(a), Some(b)) if a != b => {
+                (Some(a), Some(b)) if !a.same_profile(b) => {
                     let fields = match (&a.decoded, &b.decoded) {
                         (Some(x), Some(y)) => ftp_profile_differences(x, y),
                         _ => Vec::new(),
@@ -3888,15 +4064,18 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     }
 
     fn ftp_list_state(&mut self) -> Result<FtpListState, PtpUsbError> {
-        let (info, _) = self.read_ftp_info_step()?;
+        let (info, info_replies) = self.read_ftp_info_step()?;
         let truncated = info.count > FTP_LIST_MAX_READ;
         let mut entries = Vec::new();
         for n in 0..info.count.min(FTP_LIST_MAX_READ) {
             let reply = self.read_ftp_profile_reply(n)?;
-            let decoded = decode_ftp_profile(&reply.data).ok();
-            entries.push(FtpListEntry { raw: reply.data, decoded });
+            // Everything the reply said is kept: the decoder's reason when the blob does not decode, and the
+            // parameters and deviations of the reply itself.
+            let mut entry = FtpListEntry::from_blob(reply.data.clone());
+            entry.reply = FtpReplyNotes::of(OP_FTP_PROFILE_READ, &reply);
+            entries.push(entry);
         }
-        Ok(FtpListState { info, entries, truncated })
+        Ok(FtpListState { info, entries, truncated, info_replies })
     }
 
     /// Send one op from [`FTP_PROBE_OP_TABLE`] with the given parameters and data-out, optionally right
@@ -9183,6 +9362,79 @@ mod tests {
         let (mut s, _t) = session(replies, "Z 9");
         let p = s.probe_ftp_op(0x90EC, false, &[], Some(&[1]), NO_CONSENT).unwrap();
         assert_eq!(p.before.changes_to(p.after.as_ref().unwrap()), vec![FtpListChange::Info(FtpInfoField::DeviceName)]);
+    }
+
+    #[test]
+    fn a_list_read_keeps_why_a_profile_does_not_decode_and_what_each_reply_carried_besides_its_data() {
+        let good = hex::decode_hex(reference_ftp_blob_hex());
+        let junk = vec![0x11u8; 40];
+        let mut truncated_good = good.clone();
+        truncated_good.truncate(good.len() - 3);
+        // setup (a response carrying a parameter), info (clean), then three profiles: whole; a data container with
+        // another transaction id (a tolerated deviation); one that does not decode, with an extra response parameter.
+        let steps = vec![
+            Step::Stamped(vec![(CONTAINER_RESPONSE, RESP_OK, le(5))]),
+            data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(3, 0, "Z_9_0000000")),
+            resp(RESP_OK),
+            data_c(OP_FTP_PROFILE_READ, &good),
+            resp(RESP_OK),
+            Step::Bytes(container(CONTAINER_DATA, OP_FTP_PROFILE_READ, 777, &junk)),
+            resp(RESP_OK),
+            data_c(OP_FTP_PROFILE_READ, &truncated_good),
+            Step::Stamped(vec![(CONTAINER_RESPONSE, RESP_OK, le(9))]),
+        ];
+        let (mut s, _t) = session(steps, "Z 9");
+        let list = s.read_ftp_list().unwrap();
+        let e = &list.entries;
+        assert_eq!((e.len(), list.undecodable_count()), (3, 2));
+        // a good profile: decoded, no reason, a clean reply
+        assert!(e[0].decoded.is_some() && e[0].undecodable_because.is_none() && e[0].reply.is_empty() && e[0].reply.texts().is_empty());
+        // reason and decoded are set together, always
+        for x in e {
+            assert_eq!(x.decoded.is_none(), x.undecodable_because.is_some());
+        }
+        // junk: the decoder's own reason (the field and offset), and the deviation the reply had
+        let why = e[1].undecodable_because.as_deref().unwrap();
+        assert!(why.contains("blob header") && why.contains("byte offset 0"), "{why}");
+        assert_eq!(e[1].reply.op, OP_FTP_PROFILE_READ);
+        assert_eq!(e[1].reply.deviations, vec![ReplyDeviation::TransactionId { got: 777 }]);
+        assert!(e[1].reply.texts()[0].contains("777"), "{:?}", e[1].reply.texts());
+        // a truncated real profile: a different reason from the junk's, and the response parameter
+        let why2 = e[2].undecodable_because.as_deref().unwrap();
+        assert_ne!(why, why2);
+        assert_eq!(e[2].reply.response_params, vec![9]);
+        assert!(e[2].reply.texts()[0].contains("parameter") && e[2].reply.texts()[0].contains("[9]"));
+        // the setup reply's parameter is on the list, and is the setup's
+        assert_eq!(list.info_replies.len(), 2);
+        assert_eq!((list.info_replies[0].op, list.info_replies[0].response_params.clone()), (OP_FTP_SETUP, vec![5]));
+        assert!(list.info_replies[1].is_empty());
+        // no secret is in the reason or the notes
+        let secret = decode_ftp_profile(&good).unwrap();
+        for text in [why.to_string(), why2.to_string(), e.iter().flat_map(|x| x.reply.texts()).collect::<Vec<_>>().join(" ")] {
+            assert!(!text.contains(&secret.password) && !text.contains(&secret.ssid_5ghz), "{text}");
+        }
+        let shown = format!("{list:?}");
+        assert!(!shown.contains(&secret.password), "{shown}");
+    }
+
+    #[test]
+    fn how_a_reply_arrived_is_not_a_change_in_what_the_camera_holds() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let state = |deviate: bool| {
+            let mut steps = vec![resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(1, 0, "Z_9_0000000")), resp(RESP_OK)];
+            steps.push(if deviate { Step::Bytes(container(CONTAINER_DATA, OP_FTP_PROFILE_READ, 4242, &blob)) } else { data_c(OP_FTP_PROFILE_READ, &blob) });
+            steps.push(resp(RESP_OK));
+            let (mut s, _t) = session(steps, "Z 9");
+            s.read_ftp_list().unwrap()
+        };
+        let (clean, deviated) = (state(false), state(true));
+        assert!(clean.entries[0].reply.is_empty() && !deviated.entries[0].reply.is_empty());
+        assert_ne!(clean, deviated, "the records differ: one carries a note");
+        assert!(clean.changes_to(&deviated).is_empty() && deviated.changes_to(&clean).is_empty(), "the profile is the same profile");
+        // and a real change is still seen beside a note
+        let mut other = deviated.clone();
+        other.entries[0].raw[10] ^= 1;
+        assert_eq!(clean.changes_to(&other).len(), 1);
     }
 
     #[test]

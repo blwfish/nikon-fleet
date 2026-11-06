@@ -27,6 +27,8 @@
 //! | IPTC slots past [`IPTC_READ_MAX`] | `dropped-with-reason`: the count is the camera's and is not trusted past the cap; [`IptcStore::truncated`] says so |
 //! | a vendor read's `warnings` and `response_params` (every `ExtendedSource` read) | `dropped-with-reason`: the source trait returns bytes only. The warning is "this model is not surveyed", and the fleet's bodies are surveyed, so it is empty for them; a body that is not would be recorded as clean |
 //! | the session's identity beyond model and USB serial (`usb_warnings`, the DeviceInfo dataset) | `dropped-with-reason`: [`ReadFrom`] is used only to check the data came from the body the snapshot is of; the rest is diagnostic and the MAID capture records its own |
+//! | the session's firmware (the USB descriptor's `bcdDevice`; [`ExtendedSource::firmware`]) | `dropped-with-reason`: not stored in the section ([`ReadFrom`] is persisted and checked for model and serial only); a restore reads it from the live body for the plan and the restore point's `camera`, and the MAID capture records the firmware of its own snapshots |
+//! | each FTP profile reply's response parameters and deviations, and why a blob does not decode (`FtpListEntry::reply`, `undecodable_because`) | `raw-only` in the section (the blob's hex; the reason is recomputed from it, `FtpProfileEntry::undecodable_because`); kept on the in-memory `FtpListState` for the research commands and shown there |
 //!
 //! Passwords are stored (the point is to be able to restore them) and shown masked unless the user
 //! asks; see `DecodedFtpProfile::with_secrets_masked`.
@@ -37,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::iptc::{IptcRecord, decode_iptc_slot};
 use crate::ptp_usb::{
-    FtpListState, FtpWriteOutcome, IptcWriteOutcome, PtpResponseCode, PtpUsbError, PtpUsbSession, decode_ftp_profile,
+    FtpListState, FtpWriteOutcome, IptcWriteOutcome, PtpResponseCode, PtpUsbError, PtpUsbErrorKind, PtpUsbSession, decode_ftp_profile,
     decode_ptp_string_value, ftp_absent, iptc_absent,
 };
 
@@ -90,7 +92,7 @@ pub enum PropState {
     /// DeviceInfo: a Z 9 lists 21 properties and none of these five, yet reads all of them.)
     NotSupported,
     /// The body lists it and the read failed. `tag` is `PtpUsbError::tag()`.
-    ReadFailed { tag: String, detail: String },
+    ReadFailed { tag: PtpUsbErrorKind, detail: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,7 +140,7 @@ pub struct FtpStore {
 pub enum FtpState {
     /// The capability table says the model has no FTP profiles ([`crate::ptp_usb::ftp_absent`]): not asked.
     NotOnModel,
-    ReadFailed { tag: String, detail: String },
+    ReadFailed { tag: PtpUsbErrorKind, detail: String },
     Read(FtpStore),
 }
 
@@ -172,7 +174,7 @@ pub enum IptcState {
     NotRead,
     /// The capability table says the model has no IPTC presets ([`crate::ptp_usb::iptc_absent`]): not asked.
     NotOnModel,
-    ReadFailed { tag: String, detail: String },
+    ReadFailed { tag: PtpUsbErrorKind, detail: String },
     Read(IptcStore),
 }
 
@@ -203,19 +205,19 @@ impl Extended {
 
     /// Nothing could be read at all (the raw session did not open, or DeviceInfo failed): every item is a
     /// recorded failure with the same cause, so the snapshot says what is missing and why.
-    pub fn all_failed(read_from: ReadFrom, tag: &str, detail: &str) -> Self {
+    pub fn all_failed(read_from: ReadFrom, tag: PtpUsbErrorKind, detail: &str) -> Self {
         let props = EXTENDED_PROPS
             .iter()
             .map(|&(code, name, _)| {
-                let state = PropState::ReadFailed { tag: tag.to_string(), detail: detail.to_string() };
+                let state = PropState::ReadFailed { tag, detail: detail.to_string() };
                 (prop_key(code), ExtendedProp { code: u32::from(code), name: name.to_string(), state })
             })
             .collect();
         Extended {
             read_from,
             props,
-            ftp: FtpState::ReadFailed { tag: tag.to_string(), detail: detail.to_string() },
-            iptc: IptcState::ReadFailed { tag: tag.to_string(), detail: detail.to_string() },
+            ftp: FtpState::ReadFailed { tag, detail: detail.to_string() },
+            iptc: IptcState::ReadFailed { tag, detail: detail.to_string() },
         }
     }
 
@@ -273,6 +275,16 @@ impl FtpProfileEntry {
         hex_decode(&self.hex)
     }
 
+    /// Why this entry does not decode, in words safe to print: `None` when it does. The decoder's complaint names a
+    /// field, a byte offset and structural bytes, never a value; text that is not hex is reported without the
+    /// characters that were wrong, since the blob holds a password.
+    pub fn undecodable_because(&self) -> Option<String> {
+        match self.blob() {
+            Err(_) => Some("the stored text is not valid hex".to_string()),
+            Ok(blob) => decode_ftp_profile(&blob).err().map(|e| e.to_string()),
+        }
+    }
+
     /// The profile decoded for display or comparison. The strict decoder refuses a blob it does not
     /// fully understand; the error says where.
     pub fn decode(&self) -> Result<crate::ptp_usb::DecodedFtpProfile, String> {
@@ -285,6 +297,10 @@ impl FtpProfileEntry {
 /// source in tests; the real implementation is for [`PtpUsbSession`].
 pub trait ExtendedSource {
     fn identity(&mut self) -> Result<ReadFrom, PtpUsbError>;
+    /// The firmware of the body this source reads, as its USB descriptor reports it (`"5.31"`); empty when it is not
+    /// known. Deliberately not part of [`ReadFrom`], which is stored in snapshots and checked for model and serial
+    /// only: a restore records the LIVE body's firmware in its restore point and report, not the snapshot's.
+    fn firmware(&self) -> String;
     fn prop_bytes(&mut self, code: u16) -> Result<Vec<u8>, PtpUsbError>;
     fn ftp_list(&mut self) -> Result<FtpListState, PtpUsbError>;
     /// The directory count and the first `max` slots (slot numbers from 1), each slot's bytes as returned.
@@ -295,6 +311,10 @@ impl<T: crate::ptp_usb::BulkTransport> ExtendedSource for PtpUsbSession<T> {
     fn identity(&mut self) -> Result<ReadFrom, PtpUsbError> {
         let report = self.read_device_info_report()?;
         Ok(ReadFrom { model: report.usb_model, usb_serial: report.usb_serial })
+    }
+
+    fn firmware(&self) -> String {
+        self.usb_firmware().to_string()
     }
 
     fn prop_bytes(&mut self, code: u16) -> Result<Vec<u8>, PtpUsbError> {
@@ -358,8 +378,8 @@ pub(crate) fn ftp_write_verified(out: &FtpWriteOutcome) -> bool {
     out.verification.is_verified()
 }
 
-fn failed(e: &PtpUsbError) -> (String, String) {
-    (e.tag().to_string(), e.to_string())
+fn failed(e: &PtpUsbError) -> (PtpUsbErrorKind, String) {
+    (e.kind(), e.to_string())
 }
 
 fn prop_state(kind: PropKind, bytes: Vec<u8>) -> PropState {
@@ -381,7 +401,7 @@ pub fn read_extended<S: ExtendedSource + ?Sized>(src: &mut S) -> Extended {
         Ok(x) => x,
         Err(e) => {
             let (tag, detail) = failed(&e);
-            return Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, &tag, &detail);
+            return Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, tag, &detail);
         }
     };
     let mut props = BTreeMap::new();
@@ -439,6 +459,39 @@ pub fn read_extended<S: ExtendedSource + ?Sized>(src: &mut S) -> Extended {
     Extended { read_from, props, ftp, iptc }
 }
 
+/// Whether a section (the FTP list, the IPTC slots) was read, in the closed vocabulary a capture's summary reports.
+/// The wire strings are the ones the summary has always carried. Only [`IptcState`] has a `NotRead` (a section written
+/// before IPTC was captured); an FTP section is never `NotRead`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionState {
+    NotRead,
+    NotOnModel,
+    ReadFailed,
+    Read,
+}
+
+impl FtpState {
+    pub fn section_state(&self) -> SectionState {
+        match self {
+            FtpState::NotOnModel => SectionState::NotOnModel,
+            FtpState::ReadFailed { .. } => SectionState::ReadFailed,
+            FtpState::Read(_) => SectionState::Read,
+        }
+    }
+}
+
+impl IptcState {
+    pub fn section_state(&self) -> SectionState {
+        match self {
+            IptcState::NotRead => SectionState::NotRead,
+            IptcState::NotOnModel => SectionState::NotOnModel,
+            IptcState::ReadFailed { .. } => SectionState::ReadFailed,
+            IptcState::Read(_) => SectionState::Read,
+        }
+    }
+}
+
 /// A count of what an [`Extended`] holds, for a capture's result: small enough to put in a JSON result
 /// and a status line without the strings (which can be private) or the FTP blobs (which hold passwords).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,18 +502,22 @@ pub struct ExtendedSummary {
     pub props_not_supported: usize,
     /// Properties the body lists and the read failed on.
     pub props_failed: usize,
-    /// `not_on_model`, `read_failed` or `read`.
-    pub ftp: String,
+    /// `not_on_model`, `read_failed` or `read` (never `not_read`).
+    pub ftp: SectionState,
     /// How many profiles were stored, when the list was read.
     pub ftp_profiles: Option<usize>,
     /// Of those, how many do not decode (kept as raw hex, which a restore refuses to write).
     #[serde(default)]
     pub ftp_profiles_undecodable: Option<usize>,
+    /// Why the first of them (by slot order) does not decode, with its slot: the decoder's complaint, which names a
+    /// field and an offset and never a value. `None` when all decode, or the list was not read.
+    #[serde(default)]
+    pub ftp_undecodable_because: Option<String>,
     /// The list was read only in part (`FtpStore::truncated`).
     #[serde(default)]
     pub ftp_truncated: bool,
     /// `not_read`, `not_on_model`, `read_failed` or `read`.
-    pub iptc: String,
+    pub iptc: SectionState,
     /// How many IPTC presets hold text, when the slots were read.
     pub iptc_presets_in_use: Option<usize>,
     /// Of the slots read, how many could not be decoded at all (not counted as in use).
@@ -476,17 +533,18 @@ pub struct ExtendedSummary {
 impl Extended {
     pub fn summary(&self) -> ExtendedSummary {
         let count = |f: fn(&PropState) -> bool| self.props.values().filter(|p| f(&p.state)).count();
-        let (ftp, ftp_profiles, ftp_profiles_undecodable, ftp_truncated) = match &self.ftp {
-            FtpState::NotOnModel => ("not_on_model", None, None, false),
-            FtpState::ReadFailed { .. } => ("read_failed", None, None, false),
-            FtpState::Read(store) => ("read", Some(store.profiles.len()), Some(store.profiles.iter().filter(|p| p.decode().is_err()).count()), store.truncated),
+        let (ftp_profiles, ftp_profiles_undecodable, ftp_truncated, ftp_undecodable_because) = match &self.ftp {
+            FtpState::NotOnModel | FtpState::ReadFailed { .. } => (None, None, false, None),
+            FtpState::Read(store) => (
+                Some(store.profiles.len()),
+                Some(store.profiles.iter().filter(|p| p.undecodable_because().is_some()).count()),
+                store.truncated,
+                store.profiles.iter().find_map(|p| p.undecodable_because().map(|why| format!("slot {}: {why}", p.slot))),
+            ),
         };
-        let (iptc, iptc_presets_in_use, iptc_slots_undecodable, iptc_truncated) = match &self.iptc {
-            IptcState::NotRead => ("not_read", None, None, false),
-            IptcState::NotOnModel => ("not_on_model", None, None, false),
-            IptcState::ReadFailed { .. } => ("read_failed", None, None, false),
+        let (iptc_presets_in_use, iptc_slots_undecodable, iptc_truncated) = match &self.iptc {
+            IptcState::NotRead | IptcState::NotOnModel | IptcState::ReadFailed { .. } => (None, None, false),
             IptcState::Read(store) => (
-                "read",
                 Some(store.slots.iter().filter(|s| matches!(s.decode(), Ok(IptcRecord::Preset(p)) if !p.is_empty())).count()),
                 Some(store.slots.iter().filter(|s| s.decode().is_err()).count()),
                 store.truncated,
@@ -496,11 +554,12 @@ impl Extended {
             props_read: count(|s| matches!(s, PropState::Text { .. } | PropState::Bytes { .. } | PropState::Undecodable { .. })),
             props_not_supported: count(|s| matches!(s, PropState::NotSupported)),
             props_failed: count(|s| matches!(s, PropState::ReadFailed { .. })),
-            ftp: ftp.to_string(),
+            ftp: self.ftp.section_state(),
             ftp_profiles,
             ftp_profiles_undecodable,
+            ftp_undecodable_because,
             ftp_truncated,
-            iptc: iptc.to_string(),
+            iptc: self.iptc.section_state(),
             iptc_presets_in_use,
             iptc_slots_undecodable,
             iptc_truncated,
@@ -518,7 +577,7 @@ pub fn read_extended_for_serial(serial: Option<&str>) -> Extended {
         Ok(mut session) => read_extended(&mut session),
         Err(e) => {
             let (tag, detail) = failed(&e);
-            Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, &tag, &detail)
+            Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, tag, &detail)
         }
     }
 }
@@ -531,7 +590,7 @@ pub fn read_extended_locked(lock: crate::camera_lock::CameraLock, serial: Option
         Ok(mut session) => read_extended(&mut session),
         Err(e) => {
             let (tag, detail) = failed(&e);
-            Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, &tag, &detail)
+            Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, tag, &detail)
         }
     }
 }
@@ -543,6 +602,7 @@ mod tests {
 
     struct Fake {
         info: Result<ReadFrom, PtpUsbError>,
+        firmware: String,
         props: BTreeMap<u16, Result<Vec<u8>, PtpUsbError>>,
         ftp: Result<FtpListState, PtpUsbError>,
         iptc: Result<(u32, Vec<(u32, Vec<u8>)>), PtpUsbError>,
@@ -566,8 +626,9 @@ mod tests {
                 device_name: PtpString { text: "Z_9_1".into(), anomalies: vec![] },
                 trailer: 500,
             },
-            entries: blobs.iter().map(|b| FtpListEntry { raw: b.to_vec(), decoded: None }).collect(),
+            entries: blobs.iter().map(|b| FtpListEntry::from_blob(b.to_vec())).collect(),
             truncated: count > FTP_LIST_MAX_READ,
+            info_replies: vec![],
         }
     }
 
@@ -580,6 +641,7 @@ mod tests {
         props.insert(0xD060, Ok(vec![3]));
         Fake {
             info: Ok(ReadFrom { model: "Z 9".into(), usb_serial: "0000003023668".into() }),
+            firmware: "5.31".into(),
             props,
             ftp: Ok(list(&[&[1, 2, 3], &[4, 5]], 2, 0)),
             iptc: Ok((2, vec![(1, vec![1, 2]), (2, vec![3])])),
@@ -589,6 +651,9 @@ mod tests {
     }
 
     impl ExtendedSource for Fake {
+        fn firmware(&self) -> String {
+            self.firmware.clone()
+        }
         fn identity(&mut self) -> Result<ReadFrom, PtpUsbError> {
             match &self.info {
                 Ok(x) => Ok(x.clone()),
@@ -738,9 +803,9 @@ mod tests {
         f.props.insert(0xD073, Err(PtpUsbError::NoDataPhase { op: 0x1015 }));
         f.ftp = Err(PtpUsbError::NoDataPhase { op: 0x90ED });
         let e = read_extended(&mut f);
-        assert!(matches!(&e.prop(0xD073).unwrap().state, PropState::ReadFailed { tag, .. } if !tag.is_empty()));
+        assert!(matches!(&e.prop(0xD073).unwrap().state, PropState::ReadFailed { tag, .. } if *tag == PtpUsbErrorKind::NoDataPhase));
         assert_eq!(e.prop(0xD072).unwrap().state, PropState::Text { text: "Brian L Wong".into() });
-        assert!(matches!(&e.ftp, FtpState::ReadFailed { tag, detail } if !tag.is_empty() && !detail.is_empty()));
+        assert!(matches!(&e.ftp, FtpState::ReadFailed { tag, detail } if *tag == PtpUsbErrorKind::NoDataPhase && !detail.is_empty()));
     }
 
     #[test]
@@ -797,7 +862,7 @@ mod tests {
         assert_eq!(v["props"]["0xd053"]["hex"], "01");
         assert_eq!(v["ftp"]["state"], "read");
         assert_eq!(v["ftp"]["profiles"][1]["hex"], "0405");
-        for state in [PropState::NotSupported, PropState::ReadFailed { tag: "t".into(), detail: "d".into() }] {
+        for state in [PropState::NotSupported, PropState::ReadFailed { tag: PtpUsbErrorKind::NoDevice, detail: "d".into() }] {
             let p = ExtendedProp { code: 1, name: "n".into(), state };
             let back: ExtendedProp = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
             assert_eq!(back, p);
@@ -943,7 +1008,7 @@ mod tests {
         let s = read_extended(&mut f).summary();
         assert!(s.iptc_truncated && s.ftp_truncated);
         // sections that were not read have no counts
-        let s = Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, "t", "d").summary();
+        let s = Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, PtpUsbErrorKind::NoDevice, "d").summary();
         assert_eq!((s.ftp_profiles_undecodable, s.iptc_slots_undecodable, s.ftp_truncated, s.iptc_truncated), (None, None, false, false));
         // a summary written before these fields existed reads with them absent
         let mut v = serde_json::to_value(read_extended(&mut z9()).summary()).unwrap();
@@ -959,7 +1024,112 @@ mod tests {
         // Pinned, not endorsed: a section read when the raw session would not open has an empty ReadFrom (it records
         // the failure), and it is attached to whatever snapshot it was read for. The restore path decides the body
         // from the live camera (`restore_extended`'s same-body check), not from this.
-        let e = Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, "t", "d");
+        let e = Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, PtpUsbErrorKind::NoDevice, "d");
         assert!(e.check_body("Z 9", "1").is_ok() && e.check_body("", "").is_ok());
+    }
+    // ── the closed vocabularies in the summary and the failed-read records ──
+
+    /// Every tag `PtpUsbError::tag` returned before it became `PtpUsbErrorKind` (copied from that version): the strings
+    /// already written into snapshot files.
+    const TAGS_ALREADY_IN_FILES: [&str; 43] = ["no_device", "ambiguous_device", "serial_not_found", "duplicate_serial", "bodies_skipped", "usb", "camera_lock", "no_ptp_interface", "claim_failed", "short_container", "truncated_container", "short_write", "container_too_large", "too_many_command_params", "misaligned_response_params", "transaction_timed_out", "transaction_data_too_large", "session_poisoned", "open_session_failed", "operation_failed", "transaction_id_mismatch", "unexpected_data_op", "no_data_phase", "device_info_malformed", "ftp_blob_malformed", "ftp_info_malformed", "ftp_slot_out_of_range", "ftp_probe_op_not_allowed", "ftp_probe_data_too_long", "ftp_probe_bad_params", "ftp_probe_destructive_not_confirmed", "ftp_field_too_long", "ftp_field_not_ascii", "ftp_field_control_char", "ftp_write_indeterminate", "ftp_write_refused", "unconfirmed_model", "prop_write_unsupported", "prop_write_unconfirmed", "prop_not_writable", "prop_value_bad", "prop_write_indeterminate", "iptc_write_indeterminate"];
+
+    #[test]
+    fn the_summary_says_why_the_first_undecodable_profile_does_not_decode_and_never_echoes_bad_hex() {
+        // z9()'s placeholder blobs [1,2,3] and [4,5]: the first is named, with the decoder's reason
+        let s = read_extended(&mut z9()).summary();
+        let why = s.ftp_undecodable_because.clone().expect("a reason");
+        assert!(why.starts_with("slot 0: ") && why.contains("blob header"), "{why}");
+        // all decode: none
+        let good = crate::ptp_usb::encode_ftp_profile(&crate::ptp_usb::FtpProfile {
+            profile_name: "one".into(),
+            ssid_24ghz: "net".into(),
+            ssid_5ghz: "key-12345".into(),
+            host: "10.0.0.2".into(),
+            username: "fleet".into(),
+            password: "pw".into(),
+            port: 8080,
+        })
+        .unwrap();
+        let mut f = z9();
+        f.ftp = Ok(list(&[&good], 1, 0));
+        let s = read_extended(&mut f).summary();
+        assert_eq!((s.ftp_profiles_undecodable, s.ftp_undecodable_because), (Some(0), None));
+        // the entry's own reason: none for a good one; hex that is not hex is named without the wrong characters
+        let entry = |hex: &str| FtpProfileEntry { slot: 3, hex: hex.into() };
+        assert_eq!(entry(&hex_encode(&good)).undecodable_because(), None);
+        let bad = entry("4Q7Z").undecodable_because().unwrap();
+        assert!(bad.contains("not valid hex") && !bad.contains('Q') && !bad.contains('Z'), "{bad}");
+        assert!(entry("abc").undecodable_because().unwrap().contains("not valid hex"), "odd length");
+        assert!(entry("").undecodable_because().unwrap().contains("blob header"), "an empty blob is a short blob, not a hex error");
+        // a section not read has none
+        let s = Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, PtpUsbErrorKind::NoDevice, "d").summary();
+        assert_eq!(s.ftp_undecodable_because, None);
+        // a summary written before the field existed reads it as absent
+        let mut v = serde_json::to_value(read_extended(&mut z9()).summary()).unwrap();
+        v.as_object_mut().unwrap().remove("ftp_undecodable_because");
+        assert_eq!(serde_json::from_value::<ExtendedSummary>(v).unwrap().ftp_undecodable_because, None);
+    }
+
+    #[test]
+    fn the_error_kinds_keep_every_wire_string_files_already_hold_and_nothing_else() {
+        let now: Vec<&str> = PtpUsbErrorKind::ALL.iter().map(|k| k.tag()).collect();
+        assert_eq!(now, TAGS_ALREADY_IN_FILES, "the same strings, in the same order, no more and no fewer");
+        for &k in PtpUsbErrorKind::ALL {
+            assert_eq!(PtpUsbErrorKind::from_tag(k.tag()), Some(k));
+            assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(k.tag()));
+            assert_eq!(serde_json::from_value::<PtpUsbErrorKind>(serde_json::json!(k.tag())).unwrap(), k);
+        }
+        // a few that carry data on the error side map to the same string as before
+        assert_eq!(PtpUsbError::NoDevice.kind().tag(), "no_device");
+        assert_eq!(PtpUsbError::NoDataPhase { op: 1 }.tag(), "no_data_phase");
+        // unknown, near-miss, wrong-case and empty strings are refused, not carried as text
+        for bad in ["", "NoDevice", "No_Device", "no_device ", "no-device", "t", "unknown"] {
+            assert_eq!(PtpUsbErrorKind::from_tag(bad), None, "{bad:?}");
+            assert!(serde_json::from_value::<PtpUsbErrorKind>(serde_json::json!(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_read_is_written_and_read_back_with_the_tag_string_it_always_had() {
+        let state = FtpState::ReadFailed { tag: PtpUsbErrorKind::TransactionTimedOut, detail: "slow".into() };
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json, serde_json::json!({"state": "read_failed", "tag": "transaction_timed_out", "detail": "slow"}));
+        assert_eq!(serde_json::from_value::<FtpState>(json).unwrap(), state);
+        let prop = PropState::ReadFailed { tag: PtpUsbErrorKind::Usb, detail: "d".into() };
+        assert_eq!(serde_json::to_value(&prop).unwrap(), serde_json::json!({"state": "read_failed", "tag": "usb", "detail": "d"}));
+        // a file naming a kind this build does not have is refused whole, not loaded with a text tag
+        let bad = serde_json::json!({"state": "read_failed", "tag": "made_up", "detail": "d"});
+        assert!(serde_json::from_value::<FtpState>(bad.clone()).is_err());
+        assert!(serde_json::from_value::<IptcState>(bad.clone()).is_err());
+        assert!(serde_json::from_value::<PropState>(bad).is_err());
+    }
+
+    #[test]
+    fn the_summary_states_keep_their_wire_strings_and_every_state_of_each_section_maps_to_one() {
+        let wire = |st: SectionState| serde_json::to_value(st).unwrap();
+        assert_eq!(wire(SectionState::NotRead), serde_json::json!("not_read"));
+        assert_eq!(wire(SectionState::NotOnModel), serde_json::json!("not_on_model"));
+        assert_eq!(wire(SectionState::ReadFailed), serde_json::json!("read_failed"));
+        assert_eq!(wire(SectionState::Read), serde_json::json!("read"));
+        let fail = || (PtpUsbErrorKind::NoDevice, "d".to_string());
+        let (t, d) = fail();
+        assert_eq!(FtpState::NotOnModel.section_state(), SectionState::NotOnModel);
+        assert_eq!(FtpState::ReadFailed { tag: t, detail: d.clone() }.section_state(), SectionState::ReadFailed);
+        assert_eq!(IptcState::NotRead.section_state(), SectionState::NotRead);
+        assert_eq!(IptcState::NotOnModel.section_state(), SectionState::NotOnModel);
+        assert_eq!(IptcState::ReadFailed { tag: t, detail: d }.section_state(), SectionState::ReadFailed);
+        // the summary of a real read, as JSON, is the strings the consumers saw before
+        let v = serde_json::to_value(read_extended(&mut z9()).summary()).unwrap();
+        assert_eq!((v["ftp"].as_str(), v["iptc"].as_str()), (Some("read"), Some("read")));
+        let v = serde_json::to_value(Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, PtpUsbErrorKind::NoDevice, "d").summary()).unwrap();
+        assert_eq!((v["ftp"].as_str(), v["iptc"].as_str()), (Some("read_failed"), Some("read_failed")));
+        let mut z5 = z9();
+        z5.info = Ok(ReadFrom { model: "Z 5".into(), usb_serial: "1".into() });
+        let v = serde_json::to_value(read_extended(&mut z5).summary()).unwrap();
+        assert_eq!((v["ftp"].as_str(), v["iptc"].as_str()), (Some("not_on_model"), Some("not_on_model")), "the Z 5 has neither");
+        // an unknown state string is refused when a summary is read
+        let mut v = serde_json::to_value(read_extended(&mut z9()).summary()).unwrap();
+        v["ftp"] = serde_json::json!("sort_of_read");
+        assert!(serde_json::from_value::<ExtendedSummary>(v).is_err());
     }
 }
