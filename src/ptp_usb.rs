@@ -2677,7 +2677,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// Test-only constructor: a session over `handle` with fixed endpoints,
     /// no PTP session opened yet (call [`Self::open_ptp_session`]).
     #[cfg(test)]
-    fn with_transport(handle: T, model: &str) -> Self {
+    pub(crate) fn with_transport(handle: T, model: &str) -> Self {
         Self::new(handle, 0, 0x02, 0x81, 512, model.to_string(), None)
     }
 
@@ -10197,5 +10197,184 @@ mod tests {
         s.transact(OP_SET_DEVICE_PROP_VALUE, &[0xD090], Some(&[1, 0, 0]), TxidCheck::Enforce).unwrap();
         let e = d.snapshot().pop().unwrap();
         assert_eq!(field(&e, "data_hash"), Some(&Val::hash(&[1, 0, 0])));
+    }
+
+    // ── the `ExtendedSink` adapter: its verdicts come from the session's outcomes ─────
+
+    #[test]
+    fn the_iptc_adapter_says_verified_only_when_the_slot_read_back_holds_what_was_sent() {
+        use crate::extended::ExtendedSink;
+        let script = |after: Vec<Step>| {
+            let mut v = vec![data_c(OP_IPTC_READ, &[1, 2]), resp(RESP_OK), resp(RESP_OK)];
+            v.extend(after);
+            v
+        };
+        // The read after the write holds the data sent: verified.
+        let (mut s, _t) = session(script(vec![data_c(OP_IPTC_READ, &[9, 9]), resp(RESP_OK)]), "Z6_3");
+        assert!(ExtendedSink::write_iptc(&mut s, 1, &[9, 9]).unwrap());
+        // It holds something else: accepted, not verified.
+        let (mut s, _t) = session(script(vec![data_c(OP_IPTC_READ, &[3, 4, 5]), resp(RESP_OK)]), "Z6_3");
+        assert!(!ExtendedSink::write_iptc(&mut s, 1, &[9, 9]).unwrap());
+        // The read failed: accepted, not verified, and not an error.
+        let (mut s, _t) = session(script(vec![]), "Z6_3");
+        assert!(!ExtendedSink::write_iptc(&mut s, 1, &[9, 9]).unwrap());
+        // A refusal is an error and sends nothing.
+        let (mut s, t) = session(vec![], "Z 5");
+        assert!(matches!(ExtendedSink::write_iptc(&mut s, 1, &[9, 9]), Err(PtpUsbError::UnconfirmedModel(_))));
+        assert!(t.sent().is_empty());
+    }
+
+    #[test]
+    fn the_string_adapter_says_verified_only_when_the_read_back_is_the_text_written() {
+        use crate::extended::ExtendedSink;
+        let (mut s, _t) = session(set_script(1, "old", RESP_OK, "new"), "Z 9");
+        assert!(ExtendedSink::write_string(&mut s, 0xD090, "new").unwrap());
+        let (mut s, _t) = session(set_script(1, "old", RESP_OK, "something else"), "Z 9");
+        assert!(!ExtendedSink::write_string(&mut s, 0xD090, "new").unwrap());
+        let (mut s, t) = session(vec![], "Z 8");
+        assert!(matches!(ExtendedSink::write_string(&mut s, 0xD090, "new"), Err(PtpUsbError::UnconfirmedModel(_))));
+        assert!(t.sent().is_empty());
+    }
+
+    #[test]
+    fn the_byte_adapter_says_verified_only_when_the_read_back_is_the_value_written() {
+        use crate::extended::ExtendedSink;
+        let (mut s, _t) = session(byte_write_script(PROP_IPTC_PRESET, 1, &[0], resp(RESP_OK), &[1]), "Z6_3");
+        assert!(ExtendedSink::write_byte(&mut s, PROP_IPTC_PRESET, 1).unwrap());
+        let (mut s, _t) = session(byte_write_script(PROP_IPTC_PRESET, 1, &[0], resp(RESP_OK), &[0]), "Z6_3");
+        assert!(!ExtendedSink::write_byte(&mut s, PROP_IPTC_PRESET, 1).unwrap());
+        // The read-back failing is unverified, not an error.
+        let mut script = byte_write_script(PROP_IPTC_PRESET, 1, &[0], resp(RESP_OK), &[1]);
+        script.truncate(5);
+        let (mut s, _t) = session(script, "Z6_3");
+        assert!(!ExtendedSink::write_byte(&mut s, PROP_IPTC_PRESET, 1).unwrap());
+    }
+
+    #[test]
+    fn the_ftp_adapter_says_verified_only_when_the_count_rose_by_one_and_the_profile_is_at_the_front() {
+        use crate::extended::ExtendedSink;
+        let blob = hex::decode_hex(ftp_blob_port22_hex());
+        // count 2 -> 3, the profile at the front: verified.
+        let (mut s, _t) = session(verified_script(2, 3, &blob, &blob), "Z 9");
+        assert!(ExtendedSink::add_ftp(&mut s, &blob, 2).unwrap());
+        // The count did not move: accepted, not verified.
+        let (mut s, _t) = session(verified_script(2, 2, &blob, &blob), "Z 9");
+        assert!(!ExtendedSink::add_ftp(&mut s, &blob, 2).unwrap());
+        // The count is right and the profile at the front is another one: not verified.
+        let other = hex::decode_hex(reference_ftp_blob_hex());
+        let (mut s, _t) = session(verified_script(2, 3, &blob, &other), "Z 9");
+        assert!(!ExtendedSink::add_ftp(&mut s, &blob, 2).unwrap());
+    }
+
+    #[test]
+    fn the_delete_adapter_passes_the_count_the_camera_reports_afterwards_through() {
+        use crate::extended::ExtendedSink;
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        for left in [0u32, 1] {
+            let mut replies = list_state_replies(&blob, 0);
+            replies.push(resp(RESP_OK));
+            replies.extend(list_state_replies_of(left, &blob, if left == 0 { 0xff } else { 0 }, "Z_9_0000000"));
+            let (mut s, _t) = session(replies, "Z 9");
+            assert_eq!(ExtendedSink::delete_all_ftp(&mut s).unwrap(), left);
+        }
+    }
+
+    // ── the restore planner and the session answer the same gates alike ────────
+
+    /// An `Extended` with one property, as the planner reads a snapshot or a body.
+    fn one_prop_extended(model: &str, code: u16, state: crate::extended::PropState) -> crate::extended::Extended {
+        use crate::extended::{Extended, ExtendedProp, FtpState, IptcState, ReadFrom, prop_key};
+        let mut props = std::collections::BTreeMap::new();
+        props.insert(prop_key(code), ExtendedProp { code: u32::from(code), name: "p".into(), state });
+        Extended { read_from: ReadFrom { model: model.into(), usb_serial: "S".into() }, props, ftp: FtpState::NotOnModel, iptc: IptcState::NotRead }
+    }
+
+    fn planner_writes(source: &crate::extended::Extended, live: &crate::extended::Extended, id: &str) -> bool {
+        use crate::ops::restore_extended::{ItemAction, plan_extended_restore};
+        let plan = plan_extended_restore(source, live, None);
+        let item = plan.iter().find(|p| p.item.id == id).unwrap_or_else(|| panic!("no item {id}"));
+        matches!(item.item.action, ItemAction::Write { .. })
+    }
+
+    #[test]
+    fn the_planner_writes_a_string_exactly_when_the_session_would_send_it() {
+        use crate::extended::PropState;
+        let x254 = "x".repeat(254);
+        let x255 = "x".repeat(255);
+        let mut compared = 0;
+        for model in ["Z 9", "Z6_3", "Z 5", "Z 8", "z 9"] {
+            for &(code, _) in &STRING_PROPS {
+                for text in ["ok", "", "é", "\u{ff}", "\u{100}", "日本", "a\tb", "a\nb", x254.as_str(), x255.as_str()] {
+                    let source = one_prop_extended(model, code, PropState::Text { text: text.into() });
+                    let live = one_prop_extended(model, code, PropState::Text { text: "the value on the body".into() });
+                    let plan_says_write = planner_writes(&source, &live, &crate::extended::prop_key(code));
+                    let (mut s, t) = session(set_script_for(code, 1, "the value on the body", RESP_OK, "read back"), model);
+                    let session_result = s.set_string_property(code, text, false);
+                    let session_sent = !t.sent().is_empty();
+                    assert_eq!(plan_says_write, session_sent, "{model} {code:#x} {text:?}: planner write={plan_says_write}, session sent={session_sent} ({session_result:?})");
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, 5 * 3 * 10);
+    }
+
+    #[test]
+    fn the_planner_writes_a_byte_property_exactly_when_the_session_would_send_it() {
+        use crate::extended::PropState;
+        let (mut writes, mut skips) = (0, 0);
+        for model in ["Z 9", "Z6_3", "Z 5", "Z 8", "z 5"] {
+            for &(code, _, max) in &BYTE_PROPS {
+                for value in [0u8, 1, max, max + 1, 0xFF] {
+                    let live_value = if value == 0 { 1u8 } else { 0 };
+                    let source = one_prop_extended(model, code, PropState::Bytes { hex: crate::extended::hex_encode(&[value]) });
+                    let live = one_prop_extended(model, code, PropState::Bytes { hex: crate::extended::hex_encode(&[live_value]) });
+                    let plan_says_write = planner_writes(&source, &live, &crate::extended::prop_key(code));
+                    let (mut s, t) = session(byte_write_script(code, 1, &[live_value], resp(RESP_OK), &[value]), model);
+                    let session_result = s.set_byte_property(code, value, false);
+                    let session_sent = !t.sent().is_empty();
+                    assert_eq!(plan_says_write, session_sent, "{model} {code:#x} value {value}: planner write={plan_says_write}, session sent={session_sent} ({session_result:?})");
+                    if plan_says_write { writes += 1 } else { skips += 1 }
+                }
+            }
+        }
+        assert!(writes >= 4 && skips >= 20, "{writes} writes, {skips} skips: the grid crosses the gate both ways");
+    }
+
+    #[test]
+    fn the_planner_writes_an_iptc_slot_exactly_when_the_session_would_send_it() {
+        use crate::extended::{Extended, FtpState, IptcSlotEntry, IptcState, IptcStore, ReadFrom};
+        use crate::iptc::{IPTC_FIELDS, IptcPreset, encode_iptc_preset};
+        let preset = |name: &str| encode_iptc_preset(&IptcPreset { name: name.into(), fields: vec![String::new(); IPTC_FIELDS.len()] }).unwrap();
+        let with = |model: &str, bytes: &[u8]| Extended {
+            read_from: ReadFrom { model: model.into(), usb_serial: "S".into() },
+            props: Default::default(),
+            ftp: FtpState::NotOnModel,
+            iptc: IptcState::Read(IptcStore { count: 1, truncated: false, slots: vec![IptcSlotEntry { slot: 1, hex: crate::extended::hex_encode(bytes) }] }),
+        };
+        let (mut wrote, mut refused) = (0, 0);
+        for model in ["Z 9", "Z6_3", "Z 5", "Z 8", ""] {
+            let plan_says_write = planner_writes(&with(model, &preset("A")), &with(model, &preset("B")), "iptc:1");
+            let (mut s, t) = session(vec![data_c(OP_IPTC_READ, &preset("B")), resp(RESP_OK), resp(RESP_OK), data_c(OP_IPTC_READ, &preset("A")), resp(RESP_OK)], model);
+            let _ = s.write_iptc_slot(1, &preset("A"), false);
+            assert_eq!(plan_says_write, !t.sent().is_empty(), "{model:?}");
+            if plan_says_write { wrote += 1 } else { refused += 1 }
+        }
+        assert_eq!((wrote, refused), (2, 3), "the two confirmed models write, the other three do not");
+    }
+
+    #[test]
+    fn the_planner_rebuilds_the_ftp_list_exactly_when_the_session_would_send_the_delete() {
+        use crate::extended::{Extended, FtpProfileEntry, FtpState, FtpStore, IptcState, ReadFrom, hex_encode};
+        let one = hex::decode_hex(reference_ftp_blob_hex());
+        let two = hex::decode_hex(ftp_blob_port22_hex());
+        let store = |blob: &[u8]| FtpState::Read(FtpStore { count: 1, limit: 20, active_slot: Some(0), device_name: String::new(), truncated: false, profiles: vec![FtpProfileEntry { slot: 0, hex: hex_encode(blob) }] });
+        let with = |model: &str, blob: &[u8]| Extended { read_from: ReadFrom { model: model.into(), usb_serial: "S".into() }, props: Default::default(), ftp: store(blob), iptc: IptcState::NotRead };
+        for model in ["Z 9", "Z6_3", "Z 5", "Z 8", ""] {
+            let plan_says_write = planner_writes(&with(model, &one), &with(model, &two), "ftp");
+            let (mut s, t) = session(vec![], model);
+            let _ = s.delete_all_ftp_profiles();
+            assert_eq!(plan_says_write, !t.sent().is_empty(), "{model:?}");
+        }
     }
 }

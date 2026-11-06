@@ -259,6 +259,16 @@ mod tests {
     use serde_json::json;
     use std::io::Cursor;
 
+    #[test]
+    fn the_phase_constants_are_the_words_on_the_wire_and_all_distinct() {
+        // The supervisor and the worker compare phases as strings; a renamed constant changes what a killed worker is
+        // read as ("not applied" instead of "indeterminate"). The literals are the contract.
+        let phases = [PHASE_PLAN_VERIFIED, PHASE_RESTORE_POINT_WRITTEN, PHASE_WRITING, PHASE_READ_BACK];
+        assert_eq!(phases, ["plan_verified", "restore_point_written", "writing", "read_back"]);
+        let distinct: std::collections::BTreeSet<_> = phases.iter().collect();
+        assert_eq!(distinct.len(), phases.len());
+    }
+
     struct Unserialisable;
     impl Serialize for Unserialisable {
         fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {

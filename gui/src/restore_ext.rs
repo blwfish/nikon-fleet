@@ -384,7 +384,13 @@ pub(crate) fn ext_report_lines(r: &ExtApplyJson) -> Vec<(Level, String)> {
         line(Level::Error, aftermath.to_string());
     }
     if r.no_op {
-        line(Level::Info, "Nothing to write: the camera already holds everything the plan restores. No restore point was taken.".to_string());
+        // A no-op is "nothing was written", not "everything already matches": the library reports a failed
+        // no-op when items were skipped for a reason that is not routine (finding 02).
+        if r.status == ApplyStatus::AppliedVerified {
+            line(Level::Info, "Nothing to write: the camera already holds everything the plan restores. No restore point was taken.".to_string());
+        } else {
+            line(Level::Error, "Nothing was written: every difference the plan found was skipped, so the camera does NOT yet hold what the snapshot says. No restore point was taken.".to_string());
+        }
     }
     let verified = r.results.iter().filter(|x| x.outcome == ExtOutcomeJson::Written { verified: true }).count();
     if verified > 0 {
@@ -1166,6 +1172,15 @@ mod tests {
             r.restore_point = None;
         }));
         assert!(says(&noop, Level::Info, "Nothing to write"), "{noop:?}");
+        // A no-op that is not a verified one (everything skipped for a non-routine reason) must not claim a match.
+        let failed_noop = ext_report_lines(&report(|r| {
+            r.no_op = true;
+            r.status = ApplyStatus::Failed;
+            r.results.clear();
+            r.restore_point = None;
+        }));
+        assert!(says(&failed_noop, Level::Error, "does NOT yet hold"), "{failed_noop:?}");
+        assert!(!says(&failed_noop, Level::Info, "already holds everything"), "{failed_noop:?}");
 
         let mixed = ext_report_lines(&report(|r| {
             r.status = ApplyStatus::Failed;

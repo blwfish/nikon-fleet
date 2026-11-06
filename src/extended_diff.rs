@@ -100,8 +100,8 @@ fn ftp_changes(a: &FtpState, b: &FtpState, out: &mut Vec<ExtendedChange>) {
         return;
     };
     let (pa, pb) = (profs(&sa.profiles), profs(&sb.profiles));
-    // Identical blobs cancel out first (a profile that only moved to another slot is not a change), as a
-    // multiset: two identical profiles on one side and one on the other leave one over.
+    // Identical blobs cancel out first (a profile that only moved to another slot because one before it was added or
+    // removed is not a change), as a multiset: two identical profiles on one side and one on the other leave one over.
     let mut left: Vec<&Prof<'_>> = pa.iter().collect();
     let mut right: Vec<&Prof<'_>> = pb.iter().collect();
     left.retain(|x| match right.iter().position(|y| y.entry.hex == x.entry.hex) {
@@ -111,6 +111,27 @@ fn ftp_changes(a: &FtpState, b: &FtpState, out: &mut Vec<ExtendedChange>) {
         }
         None => true,
     });
+    // The profiles both sides hold, in each side's own order. When those orders differ the list was reordered, which a
+    // restore treats as a difference (it rebuilds the list in the snapshot's order), so the diff says so too instead of
+    // reporting nothing.
+    let common = |ps: &[Prof<'_>], rest: &[&Prof<'_>]| -> Vec<(String, String)> {
+        let mut unmatched: Vec<&str> = rest.iter().map(|p| p.entry.hex.as_str()).collect();
+        ps.iter()
+            .filter(|p| match unmatched.iter().position(|h| *h == p.entry.hex) {
+                Some(i) => {
+                    unmatched.remove(i);
+                    false
+                }
+                None => true,
+            })
+            .map(|p| (p.entry.hex.clone(), label(p)))
+            .collect()
+    };
+    let (order_a, order_b) = (common(&pa, &left), common(&pb, &right));
+    if order_a.iter().map(|(h, _)| h).ne(order_b.iter().map(|(h, _)| h)) {
+        let names = |v: &[(String, String)]| v.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join(", ");
+        out.push(change("FTP profile order", ExtendedChangeKind::Changed, Some(names(&order_a)), Some(names(&order_b))));
+    }
     // What is left differs. Pair by name where a name is unique on both sides.
     let unique = |v: &[&Prof<'_>], n: &str| v.iter().filter(|p| p.name.as_deref() == Some(n)).count() == 1;
     let mut unpaired_right: Vec<&Prof<'_>> = right.clone();
@@ -127,7 +148,9 @@ fn ftp_changes(a: &FtpState, b: &FtpState, out: &mut Vec<ExtendedChange>) {
     for y in unpaired_right {
         out.push(change(label(y), ExtendedChangeKind::OnlyInB, None, Some(format!("{} byte(s)", y.entry.hex.len() / 2))));
     }
-    if sa.active_slot != sb.active_slot && pa.iter().all(|p| p.name.is_some()) {
+    // Labels of undecodable profiles carry their slot number, so with one on either side two labels would differ for the
+    // same moved blob: the active profile is compared only when every profile on both sides has a name.
+    if sa.active_slot != sb.active_slot && pa.iter().chain(&pb).all(|p| p.name.is_some()) {
         let act = |s: &crate::extended::FtpStore, ps: &[Prof<'_>]| {
             s.active_slot.and_then(|i| ps.get(i as usize)).map_or("none".to_string(), |p| label(p))
         };
@@ -151,13 +174,34 @@ fn iptc_changes(a: &IptcState, b: &IptcState, out: &mut Vec<ExtendedChange>) {
         }
         return;
     };
-    fn by_slot(s: &IptcStore) -> BTreeMap<u32, &crate::extended::IptcSlotEntry> {
-        s.slots.iter().map(|e| (e.slot, e)).collect()
+    /// The first entry for each slot (the planner's `find` takes the first too), and the slots listed more than once with
+    /// how many times. The camera never lists a slot twice; a hand-edited file could, and which entry is "the slot" is
+    /// then not known, so it is reported instead of resolved silently.
+    fn by_slot(s: &IptcStore) -> (BTreeMap<u32, &crate::extended::IptcSlotEntry>, BTreeMap<u32, usize>) {
+        let (mut first, mut times) = (BTreeMap::new(), BTreeMap::<u32, usize>::new());
+        for e in &s.slots {
+            first.entry(e.slot).or_insert(e);
+            *times.entry(e.slot).or_default() += 1;
+        }
+        times.retain(|_, n| *n > 1);
+        (first, times)
     }
-    let (ma, mb) = (by_slot(sa), by_slot(sb));
-    let label = |slot: u32, r: &Result<IptcRecord, String>| match r {
-        Ok(IptcRecord::Preset(p)) if !p.name.is_empty() => format!("IPTC preset {slot} {:?}", p.name),
-        _ => format!("IPTC preset {slot}"),
+    let ((ma, dup_a), (mb, dup_b)) = (by_slot(sa), by_slot(sb));
+    for slot in dup_a.keys().chain(dup_b.keys()).collect::<std::collections::BTreeSet<_>>() {
+        let times = |d: &BTreeMap<u32, usize>| format!("listed {} time(s)", d.get(slot).copied().unwrap_or(1));
+        out.push(change(format!("IPTC slot {slot} (listed more than once, only the first entry is compared)"), ExtendedChangeKind::Changed, Some(times(&dup_a)), Some(times(&dup_b))));
+    }
+    // What a slot is called: the preset's name when it has one. The noun ("preset" for two presets, "slot" for a record
+    // that is not a pair of presets) is chosen by the caller, so no label is edited after it is built.
+    fn slot_name(r: &Result<IptcRecord, String>) -> Option<&str> {
+        match r {
+            Ok(IptcRecord::Preset(p)) if !p.name.is_empty() => Some(p.name.as_str()),
+            _ => None,
+        }
+    }
+    let label = |noun: &str, slot: u32, r: &Result<IptcRecord, String>| match slot_name(r) {
+        Some(name) => format!("IPTC {noun} {slot} {name:?}"),
+        None => format!("IPTC {noun} {slot}"),
     };
     for (slot, ea) in &ma {
         let Some(eb) = mb.get(slot) else {
@@ -175,7 +219,7 @@ fn iptc_changes(a: &IptcState, b: &IptcState, out: &mut Vec<ExtendedChange>) {
                 for ((name, va), vb) in IPTC_FIELDS.iter().zip(&pa.fields).zip(&pb.fields) {
                     if va != vb {
                         out.push(change(
-                            format!("{}: {name}", label(*slot, &Ok(IptcRecord::Preset(pb.clone())))),
+                            format!("{}: {name}", label("preset", *slot, &Ok(IptcRecord::Preset(pb.clone())))),
                             ExtendedChangeKind::Changed,
                             Some(format!("{va:?}")),
                             Some(format!("{vb:?}")),
@@ -184,7 +228,7 @@ fn iptc_changes(a: &IptcState, b: &IptcState, out: &mut Vec<ExtendedChange>) {
                 }
             }
             (ra, rb) => out.push(change(
-                format!("{} (record layout not shown)", label(*slot, &ra).replace("IPTC preset", "IPTC slot")),
+                format!("{} (record layout not shown)", label("slot", *slot, &ra)),
                 ExtendedChangeKind::Changed,
                 Some(format!("{} byte(s)", ea.hex.len() / 2)),
                 Some(format!("{} byte(s) {}", eb.hex.len() / 2, if rb.is_err() { "(not decodable)" } else { "" }).trim().to_string()),
@@ -326,11 +370,43 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_that_only_moved_slot_is_not_a_change() {
+    fn a_profile_that_only_moved_slot_because_another_was_removed_is_not_a_change() {
+        let (p, q, r) = (blob("p", "h1", "password-1"), blob("q", "h2", "password-2"), blob("r", "h3", "password-3"));
+        let a = ext("x", &[p.clone(), q.clone(), r.clone()], Some(1));
+        let b = ext("x", &[q, r], Some(0)); // p removed: q and r each moved up one slot, q still the active one
+        let d = diff_extended(Some(&a), Some(&b));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].difference, ExtendedChangeKind::OnlyInA);
+        assert!(d[0].item.contains("\"p\""));
+    }
+
+    #[test]
+    fn the_same_profiles_in_another_order_are_a_change_because_a_restore_rebuilds_the_list_in_order() {
         let (p, q) = (blob("p", "h1", "password-1"), blob("q", "h2", "password-2"));
         let a = ext("x", &[p.clone(), q.clone()], Some(0));
-        let b = ext("x", &[q, p], Some(1)); // the same profile active, in the other position
-        assert!(diff_extended(Some(&a), Some(&b)).is_empty(), "{:?}", diff_extended(Some(&a), Some(&b)));
+        let b = ext("x", &[q.clone(), p.clone()], Some(1)); // the same profile active, in the other position
+        let d = diff_extended(Some(&a), Some(&b));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!((d[0].item.as_str(), d[0].difference), ("FTP profile order", ExtendedChangeKind::Changed));
+        assert_eq!((d[0].a.as_deref(), d[0].b.as_deref()), (Some("FTP profile \"p\", FTP profile \"q\""), Some("FTP profile \"q\", FTP profile \"p\"")));
+        // Pinned against the restore: the same pair of lists is a rebuild there, so the diff is not "no change".
+        // (Identical lists are no change in both.)
+        assert!(diff_extended(Some(&a), Some(&a.clone())).is_empty());
+        // Three profiles, one moved: still one order entry; a swap among equals-by-name but different blobs counts too.
+        let (p2, p3) = (blob("p", "h9", "password-9"), blob("p", "h8", "password-8"));
+        let c = ext("x", &[p2.clone(), p3.clone()], None);
+        let d2 = ext("x", &[p3, p2], None);
+        assert_eq!(diff_extended(Some(&c), Some(&d2)).len(), 1, "same name, different blobs, swapped");
+    }
+
+    #[test]
+    fn an_order_change_beside_an_added_profile_is_reported_alongside_it() {
+        let (p, q, n) = (blob("p", "h1", "password-1"), blob("q", "h2", "password-2"), blob("n", "h3", "password-3"));
+        let a = ext("x", &[p.clone(), q.clone()], None);
+        let b = ext("x", &[q, n, p], None);
+        let d = diff_extended(Some(&a), Some(&b));
+        assert!(d.iter().any(|c| c.item == "FTP profile order"), "{d:?}");
+        assert!(d.iter().any(|c| c.difference == ExtendedChangeKind::OnlyInB && c.item.contains("\"n\"")), "{d:?}");
     }
 
     #[test]
@@ -361,6 +437,25 @@ mod tests {
         let d = diff_extended(Some(&a), Some(&b));
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].item, "FTP active profile");
+    }
+
+    #[test]
+    fn the_active_profile_is_compared_only_when_every_profile_on_both_sides_has_a_name() {
+        let (p, q) = (blob("p", "h1", "password-1"), blob("q", "h2", "password-2"));
+        let a = ext("x", &[p.clone(), q.clone()], Some(0));
+        let mut b = ext("x", &[p, q], Some(1));
+        assert!(diff_extended(Some(&a), Some(&b)).iter().any(|c| c.item == "FTP active profile"), "baseline: it is reported");
+        // An undecodable profile on side B only: the slot-numbered label it would get would differ for the same blob,
+        // so the active-profile row is left out (the undecodable profile is reported in its own entry).
+        if let FtpState::Read(store) = &mut b.ftp {
+            store.profiles[1].hex = "0102".into();
+        }
+        let d = diff_extended(Some(&a), Some(&b));
+        assert!(!d.iter().any(|c| c.item == "FTP active profile"), "{d:?}");
+        assert!(d.iter().any(|c| c.difference == ExtendedChangeKind::OnlyInB), "{d:?}");
+        // And the same when the undecodable one is on side A.
+        let d = diff_extended(Some(&b), Some(&a));
+        assert!(!d.iter().any(|c| c.item == "FTP active profile"), "{d:?}");
     }
 
     #[test]
@@ -408,5 +503,80 @@ mod tests {
         let d = diff_extended(Some(&old), Some(&a));
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].item, "IPTC presets");
+    }
+
+    fn iptc_ext(slots: &[(u32, String)]) -> Extended {
+        use crate::extended::IptcSlotEntry;
+        let mut e = ext("x", &[], None);
+        e.iptc = IptcState::Read(IptcStore {
+            count: slots.len() as u32,
+            truncated: false,
+            slots: slots.iter().map(|(slot, hex)| IptcSlotEntry { slot: *slot, hex: hex.clone() }).collect(),
+        });
+        e
+    }
+
+    fn preset_hex(name: &str, headline: &str) -> String {
+        use crate::iptc::{IptcPreset, encode_iptc_preset};
+        let mut fields = vec![String::new(); 14];
+        fields[2] = headline.into();
+        hex_encode(&encode_iptc_preset(&IptcPreset { name: name.into(), fields }).unwrap())
+    }
+
+    #[test]
+    fn a_slot_that_is_not_a_pair_of_presets_is_called_a_slot_and_a_pair_of_presets_a_preset() {
+        let kind2 = hex_encode(&[1, 0, 0, 0, 0xC9, 0, 2, 0, 0, 0, 0, 0, 7, 7, 7, 7]);
+        // A named preset against a record that does not decode: "slot", with the preset's name kept.
+        let d = diff_extended(Some(&iptc_ext(&[(1, preset_hex("A", "h"))])), Some(&iptc_ext(&[(1, "0102".into())])));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].item, "IPTC slot 1 \"A\" (record layout not shown)");
+        assert_eq!((d[0].a.as_deref(), d[0].b.as_deref()), (Some(&*format!("{} byte(s)", preset_hex("A", "h").len() / 2)), Some("2 byte(s) (not decodable)")));
+        // An unnamed preset against another kind: "slot" with no name.
+        let d = diff_extended(Some(&iptc_ext(&[(2, preset_hex("", ""))])), Some(&iptc_ext(&[(2, kind2.clone())])));
+        assert_eq!(d[0].item, "IPTC slot 2 (record layout not shown)");
+        // Two records of another kind that differ: also a slot.
+        let kind2b = hex_encode(&[1, 0, 0, 0, 0xC9, 0, 2, 0, 0, 0, 0, 0, 8, 8, 8, 8]);
+        let d = diff_extended(Some(&iptc_ext(&[(3, kind2)])), Some(&iptc_ext(&[(3, kind2b)])));
+        assert_eq!(d[0].item, "IPTC slot 3 (record layout not shown)");
+        // Two presets: "preset", field by field.
+        let d = diff_extended(Some(&iptc_ext(&[(1, preset_hex("A", "old"))])), Some(&iptc_ext(&[(1, preset_hex("A", "new"))])));
+        assert_eq!(d[0].item, "IPTC preset 1 \"A\": Headline");
+    }
+
+    #[test]
+    fn bytes_that_differ_are_never_silent_because_the_decoder_is_strict() {
+        // A preset's bytes are canonical: two byte strings that decode to the same preset are the same bytes, so a hex
+        // difference cannot hide behind equal decodes. A non-canonical variant (a changed header byte, or a trailing
+        // entry) does not decode at all and is reported as such.
+        let canonical = preset_hex("A", "h");
+        let mut header_changed = hex_decode_for_test(&canonical);
+        header_changed[8] ^= 1;
+        let mut trailing = hex_decode_for_test(&canonical);
+        trailing.extend_from_slice(&[0, 0, 0, 0]);
+        for variant in [header_changed, trailing] {
+            assert!(crate::iptc::decode_iptc_slot(&variant).is_err(), "{variant:?}");
+            let d = diff_extended(Some(&iptc_ext(&[(1, canonical.clone())])), Some(&iptc_ext(&[(1, hex_encode(&variant))])));
+            assert_eq!(d.len(), 1, "{d:?}");
+            assert!(d[0].item.ends_with("(record layout not shown)") && d[0].b.as_deref().unwrap().contains("not decodable"), "{:?}", d[0]);
+        }
+    }
+
+    fn hex_decode_for_test(h: &str) -> Vec<u8> {
+        crate::extended::hex_decode(h).unwrap()
+    }
+
+    #[test]
+    fn a_slot_listed_twice_is_reported_and_the_first_entry_is_the_one_compared() {
+        let a = iptc_ext(&[(1, preset_hex("A", "one")), (1, preset_hex("A", "two"))]);
+        let b = iptc_ext(&[(1, preset_hex("A", "one"))]);
+        let d = diff_extended(Some(&a), Some(&b));
+        assert_eq!(d.len(), 1, "the first entries are equal, so the only difference is the duplicate: {d:?}");
+        assert!(d[0].item.contains("IPTC slot 1") && d[0].item.contains("listed more than once"), "{:?}", d[0]);
+        assert_eq!((d[0].a.as_deref(), d[0].b.as_deref()), (Some("listed 2 time(s)"), Some("listed 1 time(s)")));
+        // Once on each side, equal: nothing.
+        assert!(diff_extended(Some(&b), Some(&b.clone())).is_empty());
+        // Duplicates on side B too.
+        let d = diff_extended(Some(&b), Some(&a));
+        assert_eq!((d[0].a.as_deref(), d[0].b.as_deref()), (Some("listed 1 time(s)"), Some("listed 2 time(s)")));
     }
 }

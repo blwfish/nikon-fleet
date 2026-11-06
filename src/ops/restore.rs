@@ -773,10 +773,8 @@ pub fn undo_command_exact(restore_point_file: &str, undo_set: &[String], data_di
         return None;
     }
     let only: String = undo_set.iter().map(|n| format!(" --only {}", n.trim_start_matches(crate::transplant::PROPERTY_PREFIX))).collect();
-    let dir = data_dir
-        .map(|d| if d.contains(char::is_whitespace) { format!(" --data-dir \"{d}\"") } else { format!(" --data-dir {d}") })
-        .unwrap_or_default();
-    Some(format!("nikon-fleet{dir} restore {restore_point_file}{only}"))
+    let dir = data_dir.map(|d| format!(" --data-dir {}", crate::ops::restore_extended::shell_word(d))).unwrap_or_default();
+    Some(format!("nikon-fleet{dir} restore {}{only}", crate::ops::restore_extended::shell_word(restore_point_file)))
 }
 
 #[cfg(test)]
@@ -1777,7 +1775,10 @@ mod tests {
         assert_eq!(undo_command("rp.json", &[]), "nothing to undo");
         // the data directory is named when it is given, quoted when it has a space
         assert_eq!(undo_command_exact("rp.json", &names(1), Some("/d")).unwrap(), "nikon-fleet --data-dir /d restore rp.json --only P0");
-        assert!(undo_command_exact("rp.json", &names(1), Some("/my data")).unwrap().contains("--data-dir \"/my data\" restore"));
+        assert!(undo_command_exact("rp.json", &names(1), Some("/my data")).unwrap().contains("--data-dir '/my data' restore"));
+        // Quote characters and expansions are neutralised too, for the directory and the file (finding 42).
+        let hostile = undo_command_exact("a b$c.json", &names(1), Some("/it's `x`")).unwrap();
+        assert!(hostile.contains("--data-dir '/it'\\''s `x`' restore 'a b$c.json' --only P0"), "{hostile}");
     }
 
     #[test]

@@ -51,16 +51,22 @@ session before it did not disturb the SDK on this body.
 
 Passwords and the Wi-Fi key field are stored in the clear (the point is to be able to restore them) and shown masked:
 
-- `show`: asterisks; `--reveal` shows them. `show --json` omits them unless `--reveal`.
+- `show`: asterisks; `--reveal` shows them. `show --json` carries the masked form too (`value` is asterisks of the same
+  length as the secret, so the secret's LENGTH is visible, its text is not) unless `--reveal`; it does not omit the field.
 - the GUI viewer: masked, with a "Show passwords" toggle per window (off whenever a window opens).
 - the MCP `get_snapshot`: always masked.
-- `diff` and `check`: a changed secret is reported as changed, with no value on either side.
+- `diff`: a changed secret is reported as changed, with no value on either side. `check` does not look at the section
+  at all (it passes `skip_extended`), so it reports nothing about a changed secret.
 - `Debug` and `serde` cannot leak one: `render_extended::Secret` has no `Serialize` and prints its length only.
 
 ## Comparison
 
 `diff` compares the section: properties by name, FTP profiles by identical blob first (a profile that only moved slot
-is not a change), then by name (field-level changes), the rest as added or removed, and the active profile. A snapshot
+because another before it was added or removed is not a change), then by name (field-level changes), the rest as added
+or removed, the ORDER of the profiles both sides hold (`FTP profile order`: the same profiles in another order are a
+change, because `restore-extended` rebuilds the list in the snapshot's order), and the active profile (only when every
+profile on both sides decodes). A slot number listed more than once in an IPTC store is reported (and the first entry
+compared). A snapshot
 with no section against one with a section is a single entry. `check` leaves the section out (`skip_extended`): its
 live capture is MAID only, so a reference's section would otherwise show as a difference every time.
 
@@ -79,21 +85,47 @@ and a read of the body afterwards to check what was written.
 | `switches` (EnableCopyright, IPTC preset) | `SetDevicePropValue`, one byte | the value |
 | `ftp` (the whole list) | `0x90EA` delete-all, then `0x90EE` adds last-first (an add lands at the front) | each add read back; the list read again at the end |
 
-Order: strings, IPTC, switches, FTP (the preset switch comes after the presets). The plan is one line per item: `same`,
+Order: strings, IPTC, switches, FTP (the preset switch comes after the presets). A run **stops at its first item that
+failed or may have changed the body**: every later item is reported `not_attempted` and sends nothing (an item that was
+written but whose own read-back did not match does not stop it). The plan is one line per item: `same`,
 `WRITE old -> new` (never a password), `skip` with a closed reason, or `not selected`. The digest covers every item's
-action and the hash of what would be written, so a body that changed under a reviewed plan is refused (exit 5), and a
-plan whose overwritten value changed is stale even when the count of changes is the same. Apply writes the restore point
-first, as a snapshot with no MAID properties and the extended section as it was (label `restore-ext`); restoring from
+action and a hash of what would be written AND of what the body held when the plan was made (the live value, the live
+IPTC slot, the live FTP list, the target serial), so a body that changed under a reviewed plan is refused (exit 5) even
+when the change is to another value the plan displays the same way (the same count of FTP profiles, the same preset
+name and number of filled fields). Whether a string, a byte or an IPTC slot is a write or a skip is decided by the
+session's own gate functions (`ptp_usb::check_string_property_write`, `check_byte_property_write`,
+`iptc_write_confirmed`), not by a copy, and `ptp_usb`'s tests run the planner and a scripted session over the same
+model-by-value grid. Apply writes the restore point
+first, as a snapshot with no MAID properties and the extended section as it was (label `restore-ext`), refusing first
+(like the MAID apply) if the data directory already holds the per-camera cap of restore points; restoring from
 it undoes the restore. The report names it as `restore_point: {file, label}` (the shape the MAID restore uses) and gives
 `undo_set`, the categories with a write that was tried (an FTP rebuild that failed part-way counts: it may have emptied
 the list); restoring the restore point with `--only` = `undo_set` puts back just those. Status: verified only if every write's read-back matched and the body, read again, matches the
-snapshot for every item written; indeterminate (exit 4) if any write's data may have gone out and the reply failed.
+snapshot for every item written; a body that cannot be read for an item afterwards (the IPTC presets or the FTP list)
+leaves the apply unverified (`after_read_failed` names it), not verified. Indeterminate (exit 4) if any write's data may
+have gone out and the reply failed, **including an FTP delete-all the camera acknowledged and whose re-read failed or
+still showed profiles**. An FTP rebuild that fails after the delete-all was acknowledged is `failed` with a message that
+says the list was emptied (or partial) and how far it got; its category is in `undo_set`.
 
-Skips (each a typed reason, never silent): the snapshot has no value (an older snapshot, a body without it); the body
-lacks it; the body's current value was unreadable; a value the camera cannot hold (text outside Latin-1); a model the
-write is not confirmed on; an IPTC slot of another record kind; a snapshot slot the body lacks; a truncated or
-undecodable FTP list; a list longer than the body's limit. Not possible: choosing the active FTP profile (no op that
-selects one was found).
+**A run that wrote nothing.** If every item is `same`, `not selected` or skipped for a routine reason (the snapshot holds
+no value, or the body lacks the feature) it is a verified no-op: `no_op: true`, `applied_verified`, no restore point. If
+any item was skipped for a non-routine reason (a model the write is not confirmed on, a value out of range or outside
+Latin-1, an unreadable body, an undecodable or truncated list, ...; `SkipKind::is_routine`) the body does NOT match the
+snapshot and nothing was done about it, so it is `no_op: true` with status `failed` (exit 1), not "already matches". A
+run that wrote something is judged by its writes; a skip beside them does not change its status.
+
+Skips (each a typed reason with the recorded cause in its detail, never silent): the snapshot has no value (an older
+snapshot, a body without it); the body lacks it; the body's current value was unreadable; a value the camera cannot hold
+(text outside Latin-1, a control character, over 254 characters, a switch above its maximum); a model the write is not
+confirmed on; an IPTC slot of another record kind or one that does not decode (the detail says which side and which); an
+IPTC slot number listed twice; a snapshot slot the body lacks; an FTP list that is truncated, whose recorded count
+disagrees with the profiles held, or that contains an undecodable profile; a live FTP list read only in part; a list
+longer than the body's limit. IPTC slots are independent, so a snapshot that read only a prefix of them still has each slot
+it read restored. Not possible: choosing the active FTP profile (no op that selects one was found). That is not a separate
+plan item: the FTP item's `to` text names the snapshot's active profile and says the camera chooses its own, and the
+read-back does not compare it. Not checked either: the per-property length limits the camera enforces (36 / 54 / 36
+characters for Artist / Copyright / Image comment; an over-long value is refused by the camera at write time, not
+planned as a skip).
 
 **Verified on hardware (2026-11-06):** strings and the `EnableCopyright` switch on a Z 5, through the whole sequence:
 dry run, apply with the echoed digest, restore point, undo from the restore point, restore again, final dry run `0 items
