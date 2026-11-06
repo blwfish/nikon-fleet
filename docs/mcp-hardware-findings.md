@@ -45,7 +45,7 @@ finding led to a code change, the commit is named.
 | F17 | The `worker` subcommand live: result delivered before a teardown hang; one SIGSEGV after a result | verified (one body) |
 | F16 | Targeted undo (`restore --only`) on the Z 9: restores the named property, leaves a later change alone | verified (two enum properties) |
 | F14 | Spike B: worker-style spawn, fd cleanliness, SIGKILL of a capture child | verified (small samples) |
-| F26 | Write applies hung in `DisconnectDevice` 10 of 20 times on a Z 9 in one batch, 0 of 10 after a power cycle (plus a 4.7 s slow mode); always after a verified result; the CLI now bounds the teardown at 10 s | measured; watchdog shipped |
+| F26 | Write applies hung in `DisconnectDevice` 10 of 20 times on a Z 9 in one batch, 0 of 10 after a power cycle (plus a 4.7 s slow mode); always after a verified result; the CLI now bounds the teardown at 10 s | measured on a Z 9; also 4 of 10 on a Z6III (2026-11-06); watchdog shipped |
 
 ---
 
@@ -934,6 +934,17 @@ white-balance fine-tune, one step either side of its default), alternating the t
   (`session_end`, pinned by tests that flip `report_in_hand`). Hardware status unchanged: mechanism verified on the Z 9, the new
   ordering is not.
 - **Not tried:** a longer or repeated pump after a write, to find the cause. The watchdog bounds the cost; it does not remove the hang.
+
+### The Z6III hangs too (2026-11-06, Z6_3 serial 0000003014527, firmware 2.00)
+
+10 real `nikon-fleet restore <snapshot> --only MovieWBTuneSunny` applies alternating between index 612 and 613, with the 10 s
+watchdog shipped: all 10 ended `applied_verified` with exit 0, **4 of 10 hit the watchdog** (runs 3, 7, 8, 10; each took 14.1 s
+of wall time against 5.9 s for the others, i.e. the 10 s limit plus the normal 4 s of the run), none was slower-but-finishing.
+So the hang is not a Z 9 quirk. The diagnostics did what they were built for: each watchdog-cut run has a `teardown_watchdog`
+event, an `abandoned` `disconnect_device` span (about 9.7 s) and the report says "exited (code 0) but cut work short", while the
+four normal runs say "exited cleanly" (disconnect 1.5 s). The camera ended on index 612, as it started. Still unknown: whether
+the rate follows camera uptime or power cycles (the Z 9 batch went from 10/20 to 0/10 after a power cycle), and whether the
+MAID `DisconnectDevice` hang depends on the property written.
 
 ## F13. Still unverified
 
