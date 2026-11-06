@@ -59,6 +59,15 @@ pub struct Deadlines {
     pub plan: Duration,
     /// Covers connect, three captures (about 5 s each on the bodies measured) and the writes.
     pub apply: Duration,
+    /// `restore_extended_apply`. Longer than `apply` on purpose: an FTP rebuild deletes the whole
+    /// profile list and then adds up to 20 profiles (several transactions each, with a read-back),
+    /// on top of the restore point and the read-backs, and a kill part-way leaves the camera's
+    /// list emptied or partial (reported indeterminate, restore point named), which is far worse
+    /// than waiting. UNMEASURED: no run on a real body has timed a 20-profile rebuild, so this is
+    /// a generous bound (twice `apply`), not a measurement; a test pins that it exceeds `apply`
+    /// and the worker's teardown watchdog. The GUI has its own constant for the same work
+    /// (`EXT_RESTORE_APPLY_TIMEOUT`).
+    pub extended_apply: Duration,
     /// The tools that read local files or the USB descriptors (no camera session, no worker):
     /// milliseconds normally, so this only ends a read stuck on a dead mount or a wedged bus.
     pub offline: Duration,
@@ -73,16 +82,33 @@ impl Default for Deadlines {
             check: Duration::from_secs(120),
             plan: Duration::from_secs(150),
             apply: Duration::from_secs(300),
+            extended_apply: Duration::from_secs(600),
             offline: Duration::from_secs(30),
             network: Duration::from_secs(180),
         }
     }
 }
 
+/// The write tools, for [`Deadlines::apply_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOp {
+    Transplant,
+    Restore,
+    RestoreExtended,
+}
+
 impl Deadlines {
+    /// The deadline of one write tool: the one place that says which tool gets which.
+    pub fn apply_for(&self, op: ApplyOp) -> Duration {
+        match op {
+            ApplyOp::Transplant | ApplyOp::Restore => self.apply,
+            ApplyOp::RestoreExtended => self.extended_apply,
+        }
+    }
+
     /// Every deadline the same (tests, and a user who knows their client's limit).
     pub fn all(d: Duration) -> Self {
-        Deadlines { capture: d, check: d, plan: d, apply: d, offline: d, network: d }
+        Deadlines { capture: d, check: d, plan: d, apply: d, extended_apply: d, offline: d, network: d }
     }
 }
 
@@ -419,8 +445,9 @@ fn empty_only(only: &Option<Vec<String>>) -> Option<CallToolResult> {
     only.as_ref().filter(|v| v.is_empty()).map(|_| {
         failure(
             "empty_selection",
-            "`only` is an empty list. An empty list would mean every property, not none: omit `only` to restore everything, \
-             or name the properties. If you are undoing an apply whose undo_set is empty there is nothing to put back.",
+            "`only` is an empty list. An empty list would mean everything (every property, or every category for the extended restore), not none: \
+             omit `only` to restore everything, or name what to restore (properties; categories for restore_extended_*). \
+             If you are undoing an apply whose undo_set is empty there is nothing to put back.",
             None,
         )
     })
@@ -823,7 +850,9 @@ impl FleetMcp {
         name = "capture_snapshot",
         description = "Read every readable setting from one body and store it as a new snapshot (never overwrites). Needs the body's USB serial. \
                        Fails, writing nothing, if the capture misses a setting this model normally reads (`capture_incomplete`), or lacks some of them \
-                       on a firmware other than the one the model's baseline came from (`firmware_shortfall`). Changes nothing on the camera.",
+                       on a firmware other than the one the model's baseline came from (`firmware_shortfall`). Changes nothing on the camera. \
+                       The stored snapshot also holds the body's extended section (owner strings, IPTC presets, FTP profiles) when it could be read, and \
+                       that includes FTP passwords and the Wi-Fi key in the clear in the file (tools show them masked); this tool has no way to leave it out.",
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false)
     )]
     async fn capture_snapshot(
@@ -913,7 +942,7 @@ impl FleetMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         Ok(self
-            .camera_call(CallKind::Apply, ops_args::transplant_apply(&p.0), self.cfg.deadlines.apply, None, &meta, &peer, &ctx.ct)
+            .camera_call(CallKind::Apply, ops_args::transplant_apply(&p.0), self.cfg.deadlines.apply_for(ApplyOp::Transplant), None, &meta, &peer, &ctx.ct)
             .await)
     }
 
@@ -935,7 +964,7 @@ impl FleetMcp {
             return Ok(refused);
         }
         Ok(self
-            .camera_call(CallKind::Apply, ops_args::restore_apply(&p.0), self.cfg.deadlines.apply, None, &meta, &peer, &ctx.ct)
+            .camera_call(CallKind::Apply, ops_args::restore_apply(&p.0), self.cfg.deadlines.apply_for(ApplyOp::Restore), None, &meta, &peer, &ctx.ct)
             .await)
     }
 
@@ -984,7 +1013,7 @@ impl FleetMcp {
             return Ok(refused);
         }
         Ok(self
-            .camera_call(CallKind::Apply, ops_args::restore_extended_apply(&p.0), self.cfg.deadlines.apply, None, &meta, &peer, &ctx.ct)
+            .camera_call(CallKind::Apply, ops_args::restore_extended_apply(&p.0), self.cfg.deadlines.apply_for(ApplyOp::RestoreExtended), None, &meta, &peer, &ctx.ct)
             .await)
     }
 }
@@ -1227,6 +1256,9 @@ mod status_and_selection_tests {
         let r = empty_only(&Some(vec![])).expect("an empty list is refused");
         assert_eq!(r.is_error, Some(true));
         assert_eq!(r.structured_content.as_ref().unwrap()["error"]["tag"], json!("empty_selection"));
+        // The same refusal serves restore_extended_*, where `only` names categories: the words must fit both.
+        let message = r.structured_content.as_ref().unwrap()["error"]["message"].as_str().unwrap().to_string();
+        assert!(message.contains("categories") && message.contains("properties"), "{message}");
     }
 
     #[test]
@@ -1301,10 +1333,28 @@ mod offline_deadline_tests {
     }
 
     #[test]
+    fn the_extended_apply_deadline_outlasts_a_plain_apply_and_the_workers_teardown_watchdog() {
+        use nikon_fleet::process_exit::TEARDOWN_WORST_CASE;
+        let d = Deadlines::default();
+        // An FTP rebuild is more camera work than a plain apply: a kill part-way leaves the list emptied.
+        assert!(d.extended_apply > d.apply, "{:?} vs {:?}", d.extended_apply, d.apply);
+        assert!(d.extended_apply > d.plan);
+        assert!(d.extended_apply > TEARDOWN_WORST_CASE * 3, "the watchdog must be able to end a hung teardown first");
+        // Each write tool gets the deadline written for it, not another tool's.
+        assert_eq!(d.apply_for(ApplyOp::Transplant), d.apply);
+        assert_eq!(d.apply_for(ApplyOp::Restore), d.apply);
+        assert_eq!(d.apply_for(ApplyOp::RestoreExtended), d.extended_apply);
+        assert_ne!(d.apply_for(ApplyOp::RestoreExtended), d.apply_for(ApplyOp::Restore));
+    }
+
+    #[test]
     fn every_deadline_kind_follows_deadlines_all_and_the_defaults_bound_the_offline_tools() {
         let all = Deadlines::all(Duration::from_secs(7));
-        for d in [all.capture, all.check, all.plan, all.apply, all.offline, all.network] {
+        for d in [all.capture, all.check, all.plan, all.apply, all.extended_apply, all.offline, all.network] {
             assert_eq!(d, Duration::from_secs(7));
+        }
+        for op in [ApplyOp::Transplant, ApplyOp::Restore, ApplyOp::RestoreExtended] {
+            assert_eq!(all.apply_for(op), Duration::from_secs(7), "{op:?}");
         }
         let d = Deadlines::default();
         assert!(d.offline > Duration::ZERO && d.offline < d.capture, "a local read must be bounded well under a camera call");

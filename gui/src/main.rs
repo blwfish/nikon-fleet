@@ -21,7 +21,7 @@ use nikon_fleet::ops::plan::planned_would_change;
 use nikon_fleet::ops::render::{self, Row, RowFilter};
 use nikon_fleet::ops::render_extended::{self, RenderedExtended};
 use nikon_fleet::ops::target::{is_id_fallback, storable_serial};
-use nikon_fleet::ptp_usb::{self, FtpField, FtpProfile};
+use nikon_fleet::ptp_usb;
 use nikon_fleet::settings::{self, Settings};
 
 use crate::menu::{Bar, Entry, MenuAction, menus};
@@ -430,12 +430,23 @@ impl SnapListing {
     }
 }
 
+/// Where the snapshots and the references live under the data directory: the one spelling in this crate (the CLI
+/// has its own private copy in `src/main.rs`, and the MCP server a third; a library function both could consume
+/// is what would end that, and is not in this crate to add).
+pub(crate) fn snapshots_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("snapshots")
+}
+
+pub(crate) fn references_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("references")
+}
+
 /// List `snapshots/` through the library's `ops::list::list_dir` (the CLI's `ls --json`
 /// code): the validity rule, the byte-identity reference rule and the order are its.
 fn list_all(data_dir: &Path) -> SnapListing {
-    let dir = data_dir.join("snapshots");
+    let dir = snapshots_dir(data_dir);
     let shown = dir.display().to_string();
-    let listing = match list_dir(&dir, None, Some(&data_dir.join("references"))) {
+    let listing = match list_dir(&dir, None, Some(&references_dir(data_dir))) {
         Ok(l) => l,
         Err(e) => return SnapListing { dir: shown, error: Some(e.to_string()), ..SnapListing::default() },
     };
@@ -677,7 +688,7 @@ fn load_for_view(data_dir: &Path, sdk_runtime: &Path, file: &str) -> Result<rend
 
 /// [`load_for_view`], and the controls too when the file is an edited copy (read from the same parse).
 fn load_for_view_full(data_dir: &Path, sdk_runtime: &Path, file: &str) -> Result<(render::RenderedSnapshot, Option<EditModel>), String> {
-    let path = render::find_named(&[&data_dir.join("snapshots")], file).map_err(|e| e.to_string())?;
+    let path = render::find_named(&[&snapshots_dir(data_dir)], file).map_err(|e| e.to_string())?;
     let snapshot = render::load(&path).map_err(|e| e.to_string())?;
     let firmware = Some(snapshot.camera.firmware.as_str()).filter(|f| !f.is_empty());
     let labels = Labels::load_for(sdk_runtime, &snapshot.camera.model, firmware);
@@ -697,7 +708,7 @@ struct FtpTestDone {
 fn spawn_ftp_test(data_dir: PathBuf, file: String, index: usize, file_check: bool, tx: mpsc::Sender<FtpTestDone>, ctx: egui::Context) -> std::io::Result<()> {
     std::thread::Builder::new().name("ftp-test".into()).spawn(move || {
         let result = (|| {
-            let path = nikon_fleet::ops::paths::resolve_existing(&data_dir.join("snapshots"), &file).map_err(|e| e.to_string())?;
+            let path = nikon_fleet::ops::paths::resolve_existing(&snapshots_dir(&data_dir), &file).map_err(|e| e.to_string())?;
             let mut snap = Snapshot::load_from_file(&path).map_err(|e| e.to_string())?;
             let view = nikon_fleet::ftp_edit::profile_view(&mut snap, index).map_err(|e| e.to_string())?;
             let req = nikon_fleet::ftp_test::TestRequest::from_profile(&view, file_check, Duration::from_secs(15));
@@ -1741,8 +1752,11 @@ fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) -> Optio
                     shown = shown.on_hover_text(format!("Cannot be edited: {reason}"));
                 }
                 if !row.value.notes.is_empty() {
-                    let tags: Vec<&str> = row.value.notes.iter().map(|n| n.tag()).collect();
-                    shown.on_hover_text(tags.join(", "));
+                    // built only while the pointer is over the row, not for every row every frame
+                    shown.on_hover_ui(|ui| {
+                        let tags: Vec<&str> = row.value.notes.iter().map(|n| n.tag()).collect();
+                        ui.label(tags.join(", "));
+                    });
                 }
                 ui.end_row();
             }
@@ -1778,13 +1792,13 @@ fn draw_extended(ui: &mut egui::Ui, file: &str, ext: &RenderedExtended, filter: 
                 ui.label(egui::RichText::new(row.code_hex()).monospace().weak());
             }
             let text = egui::RichText::new(&row.display).monospace();
-            ui.label(if row.is_problem() { text.color(warn) } else if row.state == "not_supported" { text.weak() } else { text });
+            ui.label(if row.is_problem() { text.color(warn) } else if row.state == render_extended::RowState::NotSupported { text.weak() } else { text });
             ui.end_row();
         }
     });
     let ftp = &ext.ftp;
     match ftp.state {
-        "read" => {
+        render_extended::FtpView::Read => {
             ui.label(format!(
                 "FTP profiles: {} stored (limit {}), active slot {}",
                 ftp.count.unwrap_or(0),
@@ -1795,10 +1809,10 @@ fn draw_extended(ui: &mut egui::Ui, file: &str, ext: &RenderedExtended, filter: 
                 ui.label(egui::RichText::new(note).small().color(warn));
             }
         }
-        "read_failed" => {
+        render_extended::FtpView::ReadFailed => {
             ui.label(egui::RichText::new(format!("FTP profiles: {}", ftp.note.as_deref().unwrap_or("not read"))).color(warn));
         }
-        _ => {
+        render_extended::FtpView::NotOnModel => {
             ui.label(egui::RichText::new(format!("FTP profiles: {}", ftp.note.as_deref().unwrap_or("-"))).weak());
         }
     }
@@ -1823,7 +1837,7 @@ fn draw_extended(ui: &mut egui::Ui, file: &str, ext: &RenderedExtended, filter: 
     }
     let iptc = &ext.iptc;
     match iptc.state {
-        "read" => {
+        render_extended::IptcView::Read => {
             let (unused, other) = iptc.unused_and_other();
             let in_use = iptc.slots.iter().filter(|s| s.in_use).count();
             ui.label(format!(
@@ -1835,10 +1849,10 @@ fn draw_extended(ui: &mut egui::Ui, file: &str, ext: &RenderedExtended, filter: 
                 ui.label(egui::RichText::new(note).small().color(warn));
             }
         }
-        "read_failed" => {
+        render_extended::IptcView::ReadFailed => {
             ui.label(egui::RichText::new(format!("IPTC presets: {}", iptc.note.as_deref().unwrap_or("not read"))).color(warn));
         }
-        _ => {
+        render_extended::IptcView::NotRead | render_extended::IptcView::NotOnModel => {
             ui.label(egui::RichText::new(format!("IPTC presets: {}", iptc.note.as_deref().unwrap_or("-"))).weak());
         }
     }
@@ -2556,103 +2570,6 @@ fn describe_capture(stdout: &str, stderr: String) -> Result<OpDone, String> {
     })
 }
 
-// ── The FTP profile form ──────────────────────────────────────────────────
-//
-// The entry form and its validation, left from the Vendor Ops window (removed: it wrote to a
-// camera, which the snapshot flows now do). Nothing draws it at the moment; it is kept, with its
-// tests, for the snapshot viewer's profile editor.
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FtpForm {
-    profile_name: String,
-    ssid_24ghz: String,
-    ssid_5ghz: String,
-    host: String,
-    port: String,
-    username: String,
-    password: String,
-}
-
-impl Default for FtpForm {
-    fn default() -> Self {
-        FtpForm {
-            profile_name: String::new(),
-            ssid_24ghz: String::new(),
-            ssid_5ghz: String::new(),
-            host: String::new(),
-            port: "21".to_string(),
-            username: String::new(),
-            password: String::new(),
-        }
-    }
-}
-
-#[allow(dead_code)]
-impl FtpForm {
-    fn raw(&self, field: FtpField) -> &str {
-        match field {
-            FtpField::ProfileName => &self.profile_name,
-            FtpField::Ssid24Ghz => &self.ssid_24ghz,
-            FtpField::Ssid5Ghz => &self.ssid_5ghz,
-            FtpField::Host => &self.host,
-            FtpField::Username => &self.username,
-            FtpField::Password => &self.password,
-        }
-    }
-
-    /// The value as sent: surrounding whitespace is dropped exactly for the fields
-    /// `ptp_usb::FTP_PROFILE_FIELDS` says are checked trimmed (the password never is — a
-    /// leading or trailing space could be real there). One table decides both the
-    /// required-field check and what lands on the camera.
-    fn value(&self, field: FtpField) -> String {
-        let raw = self.raw(field);
-        if field.spec().trimmed_for_required_check { raw.trim().to_string() } else { raw.to_string() }
-    }
-
-    fn build(&self) -> Result<FtpProfile, String> {
-        let missing = ptp_usb::ftp_profile_missing_fields(
-            self.raw(FtpField::ProfileName),
-            self.raw(FtpField::Ssid24Ghz),
-            self.raw(FtpField::Ssid5Ghz),
-            self.raw(FtpField::Host),
-            self.raw(FtpField::Username),
-            self.raw(FtpField::Password),
-        );
-        if !missing.is_empty() {
-            return Err(format!("Missing required field(s): {}", missing.join(", ")));
-        }
-        let port = self.port.trim().parse::<u16>().map_err(|e| format!("Invalid port: {e}"))?;
-        Ok(FtpProfile {
-            profile_name: self.value(FtpField::ProfileName),
-            ssid_24ghz: self.value(FtpField::Ssid24Ghz),
-            ssid_5ghz: self.value(FtpField::Ssid5Ghz),
-            host: self.value(FtpField::Host),
-            port,
-            username: self.value(FtpField::Username),
-            password: self.value(FtpField::Password),
-        })
-    }
-}
-
-/// The one path from the form to a profile that can be previewed or written: the missing-field
-/// rule, the trim rule, and the library's own encoder (`ptp_usb::encode_ftp_profile`, whose
-/// field limits and character rules the real write applies too). The preview encodes a copy
-/// with the password redacted — the hex dump would otherwise show it byte for byte — and that
-/// copy encodes exactly when the real profile does, so a profile the camera write would reject
-/// is rejected here, before anything is confirmed.
-#[allow(dead_code)]
-fn prepare_ftp(form: &FtpForm) -> Result<(FtpProfile, String), String> {
-    let profile = form.build()?;
-    let blob = ptp_usb::encode_ftp_profile(&profile.with_password_redacted()).map_err(|e| e.to_string())?;
-    let preview = format!(
-        "Would write {} byte(s) (password redacted in this preview): {}",
-        blob.len(),
-        ptp_usb::hex_bytes(&blob)
-    );
-    Ok((profile, preview))
-}
-
 // ── Transplant: plan, confirm, apply ──────────────────────────────────────
 //
 // Copy a stored snapshot onto a connected body, which may be another model, translating enum and
@@ -2960,7 +2877,7 @@ fn snapshot_path_for_cli(data_dir: &Path, file: &str) -> Result<String, String> 
     if !is_safe_path_component(file) {
         return Err(format!("{file:?} is not a plain snapshot file name"));
     }
-    let joined = data_dir.join("snapshots").join(file);
+    let joined = snapshots_dir(data_dir).join(file);
     let absolute = std::path::absolute(&joined).map_err(|e| format!("the path of {file} could not be made absolute: {e}"))?;
     absolute.to_str().map(str::to_string).ok_or_else(|| format!("{} is not valid UTF-8", absolute.display()))
 }
@@ -3145,7 +3062,7 @@ fn classify_apply_as<R: AppliedReport>(result: Result<CliOutput, CliError>, conf
     // What the CLI printed, if it printed anything, is a report this program could not read: a newer
     // build, a report cut off. The cause is kept for the person.
     let unreadable = match (&parsed, stdout.trim().is_empty()) {
-        (Err(e), false) => format!(" Its report could not be read ({e})."),
+        (Err(e), false) => format!(" Its report could not be read ({e}).{}", restore_point_hint(&stdout)),
         _ => String::new(),
     };
     let Some(e) = failure else {
@@ -3175,8 +3092,25 @@ fn classify_apply_as<R: AppliedReport>(result: Result<CliOutput, CliError>, conf
     }
 }
 
+/// What to say about the restore point when the report could not be read as a whole: an apply stores one before it
+/// writes, and a report this program cannot read (a newer CLI's new field or status) may still have it in a place
+/// every version puts it, `restore_point.file`. Read as JSON, not scraped as text; a report cut off in the middle
+/// does not parse at all, and then the person is told where to look instead.
+fn restore_point_hint(stdout: &str) -> String {
+    let named = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .ok()
+        .and_then(|v| v.get("restore_point")?.get("file")?.as_str().map(str::to_string));
+    match named {
+        Some(file) => format!(
+            " The restore point it stored before writing is {} (see the snapshot list): compare the camera with it.",
+            nikon_fleet::ops::render::printable(&file)
+        ),
+        None => " If it got as far as storing a restore point, that snapshot is in the snapshot list: compare the camera with it.".to_string(),
+    }
+}
+
 /// The command line parser's own exit status for a usage error (clap): the CLI has run nothing.
-const EXIT_USAGE: i32 = 2;
+const EXIT_USAGE: i32 = ExitKind::Usage.code();
 
 // What the person is shown, as text with a level. Pure, so each is tested without a window.
 
@@ -3966,16 +3900,19 @@ fn set_reference(data_dir: &Path, file: &str) -> Result<ReferenceReport, String>
     if !is_safe_path_component(file) {
         return Err(format!("{file:?} is not a plain snapshot file name"));
     }
-    let src = data_dir.join("snapshots").join(file);
+    let src = snapshots_dir(data_dir).join(file);
     let bytes = fs::read(&src).map_err(|e| format!("reading {}: {e}", src.display()))?;
     let text = std::str::from_utf8(&bytes).map_err(|e| format!("{} is not valid UTF-8: {e}", src.display()))?;
     let snap = Snapshot::from_json(text).map_err(|e| format!("loading {}: {e}", src.display()))?;
+    // The same refusal, from the same function, as the CLI's `ref set`: the hidden "Set ref" button
+    // is not the guard (a stale listing, or any other caller, reaches this function).
+    gui_argv::refuse_edited_reference(&snap).map_err(|e| format!("{} {e}", src.display()))?;
     let name = checked_reference_filename(&snap.camera.model, &snap.camera.serial).map_err(|e| {
         format!(
             "{file} cannot be a reference: {e}; the reference file name is built from its camera model and serial"
         )
     })?;
-    let refs = data_dir.join("references");
+    let refs = references_dir(data_dir);
     fs::create_dir_all(&refs).map_err(|e| format!("creating {}: {e}", refs.display()))?;
     let target = refs.join(&name);
     let previous = match fs::read(&target) {
@@ -5338,6 +5275,32 @@ mod tests {
         assert!(!d.path().join("references").exists());
     }
 
+    /// An edited copy of `a.json` made the way the editor makes one (the library's `copy_for_edit`).
+    fn write_edited_copy(snaps: &Path, file: &str) {
+        let src = Snapshot::load_from_file(snaps.join("a.json")).unwrap();
+        let copy = nikon_fleet::snapshot_edit::copy_for_edit(&src, "a.json", Some("copy"), "2026-02-02T00:00:00Z");
+        fs::write(snaps.join(file), copy.to_pretty_json().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn set_reference_refuses_an_edited_copy_as_the_cli_does_and_writes_nothing() {
+        let d = TempDir::new().unwrap();
+        let snaps = d.path().join("snapshots");
+        write_snapshot(&snaps, "a.json", "Z 9", "S1", "2026-01-01T00:00:00Z");
+        write_edited_copy(&snaps, "copy.json");
+        assert!(Snapshot::load_from_file(snaps.join("copy.json")).unwrap().is_edited());
+        let e = set_reference(d.path(), "copy.json").unwrap_err();
+        // the wording is the library's one statement of the rule, the same text the CLI prints
+        assert!(e.contains(&gui_argv::EditedCopyRefused.to_string()), "{e}");
+        assert!(!d.path().join("references").exists(), "nothing may be created for a refused promotion");
+        // the same call still promotes the captured snapshot the copy was made from
+        assert!(set_reference(d.path(), "a.json").is_ok());
+        // and an existing reference is not replaced by an edited copy
+        let before = fs::read(d.path().join("references/Z_9_S1.json")).unwrap();
+        assert!(set_reference(d.path(), "copy.json").is_err());
+        assert_eq!(fs::read(d.path().join("references/Z_9_S1.json")).unwrap(), before);
+    }
+
     #[test]
     fn an_existing_reference_that_cannot_be_read_is_left_alone() {
         let d = TempDir::new().unwrap();
@@ -5781,109 +5744,6 @@ mod tests {
         let e = with_data_dir(&Err("settings.json is unusable: x".into()), |_| panic!("must not run"));
         assert!(matches!(e, Evt::Err(m) if m.contains("unusable")));
         assert!(matches!(with_data_dir(&Ok(PathBuf::from("/d")), |d| Evt::Err(d.display().to_string())), Evt::Err(m) if m == "/d"));
-    }
-
-    // ── the FTP form (G50, G40, T04) ────────────────────────────────────────
-
-    fn filled_form() -> FtpForm {
-        FtpForm {
-            profile_name: "CLAUDE".into(),
-            ssid_24ghz: "n24".into(),
-            ssid_5ghz: "n5".into(),
-            host: "ftp.example.com".into(),
-            port: "2121".into(),
-            username: "user".into(),
-            password: "topsecret".into(),
-        }
-    }
-
-    #[test]
-    fn the_trim_rule_comes_from_the_field_table_for_every_field() {
-        let mut form = filled_form();
-        form.profile_name = "  p  ".into();
-        form.ssid_24ghz = "  a  ".into();
-        form.ssid_5ghz = "  b  ".into();
-        form.host = "  h  ".into();
-        form.username = "  u  ".into();
-        form.password = "  pw  ".into();
-        form.port = "  2121  ".into();
-        let profile = form.build().unwrap();
-        let sent = |f: FtpField| match f {
-            FtpField::ProfileName => &profile.profile_name,
-            FtpField::Ssid24Ghz => &profile.ssid_24ghz,
-            FtpField::Ssid5Ghz => &profile.ssid_5ghz,
-            FtpField::Host => &profile.host,
-            FtpField::Username => &profile.username,
-            FtpField::Password => &profile.password,
-        };
-        for f in FtpField::ALL {
-            let expected = if f.spec().trimmed_for_required_check { form.raw(f).trim() } else { form.raw(f) };
-            assert_eq!(sent(f), expected, "{}", f.spec().key);
-        }
-        // Pinned: the password is the one field that is not trimmed.
-        assert_eq!(profile.password, "  pw  ");
-        assert_eq!(profile.port, 2121);
-    }
-
-    #[test]
-    fn required_fields_are_named_from_the_table_in_wire_order() {
-        let form = FtpForm { port: "21".into(), ..FtpForm::default() };
-        let e = form.build().unwrap_err();
-        let names: Vec<&str> = nikon_fleet::ptp_usb::FTP_PROFILE_FIELDS.iter().map(|s| s.display_name).collect();
-        assert_eq!(e, format!("Missing required field(s): {}", names.join(", ")));
-        // Whitespace-only is missing for a trimmed field, present for the password.
-        let mut f = filled_form();
-        f.host = "   ".into();
-        assert!(f.build().unwrap_err().contains("host"));
-        let mut f = filled_form();
-        f.password = "   ".into();
-        assert_eq!(f.build().unwrap().password, "   ");
-    }
-
-    #[test]
-    fn the_port_boundaries() {
-        for (text, ok) in [("0", true), ("65535", true), ("65536", false), ("-1", false), ("", false), ("21a", false)] {
-            let f = FtpForm { port: text.into(), ..filled_form() };
-            assert_eq!(f.build().is_ok(), ok, "{text:?}");
-        }
-        assert!(FtpForm { port: "70000".into(), ..filled_form() }.build().unwrap_err().starts_with("Invalid port"));
-    }
-
-    #[test]
-    fn the_dry_run_redacts_the_password_in_the_blob_and_shows_the_rest_of_the_encoding() {
-        let form = filled_form();
-        let (profile, preview) = prepare_ftp(&form).unwrap();
-        let redacted_blob = ptp_usb::encode_ftp_profile(&profile.with_password_redacted()).unwrap();
-        let plain_blob = ptp_usb::encode_ftp_profile(&profile).unwrap();
-        let password_hex = ptp_usb::hex_bytes(b"topsecret");
-        // The unredacted encoding DOES contain the password's bytes: the negative below can fail.
-        assert!(ptp_usb::hex_bytes(&plain_blob).contains(&password_hex));
-        assert_eq!(
-            preview,
-            format!(
-                "Would write {} byte(s) (password redacted in this preview): {}",
-                redacted_blob.len(),
-                ptp_usb::hex_bytes(&redacted_blob)
-            )
-        );
-        assert!(!preview.contains(&password_hex), "{preview}");
-        // Positive: nine asterisks stand where the nine password characters were.
-        assert!(preview.contains(&vec!["2a"; 9].join(" ")), "{preview}");
-        // The other fields are in the preview as the real write would send them.
-        assert!(preview.contains(&ptp_usb::hex_bytes(b"n24")) && preview.contains(&ptp_usb::hex_bytes(b"user")), "{preview}");
-        assert_eq!(profile.password, "topsecret", "the profile to send keeps the real password");
-        assert_eq!(redacted_blob.len(), plain_blob.len());
-    }
-
-    #[test]
-    fn the_preview_rejects_what_the_encoder_rejects_before_anything_is_confirmed() {
-        let mut f = filled_form();
-        f.ssid_24ghz = "x".repeat(33); // 32 bytes is the limit
-        assert!(prepare_ftp(&f).is_err());
-        f.ssid_24ghz = "x".repeat(32);
-        assert!(prepare_ftp(&f).is_ok());
-        f.ssid_5ghz = "caf\u{e9}".into();
-        assert!(prepare_ftp(&f).is_err(), "non-ASCII where the wire format is ASCII");
     }
 
     // ── archive names (T01, T02) ────────────────────────────────────────────
@@ -7560,6 +7420,75 @@ mod tests {
     }
 
     #[test]
+    fn the_guis_kill_timeouts_leave_the_clis_teardown_watchdog_room_to_end_the_run_first() {
+        // Four unrelated places hold these numbers: the watchdog in the library, the MCP supervisor's grace, and the
+        // GUI's per-command kill timeouts. A run that is only waiting for its disconnect to be cut must not be killed
+        // by the GUI first (that would turn "result out, ended by the watchdog with its status" into `TimedOut`).
+        // Every GUI command that can talk to a camera is listed; the plan and apply timeouts also have to cover a
+        // whole camera session (4-20 s a read) before any teardown.
+        let worst = nikon_fleet::process_exit::TEARDOWN_WORST_CASE;
+        for (name, t) in [
+            ("CAMERA_CLI_TIMEOUT", CAMERA_CLI_TIMEOUT),
+            ("TRANSPLANT_PLAN_TIMEOUT", TRANSPLANT_PLAN_TIMEOUT),
+            ("TRANSPLANT_APPLY_TIMEOUT", TRANSPLANT_APPLY_TIMEOUT),
+            ("RESTORE_PLAN_TIMEOUT", restore::RESTORE_PLAN_TIMEOUT),
+            ("RESTORE_APPLY_TIMEOUT", restore::RESTORE_APPLY_TIMEOUT),
+            ("EXT_RESTORE_APPLY_TIMEOUT", restore_ext::EXT_RESTORE_APPLY_TIMEOUT),
+        ] {
+            assert!(t > worst * 3, "{name} = {t:?} must leave the {worst:?} watchdog plenty of room");
+        }
+        assert!(TRANSPLANT_APPLY_TIMEOUT > CAMERA_CLI_TIMEOUT, "an apply adds a restore point and a read-back to the session");
+        assert!(TRANSPLANT_APPLY_TIMEOUT > TRANSPLANT_PLAN_TIMEOUT, "an apply does a plan's reads and then writes");
+        assert!(
+            restore_ext::EXT_RESTORE_APPLY_TIMEOUT > restore::RESTORE_APPLY_TIMEOUT,
+            "an FTP rebuild (delete all, up to 20 adds with read-backs) is more camera work than a plain apply; a kill part-way leaves the list emptied"
+        );
+    }
+
+    #[test]
+    fn the_guis_reading_of_a_write_status_agrees_with_the_cli_for_every_kind_of_camera_error() {
+        // The GUI used to carry its own copy of the CLI's exit numbers. Both come from `nikon_fleet::exit_status`. This
+        // walks the camera errors a write can end with, takes the status the CLI would exit with for each
+        // (`write_kind_of_ptp_usb_error`, which the CLI's `exit_code_for` is built on), and checks what the GUI makes of
+        // an apply that ended with it and printed no report: a status the CLI uses for a write that may have happened
+        // is never read as "nothing was written".
+        use nikon_fleet::exit_status::write_kind_of_ptp_usb_error;
+        use nikon_fleet::ptp_usb::PtpUsbError as E;
+        let cause = || Box::new(E::SessionPoisoned { cause: "x".into() });
+        let errors = [
+            (E::FtpWriteIndeterminate { cause: cause() }, true),
+            (E::PropWriteIndeterminate { propcode: 0xD090, cause: cause() }, true),
+            (E::NoDevice, false),
+            (E::ShortWrite { written: 1, expected: 2 }, false),
+            (E::SessionPoisoned { cause: "x".into() }, false),
+            (E::UnconfirmedModel("Z 5".into()), false),
+            (E::PropNotWritable { propcode: 0xD090, get_set: 0 }, false),
+            (E::FtpWriteRefused { slot: 9, param2: 1, why: ptp_usb::FtpWriteRefusal::SlotHangsCamera }, false),
+        ];
+        for (err, indeterminate) in errors {
+            let kind = write_kind_of_ptp_usb_error(&err);
+            assert_eq!(kind == ExitKind::WriteIndeterminate, indeterminate, "{err:?}");
+            let out = classify_apply(Err(cli_error(CliFailure::Exit, Some(kind.code()), "")), "d");
+            // Neither status the CLI ends a camera error with is a refusal that wrote nothing.
+            assert!(matches!(out, ApplyOutcome::Indeterminate { .. }), "{err:?} -> exit {} -> {out:?}", kind.code());
+        }
+        // Every documented status, walked exhaustively (a new `ExitKind` does not compile until it is placed here):
+        // only the three that say nothing was written are read as `NotApplied`.
+        for kind in ExitKind::ALL {
+            let nothing_written = match kind {
+                ExitKind::Usage | ExitKind::StalePlan | ExitKind::RefusedBeforeWrite => true,
+                ExitKind::Done | ExitKind::Failure | ExitKind::AlreadyArchived | ExitKind::WriteIndeterminate => false,
+            };
+            let out = classify_apply(Err(cli_error(CliFailure::Exit, Some(kind.code()), "")), "d");
+            assert_eq!(matches!(out, ApplyOutcome::NotApplied { .. }), nothing_written, "{kind:?} (exit {}) -> {out:?}", kind.code());
+            assert_eq!(out.may_have_written(), !nothing_written, "{kind:?}");
+        }
+        // The GUI's own command-line-usage status is the library's, not a second number.
+        assert_eq!(EXIT_USAGE, ExitKind::Usage.code());
+        assert_eq!(ExitKind::WriteIndeterminate.code(), 4);
+    }
+
+    #[test]
     fn a_report_this_program_cannot_read_is_not_taken_for_a_refusal_even_after_exit_one() {
         // The CLI exits 1 for an apply that wrote but did not fully take, and prints its report first.
         // A report that does not parse here (a newer CLI's new status, one cut off, none) must not be
@@ -7573,6 +7502,26 @@ mod tests {
             let out = classify_apply(Err(cli_error(CliFailure::Exit, Some(1), &stdout)), &digest);
             assert!(matches!(out, ApplyOutcome::Indeterminate { .. }), "{what}: {out:?}");
         }
+    }
+
+    #[test]
+    fn an_unreadable_report_still_names_the_restore_point_when_it_can_be_found() {
+        let (json, _) = library_apply_json("failed");
+        let report = serde_json::from_str::<ApplyJson>(&json).unwrap();
+        let point = report.restore_point.as_ref().expect("an apply that wrote has a restore point").file.clone();
+        // A report that is valid JSON with a status this program does not know: the restore point is still named.
+        let new_status = json.replacen("\"failed\"", "\"applied_somehow\"", 1);
+        let out = classify_apply(Err(cli_error(CliFailure::Exit, Some(1), &new_status)), &report.plan_digest);
+        let ApplyOutcome::Indeterminate { message, .. } = out else { panic!("{out:?}") };
+        assert!(message.contains(&point) && message.contains("compare the camera"), "{message}");
+        // One cut off in the middle does not parse: no name, but the person is told where to look.
+        let out = classify_apply(Err(cli_error(CliFailure::Exit, Some(1), &json[..json.len() / 2])), &report.plan_digest);
+        let ApplyOutcome::Indeterminate { message, .. } = out else { panic!("{out:?}") };
+        assert!(!message.contains(&point) && message.contains("snapshot list"), "{message}");
+        // No output at all adds nothing it does not know.
+        let out = classify_apply(Err(cli_error(CliFailure::Exit, Some(1), "")), &report.plan_digest);
+        let ApplyOutcome::Indeterminate { message, .. } = out else { panic!("{out:?}") };
+        assert!(!message.contains("restore point"), "{message}");
     }
 
     #[test]

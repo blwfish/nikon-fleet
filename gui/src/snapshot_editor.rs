@@ -26,6 +26,9 @@ pub(crate) struct EditModel {
     /// The FTP profiles with their fields (secrets included: the window masks them), or why the list cannot be edited.
     pub ftp: Result<Vec<FtpRow>, String>,
     pub derived: DerivedFrom,
+    /// The edit log's `item` keys, as a set: a row asks "was this property edited" every frame, and scanning the whole
+    /// log for each of ~200 rows would grow with every edit. Built once, with the model.
+    edited_items: std::collections::HashSet<String>,
 }
 
 /// One FTP profile of the list as the editor needs it.
@@ -73,13 +76,13 @@ impl EditModel {
                     .collect())
             }
         };
-        Some(EditModel { controls, owner, ftp, derived })
+        let edited_items = derived.edits.iter().map(|e| e.item.clone()).collect();
+        Some(EditModel { controls, owner, ftp, derived, edited_items })
     }
 
     /// The property was changed in this copy (it is in the edit log).
     pub(crate) fn property_edited(&self, name: &str) -> bool {
-        let key = format!("property:{name}");
-        self.derived.edits.iter().any(|e| e.item == key)
+        self.edited_items.contains(&format!("property:{name}"))
     }
 }
 
@@ -121,7 +124,7 @@ pub(crate) fn now_rfc3339() -> String {
 /// Apply `edit` to the edited copy `file` in `snapshots/` and keep the result, whole or not at all. The error is for
 /// a person and names the reason; nothing was written when there is one.
 pub(crate) fn apply_view_edit(data_dir: &Path, file: &str, req: &ViewEdit, now: &str) -> Result<edit::Applied, String> {
-    let snaps = data_dir.join("snapshots");
+    let snaps = crate::snapshots_dir(data_dir);
     let done = match req {
         ViewEdit::Property { name, text } => edit_in_place(&snaps, file, |s| edit::set_property_text(s, name, text, now).map(|(_, a)| a)),
         ViewEdit::OwnerString { code, text } => edit_in_place(&snaps, file, |s| edit::set_owner_string(s, *code, text, now)),
@@ -140,7 +143,7 @@ pub(crate) fn apply_view_edit(data_dir: &Path, file: &str, req: &ViewEdit, now: 
 
 /// Make an editable copy of `snapshots/<file>`; the new file's name. The original is only read.
 pub(crate) fn make_edit_copy(data_dir: &Path, file: &str, now: &str) -> Result<String, String> {
-    let snaps = data_dir.join("snapshots");
+    let snaps = crate::snapshots_dir(data_dir);
     let source = nikon_fleet::ops::paths::resolve_existing(&snaps, file).map_err(|e| e.to_string())?;
     create_edit_copy(&snaps, &source, None, now).map(|c| c.file).map_err(|e| e.to_string())
 }

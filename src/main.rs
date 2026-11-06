@@ -1575,13 +1575,8 @@ fn set_reference(refs: &Path, snapshot_path: &Path) -> Result<ReferenceSet> {
         std::str::from_utf8(&bytes).with_context(|| format!("loading {}", snapshot_path.display()))?,
     )
     .with_context(|| format!("loading {}", snapshot_path.display()))?;
-    if snap.is_edited() {
-        bail!(
-            "{} is an edited copy, not a reading from a camera, and a reference is what `check` compares a body against: \
-             choose a snapshot that was captured",
-            snapshot_path.display()
-        );
-    }
+    nikon_fleet::gui_argv::refuse_edited_reference(&snap)
+        .map_err(|e| anyhow::anyhow!("{} {e}", snapshot_path.display()))?;
     let name = checked_reference_filename(&snap.camera.model, &snap.camera.serial).map_err(|e| {
         anyhow::anyhow!(
             "{} cannot be a reference: {e}; the reference file name is built from its camera model and serial",

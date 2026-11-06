@@ -1150,7 +1150,7 @@ impl FleetApp {
                 }
             }
             FwAction::Rollback(model, version) => {
-                let now = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
+                let now = crate::snapshot_editor::now_rfc3339();
                 match rollback_dir(&data_dir, &model, &version, &now) {
                     Ok(output_dir) => {
                         self.firmware.ask(FwOp::Rollback { model, version, output_dir }, &data_dir, None);

@@ -50,13 +50,53 @@ pub struct RenderedFtpProfile {
     pub fields: Vec<ProfileField>,
 }
 
+/// How a stored property reads. Closed: the viewers match on it exhaustively, so a new state has to be placed in each.
+/// Serialized as its snake_case tag (`text`, `bytes`, `undecodable`, `not_supported`, `read_failed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowState {
+    Text,
+    Bytes,
+    Undecodable,
+    NotSupported,
+    ReadFailed,
+}
+
+impl RowState {
+    /// A value the body did not give (not a value that happens to be empty, and not a model that lacks the property).
+    pub fn is_problem(self) -> bool {
+        match self {
+            RowState::Undecodable | RowState::ReadFailed => true,
+            RowState::Text | RowState::Bytes | RowState::NotSupported => false,
+        }
+    }
+}
+
+/// The state of the FTP profile list as shown. Closed; serialized as `read`, `not_on_model` or `read_failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FtpView {
+    Read,
+    NotOnModel,
+    ReadFailed,
+}
+
+/// The state of the IPTC presets as shown. Closed; serialized as `read`, `not_read`, `not_on_model` or `read_failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IptcView {
+    Read,
+    NotRead,
+    NotOnModel,
+    ReadFailed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExtendedRow {
     pub name: String,
     pub code: u32,
     pub display: String,
-    /// The stored state's tag: `text`, `bytes`, `undecodable`, `not_supported`, `read_failed`.
-    pub state: &'static str,
+    pub state: RowState,
 }
 
 impl ExtendedRow {
@@ -66,14 +106,13 @@ impl ExtendedRow {
 
     /// A value the body did not give (not a value that happens to be empty).
     pub fn is_problem(&self) -> bool {
-        matches!(self.state, "undecodable" | "read_failed")
+        self.state.is_problem()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RenderedFtp {
-    /// `read`, `not_on_model` or `read_failed`.
-    pub state: &'static str,
+    pub state: FtpView,
     /// Why there is nothing to show, or what to know about what is shown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -110,8 +149,7 @@ pub struct RenderedIptcSlot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RenderedIptc {
-    /// `read`, `not_read`, `not_on_model` or `read_failed`.
-    pub state: &'static str,
+    pub state: IptcView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,13 +179,13 @@ pub fn slot_matches(s: &RenderedIptcSlot, needle: &str) -> bool {
 }
 
 fn render_iptc(state: &IptcState) -> RenderedIptc {
-    let empty = |state: &'static str, note: Option<String>| RenderedIptc { state, note, count: None, slots: Vec::new() };
+    let empty = |state: IptcView, note: Option<String>| RenderedIptc { state, note, count: None, slots: Vec::new() };
     match state {
-        IptcState::NotRead => empty("not_read", Some("this snapshot was taken before IPTC was captured".to_string())),
-        IptcState::NotOnModel => empty("not_on_model", Some("this model has no IPTC presets".to_string())),
-        IptcState::ReadFailed { tag, detail } => empty("read_failed", Some(format!("not read: {tag} ({detail})"))),
+        IptcState::NotRead => empty(IptcView::NotRead, Some("this snapshot was taken before IPTC was captured".to_string())),
+        IptcState::NotOnModel => empty(IptcView::NotOnModel, Some("this model has no IPTC presets".to_string())),
+        IptcState::ReadFailed { tag, detail } => empty(IptcView::ReadFailed, Some(format!("not read: {tag} ({detail})"))),
         IptcState::Read(store) => RenderedIptc {
-            state: "read",
+            state: IptcView::Read,
             note: store.truncated.then(|| format!("only the first {} of {} slots were read", store.slots.len(), store.count)),
             count: Some(store.count),
             slots: store
@@ -202,11 +240,11 @@ impl RenderedExtended {
 
 pub(crate) fn prop_row(p: &crate::extended::ExtendedProp) -> ExtendedRow {
     let (display, state) = match &p.state {
-        PropState::Text { text } => (format!("{text:?}"), "text"),
-        PropState::Bytes { hex } => (format!("0x{hex}"), "bytes"),
-        PropState::Undecodable { hex, why } => (format!("(not a PTP string: {why}) 0x{hex}"), "undecodable"),
-        PropState::NotSupported => ("(not on this model)".to_string(), "not_supported"),
-        PropState::ReadFailed { tag, .. } => (format!("(read failed: {tag})"), "read_failed"),
+        PropState::Text { text } => (format!("{text:?}"), RowState::Text),
+        PropState::Bytes { hex } => (format!("0x{hex}"), RowState::Bytes),
+        PropState::Undecodable { hex, why } => (format!("(not a PTP string: {why}) 0x{hex}"), RowState::Undecodable),
+        PropState::NotSupported => ("(not on this model)".to_string(), RowState::NotSupported),
+        PropState::ReadFailed { tag, .. } => (format!("(read failed: {tag})"), RowState::ReadFailed),
     };
     ExtendedRow { name: p.name.clone(), code: p.code, display, state }
 }
@@ -221,6 +259,11 @@ fn secret_field(label: &'static str, clear: &str, masked: &str, reveal: bool) ->
     }
     ProfileField { label, value: masked.to_string(), secret: Some(Secret(clear.to_string())) }
 }
+
+/// The label of the field that is probably the Wi-Fi passphrase. The camera stores it where the encoder calls the 5 GHz
+/// SSID, and nobody has confirmed on a body that it is the passphrase, so the label says what is known (where it is
+/// stored) and that the meaning is unconfirmed. Starts with "Wi-Fi key" for the viewers that look for the secret by it.
+pub(crate) const WIFI_KEY_LABEL: &str = "Wi-Fi key (stored in the 5 GHz SSID field; meaning unconfirmed)";
 
 /// The fields a person reads, in the order the camera's menu would give them. The rest (the two
 /// timestamps, the structural tag bytes, the IPv6 placeholders) stay in the stored blob and are named
@@ -237,7 +280,7 @@ pub(crate) fn profile_fields(p: &DecodedFtpProfile, reveal: bool) -> Vec<Profile
         field("Username", &p.username),
         secret_field("Password", &p.password, &masked.password, reveal),
         field("Wi-Fi network (2.4 GHz)", &p.ssid_24ghz),
-        secret_field("Wi-Fi key (5 GHz field)", &p.ssid_5ghz, &masked.ssid_5ghz, reveal),
+        secret_field(WIFI_KEY_LABEL, &p.ssid_5ghz, &masked.ssid_5ghz, reveal),
         field("Camera address", format!("{}.{}.{}.{}/{}", net.ipv4[0], net.ipv4[1], net.ipv4[2], net.ipv4[3], net.prefix_len)),
         field("Option flags", format!("{:#06x}", p.option_flags)),
         field("Second port", p.second_port.to_string()),
@@ -259,7 +302,7 @@ pub fn render_extended(e: &Extended, reveal_secrets: bool) -> RenderedExtended {
     let props = e.props.values().map(prop_row).collect();
     let ftp = match &e.ftp {
         FtpState::NotOnModel => RenderedFtp {
-            state: "not_on_model",
+            state: FtpView::NotOnModel,
             note: Some("this model has no FTP profiles".to_string()),
             count: None,
             limit: None,
@@ -267,7 +310,7 @@ pub fn render_extended(e: &Extended, reveal_secrets: bool) -> RenderedExtended {
             profiles: Vec::new(),
         },
         FtpState::ReadFailed { tag, detail } => RenderedFtp {
-            state: "read_failed",
+            state: FtpView::ReadFailed,
             note: Some(format!("not read: {tag} ({detail})")),
             count: None,
             limit: None,
@@ -275,7 +318,7 @@ pub fn render_extended(e: &Extended, reveal_secrets: bool) -> RenderedExtended {
             profiles: Vec::new(),
         },
         FtpState::Read(store) => RenderedFtp {
-            state: "read",
+            state: FtpView::Read,
             note: store
                 .truncated
                 .then(|| format!("only the first {} of {} profiles were read", store.profiles.len(), store.count)),
@@ -322,7 +365,7 @@ impl RenderedExtended {
         let ftp_shown = needle.is_empty() || !profiles.is_empty() || "ftp".contains(needle);
         if ftp_shown {
             match self.ftp.state {
-                "read" => {
+                FtpView::Read => {
                     out.push_str(&format!(
                         "  FTP profiles: {} stored (limit {}), active slot {}\n",
                         self.ftp.count.unwrap_or(0),
@@ -330,9 +373,9 @@ impl RenderedExtended {
                         self.ftp.active_slot.map_or("none".to_string(), |s| s.to_string()),
                     ));
                 }
-                _ => out.push_str(&format!("  FTP profiles: {}\n", self.ftp.note.as_deref().unwrap_or("-"))),
+                FtpView::NotOnModel | FtpView::ReadFailed => out.push_str(&format!("  FTP profiles: {}\n", self.ftp.note.as_deref().unwrap_or("-"))),
             }
-            if let Some(note) = self.ftp.note.as_deref().filter(|_| self.ftp.state == "read") {
+            if let Some(note) = self.ftp.note.as_deref().filter(|_| self.ftp.state == FtpView::Read) {
                 out.push_str(&format!("  note: {note}\n"));
             }
             for p in profiles {
@@ -349,7 +392,7 @@ impl RenderedExtended {
         let iptc_shown = needle.is_empty() || !slots.is_empty();
         if iptc_shown {
             match self.iptc.state {
-                "read" => {
+                IptcView::Read => {
                     let (unused, other) = self.iptc.unused_and_other();
                     let in_use = self.iptc.slots.iter().filter(|s| s.in_use).count();
                     out.push_str(&format!(
@@ -362,7 +405,9 @@ impl RenderedExtended {
                         out.push_str(&format!("  note: {note}\n"));
                     }
                 }
-                _ => out.push_str(&format!("  IPTC presets: {}\n", self.iptc.note.as_deref().unwrap_or("-"))),
+                IptcView::NotRead | IptcView::NotOnModel | IptcView::ReadFailed => {
+                    out.push_str(&format!("  IPTC presets: {}\n", self.iptc.note.as_deref().unwrap_or("-")))
+                }
             }
             for s in slots {
                 out.push_str(&format!("  [{}] {:?}\n", s.slot, s.name));
@@ -442,6 +487,8 @@ mod tests {
         assert!(r.has_secrets());
         let key = p.fields.iter().find(|f| f.label.starts_with("Wi-Fi key")).unwrap();
         assert_eq!(key.value, "************");
+        // The label does not state the unconfirmed mapping as fact.
+        assert!(key.label.contains("unconfirmed") && key.label.contains("5 GHz SSID"), "{}", key.label);
         // Not secrets: shown as they are.
         assert_eq!(p.fields.iter().find(|f| f.label == "Username").unwrap().value, "fleet");
         assert_eq!(p.fields.iter().find(|f| f.label == "Host").unwrap().value, "10.0.0.2");
@@ -541,13 +588,43 @@ mod tests {
 
     #[test]
     fn iptc_states_without_slots_say_why() {
-        for (state, tag) in [(IptcState::NotRead, "not_read"), (IptcState::NotOnModel, "not_on_model")] {
+        for (state, view, tag) in [(IptcState::NotRead, IptcView::NotRead, "not_read"), (IptcState::NotOnModel, IptcView::NotOnModel, "not_on_model")] {
             let mut e = ext(vec![]);
             e.iptc = state;
             let r = render_extended(&e, false);
-            assert_eq!(r.iptc.state, tag);
+            assert_eq!(r.iptc.state, view);
+            assert_eq!(serde_json::to_value(r.iptc.state).unwrap(), serde_json::json!(tag), "the --json shape is the same words");
             assert!(r.to_text("").contains("IPTC presets: "), "{tag}");
         }
+    }
+
+    #[test]
+    fn the_state_vocabularies_serialize_as_their_documented_tags_and_only_two_row_states_are_problems() {
+        let tag = |v: serde_json::Value| v.as_str().unwrap().to_string();
+        let rows = [
+            (RowState::Text, "text", false),
+            (RowState::Bytes, "bytes", false),
+            (RowState::Undecodable, "undecodable", true),
+            (RowState::NotSupported, "not_supported", false),
+            (RowState::ReadFailed, "read_failed", true),
+        ];
+        for (state, expected, problem) in rows {
+            assert_eq!(tag(serde_json::to_value(state).unwrap()), expected);
+            assert_eq!(state.is_problem(), problem, "{expected}");
+        }
+        for (state, expected) in [(FtpView::Read, "read"), (FtpView::NotOnModel, "not_on_model"), (FtpView::ReadFailed, "read_failed")] {
+            assert_eq!(tag(serde_json::to_value(state).unwrap()), expected);
+        }
+        for (state, expected) in [(IptcView::Read, "read"), (IptcView::NotRead, "not_read"), (IptcView::NotOnModel, "not_on_model"), (IptcView::ReadFailed, "read_failed")] {
+            assert_eq!(tag(serde_json::to_value(state).unwrap()), expected);
+        }
+        // Every stored property state maps to a row state, and the failed ones are the problems.
+        let row = |state: PropState| prop_row(&crate::extended::ExtendedProp { code: 0xd072, name: "Artist".into(), state }).state;
+        assert_eq!(row(PropState::Text { text: String::new() }), RowState::Text, "an empty string is a value, not a problem");
+        assert_eq!(row(PropState::Bytes { hex: "01".into() }), RowState::Bytes);
+        assert_eq!(row(PropState::Undecodable { hex: "ff".into(), why: "w".into() }), RowState::Undecodable);
+        assert_eq!(row(PropState::NotSupported), RowState::NotSupported);
+        assert_eq!(row(PropState::ReadFailed { tag: "t".into(), detail: "d".into() }), RowState::ReadFailed);
     }
 
     #[test]
@@ -555,7 +632,8 @@ mod tests {
         let mut e = ext(vec![]);
         e.ftp = FtpState::NotOnModel;
         let r = render_extended(&e, false);
-        assert_eq!(r.ftp.state, "not_on_model");
+        assert_eq!(r.ftp.state, FtpView::NotOnModel);
+        assert_eq!(serde_json::to_value(r.ftp.state).unwrap(), serde_json::json!("not_on_model"));
         assert!(r.to_text("").contains("no FTP profiles"));
     }
 }

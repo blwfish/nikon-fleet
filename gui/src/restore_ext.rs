@@ -20,7 +20,7 @@
 // categories the apply wrote, through the same four steps.
 
 use super::*;
-use crate::restore::{NoAside, RESTORE_APPLY_TIMEOUT, RESTORE_PLAN_TIMEOUT, UndoKind, UndoOffer};
+use crate::restore::{NoAside, RESTORE_PLAN_TIMEOUT, UndoKind, UndoOffer};
 use nikon_fleet::ops::restore_extended::{Category, SkipKind};
 
 /// What an extended restore is asked for. These exact values reach the CLI: a plan is good for this
@@ -36,10 +36,16 @@ pub(crate) struct ExtRestoreRequest {
 }
 
 // The CLI's JSON, as `ops::restore_extended::ExtendedPlanReport` and `ExtendedApplyReport` serialise
-// it. The closed vocabularies (`Category`, `SkipKind`) are the library's own types, so a new one fails
-// to compile here instead of being shown as nothing; the two that the library only serialises
-// (`ItemAction`, `ItemOutcome`) are read here, and one this build does not know is `Unknown`: shown,
-// and a plan containing it is not offered for confirmation.
+// it. The closed vocabularies (`Category`, `SkipKind`) are the library's own types: a variant added to
+// the library fails to compile in the exhaustive matches that word them here (`category_words`, the skip
+// words), instead of being shown as nothing. They have NO catch-all, so output from a CLI built from a
+// newer library that carries a variant this build lacks does not parse at all: the plan or report is
+// refused with the parse error, nothing is written (fails safe; same-commit builds never meet this).
+// The two the library only serialises (`ItemAction`, `ItemOutcome`) are read here, and one this build
+// does not know is `Unknown`: shown (an unknown outcome as an error), and a plan containing an unknown
+// action is not offered for confirmation. `Unknown` does not keep the raw tag (serde's `other` drops it).
+// The mirror structs do not deny unknown fields, so a field the library adds is ignored here until it is
+// added to the mirror; `the_mirror_structs_read_every_field_the_library_writes` holds them to the library's key sets in tests.
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -68,7 +74,11 @@ pub(crate) struct ExtItemJson {
     pub action: ExtActionJson,
 }
 
+// In tests the two top-level mirrors refuse a key they do not read (`deny_unknown_fields`), so a field the library
+// adds to its report fails the tests that read the library's own output until it is mirrored here. In the program they
+// stay lenient: a report that has already been printed (an apply has written) must not be thrown away for a new field.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 pub(crate) struct ExtPlanJson {
     pub camera: BodyJson,
     /// The snapshot's file name.
@@ -77,6 +87,16 @@ pub(crate) struct ExtPlanJson {
     pub summary: String,
     pub digest: String,
     pub items: Vec<ExtItemJson>,
+}
+
+impl ExtPlanJson {
+    /// The invariant "the plan's own count of changes is the number of its `write` items", in one place: `None` when
+    /// it holds, else `(claimed, items)`. The gate that offers a plan for confirmation and the check on a plan just
+    /// returned both read this and word the refusal for their own moment.
+    pub(crate) fn count_disagreement(&self) -> Option<(usize, usize)> {
+        let writes = self.items.iter().filter(|i| matches!(i.action, ExtActionJson::Write { .. })).count();
+        (self.would_change != writes).then_some((self.would_change, writes))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -108,6 +128,7 @@ pub(crate) struct ExtResultJson {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 pub(crate) struct ExtApplyJson {
     pub status: ApplyStatus,
     pub no_op: bool,
@@ -187,11 +208,8 @@ impl PlannedExt {
     /// state machine and the words beside the button all read it.
     pub(crate) fn blocked_reason(&self) -> Option<String> {
         let writes = self.writes().len();
-        if self.plan.would_change != writes {
-            return Some(format!(
-                "The plan's own count of changes ({}) disagrees with its items ({writes}), so it cannot be trusted.",
-                self.plan.would_change
-            ));
+        if let Some((claimed, items)) = self.plan.count_disagreement() {
+            return Some(format!("The plan's own count of changes ({claimed}) disagrees with its items ({items}), so it cannot be trusted."));
         }
         if writes == 0 {
             return Some("This plan would change nothing, so there is nothing to restore.".to_string());
@@ -300,16 +318,26 @@ pub(crate) fn check_ext_plan_is_for(plan: &ExtPlanJson, request: &ExtRestoreRequ
             return Err(format!("the plan acts on {} although {} was not asked for; nothing was written", i.label, category_words(i.category).0));
         }
     }
-    let writes = plan.items.iter().filter(|i| matches!(i.action, ExtActionJson::Write { .. })).count();
-    if plan.would_change != writes {
-        return Err(format!("the plan's own count of changes ({}) disagrees with its items ({writes}); nothing was written", plan.would_change));
+    if let Some((claimed, items)) = plan.count_disagreement() {
+        return Err(format!("the plan's own count of changes ({claimed}) disagrees with its items ({items}); nothing was written"));
     }
     Ok(())
 }
 
+/// How long an extended apply may run before the GUI kills it. Longer than a plain apply on purpose:
+/// besides the restore point and read-back (each a full capture, now with the extended section), an
+/// FTP rebuild deletes the whole list and then adds up to 20 profiles, each several transactions
+/// with a read-back; a kill part-way leaves the camera's list emptied or partial (reported
+/// Indeterminate, restore point named), which is far worse than waiting. UNMEASURED: no run on a
+/// real body has timed a full 20-profile rebuild, so this is a generous bound, not a measurement
+/// (twice the plain apply's 300 s); a test pins that it exceeds the plain apply and the teardown
+/// watchdog's worst case. The MCP server has its own constant for the same work
+/// (`Deadlines::extended_apply`).
+pub(crate) const EXT_RESTORE_APPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
 pub(crate) fn do_ext_apply(data_dir: &Path, request: &ExtRestoreRequest, digest: &str, summary: &str) -> ApplyOutcome<ExtApplyJson> {
     match locate_cli() {
-        Ok(cli) => ext_apply_via(&cli, data_dir, request, digest, summary, &list_cameras, RESTORE_APPLY_TIMEOUT),
+        Ok(cli) => ext_apply_via(&cli, data_dir, request, digest, summary, &list_cameras, EXT_RESTORE_APPLY_TIMEOUT),
         Err(message) => no_cli(message),
     }
 }
@@ -375,8 +403,9 @@ pub(crate) fn ext_report_lines(r: &ExtApplyJson) -> Vec<(Level, String)> {
             ExtOutcomeJson::NotAttempted { because } => {
                 line(Level::Warn, format!("Not attempted: {label}: {}", nikon_fleet::ops::render::printable(because)))
             }
+            // A write whose end this program cannot read may have changed the camera: as loud as `Indeterminate`.
             ExtOutcomeJson::Unknown => line(
-                Level::Warn,
+                Level::Error,
                 format!("{label} ended in a way this program does not know; check the camera against the restore point."),
             ),
         }
@@ -941,6 +970,36 @@ mod tests {
     }
 
     #[test]
+    fn the_mirror_structs_read_every_field_the_library_writes() {
+        // The library's own plan and apply report, serialised: every key must be one the mirror reads (in tests the
+        // mirrors deny unknown fields), so a field added on the library side fails here instead of being dropped.
+        let plan = serde_json::to_value(library_plan(mixed_items())).unwrap();
+        let parsed: ExtPlanJson = serde_json::from_value(plan.clone()).expect("the mirror reads every key of the library's plan");
+        assert_eq!(parsed.digest, "d1");
+        let apply = ExtendedApplyReport {
+            status: ApplyStatus::AppliedVerified,
+            no_op: false,
+            plan_digest: "d1".into(),
+            restore_point: Some(nikon_fleet::ops::apply::RestorePoint { file: "rp.json".into(), label: "restore-ext".into() }),
+            undo_set: vec!["strings".into()],
+            results: vec![ItemResult { id: "a".into(), label: "A".into(), category: Category::Strings, outcome: ItemOutcome::Written { verified: true } }],
+            still_differing: vec!["ftp".into()],
+            after_read_failed: Some("why".into()),
+        };
+        let apply_json = serde_json::to_value(&apply).unwrap();
+        let keys = |v: &serde_json::Value| v.as_object().unwrap().keys().cloned().collect::<BTreeSet<_>>();
+        let parsed: ExtApplyJson = serde_json::from_value(apply_json.clone()).expect("the mirror reads every key of the library's report");
+        assert_eq!(parsed.after_read_failed.as_deref(), Some("why"), "the fixture sets every optional key, so none is skipped");
+        assert_eq!(keys(&apply_json).len(), 8, "the report has eight keys with every optional one set");
+        // And the guard bites: a key the mirror does not know is refused in tests.
+        for (name, mut v) in [("plan", plan), ("apply report", apply_json)] {
+            v.as_object_mut().unwrap().insert("a_field_added_later".into(), serde_json::json!(1));
+            let refused = if name == "plan" { serde_json::from_value::<ExtPlanJson>(v).err() } else { serde_json::from_value::<ExtApplyJson>(v).err() };
+            assert!(refused.is_some_and(|e| e.to_string().contains("a_field_added_later")), "{name}");
+        }
+    }
+
+    #[test]
     fn every_skip_reason_and_category_the_library_has_is_worded() {
         // No wildcard: a new variant fails to compile here until it is listed (and then worded).
         for reason in [
@@ -1043,6 +1102,27 @@ mod tests {
         assert!(check_ext_plan_is_for(&counted, &request(None)).unwrap_err().contains("disagrees"));
     }
 
+    #[test]
+    fn the_plans_count_of_changes_must_equal_its_write_items_exactly_and_both_gates_read_the_same_rule() {
+        let mut p = plan_json(mixed_items());
+        let writes = p.items.iter().filter(|i| matches!(i.action, ExtActionJson::Write { .. })).count();
+        assert_eq!(writes, 2, "the fixture writes two items");
+        for (claimed, disagrees) in [(writes - 1, true), (writes, false), (writes + 1, true)] {
+            p.would_change = claimed;
+            assert_eq!(p.count_disagreement(), disagrees.then_some((claimed, writes)), "claimed {claimed}");
+            // the pre-confirmation gate and the check on a fresh plan agree about it
+            assert_eq!(check_ext_plan_is_for(&p, &request(None)).is_err(), disagrees, "check, claimed {claimed}");
+            let gate = PlannedExt { request: request(None), plan: p.clone(), cli_log: String::new() };
+            assert_eq!(gate.blocked_reason().is_some_and(|r| r.contains("disagrees")), disagrees, "gate, claimed {claimed}");
+        }
+        // zero items, zero claimed: consistent (the gate blocks it for another reason: nothing to restore)
+        let empty = plan_json(vec![]);
+        assert_eq!(empty.count_disagreement(), None);
+        let mut lying_empty = empty.clone();
+        lying_empty.would_change = 1;
+        assert_eq!(lying_empty.count_disagreement(), Some((1, 0)));
+    }
+
     // ── the confirmation and the result, in words ──
 
     #[test]
@@ -1107,7 +1187,8 @@ mod tests {
         assert!(says(&mixed, Level::Error, "Failed: Item: refused"), "{mixed:?}");
         assert!(says(&mixed, Level::Error, "May or may not have changed: Item: timed out"), "{mixed:?}");
         assert!(says(&mixed, Level::Warn, "Not attempted: Item: earlier"), "{mixed:?}");
-        assert!(says(&mixed, Level::Warn, "does not know"), "{mixed:?}");
+        assert!(says(&mixed, Level::Error, "does not know"), "an outcome it cannot read is as loud as an indeterminate one: {mixed:?}");
+        assert!(!says(&mixed, Level::Warn, "does not know"), "{mixed:?}");
         assert!(says(&mixed, Level::Warn, "still differs from the snapshot in: ftp"), "{mixed:?}");
         assert!(says(&mixed, Level::Warn, "nothing written could be checked"), "{mixed:?}");
     }

@@ -38,7 +38,7 @@ struct Args {
     #[arg(long)]
     schema: Option<PathBuf>,
 
-    /// Register the tools that write to cameras (transplant_apply, restore_apply).
+    /// Register the tools that write to cameras (transplant_apply, restore_apply, restore_extended_apply).
     #[arg(long)]
     enable_writes: bool,
 
@@ -49,9 +49,14 @@ struct Args {
     /// After the client goes away, wait this long for an apply that is still running before
     /// exiting. If one is still running then, it is recorded (stderr, and a marker file in the
     /// data directory when it had reached `writing`) so the next session can report it.
-    #[arg(long, value_name = "SECS", default_value_t = 400)]
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_EXIT_WAIT_SECS)]
     exit_wait_secs: u64,
 }
+
+/// How long, by default, the server waits at exit for an apply still running: the longest apply deadline
+/// (`Deadlines::extended_apply`, the FTP rebuild) plus the worker's teardown watchdog and a margin. A test pins
+/// that it outlasts every apply deadline, so a call that is merely slow is not abandoned and recorded as lost.
+const DEFAULT_EXIT_WAIT_SECS: u64 = 700;
 
 /// The write end of the self-pipe the termination signals are reported through.
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
@@ -251,6 +256,25 @@ mod signal_tests {
             *errno_location() = 77;
             report_signal(-1, libc::SIGTERM); // EBADF: the write fails and would set errno
             assert_eq!(*errno_location(), 77);
+        }
+    }
+}
+
+#[cfg(test)]
+mod exit_wait_tests {
+    use super::*;
+    use fleet_mcp::server::ApplyOp;
+
+    #[test]
+    fn the_default_exit_wait_outlasts_every_apply_deadline_by_more_than_the_teardown_watchdog() {
+        let d = Deadlines::default();
+        let wait = Duration::from_secs(DEFAULT_EXIT_WAIT_SECS);
+        for op in [ApplyOp::Transplant, ApplyOp::Restore, ApplyOp::RestoreExtended] {
+            let deadline = d.apply_for(op);
+            assert!(
+                wait >= deadline + nikon_fleet::process_exit::TEARDOWN_WORST_CASE,
+                "{op:?}: waiting {wait:?} at exit would abandon an apply still inside its {deadline:?} deadline"
+            );
         }
     }
 }

@@ -11,6 +11,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::snapshot::Snapshot;
+
 /// Why an argv cannot be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArgvError {
@@ -114,6 +116,31 @@ pub fn transplant_argv(
     argv
 }
 
+/// Why a snapshot cannot be promoted to a reference: it is an edited copy.
+///
+/// The ONE statement of "an edited copy never becomes a reference": a reference is what `check`
+/// compares a body against, and an edited copy is not a reading from a camera. The CLI's
+/// `ref set` and the GUI's "Set ref" both call [`refuse_edited_reference`] and put their own file
+/// name in front of this text, so the rule and its wording cannot drift apart between the two.
+/// (It lives in this module only because this is the library file both front ends share and the one
+/// this change could own; `Snapshot` or `ops::paths` would be the natural home.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditedCopyRefused;
+
+impl std::fmt::Display for EditedCopyRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "is an edited copy, not a reading from a camera, and a reference is what `check` compares a body against: \
+             choose a snapshot that was captured",
+        )
+    }
+}
+
+/// `Err` when `snap` is an edited copy (`Snapshot::is_edited`); a captured snapshot passes.
+pub fn refuse_edited_reference(snap: &Snapshot) -> Result<(), EditedCopyRefused> {
+    if snap.is_edited() { Err(EditedCopyRefused) } else { Ok(()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +204,17 @@ mod tests {
         assert!(chars > ARGV_LIMIT && tipped.1.to_string().contains("narrow the selection"));
         let before = restore_argv("/d", "S", Some(&names(tipped.0 - 1)), Some(("d", &summary(tipped.0 - 1))), "/d/snapshots/rp.json").unwrap();
         assert!(before.iter().map(|a| a.chars().count() + 1).sum::<usize>() <= ARGV_LIMIT);
+    }
+
+    #[test]
+    fn an_edited_copy_is_refused_as_a_reference_and_a_captured_snapshot_is_not() {
+        use crate::snapshot::{Camera, Transport};
+        let captured = Snapshot::new(Camera { model: "Z 9".into(), serial: "S1".into(), firmware: "1".into() }, Transport::Usb, "2026-01-01T00:00:00Z".into());
+        assert_eq!(refuse_edited_reference(&captured), Ok(()));
+        let copy = crate::snapshot_edit::copy_for_edit(&captured, "a.json", None, "2026-02-02T00:00:00Z");
+        assert!(copy.is_edited());
+        assert_eq!(refuse_edited_reference(&copy), Err(EditedCopyRefused));
+        assert!(EditedCopyRefused.to_string().contains("edited copy"));
     }
 
     #[test]

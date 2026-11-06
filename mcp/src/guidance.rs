@@ -44,7 +44,9 @@ pub fn notes() -> Vec<Note> {
             "1. transplant_plan (copy settings from a stored snapshot, possibly of another body) or restore_plan (put the same body back).\n\
              2. Tell the user what the plan says: the summary line, what would change, and what could not be copied.\n\
              3. transplant_apply / restore_apply with `plan_digest` and `summary` copied character for character from the plan result. \
-                Never compose either one yourself.\n\n\
+                Never compose either one yourself.\n\
+             Owner strings (Artist, Copyright, Image comment), IPTC presets, FTP profiles and the extended switches are not in those plans: \
+             they go through restore_extended_plan then restore_extended_apply, with the same digest and summary rules.\n\n\
              A plan is not a prediction: a write can still fail or be ignored by the camera. The digest only proves the camera and snapshot \
              have not changed since the plan; it is not consent, so do not plan and apply in one breath without the user seeing the summary.\n\
              `stale_plan` means something changed (including a previous successful apply): plan again and show it again.\n\
@@ -181,7 +183,11 @@ pub fn notes() -> Vec<Note> {
              or not in the restore point). Restoring with `only` = undo_set puts back just those; a restore without `only` overwrites every writable \
              setting with the old value, including changes made since. If `undo_set` is empty there is nothing to put back: do not send `only: []`, \
              it is refused as empty_selection because an empty list would otherwise mean every property. \
-             The undo stores its own restore point and reports its own status, so it can be undone too; check that status.",
+             The undo stores its own restore point and reports its own status, so it can be undone too; check that status.\n\
+             An EXTENDED restore (restore_extended_apply: owner strings, IPTC, FTP profiles, switches) is undone with the extended tools, not these: \
+             its restore point is labelled `restore-ext` (no `mcp-` prefix), its `undo_set` names categories (strings, iptc, switches, ftp), and the undo is \
+             restore_extended_plan then restore_extended_apply on that restore point with `only` = that undo_set. restore_plan / restore_apply on a \
+             restore-ext point would not put those items back.",
         )
         .tags(&["restore"])
         .addresses(&["undo", "put it back", "revert", "roll back", "restore point", "undo_set"]),
@@ -328,12 +334,12 @@ pub fn notes() -> Vec<Note> {
             "When this server exits (the client went away and the apply outlived the wait, or it was sent SIGTERM, SIGINT or SIGHUP) while an apply that had reached \
              `writing` is still running, it writes `in-flight-apply.json` in the data directory. The next server start puts its content on the first tool result \
              that can carry it (any tool but get_usage_guidance), as `previous_session_incomplete`, once: the file is then renamed to `in-flight-apply.seen.json` and kept. \
-             `reason` is client_gone_wait_expired, sigterm, sigint or sighup. `in_flight` says what was running: `op` (restore-apply or transplant-apply), `serial`, \
+             `reason` is client_gone_wait_expired, sigterm, sigint or sighup. `in_flight` says what was running: `op` (restore-apply, restore-extended-apply or transplant-apply), `serial`, \
              `last_phase`, `writing_seen`, `may_write` and `started_at`. `recorded_at` is when the server left. `marker_unreadable: true` means the marker could not be read \
              at all (`file`, `error`): treat that the same way.\n\
              What it does not tell you is how far the apply got, or whether the worker finished after the server left. Do not run the apply again from the same plan. Capture the \
              body (capture_snapshot) or check it against its reference (check_against_reference), compare with the restore point the apply stored first \
-             (list_snapshots with label_prefix `mcp-restore-`), and tell the user what you find.",
+             (list_snapshots with label_prefix `mcp-restore-`, or `restore-ext` after a restore-extended-apply), and tell the user what you find.",
         )
         .tags(&["camera"])
         .addresses(&[
@@ -353,7 +359,7 @@ pub fn notes() -> Vec<Note> {
         )
         .detail(
             "Progress notifications are sent when the client supplies a progress token. Deadlines are 90 s for a capture, 120 s for a check, \
-             150 s for a plan and 300 s for an apply. A read-only or plan call that hits its deadline was stopped and changed nothing. \
+             150 s for a plan, 300 s for an apply and 600 s for restore_extended_apply (its FTP rebuild is slower; unmeasured). A read-only or plan call that hits its deadline was stopped and changed nothing. \
              The tools that only read local files or USB descriptors answer `tool_deadline` after 30 s (firmware_status, which uses the network, after 180 s) \
              and are abandoned; nothing was changed.",
         )
@@ -384,7 +390,7 @@ pub fn notes() -> Vec<Note> {
         )
         .detail(
             "There is no delete tool. Past a cap the call fails with `data_dir_full` before touching the camera; the user clears old files themselves. \
-             Labels you supply are stored as `mcp-<label>`; restore points are `mcp-restore-...`.",
+             Labels you supply are stored as `mcp-<label>`; restore points are `mcp-restore-...` (`restore-ext` after an extended restore).",
         )
         .tags(&["snapshots"])
         .addresses(&["data_dir_full", "disk full", "too many snapshots", "delete snapshot"]),
@@ -579,6 +585,27 @@ mod tests {
         assert_eq!(top("how do I undo it").as_deref(), Some("undoing-a-change"));
         assert_eq!(top("two cameras of the same model attached").as_deref(), Some("name-bodies-by-usb-serial"));
         assert_eq!(top("camera_busy").as_deref(), Some("camera-busy"));
+    }
+
+    #[test]
+    fn the_change_and_undo_strategies_route_an_extended_restore_to_the_extended_tools() {
+        let n = notes();
+        let detail = |id: &str| n.iter().find(|x| x.id == id).unwrap_or_else(|| panic!("no note {id}")).detail.clone();
+        // Making the change: the extended pair is named where the plain pair is.
+        let change = detail("changing-a-camera");
+        assert!(change.contains("restore_extended_plan") && change.contains("restore_extended_apply"), "{change}");
+        // Undoing it: the plain undo recipe would not put owner strings / IPTC / FTP back, so the note says to use
+        // the extended pair, names the label an extended restore point really carries and the unit of `undo_set`.
+        let undo = detail("undoing-a-change");
+        assert!(undo.contains("restore_extended_plan") && undo.contains("restore_extended_apply"), "{undo}");
+        assert!(undo.contains("`restore-ext`") && undo.contains("categories"), "{undo}");
+        // The in-flight marker's op names and the label to look for afterwards.
+        let marker = detail("previous-session-incomplete");
+        assert!(marker.contains("restore-extended-apply") && marker.contains("`restore-ext`"), "{marker}");
+        // An agent asking how to undo an FTP-profile restore finds the undo note, not only the plain-restore one.
+        let found = find_notes(&n, "undo an extended restore of ftp profiles restore point", 3);
+        assert!(found.iter().any(|x| x.id == "undoing-a-change"), "{:?}", found.iter().map(|x| &x.id).collect::<Vec<_>>());
+        // (That the two tools exist under these names is pinned by tests/stdio.rs's tools/list checks.)
     }
 
     #[test]
