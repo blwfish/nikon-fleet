@@ -15,9 +15,14 @@
 //
 // Also here: the pre-flight, the plan and apply runners, the target check, the confirmation's
 // head and tail, and the result view's tail, which were copies of one another.
+//
+// And the window both restore commands share (`GuardedWindow`, `draw_window`, `act`,
+// `start_undo_in`): the pickers for a body and one of its snapshots, the plan button, the stage
+// switch, the result and the undo. A restore window is a flow plus what only it draws (its plan, its
+// confirmation, its report, what it adds to the form); everything else is written once.
 
 use super::*;
-use crate::restore::{draw_restore_point, undo_offer};
+use crate::restore::{NoAside, UndoOffer, draw_restore_point, undo_offer};
 use std::fmt::Debug;
 
 /// What distinguishes one guarded write from another.
@@ -281,6 +286,13 @@ pub(crate) fn write_target_refusal(camera: &CameraRow) -> Option<String> {
         .then(|| AmbiguousPairing { model: camera.model.clone(), count: camera.model_count }.to_string())
 }
 
+/// The plan's count of changes disagrees with what it lists: how both restore windows word it, so the
+/// invariant reads the same wherever it is enforced. The caller adds its own ending ("so it cannot be
+/// trusted" / "nothing was written") and its own capital. `noun` is what the plan lists ("steps", "items").
+pub(crate) fn count_disagreement_clause(claimed: usize, listed: usize, noun: &str) -> String {
+    format!("own count of changes ({claimed}) disagrees with its {noun} ({listed})")
+}
+
 /// The full pre-flight: the target's own check, then a fresh USB-only look at the bus (the same rule
 /// a snapshot uses to trust a serial pairing), then that the body still runs the firmware the plan
 /// was made for (the digest does not cover it). `noun` is "Transplant" / "Restore".
@@ -471,5 +483,593 @@ fn draw_log(ui: &mut egui::Ui, id: &str, log: &str) {
         egui::CollapsingHeader::new("CLI messages").id_salt((id, "log")).show(ui, |ui| {
             ui.label(egui::RichText::new(log.trim_end()).monospace());
         });
+    }
+}
+
+// ── The window the restore commands share ─────────────────────────────────
+
+/// What a window picks: a body and one of its own snapshots.
+#[derive(Debug, Default)]
+pub(crate) struct Pick {
+    pub open: bool,
+    /// The chosen target, by identity; the live row is found among the discovered cameras.
+    pub target_key: Option<(String, String)>,
+    pub source_file: Option<String>,
+}
+
+impl Pick {
+    pub(crate) fn target_camera<'a>(&self, cameras: &'a [CameraRow]) -> Option<&'a CameraRow> {
+        let (model, serial) = self.target_key.as_ref()?;
+        cameras.iter().find(|c| &c.model == model && &c.serial == serial)
+    }
+}
+
+/// What a click in a restore window asks for. Collected while drawing and applied after. The window's
+/// own buttons (`O`) ride beside the ones every guarded write has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WindowAct<O> {
+    Plan,
+    AskApply,
+    ConfirmApply,
+    CancelConfirmation,
+    Discard,
+    Applied(AppliedAction),
+    Own(O),
+}
+
+/// A window with no buttons of its own: this type has no values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoOwn {}
+
+/// What applying a click asks the app to do beyond changing the window.
+pub(crate) enum Effect {
+    Nothing,
+    /// Hand this to the worker (and tell the window if the worker is gone).
+    Send(Cmd),
+    /// A click in the result view: open, copy or undo.
+    Applied(AppliedAction),
+}
+
+/// The part of the app a window needs to be drawn, borrowed apart from the window itself.
+pub(crate) struct WindowEnv<'a> {
+    pub cameras: &'a [CameraRow],
+    pub listing: Option<&'a SnapListing>,
+    pub busy: bool,
+    pub data_dir: Option<&'a Path>,
+}
+
+type ReportOf<W> = <<W as GuardedUi>::F as Flow>::Report;
+
+/// A restore window: a guarded write aimed at one body from one of its own snapshots. The trait
+/// holds only what differs between the windows; the transitions are `GuardedUi`'s, the layout and the
+/// undo are provided here.
+pub(crate) trait GuardedWindow: GuardedUi {
+    /// The buttons only this window has.
+    type Own;
+
+    const TITLE: &'static str;
+    /// Prefix of the ids of this window's widgets (two windows must not share them).
+    const ID: &'static str;
+    /// What the empty window says.
+    const IDLE: &'static str;
+    /// The small print under the snapshot picker.
+    const SNAPSHOT_HINT: &'static str;
+
+    fn pick(&self) -> &Pick;
+    fn pick_mut(&mut self) -> &mut Pick;
+
+    /// First line of the window, if it has one.
+    fn intro(_ui: &mut egui::Ui) {}
+    /// A snapshot in the picker; `camera_firmware` is the chosen body's.
+    fn snapshot_option_label(row: &SnapRow, camera_firmware: Option<&str>) -> String;
+    /// The rest of the form, between the snapshot and the plan button.
+    fn draw_form(&mut self, _ui: &mut egui::Ui, _busy: bool) {}
+    /// The plan under review. `can_edit` is false while a confirmation is up or the camera is busy.
+    fn draw_plan(ui: &mut egui::Ui, plan: &Plan<Self>, can_edit: bool, action: &mut Option<WindowAct<Self::Own>>);
+    /// Under the buttons of a plan under review.
+    fn plan_footer(_ui: &mut egui::Ui, _plan: &Plan<Self>) {}
+    fn confirm_text(plan: &Plan<Self>) -> String;
+    /// The snapshot a request reads from, for the line above a result.
+    fn request_source(request: &Req<Self>) -> &str;
+    fn report_lines(report: &ReportOf<Self>) -> Vec<(Level, String)>;
+    fn report_extra(ui: &mut egui::Ui, report: &ReportOf<Self>);
+    /// A button of this window's own. The command to send, if it sends one.
+    fn act_own(&mut self, own: Self::Own, cameras: &[CameraRow]) -> Result<Option<Cmd>, String>;
+    /// Take the selection an undo of `offer` is (everything it puts back, nothing else). Called before
+    /// the window is touched: an `Err` leaves it as it was.
+    fn adopt_undo(&mut self, offer: &UndoOffer, camera: &CameraRow) -> Result<(), String>;
+
+    fn target_camera<'a>(&self, cameras: &'a [CameraRow]) -> Option<&'a CameraRow> {
+        self.pick().target_camera(cameras)
+    }
+
+    /// Set the form to undo `offer` (a restore point and what the apply wrote) and plan it. The plan
+    /// is read-only; the person reviews it and confirms it like any restore. The body must be
+    /// connected, and no step may be in flight.
+    fn start_undo(&mut self, offer: &UndoOffer, cameras: &[CameraRow]) -> Result<Cmd, String> {
+        if matches!(self.stage(), Stage::Applying(_) | Stage::Planning(_)) {
+            return Err("Another restore step is still running.".to_string());
+        }
+        let Some(camera) = cameras.iter().find(|c| c.model == offer.target.model && c.serial == offer.target.serial) else {
+            return Err(format!("{} {} is not connected: connect it and Discover, then undo.", offer.target.model, offer.target.serial));
+        };
+        if offer.undo_set.is_empty() {
+            return Err("There is nothing to undo.".to_string());
+        }
+        self.adopt_undo(offer, camera)?;
+        let pick = self.pick_mut();
+        pick.open = true;
+        pick.target_key = Some((camera.model.clone(), camera.serial.clone()));
+        pick.source_file = Some(offer.restore_point.clone());
+        *self.stage_mut() = Stage::Idle;
+        self.begin_plan(cameras)
+    }
+}
+
+/// Undo an apply in `win`: it opens on the restore point with the apply's undo set and the plan is
+/// asked for. The command to send, if there is one; otherwise the window says why.
+pub(crate) fn start_undo_in<W: GuardedWindow>(win: &mut W, offer: &UndoOffer, cameras: &[CameraRow], data_dir: Option<&Path>) -> Option<Cmd> {
+    // The restore point is a file in the data directory the apply used.
+    if data_dir != Some(offer.data_dir.as_path()) {
+        win.pick_mut().open = true;
+        *win.notice_mut() = format!(
+            "The data directory changed since this apply: its restore point {} is in {}. Switch back to undo it.",
+            offer.restore_point,
+            offer.data_dir.display()
+        );
+        return None;
+    }
+    match win.start_undo(offer, cameras) {
+        Ok(cmd) => Some(cmd),
+        Err(e) => {
+            win.pick_mut().open = true;
+            *win.notice_mut() = e;
+            None
+        }
+    }
+}
+
+/// Apply a click. Refusals become the window's notice; what the app must do is returned.
+pub(crate) fn act<W: GuardedWindow>(win: &mut W, cameras: &[CameraRow], click: WindowAct<W::Own>) -> Effect {
+    let sent = |win: &mut W, r: Result<Cmd, String>| match r {
+        Ok(cmd) => Effect::Send(cmd),
+        Err(e) => {
+            *win.notice_mut() = e;
+            Effect::Nothing
+        }
+    };
+    match click {
+        WindowAct::Plan => {
+            let r = win.begin_plan(cameras);
+            sent(win, r)
+        }
+        WindowAct::Own(own) => match win.act_own(own, cameras) {
+            Ok(Some(cmd)) => Effect::Send(cmd),
+            Ok(None) => Effect::Nothing,
+            Err(e) => {
+                *win.notice_mut() = e;
+                Effect::Nothing
+            }
+        },
+        WindowAct::AskApply => {
+            win.ask_apply();
+            Effect::Nothing
+        }
+        WindowAct::ConfirmApply => win.confirm_apply().map_or(Effect::Nothing, Effect::Send),
+        WindowAct::CancelConfirmation => {
+            win.cancel_confirmation();
+            Effect::Nothing
+        }
+        WindowAct::Discard => {
+            win.discard();
+            Effect::Nothing
+        }
+        WindowAct::Applied(a) => Effect::Applied(a),
+    }
+}
+
+/// Draw the window if it is open: the body, the snapshot, what the window adds, the plan button, and
+/// whatever stage the write is in. The click, if any, is returned to be applied after drawing.
+pub(crate) fn draw_window<W: GuardedWindow>(ctx: &egui::Context, win: &mut W, env: &WindowEnv<'_>) -> Option<WindowAct<W::Own>>
+where
+    <W as GuardedUi>::F: Flow<Aside = NoAside>,
+{
+    if !win.pick().open {
+        return None;
+    }
+    let mut open = true;
+    let mut action: Option<WindowAct<W::Own>> = None;
+    let WindowEnv { cameras, listing, busy, data_dir } = *env;
+    let data_ready = data_dir.is_some();
+    egui::Window::new(W::TITLE).open(&mut open).default_size([700.0, 620.0]).resizable(true).collapsible(false).show(ctx, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(720.0).show(ui, |ui| {
+            W::intro(ui);
+            ui.label(egui::RichText::new("1. The camera: a connected body").strong());
+            if cameras.is_empty() {
+                ui.label(egui::RichText::new("No camera is connected: use Discover first.").italics().weak());
+            }
+            ui.add_enabled_ui(!busy, |ui| {
+                let pick = win.pick_mut();
+                let text = pick.target_camera(cameras).map_or("choose a body…".to_string(), camera_label);
+                egui::ComboBox::from_id_salt((W::ID, "target")).selected_text(text).width(420.0).show_ui(ui, |ui| {
+                    for c in cameras {
+                        let picked = pick.target_key.as_ref() == Some(&(c.model.clone(), c.serial.clone()));
+                        if ui.selectable_label(picked, camera_label(c)).clicked() && !picked {
+                            pick.target_key = Some((c.model.clone(), c.serial.clone()));
+                            pick.source_file = None;
+                        }
+                    }
+                });
+            });
+            let target = win.target_camera(cameras);
+            if win.pick().target_key.is_some() && target.is_none() {
+                ui.colored_label(WARN_COLOR, "That body is no longer connected.");
+            }
+            let refusal = target.and_then(write_target_refusal);
+            if let Some(why) = &refusal {
+                ui.colored_label(ERROR_COLOR, why);
+            }
+
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("2. The snapshot: one of that body's own").strong());
+            let all_rows: Vec<&SnapRow> = match (listing, target) {
+                (Some(l), Some(c)) => l.rows_for(&c.model, &c.serial).collect(),
+                _ => Vec::new(),
+            };
+            let hidden = all_rows.iter().filter(|row| row.name_lossy).count();
+            let rows: Vec<&SnapRow> = all_rows.iter().copied().filter(|row| !row.name_lossy).collect();
+            if target.is_some() && rows.is_empty() {
+                ui.label(egui::RichText::new(if hidden > 0 { "No snapshot with a usable file name." } else { "This body has no stored snapshots." }).italics().weak());
+            }
+            if hidden > 0 {
+                ui.colored_label(WARN_COLOR, format!("{hidden} snapshot(s) of this body have file names that cannot be shown and are not offered."));
+            }
+            let camera_fw = target.map(|c| c.firmware.clone());
+            ui.add_enabled_ui(!busy, |ui| {
+                let pick = win.pick_mut();
+                let text = pick
+                    .source_file
+                    .as_ref()
+                    .map(|f| rows.iter().find(|row| &row.file == f).map_or_else(|| f.clone(), |row| W::snapshot_option_label(row, camera_fw.as_deref())))
+                    .unwrap_or_else(|| "choose a snapshot…".to_string());
+                egui::ComboBox::from_id_salt((W::ID, "source")).selected_text(text).width(560.0).show_ui(ui, |ui| {
+                    for row in &rows {
+                        let picked = pick.source_file.as_ref() == Some(&row.file);
+                        if ui.selectable_label(picked, W::snapshot_option_label(row, camera_fw.as_deref())).clicked() {
+                            pick.source_file = Some(row.file.clone());
+                        }
+                    }
+                });
+            });
+            ui.label(egui::RichText::new(W::SNAPSHOT_HINT).small().weak());
+
+            win.draw_form(ui, busy);
+
+            ui.add_space(6.0);
+            let planning_possible = !busy
+                && data_ready
+                && refusal.is_none()
+                && win.request(cameras).is_some()
+                && !matches!(win.stage(), Stage::Applying(_) | Stage::Planning(_));
+            ui.add_enabled_ui(planning_possible, |ui| {
+                if ui.button("Plan (reads the camera, writes nothing)").clicked() {
+                    action = Some(WindowAct::Plan);
+                }
+            });
+            if !win.notice_mut().is_empty() {
+                ui.colored_label(WARN_COLOR, win.notice_mut().as_str());
+            }
+            ui.separator();
+
+            match win.stage() {
+                Stage::Idle => {
+                    ui.label(egui::RichText::new(W::IDLE).weak());
+                }
+                Stage::Planning(_) => {
+                    ui.label("Planning… the camera is being read.");
+                }
+                Stage::Planned(p) => {
+                    W::draw_plan(ui, p, !busy, &mut action);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(!busy && <W::F as Flow>::applicable(p), |ui| {
+                            if ui.button("Restore to camera…").clicked() {
+                                action = Some(WindowAct::AskApply);
+                            }
+                        });
+                        if ui.button("Discard plan").clicked() {
+                            action = Some(WindowAct::Discard);
+                        }
+                    });
+                    W::plan_footer(ui, p);
+                }
+                Stage::Aside(a) => match *a {},
+                Stage::ConfirmApply(p) => {
+                    W::draw_plan(ui, p, false, &mut action);
+                    ui.separator();
+                    ui.colored_label(WARN_COLOR, W::confirm_text(p));
+                    ui.add_enabled_ui(!busy, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("Confirm: write to camera").clicked() {
+                                action = Some(WindowAct::ConfirmApply);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(WindowAct::CancelConfirmation);
+                            }
+                        });
+                    });
+                }
+                Stage::Applying(req) => {
+                    let t = <W::F as Flow>::request_target(req);
+                    ui.colored_label(WARN_COLOR, format!("Writing to {} {}… keep it connected and do not close this program.", t.model, t.serial));
+                }
+                Stage::Done(a) => {
+                    let t = <W::F as Flow>::request_target(&a.request);
+                    ui.label(egui::RichText::new(format!("{}  →  {} {}", W::request_source(&a.request), t.model, t.serial)).weak());
+                    let id = format!("{}_applied", W::ID);
+                    let chosen = draw_applied_outcome(ui, t, &id, &a.outcome, busy, data_dir, W::report_lines, W::report_extra);
+                    if let Some(c) = chosen {
+                        action = Some(WindowAct::Applied(c));
+                    }
+                    ui.separator();
+                    if ui.button("Close this result").clicked() {
+                        action = Some(WindowAct::Discard);
+                    }
+                }
+            }
+        });
+    });
+    win.pick_mut().open = open;
+    action
+}
+
+// ── Parity: both restore windows, the same events, the same transitions ───
+
+#[cfg(test)]
+pub(crate) mod parity {
+    use super::*;
+
+    /// How a plan arrives in a window.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) enum Delivery {
+        /// A plan that changes something and can be confirmed.
+        Applicable,
+        /// A plan that would change nothing.
+        NothingToChange,
+        /// The CLI failed to plan.
+        Failed,
+    }
+
+    /// How an apply ends.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) enum End {
+        Verified,
+        Stale,
+        Indeterminate,
+    }
+
+    /// What a window must supply for the same events to be fed to it: its own fixtures. Everything
+    /// else is the shared state machine.
+    pub(crate) trait Kit: GuardedWindow + Sized {
+        /// A window aimed at a connected body and a snapshot, synced, with the cameras it knows.
+        fn ready() -> (Self, Vec<CameraRow>);
+        fn deliver(&mut self, request: Req<Self>, how: Delivery);
+        fn outcome(end: End) -> ApplyOutcome<ReportOf<Self>>;
+        /// The same request for another snapshot.
+        fn other_source(request: Req<Self>) -> Req<Self>;
+        fn offer() -> UndoOffer;
+    }
+
+    fn shape<F: Flow>(s: &Stage<F>) -> String {
+        match s {
+            Stage::Idle => "idle".into(),
+            Stage::Planning(_) => "planning".into(),
+            Stage::Planned(p) => format!("planned(applicable={})", F::applicable(p)),
+            Stage::Aside(_) => "aside".into(),
+            Stage::ConfirmApply(_) => "confirm".into(),
+            Stage::Applying(_) => "applying".into(),
+            Stage::Done(a) => match &a.outcome {
+                ApplyOutcome::Report { report, .. } => format!("done(report {:?})", report.status()),
+                ApplyOutcome::NotApplied { why, .. } => format!("done(not_applied {why:?})"),
+                ApplyOutcome::Indeterminate { .. } => "done(indeterminate)".into(),
+            },
+        }
+    }
+
+    /// The state a person sees: the stage and whether a notice is up.
+    fn seen<K: Kit>(w: &mut K) -> String {
+        let notice = !w.notice_mut().is_empty();
+        format!("{} notice={notice}", shape(w.stage()))
+    }
+
+    /// The request a plan was asked for, as the worker would answer it.
+    fn asked<K: Kit>(w: &mut K) -> Req<K> {
+        match w.stage() {
+            Stage::Planning(r) => r.clone(),
+            other => panic!("no plan was asked for: {}", shape(other)),
+        }
+    }
+
+    fn draw<K: Kit>(w: &mut K, cameras: &[CameraRow], busy: bool) -> bool
+    where
+        <K as GuardedUi>::F: Flow<Aside = NoAside>,
+    {
+        let ctx = egui::Context::default();
+        let env = WindowEnv { cameras, listing: None, busy, data_dir: Some(Path::new("/data")) };
+        w.pick_mut().open = true;
+        let mut clicked = false;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| clicked = draw_window(ctx, w, &env).is_some());
+        clicked
+    }
+
+    /// The same sequence of events, recorded as what the person sees after each.
+    pub(crate) fn trace<K: Kit>() -> Vec<String>
+    where
+        <K as GuardedUi>::F: Flow<Aside = NoAside>,
+    {
+        let mut t: Vec<String> = Vec::new();
+        let mut note = |t: &mut Vec<String>, what: &str, w: &mut K, cameras: &[CameraRow]| {
+            // every state draws, busy or not, and drawing alone clicks nothing
+            assert!(!draw(w, cameras, false) && !draw(w, cameras, true), "{what}: drawing is not a click");
+            t.push(format!("{what}: {}", seen(w)));
+        };
+
+        // plan ok, confirm in two steps, apply ok, close
+        let (mut w, cameras) = K::ready();
+        note(&mut t, "start", &mut w, &cameras);
+        w.begin_plan(&cameras).expect("a plan");
+        note(&mut t, "plan asked", &mut w, &cameras);
+        t.push(format!("second plan refused: {}", w.begin_plan(&cameras).is_err()));
+        let request = asked(&mut w);
+        w.deliver(request.clone(), Delivery::Applicable);
+        note(&mut t, "plan arrived", &mut w, &cameras);
+        t.push(format!("confirm without asking: {}", w.confirm_apply().is_some()));
+        w.ask_apply();
+        note(&mut t, "apply asked", &mut w, &cameras);
+        w.cancel_confirmation();
+        note(&mut t, "cancelled", &mut w, &cameras);
+        w.ask_apply();
+        t.push(format!("confirmed: {}", w.confirm_apply().is_some()));
+        note(&mut t, "applying", &mut w, &cameras);
+        t.push(format!("second confirm: {}", w.confirm_apply().is_some()));
+        t.push(format!("plan during apply refused: {}", w.begin_plan(&cameras).is_err()));
+        t.push(format!("undo during apply refused: {}", w.start_undo(&K::offer(), &cameras).is_err()));
+        w.applied(K::other_source(request.clone()), K::outcome(End::Verified));
+        note(&mut t, "answer for another apply dropped", &mut w, &cameras);
+        w.applied(request.clone(), K::outcome(End::Verified));
+        note(&mut t, "applied", &mut w, &cameras);
+        w.discard();
+        note(&mut t, "closed", &mut w, &cameras);
+
+        // the other ways an apply ends
+        for end in [End::Stale, End::Indeterminate] {
+            let (mut w, cameras) = K::ready();
+            w.begin_plan(&cameras).unwrap();
+            let request = asked(&mut w);
+            w.deliver(request.clone(), Delivery::Applicable);
+            w.ask_apply();
+            w.confirm_apply().unwrap();
+            w.applied(request, K::outcome(end));
+            note(&mut t, &format!("ended {end:?}"), &mut w, &cameras);
+        }
+
+        // a plan that changes nothing is not offered; a failed plan is a notice; a stray plan is dropped
+        let (mut w, cameras) = K::ready();
+        w.begin_plan(&cameras).unwrap();
+        let request = asked(&mut w);
+        w.deliver(K::other_source(request.clone()), Delivery::Applicable);
+        note(&mut t, "plan for another request", &mut w, &cameras);
+        w.deliver(request.clone(), Delivery::NothingToChange);
+        w.ask_apply();
+        note(&mut t, "nothing to change, asked", &mut w, &cameras);
+        w.discard();
+        w.begin_plan(&cameras).unwrap();
+        w.deliver(request.clone(), Delivery::Failed);
+        note(&mut t, "plan failed", &mut w, &cameras);
+        w.deliver(request.clone(), Delivery::Applicable);
+        note(&mut t, "plan nobody asked for", &mut w, &cameras);
+
+        // a change withdraws a plan and each confirmation but not an apply on the wire
+        for stage in ["planned", "confirming", "applying"] {
+            let (mut w, cameras) = K::ready();
+            w.begin_plan(&cameras).unwrap();
+            let request = asked(&mut w);
+            w.deliver(request, Delivery::Applicable);
+            if stage != "planned" {
+                w.ask_apply();
+            }
+            if stage == "applying" {
+                w.confirm_apply().unwrap();
+            }
+            w.pick_mut().source_file = Some("another.json".into());
+            w.sync(&cameras);
+            note(&mut t, &format!("snapshot changed while {stage}"), &mut w, &cameras);
+            let (mut w, cameras) = K::ready();
+            w.begin_plan(&cameras).unwrap();
+            let request = asked(&mut w);
+            w.deliver(request, Delivery::Applicable);
+            if stage != "planned" {
+                w.ask_apply();
+            }
+            if stage == "applying" {
+                w.confirm_apply().unwrap();
+            }
+            let mut moved = cameras[0].clone();
+            moved.firmware = "9.99".into();
+            w.sync(&[moved]);
+            note(&mut t, &format!("camera changed while {stage}"), &mut w, &cameras);
+            let (mut w, cameras) = K::ready();
+            w.begin_plan(&cameras).unwrap();
+            let request = asked(&mut w);
+            w.deliver(request, Delivery::Applicable);
+            if stage != "planned" {
+                w.ask_apply();
+            }
+            if stage == "applying" {
+                w.confirm_apply().unwrap();
+            }
+            w.data_dir_changed();
+            note(&mut t, &format!("data directory changed while {stage}"), &mut w, &cameras);
+        }
+
+        // a dead worker: a plan is lost, an apply is unknown, a command that never left was not applied
+        let (mut w, cameras) = K::ready();
+        w.begin_plan(&cameras).unwrap();
+        w.worker_lost();
+        note(&mut t, "worker lost while planning", &mut w, &cameras);
+        let (mut w, cameras) = K::ready();
+        w.begin_plan(&cameras).unwrap();
+        w.not_sent();
+        note(&mut t, "plan not sent", &mut w, &cameras);
+        for lost in [true, false] {
+            let (mut w, cameras) = K::ready();
+            w.begin_plan(&cameras).unwrap();
+            let request = asked(&mut w);
+            w.deliver(request, Delivery::Applicable);
+            w.ask_apply();
+            w.confirm_apply().unwrap();
+            if lost {
+                w.worker_lost();
+            } else {
+                w.not_sent();
+            }
+            note(&mut t, if lost { "worker lost while applying" } else { "apply not sent" }, &mut w, &cameras);
+        }
+
+        // an undo plans the restore point, and is refused while a step is in flight or the body is not there
+        let (mut w, cameras) = K::ready();
+        t.push(format!("undo of nothing refused: {}", w.start_undo(&UndoOffer { undo_set: vec![], ..K::offer() }, &cameras).is_err()));
+        t.push(format!("undo of an absent body refused: {}", w.start_undo(&K::offer(), &[]).is_err()));
+        t.push(format!("undo planned: {}", w.start_undo(&K::offer(), &cameras).is_ok()));
+        note(&mut t, "undo", &mut w, &cameras);
+        t.push(format!("undo while planning refused: {}", w.start_undo(&K::offer(), &cameras).is_err()));
+        t
+    }
+
+    #[test]
+    fn both_restore_windows_make_the_same_transitions_for_the_same_events() {
+        use crate::restore::RestoreUi;
+        use crate::restore_ext::ExtRestoreUi;
+        let plain = trace::<RestoreUi>();
+        let ext = trace::<ExtRestoreUi>();
+        assert!(plain.len() > 35, "the sequence ran: {}", plain.len());
+        for (i, (a, b)) in plain.iter().zip(&ext).enumerate() {
+            assert_eq!(a, b, "event {i}: the settings restore and the owner-data restore disagree");
+        }
+        assert_eq!(plain.len(), ext.len());
+        // Equal traces would pass if both were empty or both stuck: pin what the sequence ends in at its landmarks.
+        for (at, expect) in [
+            (3, "plan arrived: planned(applicable=true) notice=false"),
+            (13, "applied: done(report AppliedVerified) notice=false"),
+            (15, "ended Stale: done(not_applied PlanStale) notice=false"),
+            (16, "ended Indeterminate: done(indeterminate) notice=false"),
+            (18, "nothing to change, asked: planned(applicable=false) notice=false"),
+            (21, "snapshot changed while planned: idle notice=true"),
+            (27, "snapshot changed while applying: applying notice=false"),
+            (32, "worker lost while applying: done(indeterminate) notice=false"),
+            (33, "apply not sent: done(not_applied Refused) notice=false"),
+        ] {
+            assert_eq!(plain[at], expect, "landmark {at}");
+        }
     }
 }

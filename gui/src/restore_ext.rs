@@ -209,7 +209,7 @@ impl PlannedExt {
     pub(crate) fn blocked_reason(&self) -> Option<String> {
         let writes = self.writes().len();
         if let Some((claimed, items)) = self.plan.count_disagreement() {
-            return Some(format!("The plan's own count of changes ({claimed}) disagrees with its items ({items}), so it cannot be trusted."));
+            return Some(format!("The plan's {}, so it cannot be trusted.", guarded::count_disagreement_clause(claimed, items, "items")));
         }
         if writes == 0 {
             return Some("This plan would change nothing, so there is nothing to restore.".to_string());
@@ -319,7 +319,7 @@ pub(crate) fn check_ext_plan_is_for(plan: &ExtPlanJson, request: &ExtRestoreRequ
         }
     }
     if let Some((claimed, items)) = plan.count_disagreement() {
-        return Err(format!("the plan's own count of changes ({claimed}) disagrees with its items ({items}); nothing was written"));
+        return Err(format!("the plan's {}; nothing was written", guarded::count_disagreement_clause(claimed, items, "items")));
     }
     Ok(())
 }
@@ -431,10 +431,8 @@ pub(crate) fn ext_report_lines(r: &ExtApplyJson) -> Vec<(Level, String)> {
 /// The extended restore window's state.
 #[derive(Debug)]
 pub(crate) struct ExtRestoreUi {
-    pub open: bool,
-    /// The chosen target, by identity; the live row is found among the discovered cameras.
-    pub target_key: Option<(String, String)>,
-    pub source_file: Option<String>,
+    /// The window, the body and the snapshot it is aimed at.
+    pub pick: Pick,
     /// The categories ticked. All of them is a restore of everything (no `--only`); none cannot be planned.
     pub categories: BTreeSet<Category>,
     pub(crate) stage: Stage<ExtFlow>,
@@ -445,9 +443,7 @@ pub(crate) struct ExtRestoreUi {
 impl Default for ExtRestoreUi {
     fn default() -> Self {
         ExtRestoreUi {
-            open: false,
-            target_key: None,
-            source_file: None,
+            pick: Pick::default(),
             categories: Category::ALL.into_iter().collect(),
             stage: Stage::Idle,
             notice: String::new(),
@@ -473,7 +469,7 @@ impl GuardedUi for ExtRestoreUi {
             return None;
         }
         Some(ExtRestoreRequest {
-            source_file: self.source_file.clone()?,
+            source_file: self.pick.source_file.clone()?,
             target: self.target_camera(cameras)?.clone(),
             only: (self.categories.len() != Category::ALL.len()).then(|| self.categories.clone()),
         })
@@ -487,11 +483,6 @@ impl GuardedUi for ExtRestoreUi {
 }
 
 impl ExtRestoreUi {
-    pub fn target_camera<'a>(&self, cameras: &'a [CameraRow]) -> Option<&'a CameraRow> {
-        let (model, serial) = self.target_key.as_ref()?;
-        cameras.iter().find(|c| &c.model == model && &c.serial == serial)
-    }
-
     /// A plan came back. Dropped unless it is the one asked for and still wanted.
     pub fn plan_arrived(&mut self, request: ExtRestoreRequest, result: Result<(ExtPlanJson, String), String>) {
         self.plan_arrived_with(request, result, |_, request, (plan, cli_log)| PlannedExt { request, plan, cli_log });
@@ -503,46 +494,12 @@ impl ExtRestoreUi {
             self.categories.insert(category);
         }
     }
-
-    /// Set the form to undo `offer` (a restore point and the categories the apply wrote) and plan it.
-    /// The plan is read-only; the person reviews it and confirms it like any restore. The body must be
-    /// connected, and no step may be in flight.
-    pub fn start_undo(&mut self, offer: &UndoOffer, cameras: &[CameraRow]) -> Result<Cmd, String> {
-        if matches!(self.stage, Stage::Applying(_) | Stage::Planning(_)) {
-            return Err("Another restore step is still running.".to_string());
-        }
-        let Some(camera) = cameras.iter().find(|c| c.model == offer.target.model && c.serial == offer.target.serial) else {
-            return Err(format!("{} {} is not connected: connect it and Discover, then undo.", offer.target.model, offer.target.serial));
-        };
-        if offer.undo_set.is_empty() {
-            return Err("There is nothing to undo.".to_string());
-        }
-        let categories: BTreeSet<Category> = offer
-            .undo_set
-            .iter()
-            .map(|t| Category::parse(t).map_err(|e| format!("The undo names something this program does not know: {e}")))
-            .collect::<Result<_, _>>()?;
-        self.open = true;
-        self.target_key = Some((camera.model.clone(), camera.serial.clone()));
-        self.source_file = Some(offer.restore_point.clone());
-        self.categories = categories;
-        self.stage = Stage::Idle;
-        self.begin_plan(cameras)
-    }
 }
 
 // ── The window ────────────────────────────────────────────────────────────
 
-/// What a click in the window asks for. Collected while drawing and applied after.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ExtAction {
-    Plan,
-    AskApply,
-    ConfirmApply,
-    CancelConfirmation,
-    Discard,
-    Applied(AppliedAction),
-}
+/// What a click in the window asks for. It has no buttons beyond the ones every guarded write has.
+pub(crate) type ExtAction = WindowAct<NoOwn>;
 
 fn draw_ext_plan(ui: &mut egui::Ui, p: &PlannedExt) {
     let plan = &p.plan;
@@ -588,210 +545,93 @@ fn draw_ext_plan(ui: &mut egui::Ui, p: &PlannedExt) {
     }
 }
 
+impl GuardedWindow for ExtRestoreUi {
+    type Own = NoOwn;
+
+    const TITLE: &'static str = "Restore owner data from a stored snapshot";
+    const ID: &'static str = "rx";
+    const IDLE: &'static str =
+        "Choose a body, a snapshot and what to restore, then plan. Nothing is sent to the camera until you have read the plan and confirmed it.";
+    const SNAPSHOT_HINT: &'static str = "A snapshot taken without its extended section (an older one, or captured with --no-extended) is refused when planned.";
+
+    fn pick(&self) -> &Pick {
+        &self.pick
+    }
+    fn pick_mut(&mut self) -> &mut Pick {
+        &mut self.pick
+    }
+    fn intro(ui: &mut egui::Ui) {
+        ui.label("Artist, Copyright, Image comment, IPTC presets, switches and FTP profiles. The settings restore does not touch these.");
+        ui.add_space(4.0);
+    }
+    fn snapshot_option_label(row: &SnapRow, _camera_firmware: Option<&str>) -> String {
+        snapshot_label(row)
+    }
+    fn draw_form(&mut self, ui: &mut egui::Ui, busy: bool) {
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("3. What to restore").strong());
+        ui.add_enabled_ui(!busy, |ui| {
+            for category in Category::ALL {
+                let (name, what) = category_words(category);
+                let mut ticked = self.categories.contains(&category);
+                if ui.checkbox(&mut ticked, format!("{name}: {what}")).changed() {
+                    self.toggle(category);
+                }
+            }
+        });
+        if self.categories.is_empty() {
+            ui.colored_label(WARN_COLOR, "Tick at least one category.");
+        }
+    }
+    fn draw_plan(ui: &mut egui::Ui, plan: &PlannedExt, _can_edit: bool, _action: &mut Option<ExtAction>) {
+        draw_ext_plan(ui, plan);
+    }
+    fn confirm_text(plan: &PlannedExt) -> String {
+        ext_confirm_text(plan)
+    }
+    fn request_source(request: &ExtRestoreRequest) -> &str {
+        &request.source_file
+    }
+    fn report_lines(report: &ExtApplyJson) -> Vec<(Level, String)> {
+        ext_report_lines(report)
+    }
+    fn report_extra(ui: &mut egui::Ui, report: &ExtApplyJson) {
+        if !report.results.is_empty() {
+            egui::CollapsingHeader::new(format!("Items written or tried ({})", report.results.len())).id_salt("rx_results").show(ui, |ui| {
+                for x in &report.results {
+                    ui.label(format!("{}  ({})", nikon_fleet::ops::render::printable(&x.label), category_words(x.category).0));
+                }
+            });
+        }
+    }
+    fn act_own(&mut self, own: NoOwn, _cameras: &[CameraRow]) -> Result<Option<Cmd>, String> {
+        match own {}
+    }
+    /// The categories the apply wrote, and nothing else. All of them is no restriction.
+    fn adopt_undo(&mut self, offer: &UndoOffer, _camera: &CameraRow) -> Result<(), String> {
+        self.categories = offer
+            .undo_set
+            .iter()
+            .map(|t| Category::parse(t).map_err(|e| format!("The undo names something this program does not know: {e}")))
+            .collect::<Result<_, _>>()?;
+        Ok(())
+    }
+}
+
 impl FleetApp {
     pub(crate) fn ui_restore_ext(&mut self, ctx: &egui::Context) {
-        if !self.restore_ext.open {
-            return;
-        }
-        let mut open = true;
-        let mut action: Option<ExtAction> = None;
         let busy = self.busy();
-        let data_ready = self.settings.data_dir.is_some();
-        let data_dir = self.settings.data_dir.clone();
-        let data_dir = data_dir.as_deref();
-
-        egui::Window::new("Restore owner data from a stored snapshot")
-            .open(&mut open)
-            .default_size([700.0, 620.0])
-            .resizable(true)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                let r = &mut self.restore_ext;
-                let cameras = &self.cameras;
-                let listing = self.listing.as_ref();
-                egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(720.0).show(ui, |ui| {
-                    ui.label("Artist, Copyright, Image comment, IPTC presets, switches and FTP profiles. The settings restore does not touch these.");
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("1. The camera: a connected body").strong());
-                    if cameras.is_empty() {
-                        ui.label(egui::RichText::new("No camera is connected: use Discover first.").italics().weak());
-                    }
-                    ui.add_enabled_ui(!busy, |ui| {
-                        let text = r.target_camera(cameras).map_or("choose a body…".to_string(), camera_label);
-                        egui::ComboBox::from_id_salt("rx_target").selected_text(text).width(420.0).show_ui(ui, |ui| {
-                            for c in cameras {
-                                let picked = r.target_key.as_ref() == Some(&(c.model.clone(), c.serial.clone()));
-                                if ui.selectable_label(picked, camera_label(c)).clicked() && !picked {
-                                    r.target_key = Some((c.model.clone(), c.serial.clone()));
-                                    r.source_file = None;
-                                }
-                            }
-                        });
-                    });
-                    if r.target_key.is_some() && r.target_camera(cameras).is_none() {
-                        ui.colored_label(WARN_COLOR, "That body is no longer connected.");
-                    }
-                    let refusal = r.target_camera(cameras).and_then(write_target_refusal);
-                    if let Some(why) = &refusal {
-                        ui.colored_label(ERROR_COLOR, why);
-                    }
-
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("2. The snapshot: one of that body's own").strong());
-                    let all_rows: Vec<&SnapRow> = match (listing, r.target_camera(cameras)) {
-                        (Some(l), Some(c)) => l.rows_for(&c.model, &c.serial).collect(),
-                        _ => Vec::new(),
-                    };
-                    let hidden = all_rows.iter().filter(|row| row.name_lossy).count();
-                    let rows: Vec<&SnapRow> = all_rows.iter().copied().filter(|row| !row.name_lossy).collect();
-                    if r.target_camera(cameras).is_some() && rows.is_empty() {
-                        ui.label(egui::RichText::new(if hidden > 0 { "No snapshot with a usable file name." } else { "This body has no stored snapshots." }).italics().weak());
-                    }
-                    if hidden > 0 {
-                        ui.colored_label(WARN_COLOR, format!("{hidden} snapshot(s) of this body have file names that cannot be shown and are not offered."));
-                    }
-                    ui.add_enabled_ui(!busy, |ui| {
-                        let text = r
-                            .source_file
-                            .as_ref()
-                            .map(|f| rows.iter().find(|row| &row.file == f).map_or_else(|| f.clone(), |row| snapshot_label(row)))
-                            .unwrap_or_else(|| "choose a snapshot…".to_string());
-                        egui::ComboBox::from_id_salt("rx_source").selected_text(text).width(560.0).show_ui(ui, |ui| {
-                            for row in &rows {
-                                let picked = r.source_file.as_ref() == Some(&row.file);
-                                if ui.selectable_label(picked, snapshot_label(row)).clicked() {
-                                    r.source_file = Some(row.file.clone());
-                                }
-                            }
-                        });
-                    });
-                    ui.label(
-                        egui::RichText::new("A snapshot taken without its extended section (an older one, or captured with --no-extended) is refused when planned.")
-                            .small()
-                            .weak(),
-                    );
-
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("3. What to restore").strong());
-                    ui.add_enabled_ui(!busy, |ui| {
-                        for category in Category::ALL {
-                            let (name, what) = category_words(category);
-                            let mut ticked = r.categories.contains(&category);
-                            if ui.checkbox(&mut ticked, format!("{name}: {what}")).changed() {
-                                r.toggle(category);
-                            }
-                        }
-                    });
-                    if r.categories.is_empty() {
-                        ui.colored_label(WARN_COLOR, "Tick at least one category.");
-                    }
-
-                    ui.add_space(6.0);
-                    let planning_possible = !busy
-                        && data_ready
-                        && refusal.is_none()
-                        && r.request(cameras).is_some()
-                        && !matches!(r.stage(), Stage::Applying(_) | Stage::Planning(_));
-                    ui.add_enabled_ui(planning_possible, |ui| {
-                        if ui.button("Plan (reads the camera, writes nothing)").clicked() {
-                            action = Some(ExtAction::Plan);
-                        }
-                    });
-                    if !r.notice.is_empty() {
-                        ui.colored_label(WARN_COLOR, &r.notice);
-                    }
-                    ui.separator();
-
-                    match r.stage() {
-                        Stage::Idle => {
-                            ui.label(
-                                egui::RichText::new("Choose a body, a snapshot and what to restore, then plan. Nothing is sent to the camera until you have read the plan and confirmed it.")
-                                    .weak(),
-                            );
-                        }
-                        Stage::Planning(_) => {
-                            ui.label("Planning… the camera is being read.");
-                        }
-                        Stage::Planned(p) => {
-                            draw_ext_plan(ui, p);
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.add_enabled_ui(!busy && p.applicable(), |ui| {
-                                    if ui.button("Restore to camera…").clicked() {
-                                        action = Some(ExtAction::AskApply);
-                                    }
-                                });
-                                if ui.button("Discard plan").clicked() {
-                                    action = Some(ExtAction::Discard);
-                                }
-                            });
-                        }
-                        Stage::Aside(a) => match *a {},
-                        Stage::ConfirmApply(p) => {
-                            draw_ext_plan(ui, p);
-                            ui.separator();
-                            ui.colored_label(WARN_COLOR, ext_confirm_text(p));
-                            ui.add_enabled_ui(!busy, |ui| {
-                                ui.horizontal(|ui| {
-                                    if ui.button("Confirm: write to camera").clicked() {
-                                        action = Some(ExtAction::ConfirmApply);
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        action = Some(ExtAction::CancelConfirmation);
-                                    }
-                                });
-                            });
-                        }
-                        Stage::Applying(req) => {
-                            ui.colored_label(
-                                WARN_COLOR,
-                                format!("Writing to {} {}… keep it connected and do not close this program.", req.target.model, req.target.serial),
-                            );
-                        }
-                        Stage::Done(a) => {
-                            let t = &a.request.target;
-                            ui.label(egui::RichText::new(format!("{}  →  {} {}", a.request.source_file, t.model, t.serial)).weak());
-                            let chosen = draw_applied_outcome(ui, t, "rx_applied", &a.outcome, busy, data_dir, ext_report_lines, |ui, report| {
-                                if !report.results.is_empty() {
-                                    egui::CollapsingHeader::new(format!("Items written or tried ({})", report.results.len())).id_salt("rx_results").show(ui, |ui| {
-                                        for x in &report.results {
-                                            ui.label(format!("{}  ({})", nikon_fleet::ops::render::printable(&x.label), category_words(x.category).0));
-                                        }
-                                    });
-                                }
-                            });
-                            if let Some(c) = chosen {
-                                action = Some(ExtAction::Applied(c));
-                            }
-                            ui.separator();
-                            if ui.button("Close this result").clicked() {
-                                action = Some(ExtAction::Discard);
-                            }
-                        }
-                    }
-                });
-            });
-        self.restore_ext.open = open;
-        if let Some(a) = action {
-            self.ext_act(ctx, a);
+        let env = WindowEnv { cameras: &self.cameras, listing: self.listing.as_ref(), busy, data_dir: self.settings.data_dir.as_deref() };
+        if let Some(click) = guarded::draw_window(ctx, &mut self.restore_ext, &env) {
+            self.ext_act(ctx, click);
         }
     }
 
-    fn ext_act(&mut self, ctx: &egui::Context, action: ExtAction) {
-        match action {
-            ExtAction::Plan => match self.restore_ext.begin_plan(&self.cameras) {
-                Ok(cmd) => self.send_restore_ext(cmd),
-                Err(e) => self.restore_ext.notice = e,
-            },
-            ExtAction::AskApply => self.restore_ext.ask_apply(),
-            ExtAction::ConfirmApply => {
-                if let Some(cmd) = self.restore_ext.confirm_apply() {
-                    self.send_restore_ext(cmd);
-                }
-            }
-            ExtAction::CancelConfirmation => self.restore_ext.cancel_confirmation(),
-            ExtAction::Discard => self.restore_ext.discard(),
-            ExtAction::Applied(a) => self.applied_action(ctx, a),
+    fn ext_act(&mut self, ctx: &egui::Context, click: ExtAction) {
+        match guarded::act(&mut self.restore_ext, &self.cameras, click) {
+            Effect::Nothing => {}
+            Effect::Send(cmd) => self.send_restore_ext(cmd),
+            Effect::Applied(a) => self.applied_action(ctx, a),
         }
     }
 
@@ -806,26 +646,11 @@ impl FleetApp {
     /// Undo an extended restore: this window opens on its restore point with the categories the apply
     /// wrote, and the plan is made (read-only). The person reviews it and confirms it as any restore.
     pub(crate) fn start_undo_ext(&mut self, offer: UndoOffer) {
-        if self.busy() {
-            self.status = Status::new(Level::Warn, "Another camera operation is running; try the undo when it has finished.");
+        if self.undo_refused_while_busy() {
             return;
         }
-        // The restore point is a file in the data directory the apply used.
-        if self.settings.data_dir.as_deref() != Some(offer.data_dir.as_path()) {
-            self.restore_ext.open = true;
-            self.restore_ext.notice = format!(
-                "The data directory changed since this apply: its restore point {} is in {}. Switch back to undo it.",
-                offer.restore_point,
-                offer.data_dir.display()
-            );
-            return;
-        }
-        match self.restore_ext.start_undo(&offer, &self.cameras) {
-            Ok(cmd) => self.send_restore_ext(cmd),
-            Err(e) => {
-                self.restore_ext.open = true;
-                self.restore_ext.notice = e;
-            }
+        if let Some(cmd) = guarded::start_undo_in(&mut self.restore_ext, &offer, &self.cameras, self.settings.data_dir.as_deref()) {
+            self.send_restore_ext(cmd);
         }
     }
 }
@@ -888,7 +713,7 @@ mod tests {
     }
 
     fn ready() -> (ExtRestoreUi, Vec<CameraRow>) {
-        let ui = ExtRestoreUi { open: true, target_key: Some(("Z 9".into(), "T1".into())), source_file: Some(FILE.into()), ..ExtRestoreUi::default() };
+        let ui = ExtRestoreUi { pick: Pick { open: true, target_key: Some(("Z 9".into(), "T1".into())), source_file: Some(FILE.into()) }, ..ExtRestoreUi::default() };
         (ui, vec![target()])
     }
 
@@ -1214,9 +1039,9 @@ mod tests {
     fn nothing_is_asked_of_the_camera_until_a_body_a_snapshot_and_a_category_are_chosen() {
         let mut ui = ExtRestoreUi::default();
         assert!(ui.begin_plan(&[target()]).is_err());
-        ui.source_file = Some(FILE.into());
+        ui.pick.source_file = Some(FILE.into());
         assert!(ui.begin_plan(&[target()]).is_err(), "no body yet");
-        ui.target_key = Some(("Z 9".into(), "T1".into()));
+        ui.pick.target_key = Some(("Z 9".into(), "T1".into()));
         assert!(ui.begin_plan(&[]).is_err(), "the chosen body is not connected");
         assert!(ui.begin_plan(&[row("Z 9", "T1", 2)]).is_err(), "a body that shares its model cannot be aimed at");
         ui.categories.clear();
@@ -1289,7 +1114,7 @@ mod tests {
             if confirming {
                 ui.ask_apply();
             }
-            ui.source_file = Some("another.json".into());
+            ui.pick.source_file = Some("another.json".into());
             ui.sync(&cameras);
             assert_eq!(*ui.stage(), Stage::Idle);
             // the camera (firmware changed after a replug)
@@ -1370,7 +1195,7 @@ mod tests {
         let mut ui = ExtRestoreUi::default();
         let cameras = vec![target()];
         let Ok(Cmd::Plan(PlanJob::RestoreExt(asked))) = ui.start_undo(&offer(&["strings", "ftp"]), &cameras) else { panic!("a plan") };
-        assert!(ui.open);
+        assert!(ui.pick.open);
         assert_eq!(asked.source_file, "Z_9_T1_restore-ext_20261106T020000Z.json");
         assert_eq!(asked.only, Some([Category::Strings, Category::Ftp].into_iter().collect()));
         assert!(matches!(ui.stage(), Stage::Planning(_)), "a plan, not an apply");
@@ -1387,9 +1212,73 @@ mod tests {
         assert!(ui.start_undo(&offer(&[]), &cameras).unwrap_err().contains("nothing to undo"), "an empty set is not 'everything'");
         assert!(ui.start_undo(&offer(&["strings"]), &[]).unwrap_err().contains("not connected"));
         assert!(ui.start_undo(&offer(&["strings", "wifi"]), &cameras).unwrap_err().contains("does not know"));
-        assert!(!ui.open && ui.source_file.is_none(), "a refused undo changed nothing");
+        assert!(!ui.pick.open && ui.pick.source_file.is_none(), "a refused undo changed nothing");
         let mut busy = ExtRestoreUi { stage: Stage::Planning(request(None)), ..ExtRestoreUi::default() };
         assert!(busy.start_undo(&offer(&["strings"]), &cameras).unwrap_err().contains("still running"));
+    }
+
+    #[test]
+    fn the_app_plans_confirms_and_applies_the_extended_restore_through_the_worker() {
+        let (mut app, cmd_rx, evt_tx, _dir) = test_app();
+        let ctx = egui::Context::default();
+        app.restore_ext.pick.target_key = Some(("Z 9".into(), "T1".into()));
+        app.restore_ext.pick.source_file = Some(FILE.into());
+        app.restore_ext.sync(&app.cameras);
+        app.ext_act(&ctx, ExtAction::Plan);
+        let Ok(Cmd::Plan(PlanJob::RestoreExt(asked))) = cmd_rx.try_recv() else { panic!("a plan") };
+        assert!(app.busy());
+        let plan = plan_json(mixed_items());
+        evt_tx.send(Evt::Planned(PlannedEvt::RestoreExt { request: asked.clone(), result: Ok((plan.clone(), String::new())) })).unwrap();
+        app.poll();
+        // applying without having been asked the question sends nothing
+        app.ext_act(&ctx, ExtAction::ConfirmApply);
+        assert!(cmd_rx.try_recv().is_err());
+        app.ext_act(&ctx, ExtAction::AskApply);
+        assert!(cmd_rx.try_recv().is_err(), "asking is not applying");
+        app.ext_act(&ctx, ExtAction::ConfirmApply);
+        let Ok(Cmd::Apply(ApplyJob::RestoreExt { request: sent, digest, summary })) = cmd_rx.try_recv() else { panic!("an apply") };
+        assert_eq!((sent.clone(), digest, summary), (asked, plan.digest, plan.summary));
+        // while it is pending nothing else starts
+        app.ext_act(&ctx, ExtAction::Plan);
+        assert!(cmd_rx.try_recv().is_err());
+        let outcome = ApplyOutcome::Report { report: Box::new(report(|_| {})), note: None, cli_log: String::new() };
+        evt_tx.send(Evt::Applied(AppliedEvt::RestoreExt { request: sent, outcome })).unwrap();
+        app.poll();
+        assert!(matches!(app.restore_ext.stage(), Stage::Done(_)));
+        // closing the result
+        app.ext_act(&ctx, ExtAction::Discard);
+        assert_eq!(*app.restore_ext.stage(), Stage::Idle);
+    }
+
+    #[test]
+    fn the_extended_undo_button_waits_while_busy_refuses_another_data_directory_and_plans_through_the_worker() {
+        let (mut app, cmd_rx, _evt_tx, dir) = test_app();
+        let mut o = UndoOffer { data_dir: dir.path().to_path_buf(), ..offer(&["strings", "ftp"]) };
+        app.pending = 1;
+        app.start_undo_ext(o.clone());
+        assert!(cmd_rx.try_recv().is_err(), "a camera operation is running");
+        assert_eq!(app.status.level, Level::Warn);
+        assert!(!app.restore_ext.pick.open, "a refused undo opens nothing");
+        app.pending = 0;
+        app.start_undo_ext(o.clone());
+        let Ok(Cmd::Plan(PlanJob::RestoreExt(asked))) = cmd_rx.try_recv() else { panic!("a plan") };
+        assert_eq!(asked.only, Some([Category::Strings, Category::Ftp].into_iter().collect()));
+        assert!(app.restore_ext.pick.open && matches!(app.restore_ext.stage(), Stage::Planning(_)));
+        assert!(cmd_rx.try_recv().is_err(), "a plan, not an apply: the person still confirms");
+
+        let (mut app, cmd_rx, _evt_tx, _dir) = test_app();
+        o.data_dir = PathBuf::from("/elsewhere");
+        app.start_undo_ext(o.clone());
+        assert!(cmd_rx.try_recv().is_err(), "nothing is planned against a directory the restore point is not in");
+        let n = &app.restore_ext.notice;
+        assert!(app.restore_ext.pick.open && n.contains("data directory changed") && n.contains("/elsewhere"), "{n}");
+
+        // the worker is gone: the plan was never asked for, and the window does not wait for it
+        let (mut app, cmd_rx, _evt_tx, dir) = test_app();
+        drop(cmd_rx);
+        app.start_undo_ext(UndoOffer { data_dir: dir.path().to_path_buf(), ..offer(&["strings"]) });
+        assert_eq!(*app.restore_ext.stage(), Stage::Idle);
+        assert!(app.restore_ext.notice.contains("Nothing was written"), "{}", app.restore_ext.notice);
     }
 
     #[test]
@@ -1495,10 +1384,10 @@ mod tests {
         let draw = |app: &mut FleetApp| {
             let _ = ctx.run(egui::RawInput::default(), |ctx| app.ui_restore_ext(ctx));
         };
-        app.restore_ext.open = true;
+        app.restore_ext.pick.open = true;
         draw(&mut app); // nothing chosen
-        app.restore_ext.target_key = Some(("Z 9".into(), "T1".into()));
-        app.restore_ext.source_file = Some(FILE.into());
+        app.restore_ext.pick.target_key = Some(("Z 9".into(), "T1".into()));
+        app.restore_ext.pick.source_file = Some(FILE.into());
         app.restore_ext.sync(&app.cameras);
         draw(&mut app);
         app.restore_ext.categories.clear();
@@ -1531,5 +1420,36 @@ mod tests {
         draw(&mut app);
         app.restore_ext.notice = "a notice".into();
         draw(&mut app);
+    }
+
+    impl crate::guarded::parity::Kit for ExtRestoreUi {
+        fn ready() -> (ExtRestoreUi, Vec<CameraRow>) {
+            let (mut ui, cameras) = ready();
+            ui.sync(&cameras);
+            (ui, cameras)
+        }
+        fn deliver(&mut self, request: ExtRestoreRequest, how: crate::guarded::parity::Delivery) {
+            use crate::guarded::parity::Delivery;
+            let result = match how {
+                Delivery::Applicable => Ok((plan_json(mixed_items()), String::new())),
+                Delivery::NothingToChange => Ok((plan_json(vec![item("a", Category::Strings, ItemAction::Unchanged)]), String::new())),
+                Delivery::Failed => Err("Planning failed: camera busy".to_string()),
+            };
+            self.plan_arrived(request, result);
+        }
+        fn outcome(end: crate::guarded::parity::End) -> ApplyOutcome<ExtApplyJson> {
+            use crate::guarded::parity::End;
+            match end {
+                End::Verified => ApplyOutcome::Report { report: Box::new(report(|_| {})), note: None, cli_log: String::new() },
+                End::Stale => ApplyOutcome::NotApplied { why: NotAppliedWhy::PlanStale, message: "stale".into(), cli_log: String::new() },
+                End::Indeterminate => ApplyOutcome::Indeterminate { message: "unknown".into(), cli_log: String::new() },
+            }
+        }
+        fn other_source(request: ExtRestoreRequest) -> ExtRestoreRequest {
+            ExtRestoreRequest { source_file: "another.json".into(), ..request }
+        }
+        fn offer() -> UndoOffer {
+            offer(&["strings"])
+        }
     }
 }

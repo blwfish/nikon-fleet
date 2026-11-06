@@ -233,6 +233,16 @@ pub(crate) struct RestorePlanJson {
     pub(crate) cannot_read: Vec<NotTransferableJson>,
 }
 
+impl RestorePlanJson {
+    /// The invariant "the plan's own count of changes is the number of its steps that would change the
+    /// body", in one place: `None` when it holds, else `(claimed, steps)`. The gate that offers a plan
+    /// for confirmation and the check on a plan just returned both read this.
+    pub(crate) fn count_disagreement(&self) -> Option<(usize, usize)> {
+        let changing = self.steps.iter().filter(|s| s.may_change()).count();
+        (self.would_change != changing).then_some((self.would_change, changing))
+    }
+}
+
 /// The read-back's verdict: the library's own closed vocabulary, or a text this build does not know.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
@@ -382,11 +392,8 @@ impl PlannedRestore {
     /// state machine and the words beside the button all read it.
     pub(crate) fn blocked_reason(&self) -> Option<String> {
         let changing = self.changing().len();
-        if self.plan.would_change != changing {
-            return Some(format!(
-                "The plan's own count of changes ({}) disagrees with its steps ({changing}), so it cannot be trusted.",
-                self.plan.would_change
-            ));
+        if let Some((claimed, steps)) = self.plan.count_disagreement() {
+            return Some(format!("The plan's {}, so it cannot be trusted.", guarded::count_disagreement_clause(claimed, steps, "steps")));
         }
         if changing == 0 {
             return Some("This plan would change nothing, so there is nothing to restore.".to_string());
@@ -536,12 +543,8 @@ pub(crate) fn check_restore_plan_is_for(plan: &RestorePlanJson, request: &Restor
     if planned != asked {
         return Err("the plan does not carry the selection that was asked for; nothing was written".to_string());
     }
-    let changing = plan.steps.iter().filter(|s| s.may_change()).count();
-    if plan.would_change != changing {
-        return Err(format!(
-            "the plan's own count of changes ({}) disagrees with its steps ({changing}); nothing was written",
-            plan.would_change
-        ));
+    if let Some((claimed, steps)) = plan.count_disagreement() {
+        return Err(format!("the plan's {}; nothing was written", guarded::count_disagreement_clause(claimed, steps, "steps")));
     }
     Ok(())
 }
@@ -774,10 +777,8 @@ pub(crate) fn undo_offer<R: AppliedReport>(target: &CameraRow, data_dir: Option<
 /// The restore window's state.
 #[derive(Debug, Default)]
 pub(crate) struct RestoreUi {
-    pub open: bool,
-    /// The chosen target, by identity; the live row is found among the discovered cameras.
-    pub target_key: Option<(String, String)>,
-    pub source_file: Option<String>,
+    /// The window, the body and the snapshot it is aimed at.
+    pub pick: Pick,
     /// Full property names the restore is limited to (an undo, or a narrowed restore).
     pub(crate) only: Option<BTreeSet<String>>,
     /// The source file and the whole target row (firmware and pairing included) `only` was given
@@ -805,7 +806,7 @@ impl GuardedUi for RestoreUi {
 
     fn request(&self, cameras: &[CameraRow]) -> Option<RestoreRequest> {
         Some(RestoreRequest {
-            source_file: self.source_file.clone()?,
+            source_file: self.pick.source_file.clone()?,
             target: self.target_camera(cameras)?.clone(),
             only: self.only.clone(),
         })
@@ -816,16 +817,16 @@ impl GuardedUi for RestoreUi {
     /// update) the form is withdrawn and says so: dropping only the restriction would make the next
     /// plan a restore of every property.
     fn sync_selection(&mut self, cameras: &[CameraRow]) {
-        let pair = self.source_file.clone().zip(self.target_camera(cameras).cloned());
+        let pair = self.pick.source_file.clone().zip(self.target_camera(cameras).cloned());
         if self.only_for == pair {
             return;
         }
         let was_for = std::mem::replace(&mut self.only_for, pair);
         let Some(only) = self.only.take() else { return };
         self.undo_of = None;
-        let snapshot_unchanged = was_for.as_ref().map(|(f, _)| f) == self.source_file.as_ref();
+        let snapshot_unchanged = was_for.as_ref().map(|(f, _)| f) == self.pick.source_file.as_ref();
         if snapshot_unchanged {
-            self.source_file = None;
+            self.pick.source_file = None;
             self.notice = format!(
                 "The restriction to {} propert(ies) was dropped because the camera changed. The snapshot was cleared too, so the next plan does not restore everything by accident: choose it again.",
                 only.len()
@@ -840,11 +841,6 @@ impl GuardedUi for RestoreUi {
 }
 
 impl RestoreUi {
-    pub fn target_camera<'a>(&self, cameras: &'a [CameraRow]) -> Option<&'a CameraRow> {
-        let (model, serial) = self.target_key.as_ref()?;
-        cameras.iter().find(|c| &c.model == model && &c.serial == serial)
-    }
-
     #[cfg(test)]
     pub fn only(&self) -> Option<&BTreeSet<String>> {
         self.only.as_ref()
@@ -897,53 +893,28 @@ impl RestoreUi {
         self.begin_plan(cameras)
     }
 
-    /// Set the form to undo `offer` and plan it. The plan is read-only; the person reviews it and
-    /// confirms it like any restore. The body must be connected, and no step may be in flight.
-    pub fn start_undo(&mut self, offer: &UndoOffer, cameras: &[CameraRow]) -> Result<Cmd, String> {
-        if matches!(self.stage, Stage::Applying(_) | Stage::Planning(_)) {
-            return Err("Another restore step is still running.".to_string());
-        }
-        let Some(camera) = cameras.iter().find(|c| c.model == offer.target.model && c.serial == offer.target.serial) else {
-            return Err(format!("{} {} is not connected: connect it and Discover, then undo.", offer.target.model, offer.target.serial));
-        };
-        if offer.undo_set.is_empty() {
-            return Err("There is nothing to undo.".to_string());
-        }
-        self.open = true;
-        self.target_key = Some((camera.model.clone(), camera.serial.clone()));
-        self.source_file = Some(offer.restore_point.clone());
-        self.only = Some(offer.undo_set.iter().cloned().collect());
-        self.only_for = Some((offer.restore_point.clone(), camera.clone()));
-        self.undo_of = Some(offer.restore_point.clone());
-        self.stage = Stage::Idle;
-        self.begin_plan(cameras)
-    }
-
     /// Open the window on `file` of `body`, a snapshot of a connected body: a restore of everything
     /// in it, whatever an earlier undo had limited.
     pub fn start_from(&mut self, body: (String, String), file: String) {
-        self.open = true;
-        self.target_key = Some(body);
-        self.source_file = Some(file);
+        self.pick.open = true;
+        self.pick.target_key = Some(body);
+        self.pick.source_file = Some(file);
         self.clear_selection();
     }
 }
 
 // ── The restore window ────────────────────────────────────────────────────
 
-/// What a click in the restore window asks for. Collected while drawing and applied after.
+/// The restore window's own buttons, beside the ones every guarded write has.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RestoreAction {
-    Plan,
+pub(crate) enum RestoreOwn {
     Toggle(String),
     PlanSelection,
     PlanEverything,
-    AskApply,
-    ConfirmApply,
-    CancelConfirmation,
-    Discard,
-    Applied(AppliedAction),
 }
+
+/// What a click in the restore window asks for. Collected while drawing and applied after.
+pub(crate) type RestoreAction = WindowAct<RestoreOwn>;
 
 fn draw_restore_plan(ui: &mut egui::Ui, p: &PlannedRestore, can_edit: bool, action: &mut Option<RestoreAction>) {
     let plan = &p.plan;
@@ -998,7 +969,7 @@ fn draw_restore_plan(ui: &mut egui::Ui, p: &PlannedRestore, can_edit: bool, acti
             ui.colored_label(WARN_COLOR, format!("Limited to {} propert(ies); everything else on the camera is left as it is.", only.len()));
             ui.add_enabled_ui(can_edit, |ui| {
                 if ui.small_button("Restore everything instead").clicked() {
-                    *action = Some(RestoreAction::PlanEverything);
+                    *action = Some(WindowAct::Own(RestoreOwn::PlanEverything));
                 }
             });
         });
@@ -1021,7 +992,7 @@ fn draw_restore_plan(ui: &mut egui::Ui, p: &PlannedRestore, can_edit: bool, acti
                     let mut ticked = p.selected.contains(&s.name);
                     ui.add_enabled_ui(can_edit, |ui| {
                         if ui.checkbox(&mut ticked, "").clicked() {
-                            *action = Some(RestoreAction::Toggle(s.name.clone()));
+                            *action = Some(WindowAct::Own(RestoreOwn::Toggle(s.name.clone())));
                         }
                     });
                     ui.label(s.line(&p.source));
@@ -1031,7 +1002,7 @@ fn draw_restore_plan(ui: &mut egui::Ui, p: &PlannedRestore, can_edit: bool, acti
                 ui.label(egui::RichText::new(format!("{} of {} ticked.", p.selected.len(), changing.len())).weak());
                 ui.add_enabled_ui(can_edit && p.can_plan_selection(), |ui| {
                     if ui.button("Plan again for the ticked ones only").clicked() {
-                        *action = Some(RestoreAction::PlanSelection);
+                        *action = Some(WindowAct::Own(RestoreOwn::PlanSelection));
                     }
                 });
             });
@@ -1150,202 +1121,79 @@ pub(crate) fn draw_restore_point(
     chosen
 }
 
+impl GuardedWindow for RestoreUi {
+    type Own = RestoreOwn;
+
+    const TITLE: &'static str = "Restore a camera from a stored snapshot";
+    const ID: &'static str = "rs";
+    const IDLE: &'static str = "Choose a body and a snapshot, then plan. Nothing is sent to the camera until you have read the plan and confirmed it.";
+    const SNAPSHOT_HINT: &'static str = "Only this body's own snapshots are offered; to put another body's settings here, use Transplant.";
+
+    fn pick(&self) -> &Pick {
+        &self.pick
+    }
+    fn pick_mut(&mut self) -> &mut Pick {
+        &mut self.pick
+    }
+    fn snapshot_option_label(row: &SnapRow, camera_firmware: Option<&str>) -> String {
+        restore_snapshot_label(row, camera_firmware)
+    }
+    fn draw_plan(ui: &mut egui::Ui, plan: &PlannedRestore, can_edit: bool, action: &mut Option<RestoreAction>) {
+        draw_restore_plan(ui, plan, can_edit, action);
+    }
+    fn plan_footer(ui: &mut egui::Ui, plan: &PlannedRestore) {
+        if plan.plan.would_change == 0 {
+            ui.label(egui::RichText::new("This plan would change nothing, so there is nothing to restore.").weak());
+        }
+    }
+    fn confirm_text(plan: &PlannedRestore) -> String {
+        restore_confirm_text(plan)
+    }
+    fn request_source(request: &RestoreRequest) -> &str {
+        &request.source_file
+    }
+    fn report_lines(report: &RestoreApplyJson) -> Vec<(Level, String)> {
+        restore_report_lines(report)
+    }
+    fn report_extra(ui: &mut egui::Ui, report: &RestoreApplyJson) {
+        if !report.written.is_empty() {
+            egui::CollapsingHeader::new(format!("Properties written ({})", report.written.len())).id_salt("rs_written").show(ui, |ui| {
+                ui.label(names_list(&report.written));
+            });
+        }
+    }
+    fn act_own(&mut self, own: RestoreOwn, cameras: &[CameraRow]) -> Result<Option<Cmd>, String> {
+        match own {
+            RestoreOwn::Toggle(name) => {
+                self.toggle(&name);
+                Ok(None)
+            }
+            RestoreOwn::PlanSelection => self.plan_selection(cameras).map(Some),
+            RestoreOwn::PlanEverything => self.plan_everything(cameras).map(Some),
+        }
+    }
+    fn adopt_undo(&mut self, offer: &UndoOffer, camera: &CameraRow) -> Result<(), String> {
+        self.only = Some(offer.undo_set.iter().cloned().collect());
+        self.only_for = Some((offer.restore_point.clone(), camera.clone()));
+        self.undo_of = Some(offer.restore_point.clone());
+        Ok(())
+    }
+}
+
 impl FleetApp {
     pub(crate) fn ui_restore(&mut self, ctx: &egui::Context) {
-        if !self.restore.open {
-            return;
-        }
-        let mut open = true;
-        let mut action: Option<RestoreAction> = None;
         let busy = self.busy();
-        let data_ready = self.settings.data_dir.is_some();
-        let data_dir = self.settings.data_dir.clone();
-        let data_dir = data_dir.as_deref();
-
-        egui::Window::new("Restore a camera from a stored snapshot")
-            .open(&mut open)
-            .default_size([700.0, 620.0])
-            .resizable(true)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                let r = &mut self.restore;
-                let cameras = &self.cameras;
-                let listing = self.listing.as_ref();
-                egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(720.0).show(ui, |ui| {
-                    ui.label(egui::RichText::new("1. The camera: a connected body").strong());
-                    if cameras.is_empty() {
-                        ui.label(egui::RichText::new("No camera is connected: use Discover first.").italics().weak());
-                    }
-                    ui.add_enabled_ui(!busy, |ui| {
-                        let text = r.target_camera(cameras).map_or("choose a body…".to_string(), camera_label);
-                        egui::ComboBox::from_id_salt("rs_target").selected_text(text).width(420.0).show_ui(ui, |ui| {
-                            for c in cameras {
-                                let picked = r.target_key.as_ref() == Some(&(c.model.clone(), c.serial.clone()));
-                                if ui.selectable_label(picked, camera_label(c)).clicked() && !picked {
-                                    r.target_key = Some((c.model.clone(), c.serial.clone()));
-                                    r.source_file = None;
-                                }
-                            }
-                        });
-                    });
-                    if r.target_key.is_some() && r.target_camera(cameras).is_none() {
-                        ui.colored_label(WARN_COLOR, "That body is no longer connected.");
-                    }
-                    let refusal = r.target_camera(cameras).and_then(write_target_refusal);
-                    if let Some(why) = &refusal {
-                        ui.colored_label(ERROR_COLOR, why);
-                    }
-
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("2. The snapshot: one of that body's own").strong());
-                    let all_rows: Vec<&SnapRow> = match (listing, r.target_camera(cameras)) {
-                        (Some(l), Some(c)) => l.rows_for(&c.model, &c.serial).collect(),
-                        _ => Vec::new(),
-                    };
-                    let hidden = all_rows.iter().filter(|row| row.name_lossy).count();
-                    let rows: Vec<&SnapRow> = all_rows.iter().copied().filter(|row| !row.name_lossy).collect();
-                    if r.target_camera(cameras).is_some() && rows.is_empty() {
-                        ui.label(egui::RichText::new(if hidden > 0 { "No snapshot with a usable file name." } else { "This body has no stored snapshots." }).italics().weak());
-                    }
-                    if hidden > 0 {
-                        ui.colored_label(WARN_COLOR, format!("{hidden} snapshot(s) of this body have file names that cannot be shown and are not offered."));
-                    }
-                    let camera_fw = r.target_camera(cameras).map(|c| c.firmware.clone());
-                    ui.add_enabled_ui(!busy, |ui| {
-                        let text = r
-                            .source_file
-                            .as_ref()
-                            .map(|f| rows.iter().find(|row| &row.file == f).map_or_else(|| f.clone(), |row| restore_snapshot_label(row, camera_fw.as_deref())))
-                            .unwrap_or_else(|| "choose a snapshot…".to_string());
-                        egui::ComboBox::from_id_salt("rs_source").selected_text(text).width(560.0).show_ui(ui, |ui| {
-                            for row in &rows {
-                                let picked = r.source_file.as_ref() == Some(&row.file);
-                                if ui.selectable_label(picked, restore_snapshot_label(row, camera_fw.as_deref())).clicked() {
-                                    r.source_file = Some(row.file.clone());
-                                }
-                            }
-                        });
-                    });
-                    ui.label(
-                        egui::RichText::new("Only this body's own snapshots are offered; to put another body's settings here, use Transplant.").small().weak(),
-                    );
-
-                    ui.add_space(6.0);
-                    let planning_possible = !busy
-                        && data_ready
-                        && refusal.is_none()
-                        && r.request(cameras).is_some()
-                        && !matches!(r.stage(), Stage::Applying(_) | Stage::Planning(_));
-                    ui.add_enabled_ui(planning_possible, |ui| {
-                        if ui.button("Plan (reads the camera, writes nothing)").clicked() {
-                            action = Some(RestoreAction::Plan);
-                        }
-                    });
-                    if !r.notice.is_empty() {
-                        ui.colored_label(WARN_COLOR, &r.notice);
-                    }
-                    ui.separator();
-
-                    match r.stage() {
-                        Stage::Idle => {
-                            ui.label(
-                                egui::RichText::new("Choose a body and a snapshot, then plan. Nothing is sent to the camera until you have read the plan and confirmed it.")
-                                    .weak(),
-                            );
-                        }
-                        Stage::Planning(_) => {
-                            ui.label("Planning… the camera is being read.");
-                        }
-                        Stage::Planned(p) => {
-                            draw_restore_plan(ui, p, !busy, &mut action);
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.add_enabled_ui(!busy && p.applicable(), |ui| {
-                                    if ui.button("Restore to camera…").clicked() {
-                                        action = Some(RestoreAction::AskApply);
-                                    }
-                                });
-                                if ui.button("Discard plan").clicked() {
-                                    action = Some(RestoreAction::Discard);
-                                }
-                            });
-                            if p.plan.would_change == 0 {
-                                ui.label(egui::RichText::new("This plan would change nothing, so there is nothing to restore.").weak());
-                            }
-                        }
-                        Stage::Aside(a) => match *a {},
-                        Stage::ConfirmApply(p) => {
-                            draw_restore_plan(ui, p, false, &mut action);
-                            ui.separator();
-                            ui.colored_label(WARN_COLOR, restore_confirm_text(p));
-                            ui.add_enabled_ui(!busy, |ui| {
-                                ui.horizontal(|ui| {
-                                    if ui.button("Confirm: write to camera").clicked() {
-                                        action = Some(RestoreAction::ConfirmApply);
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        action = Some(RestoreAction::CancelConfirmation);
-                                    }
-                                });
-                            });
-                        }
-                        Stage::Applying(req) => {
-                            ui.colored_label(
-                                WARN_COLOR,
-                                format!("Writing to {} {}… keep it connected and do not close this program.", req.target.model, req.target.serial),
-                            );
-                        }
-                        Stage::Done(a) => {
-                            let t = &a.request.target;
-                            ui.label(egui::RichText::new(format!("{}  →  {} {}", a.request.source_file, t.model, t.serial)).weak());
-                            let chosen = draw_applied_outcome(ui, t, "rs_applied", &a.outcome, busy, data_dir, restore_report_lines, |ui, report| {
-                                if !report.written.is_empty() {
-                                    egui::CollapsingHeader::new(format!("Properties written ({})", report.written.len())).id_salt("rs_written").show(ui, |ui| {
-                                        ui.label(names_list(&report.written));
-                                    });
-                                }
-                            });
-                            if let Some(c) = chosen {
-                                action = Some(RestoreAction::Applied(c));
-                            }
-                            ui.separator();
-                            if ui.button("Close this result").clicked() {
-                                action = Some(RestoreAction::Discard);
-                            }
-                        }
-                    }
-                });
-            });
-        self.restore.open = open;
-        if let Some(a) = action {
-            self.restore_act(ctx, a);
+        let env = WindowEnv { cameras: &self.cameras, listing: self.listing.as_ref(), busy, data_dir: self.settings.data_dir.as_deref() };
+        if let Some(click) = guarded::draw_window(ctx, &mut self.restore, &env) {
+            self.restore_act(ctx, click);
         }
     }
 
-    fn restore_act(&mut self, ctx: &egui::Context, action: RestoreAction) {
-        match action {
-            RestoreAction::Plan => match self.restore.begin_plan(&self.cameras) {
-                Ok(cmd) => self.send_restore(cmd),
-                Err(e) => self.restore.notice = e,
-            },
-            RestoreAction::Toggle(name) => self.restore.toggle(&name),
-            RestoreAction::PlanSelection => match self.restore.plan_selection(&self.cameras) {
-                Ok(cmd) => self.send_restore(cmd),
-                Err(e) => self.restore.notice = e,
-            },
-            RestoreAction::PlanEverything => match self.restore.plan_everything(&self.cameras) {
-                Ok(cmd) => self.send_restore(cmd),
-                Err(e) => self.restore.notice = e,
-            },
-            RestoreAction::AskApply => self.restore.ask_apply(),
-            RestoreAction::ConfirmApply => {
-                if let Some(cmd) = self.restore.confirm_apply() {
-                    self.send_restore(cmd);
-                }
-            }
-            RestoreAction::CancelConfirmation => self.restore.cancel_confirmation(),
-            RestoreAction::Discard => self.restore.discard(),
-            RestoreAction::Applied(a) => self.applied_action(ctx, a),
+    fn restore_act(&mut self, ctx: &egui::Context, click: RestoreAction) {
+        match guarded::act(&mut self.restore, &self.cameras, click) {
+            Effect::Nothing => {}
+            Effect::Send(cmd) => self.send_restore(cmd),
+            Effect::Applied(a) => self.applied_action(ctx, a),
         }
     }
 
@@ -1372,27 +1220,21 @@ impl FleetApp {
     /// Undo an apply: the restore window opens on its restore point with the apply's undo set, and
     /// the plan is made (read-only). The person reviews it and confirms it as any restore.
     pub(crate) fn start_undo(&mut self, offer: UndoOffer) {
-        if self.busy() {
+        if self.undo_refused_while_busy() {
+            return;
+        }
+        if let Some(cmd) = guarded::start_undo_in(&mut self.restore, &offer, &self.cameras, self.settings.data_dir.as_deref()) {
+            self.send_restore(cmd);
+        }
+    }
+
+    /// An undo is not started while another camera operation runs. True (with the status saying so) if so.
+    pub(crate) fn undo_refused_while_busy(&mut self) -> bool {
+        let busy = self.busy();
+        if busy {
             self.status = Status::new(Level::Warn, "Another camera operation is running; try the undo when it has finished.");
-            return;
         }
-        // The restore point is a file in the data directory the apply used.
-        if self.settings.data_dir.as_deref() != Some(offer.data_dir.as_path()) {
-            self.restore.open = true;
-            self.restore.notice = format!(
-                "The data directory changed since this apply: its restore point {} is in {}. Switch back to undo it.",
-                offer.restore_point,
-                offer.data_dir.display()
-            );
-            return;
-        }
-        match self.restore.start_undo(&offer, &self.cameras) {
-            Ok(cmd) => self.send_restore(cmd),
-            Err(e) => {
-                self.restore.open = true;
-                self.restore.notice = e;
-            }
-        }
+        busy
     }
 
     /// Open the window on `file` of `body`, a snapshot of a connected body.
@@ -1877,9 +1719,7 @@ mod tests {
 
     fn ui_ready() -> (RestoreUi, Vec<CameraRow>) {
         let ui = RestoreUi {
-            open: true,
-            target_key: Some(("Z 9".into(), "T1".into())),
-            source_file: Some(FILE.into()),
+            pick: Pick { open: true, target_key: Some(("Z 9".into(), "T1".into())), source_file: Some(FILE.into()) },
             ..RestoreUi::default()
         };
         (ui, vec![target()])
@@ -1898,9 +1738,9 @@ mod tests {
     fn nothing_is_asked_of_the_camera_until_a_body_and_its_snapshot_are_chosen() {
         let mut ui = RestoreUi::default();
         assert!(ui.begin_plan(&[target()]).is_err());
-        ui.source_file = Some(FILE.into());
+        ui.pick.source_file = Some(FILE.into());
         assert!(ui.begin_plan(&[target()]).is_err(), "no body yet");
-        ui.target_key = Some(("Z 9".into(), "T1".into()));
+        ui.pick.target_key = Some(("Z 9".into(), "T1".into()));
         assert!(ui.begin_plan(&[]).is_err(), "the chosen body is not connected");
         assert_eq!(*ui.stage(), Stage::Idle);
         assert!(matches!(ui.begin_plan(&[row("Z 9", "T1", 2)]), Err(_)), "a body that shares its model cannot be aimed at");
@@ -1969,10 +1809,10 @@ mod tests {
             ("firmware", Box::new(|_, c| c[0].firmware = "5.40".into())),
             ("pairing", Box::new(|_, c| c[0].model_count = 2)),
             ("body gone", Box::new(|_, c| c.clear())),
-            ("snapshot", Box::new(|u, _| u.source_file = Some("another.json".into()))),
+            ("snapshot", Box::new(|u, _| u.pick.source_file = Some("another.json".into()))),
             ("other body", Box::new(|u, c| {
                 c.push(row("Z 9", "T2", 1));
-                u.target_key = Some(("Z 9".into(), "T2".into()));
+                u.pick.target_key = Some(("Z 9".into(), "T2".into()));
             })),
         ];
         for (what, change) in &changed {
@@ -2008,7 +1848,7 @@ mod tests {
         ui.ask_apply();
         let Some(Cmd::Apply(ApplyJob::Restore { request, .. })) = ui.confirm_apply() else { panic!() };
         cameras[0].firmware = "5.40".into();
-        ui.source_file = Some("another.json".into());
+        ui.pick.source_file = Some("another.json".into());
         ui.sync(&cameras);
         assert!(matches!(ui.stage(), Stage::Applying(_)), "the answer must still find it");
         // an answer for another request is not this apply's
@@ -2136,10 +1976,10 @@ mod tests {
         ui.only = Some(BTreeSet::from(["kNkMAIDCapability_A".to_string()]));
         ui.sync(&cameras);
         assert!(ui.only().is_some(), "same snapshot and body");
-        ui.source_file = Some("another.json".into());
+        ui.pick.source_file = Some("another.json".into());
         ui.sync(&cameras);
         assert!(ui.only().is_none(), "another snapshot has other properties");
-        ui.source_file = Some(FILE.into());
+        ui.pick.source_file = Some(FILE.into());
         ui.sync(&cameras);
         ui.only = Some(BTreeSet::from(["kNkMAIDCapability_A".to_string()]));
         let mut newer = cameras.clone();
@@ -2270,7 +2110,7 @@ mod tests {
         assert_eq!(request.source_file, offer.restore_point);
         assert_eq!(request.only, Some(BTreeSet::from(["kNkMAIDCapability_A".to_string(), "kNkMAIDCapability_B".to_string()])));
         assert_eq!(request.target, target());
-        assert!(ui.open && matches!(ui.stage(), Stage::Planning(_)));
+        assert!(ui.pick.open && matches!(ui.stage(), Stage::Planning(_)));
         // the next frame does not take the selection away: it was made for this snapshot and body
         ui.sync(&cameras);
         assert!(ui.only().is_some() && matches!(ui.stage(), Stage::Planning(_)));
@@ -2297,8 +2137,8 @@ mod tests {
     fn the_app_plans_confirms_and_applies_through_the_worker_and_shows_the_answer_honestly() {
         let (mut app, cmd_rx, evt_tx, _dir) = test_app();
         let ctx = egui::Context::default();
-        app.restore.target_key = Some(("Z 9".into(), "T1".into()));
-        app.restore.source_file = Some(FILE.into());
+        app.restore.pick.target_key = Some(("Z 9".into(), "T1".into()));
+        app.restore.pick.source_file = Some(FILE.into());
         app.restore.sync(&app.cameras);
         app.restore_act(&ctx, RestoreAction::Plan);
         let Ok(Cmd::Plan(PlanJob::Restore(request))) = cmd_rx.try_recv() else { panic!("a plan") };
@@ -2338,8 +2178,8 @@ mod tests {
     fn a_refused_restore_changes_nothing_and_does_not_relist() {
         let (mut app, cmd_rx, evt_tx, _dir) = test_app();
         let ctx = egui::Context::default();
-        app.restore.target_key = Some(("Z 9".into(), "T1".into()));
-        app.restore.source_file = Some(FILE.into());
+        app.restore.pick.target_key = Some(("Z 9".into(), "T1".into()));
+        app.restore.pick.source_file = Some(FILE.into());
         app.restore.sync(&app.cameras);
         let (mut ui, _) = ui_with_plan();
         ui.ask_apply();
@@ -2382,7 +2222,7 @@ mod tests {
         app.start_undo(offer);
         let Ok(Cmd::Plan(PlanJob::Restore(request))) = cmd_rx.try_recv() else { panic!("a plan") };
         assert_eq!(request.source_file, "rp.json");
-        assert!(app.restore.open);
+        assert!(app.restore.pick.open);
         assert!(cmd_rx.try_recv().is_err(), "a plan, not an apply: the person still confirms");
     }
     // ── review round: what is written, what is ticked, what is shown ─────
@@ -2695,7 +2535,7 @@ mod tests {
         let (mut ui, _, _) = planned_for_only();
         ui.start_from(("Z 9".into(), "T1".into()), "another.json".into());
         assert!(!held(&ui));
-        assert_eq!(ui.source_file.as_deref(), Some("another.json"));
+        assert_eq!(ui.pick.source_file.as_deref(), Some("another.json"));
     }
 
     #[test]
@@ -2720,22 +2560,22 @@ mod tests {
         ui.go_idle_for_test();
         cameras[0].firmware = "5.40".into();
         ui.sync(&cameras);
-        assert!(ui.only().is_none() && ui.source_file.is_none(), "{:?} / {:?}", ui.only(), ui.source_file);
+        assert!(ui.only().is_none() && ui.pick.source_file.is_none(), "{:?} / {:?}", ui.only(), ui.pick.source_file);
         assert!(ui.notice.contains("2 propert") && ui.notice.contains("choose it again"), "{}", ui.notice);
         assert!(ui.begin_plan(&cameras).is_err(), "nothing can be planned: it would restore everything");
         // the camera is gone (unplugged, Discover): the same
         let (mut ui, _) = start();
         ui.go_idle_for_test();
         ui.sync(&[]);
-        assert!(ui.only().is_none() && ui.source_file.is_none() && ui.notice.contains("camera changed"), "{}", ui.notice);
+        assert!(ui.only().is_none() && ui.pick.source_file.is_none() && ui.notice.contains("camera changed"), "{}", ui.notice);
         ui.sync(&[target()]);
         assert!(ui.begin_plan(&[target()]).is_err(), "and it does not come back as a full restore when the camera does");
         // the person chose another snapshot: the selection of the old one goes quietly
         let (mut ui, cameras) = start();
         ui.go_idle_for_test();
-        ui.source_file = Some("another.json".into());
+        ui.pick.source_file = Some("another.json".into());
         ui.sync(&cameras);
-        assert!(ui.only().is_none() && ui.source_file.as_deref() == Some("another.json") && ui.notice.is_empty(), "{}", ui.notice);
+        assert!(ui.only().is_none() && ui.pick.source_file.as_deref() == Some("another.json") && ui.notice.is_empty(), "{}", ui.notice);
     }
 
     impl RestoreUi {
@@ -2755,7 +2595,7 @@ mod tests {
         offer.data_dir = PathBuf::from("/elsewhere");
         app.start_undo(offer);
         assert!(cmd_rx.try_recv().is_err(), "nothing is planned against a directory the restore point is not in");
-        assert!(app.restore.open && app.restore.notice.contains("data directory changed") && app.restore.notice.contains("/elsewhere"), "{}", app.restore.notice);
+        assert!(app.restore.pick.open && app.restore.notice.contains("data directory changed") && app.restore.notice.contains("/elsewhere"), "{}", app.restore.notice);
     }
 
     #[cfg(unix)]
@@ -3024,10 +2864,10 @@ mod tests {
         let mut draw = |app: &mut FleetApp| {
             let _ = ctx.run(egui::RawInput::default(), |ctx| app.ui_restore(ctx));
         };
-        app.restore.open = true;
+        app.restore.pick.open = true;
         draw(&mut app); // nothing chosen
-        app.restore.target_key = Some(("Z 9".into(), "T1".into()));
-        app.restore.source_file = Some(FILE.into());
+        app.restore.pick.target_key = Some(("Z 9".into(), "T1".into()));
+        app.restore.pick.source_file = Some(FILE.into());
         app.restore.sync(&app.cameras);
         draw(&mut app);
         let Cmd::Plan(PlanJob::Restore(request)) = app.restore.begin_plan(&app.cameras).unwrap() else { panic!() };
@@ -3070,4 +2910,41 @@ mod tests {
         draw(&mut app);
     }
 
+
+    impl crate::guarded::parity::Kit for RestoreUi {
+        fn ready() -> (RestoreUi, Vec<CameraRow>) {
+            let (mut ui, cameras) = ui_ready();
+            ui.sync(&cameras);
+            (ui, cameras)
+        }
+        fn deliver(&mut self, request: RestoreRequest, how: crate::guarded::parity::Delivery) {
+            use crate::guarded::parity::Delivery;
+            let result = match how {
+                Delivery::Applicable => Ok(arrived(&world(), None)),
+                Delivery::NothingToChange => Ok(arrived(&world_with(&[0, 1, 2], &[], None), None)),
+                Delivery::Failed => Err("Planning failed: camera busy".to_string()),
+            };
+            self.plan_arrived(request, result);
+        }
+        fn outcome(end: crate::guarded::parity::End) -> ApplyOutcome<RestoreApplyJson> {
+            use crate::guarded::parity::End;
+            match end {
+                End::Verified => report(&apply_text(&world(), None).0),
+                End::Stale => ApplyOutcome::NotApplied { why: NotAppliedWhy::PlanStale, message: "stale".into(), cli_log: String::new() },
+                End::Indeterminate => ApplyOutcome::Indeterminate { message: "unknown".into(), cli_log: String::new() },
+            }
+        }
+        fn other_source(request: RestoreRequest) -> RestoreRequest {
+            RestoreRequest { source_file: "another.json".into(), ..request }
+        }
+        fn offer() -> UndoOffer {
+            UndoOffer {
+                kind: UndoKind::Properties,
+                restore_point: "Z_9_T1_restore_20261106T020000Z.json".into(),
+                undo_set: vec!["Some property".into()],
+                target: target(),
+                data_dir: PathBuf::from("/data"),
+            }
+        }
+    }
 }

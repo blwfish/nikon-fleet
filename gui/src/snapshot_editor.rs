@@ -690,7 +690,7 @@ fn draw_ftp_test(ui: &mut egui::Ui, t: &FtpTestState) -> bool {
 }
 
 /// The strip at the top of an edited copy's window: where it came from, and the history.
-pub(crate) fn draw_edit_header(ui: &mut egui::Ui, file: &str, model: &EditModel, notice: Option<&(Level, String)>, reloading: bool) {
+pub(crate) fn draw_edit_header(ui: &mut egui::Ui, file: &str, model: &EditModel, notice: Option<&(Level, String)>, saving: bool) {
     let d = &model.derived;
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new("✎ Edited copy").strong());
@@ -699,7 +699,7 @@ pub(crate) fn draw_edit_header(ui: &mut egui::Ui, file: &str, model: &EditModel,
             nikon_fleet::ops::render::printable(&d.source_file),
             d.source_captured_at.get(..19).unwrap_or(&d.source_captured_at)
         ));
-        if reloading {
+        if saving {
             ui.label(egui::RichText::new("saving…").italics().weak());
         }
     });
@@ -1116,10 +1116,13 @@ mod tests {
         (app, cmd_rx, dir, "captured.json".into())
     }
 
+    /// Pump the app's events until the window for `file` has nothing in flight: neither a change being written
+    /// nor a file being read.
     fn wait_for_reload(app: &mut FleetApp, file: &str) {
+        let ctx = egui::Context::default();
         for _ in 0..400 {
-            app.poll_views();
-            if app.viewers.find_mut(file).is_some_and(|v| !v.reloading && !v.loading) {
+            app.poll_views(&ctx);
+            if app.viewers.find_mut(file).is_some_and(|v| !v.reloading && !v.loading && v.saving.is_none()) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -1158,11 +1161,9 @@ mod tests {
         wait_for_reload(&mut app, &copy);
         app.viewers.find_mut(&copy).unwrap().edit_ui.texts.insert("string:0xd073".into(), "half typed".into());
         app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: VR.into(), text: "0".into() });
-        let v = app.viewers.find_mut(&copy).unwrap();
-        assert!(v.reloading, "the controls wait for the file to be read again");
-        assert_eq!(v.edit_notice.as_ref().map(|(l, t)| (*l, t.as_str())), Some((Level::Info, "VibrationReduction: 2 -> 0")));
         wait_for_reload(&mut app, &copy);
         let v = app.viewers.find_mut(&copy).unwrap();
+        assert_eq!(v.edit_notice.as_ref().map(|(l, t)| (*l, t.as_str())), Some((Level::Info, "VibrationReduction: 2 -> 0")));
         let m = v.edit.as_ref().unwrap();
         assert_eq!(m.controls[VR].control, Control::Choice { values: vec![0, 1, 2], current: Some(0) }, "what is shown is what is stored");
         assert!(m.property_edited(VR));
@@ -1182,6 +1183,7 @@ mod tests {
         let bytes = std::fs::read(dir.path().join("snapshots").join(&copy)).unwrap();
         app.viewers.find_mut(&copy).unwrap().edit_ui.texts.insert("property:kNkMAIDCapability_ElectronicVR".into(), "typed".into());
         app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: "kNkMAIDCapability_ElectronicVR".into(), text: "x".into() });
+        wait_for_reload(&mut app, &copy);
         let v = app.viewers.find_mut(&copy).unwrap();
         let (level, text) = v.edit_notice.clone().unwrap();
         assert_eq!(level, Level::Error);
@@ -1191,8 +1193,187 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("snapshots").join(&copy)).unwrap(), bytes);
         // a change to what it already holds says so and does not reload
         app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: VR.into(), text: "2".into() });
+        wait_for_reload(&mut app, &copy);
         let v = app.viewers.find_mut(&copy).unwrap();
         assert!(!v.reloading && v.edit_notice.as_ref().unwrap().1.starts_with("No change"), "{:?}", v.edit_notice);
+    }
+
+    // ── a change is written off the UI thread ──
+
+    /// Stand in for the writer: each call reports the thread it runs on and the request, then waits to be released
+    /// before it writes (with the real function), so a test sees the app while a change is in flight.
+    struct Gate {
+        release: std::sync::mpsc::Sender<()>,
+        started: std::sync::mpsc::Receiver<(std::thread::ThreadId, ViewEdit)>,
+    }
+
+    impl Gate {
+        fn install(app: &mut FleetApp) -> Gate {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let (started_tx, started) = std::sync::mpsc::channel();
+            let wait = std::sync::Mutex::new(wait);
+            let started_tx = std::sync::Mutex::new(started_tx);
+            app.edit_runner = std::sync::Arc::new(move |dir: &Path, file: &str, req: &ViewEdit, now: &str| {
+                started_tx.lock().unwrap().send((std::thread::current().id(), req.clone())).unwrap();
+                wait.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5)).map_err(|_| "the test never released the writer".to_string())?;
+                apply_view_edit(dir, file, req, now)
+            });
+            Gate { release, started }
+        }
+
+        /// The writer has been called, and is waiting.
+        fn started(&self) -> (std::thread::ThreadId, ViewEdit) {
+            self.started.recv_timeout(std::time::Duration::from_secs(5)).expect("the writer was called")
+        }
+
+        fn release(&self) {
+            self.release.send(()).unwrap();
+        }
+    }
+
+    /// An edited copy of the stored snapshot, open and loaded, with the writer gated.
+    fn gated_copy() -> (FleetApp, Gate, tempfile::TempDir, String, egui::Context) {
+        let (mut app, _cmd_rx, dir, file) = app_with_snapshot();
+        let ctx = egui::Context::default();
+        app.start_edit_copy(&ctx, &file);
+        let copy = app.viewers.open[0].file.clone();
+        wait_for_reload(&mut app, &copy);
+        let gate = Gate::install(&mut app);
+        (app, gate, dir, copy, ctx)
+    }
+
+    fn stored(dir: &tempfile::TempDir, file: &str) -> Vec<u8> {
+        std::fs::read(dir.path().join("snapshots").join(file)).unwrap()
+    }
+
+    #[test]
+    fn a_change_is_written_off_the_ui_thread_and_is_not_claimed_until_the_thread_reports() {
+        let (mut app, gate, dir, copy, ctx) = gated_copy();
+        let before = stored(&dir, &copy);
+        app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: VR.into(), text: "0".into() });
+        let (thread, asked) = gate.started();
+        assert_ne!(thread, std::thread::current().id(), "the writer runs on a thread of its own");
+        assert_eq!(asked, ViewEdit::Property { name: VR.into(), text: "0".into() });
+        // the call has returned and the writer is parked before it writes: the file is as it was, and the window says nothing was done
+        assert_eq!(stored(&dir, &copy), before, "the calling thread did not write");
+        let v = app.viewers.find_mut(&copy).unwrap();
+        assert!(v.saving.is_some() && !v.controls_enabled(), "in flight, and the controls wait");
+        assert!(v.edit_notice.is_none() && !v.reloading, "no claim that the change happened: {:?}", v.edit_notice);
+        app.poll_views(&ctx);
+        let v = app.viewers.find_mut(&copy).unwrap();
+        assert!(v.saving.is_some() && v.edit_notice.is_none(), "pumping the events before the answer changes nothing");
+        gate.release();
+        wait_for_reload(&mut app, &copy);
+        assert_ne!(stored(&dir, &copy), before, "now it is written");
+        let v = app.viewers.find_mut(&copy).unwrap();
+        assert!(v.controls_enabled());
+        assert_eq!(v.edit_notice.as_ref().map(|(l, t)| (*l, t.as_str())), Some((Level::Info, "VibrationReduction: 2 -> 0")));
+    }
+
+    #[test]
+    fn changes_are_applied_in_the_order_made_with_at_most_one_in_flight_per_window() {
+        let (mut app, gate, dir, copy, ctx) = gated_copy();
+        app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: VR.into(), text: "0".into() });
+        gate.started();
+        // a second change made while the first is in flight is refused, not run beside it and not queued
+        let mid = stored(&dir, &copy);
+        app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: VR.into(), text: "1".into() });
+        assert!(gate.started.try_recv().is_err(), "the writer was not called for the second change");
+        let v = app.viewers.find_mut(&copy).unwrap();
+        let (level, text) = v.edit_notice.clone().expect("it says so");
+        assert_eq!(level, Level::Warn);
+        assert!(text.contains("still being saved"), "{text}");
+        assert_eq!(stored(&dir, &copy), mid);
+        gate.release();
+        wait_for_reload(&mut app, &copy);
+        // and once the first is done the second goes through, after it
+        app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: VR.into(), text: "1".into() });
+        gate.started();
+        gate.release();
+        wait_for_reload(&mut app, &copy);
+        let m = app.viewers.find_mut(&copy).unwrap().edit.clone().unwrap();
+        assert_eq!(m.controls[VR].control, Control::Choice { values: vec![0, 1, 2], current: Some(1) });
+        let log: Vec<&str> = m.derived.edits.iter().map(|e| e.change.as_str()).collect();
+        assert_eq!(log, ["VibrationReduction: 2 -> 0", "VibrationReduction: 0 -> 1"], "in the order they were made");
+    }
+
+    #[test]
+    fn the_controls_are_disabled_while_the_file_is_read_and_while_a_change_is_written() {
+        let (mut app, gate, _dir, copy, ctx) = gated_copy();
+        let v = app.viewers.find_mut(&copy).unwrap();
+        assert!(v.controls_enabled(), "idle");
+        v.reloading = true;
+        assert!(!v.controls_enabled(), "being read again");
+        v.reloading = false;
+        app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: VR.into(), text: "0".into() });
+        gate.started();
+        assert!(!app.viewers.find_mut(&copy).unwrap().controls_enabled(), "being written");
+        // a window drawn in that state asks for nothing (the wiring of `controls_enabled` into each widget is not driven by input here)
+        let mut asked = Vec::new();
+        run_ui(|ui| asked.push(crate::draw_snapshot_viewer(ui, app.viewers.find_mut(&copy).unwrap())));
+        assert!(asked.iter().all(Option::is_none), "{asked:?}");
+        gate.release();
+        wait_for_reload(&mut app, &copy);
+        assert!(app.viewers.find_mut(&copy).unwrap().controls_enabled(), "idle again");
+    }
+
+    #[test]
+    fn an_answer_for_a_window_that_was_closed_or_closed_and_opened_again_is_dropped() {
+        let (mut app, gate, _dir, copy, ctx) = gated_copy();
+        app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: VR.into(), text: "0".into() });
+        gate.started();
+        // closed while the change is being written
+        assert!(app.viewers.close(&copy));
+        gate.release();
+        for _ in 0..40 {
+            app.poll_views(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.viewers.find_mut(&copy).is_none(), "nothing reopened it");
+        assert!(app.status.level != Level::Error, "{}", app.status.text);
+        // opened again, then the old change's answer turns up: it is not this window's
+        app.open_snapshot(&ctx, &copy, false, false);
+        wait_for_reload(&mut app, &copy);
+        let fresh = app.viewers.find_mut(&copy).unwrap().clone();
+        app.edit_tx
+            .send(crate::ViewEditDone { file: copy.clone(), ticket: 1, req: ViewEdit::Property { name: VR.into(), text: "0".into() }, result: Ok(edit::Applied { changed: true, item: "i".into(), change: "stray".into() }) })
+            .unwrap();
+        app.poll_views(&ctx);
+        let v = app.viewers.find_mut(&copy).unwrap();
+        assert!(v.edit_notice.is_none() && !v.reloading && v.saving.is_none(), "{:?}", v.edit_notice);
+        assert_eq!(*v, fresh, "the stray answer changed nothing");
+        // and while a newer change is in flight, an older ticket's answer is not taken for it
+        app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: VR.into(), text: "1".into() });
+        gate.started();
+        let waiting = app.viewers.find_mut(&copy).unwrap().saving.unwrap();
+        app.edit_tx
+            .send(crate::ViewEditDone { file: copy.clone(), ticket: waiting - 1, req: ViewEdit::Property { name: VR.into(), text: "0".into() }, result: Ok(edit::Applied { changed: true, item: "i".into(), change: "stray".into() }) })
+            .unwrap();
+        app.poll_views(&ctx);
+        let v = app.viewers.find_mut(&copy).unwrap();
+        assert_eq!(v.saving, Some(waiting), "still waiting for its own answer");
+        assert!(v.edit_notice.is_none());
+        gate.release();
+        wait_for_reload(&mut app, &copy);
+    }
+
+    #[test]
+    fn a_change_the_writer_refuses_or_cannot_save_is_a_notice_and_nothing_is_read_again() {
+        let (mut app, _cmd_rx, dir, file) = app_with_snapshot();
+        let ctx = egui::Context::default();
+        app.start_edit_copy(&ctx, &file);
+        let copy = app.viewers.open[0].file.clone();
+        wait_for_reload(&mut app, &copy);
+        app.edit_runner = std::sync::Arc::new(|_: &Path, _: &str, _: &ViewEdit, _: &str| Err("the disk is full".to_string()));
+        let before = stored(&dir, &copy);
+        app.viewers.find_mut(&copy).unwrap().edit_ui.texts.insert(format!("property:{VR}"), "typed".into());
+        app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: VR.into(), text: "0".into() });
+        wait_for_reload(&mut app, &copy);
+        let v = app.viewers.find_mut(&copy).unwrap();
+        assert_eq!(v.edit_notice, Some((Level::Error, "the disk is full".to_string())));
+        assert!(v.controls_enabled() && !v.reloading, "usable again, and nothing to read");
+        assert!(!v.edit_ui.has_text(&format!("property:{VR}")), "the field shows the stored value again");
+        assert_eq!(stored(&dir, &copy), before);
     }
 
     #[test]
@@ -1203,6 +1384,7 @@ mod tests {
         wait_for_reload(&mut app, &file);
         let before = std::fs::read(dir.path().join("snapshots").join(&file)).unwrap();
         app.apply_viewer_edit(&ctx, &file, ViewEdit::Property { name: VR.into(), text: "0".into() });
+        wait_for_reload(&mut app, &file);
         let v = app.viewers.find_mut(&file).unwrap();
         assert!(v.edit_notice.as_ref().unwrap().1.contains("read from a camera"), "{:?}", v.edit_notice);
         assert_eq!(std::fs::read(dir.path().join("snapshots").join(&file)).unwrap(), before);
@@ -1464,7 +1646,7 @@ mod tests {
 
     fn wait_for_test(app: &mut FleetApp, file: &str, index: usize) -> FtpTestState {
         for _ in 0..400 {
-            app.poll_views();
+            app.poll_views(&egui::Context::default());
             let st = app.viewers.find_mut(file).and_then(|v| v.edit_ui.ftp_tests.get(&index).cloned());
             match st {
                 Some(FtpTestState::Running) | None => std::thread::sleep(std::time::Duration::from_millis(25)),
@@ -1532,16 +1714,16 @@ mod tests {
         let report = nikon_fleet::ftp_test::run_test(&nikon_fleet::ftp_test::TestRequest::from_profile(&ftp_row("no-such-host.invalid"), false, std::time::Duration::from_millis(300)));
         // nothing was started: a result that turns up anyway (from before a reload, say) must not appear
         app.ftp_test_tx.send(crate::FtpTestDone { file: name.clone(), index: 0, result: Ok(report.clone()) }).unwrap();
-        app.poll_views();
+        app.poll_views(&egui::Context::default());
         assert!(app.viewers.find_mut(&name).unwrap().edit_ui.ftp_tests.is_empty());
         // one that is waited for is shown
         app.viewers.find_mut(&name).unwrap().edit_ui.ftp_tests.insert(0, FtpTestState::Running);
         app.ftp_test_tx.send(crate::FtpTestDone { file: name.clone(), index: 0, result: Ok(report) }).unwrap();
-        app.poll_views();
+        app.poll_views(&egui::Context::default());
         assert!(matches!(app.viewers.find_mut(&name).unwrap().edit_ui.ftp_tests.get(&0), Some(FtpTestState::Done(_))));
         // a result for a window that was closed is ignored
         app.ftp_test_tx.send(crate::FtpTestDone { file: "closed.json".into(), index: 0, result: Err("x".into()) }).unwrap();
-        app.poll_views();
+        app.poll_views(&egui::Context::default());
     }
 
     #[test]
@@ -1557,7 +1739,7 @@ mod tests {
         app.apply_viewer_edit(&ctx, &name, ViewEdit::FtpFields { index: 0, fields: ProfileFields { folder: Some("incoming".into()), host: Some("localhost".into()), ..Default::default() } });
         wait_for_reload(&mut app, &name);
         std::thread::sleep(std::time::Duration::from_millis(600));
-        app.poll_views();
+        app.poll_views(&egui::Context::default());
         assert!(app.viewers.find_mut(&name).unwrap().edit_ui.ftp_tests.is_empty(), "the reload cleared it and the late result did not bring it back");
         // the choice about the test file survives a reload
         let v = app.viewers.find_mut(&name).unwrap();

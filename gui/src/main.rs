@@ -45,12 +45,12 @@ mod snapshot_editor;
 
 use check::{CheckRequest, CheckUi, CheckView};
 use guarded::{
-    Applied, AppliedAction, Flow, GuardedUi, PlanFailure, Stage, apply_via, check_plan_target, confirm_head, draw_applied_outcome, no_cli, plan_via,
-    write_target_refusal, CONFIRM_TAIL,
+    Applied, AppliedAction, Effect, Flow, GuardedUi, GuardedWindow, NoOwn, PlanFailure, Pick, Stage, WindowAct, WindowEnv, apply_via, check_plan_target,
+    confirm_head, draw_applied_outcome, no_cli, plan_via, write_target_refusal, CONFIRM_TAIL,
 };
 use nikon_fleet::gui_argv;
 use firmware_win::FwUi;
-use restore::{RestoreApplyJson, RestorePlanJson, RestoreRequest, RestoreUi, SourceView, UndoOffer};
+use restore::{RestoreApplyJson, RestorePlanJson, RestoreRequest, RestoreUi, SourceView};
 use restore_ext::{ExtApplyJson, ExtPlanJson, ExtRestoreRequest, ExtRestoreUi};
 use snapshot_editor::{EditModel, EditUi, ViewEdit};
 
@@ -511,6 +511,9 @@ struct SnapshotViewer {
     edit_ui: EditUi,
     /// A change was saved and the file is being read again; the controls wait for it.
     reloading: bool,
+    /// A change is being written on a thread of its own (the ticket it was sent with); the controls wait for its
+    /// answer, so a window has at most one change in flight and changes are applied in the order they were made.
+    saving: Option<u64>,
     /// What the last change did, or why it was refused.
     edit_notice: Option<(Level, String)>,
 }
@@ -532,8 +535,15 @@ impl SnapshotViewer {
             edit: None,
             edit_ui: EditUi::default(),
             reloading: false,
+            saving: None,
             edit_notice: None,
         }
+    }
+
+    /// Whether the controls of an edited copy may be used: not while the file is being read, and not while a change
+    /// is being written. The one place the rule is; drawing and the commit both read it.
+    fn controls_enabled(&self) -> bool {
+        !self.reloading && self.saving.is_none()
     }
 
     /// The load's answer: the rendered snapshot, or why there is none.
@@ -694,6 +704,31 @@ fn load_for_view_full(data_dir: &Path, sdk_runtime: &Path, file: &str) -> Result
     Ok((render::render_snapshot_with(&snapshot, None, &labels), edit))
 }
 
+/// A finished change to an edited copy, from the thread that wrote it.
+struct ViewEditDone {
+    file: String,
+    /// The ticket the change was sent with: only the window still waiting for it takes the answer.
+    ticket: u64,
+    req: ViewEdit,
+    result: Result<nikon_fleet::snapshot_edit::Applied, String>,
+}
+
+/// What writes a change to an edited copy: `snapshot_editor::apply_view_edit`. A field of the app so a test can stand
+/// in a runner that waits, to see that the UI thread does not wait with it.
+type EditRunner = std::sync::Arc<dyn Fn(&Path, &str, &ViewEdit, &str) -> Result<nikon_fleet::snapshot_edit::Applied, String> + Send + Sync>;
+
+/// Apply `req` to the edited copy `file` on a thread of its own (it reads, edits and atomically rewrites the file, which
+/// may be on a slow disk) and send the answer back. The UI thread never touches the file for an edit.
+fn spawn_view_edit(run: EditRunner, data_dir: PathBuf, file: String, ticket: u64, req: ViewEdit, tx: mpsc::Sender<ViewEditDone>, ctx: egui::Context) -> std::io::Result<()> {
+    std::thread::Builder::new().name("snapshot-edit".into()).spawn(move || {
+        let result = run(&data_dir, &file, &req, &snapshot_editor::now_rfc3339());
+        // The receiver is gone only when the app is closing; there is no one to tell.
+        let _ = tx.send(ViewEditDone { file, ticket, req, result });
+        ctx.request_repaint();
+    })?;
+    Ok(())
+}
+
 /// A finished FTP test, from the thread that ran it.
 struct FtpTestDone {
     file: String,
@@ -758,6 +793,12 @@ struct FleetApp {
     /// FTP tests started from edited copies' windows.
     ftp_test_tx: mpsc::Sender<FtpTestDone>,
     ftp_test_rx: mpsc::Receiver<FtpTestDone>,
+    /// Changes to edited copies, written off the UI thread.
+    edit_tx: mpsc::Sender<ViewEditDone>,
+    edit_rx: mpsc::Receiver<ViewEditDone>,
+    /// The next ticket a change is sent with.
+    next_edit_ticket: u64,
+    edit_runner: EditRunner,
     label: String,
     status: Status,
     notices: Vec<String>,
@@ -793,6 +834,7 @@ impl FleetApp {
         let (evt_tx, evt_rx) = mpsc::channel();
         let (view_tx, view_rx) = mpsc::channel();
         let (ftp_test_tx, ftp_test_rx) = mpsc::channel();
+        let (edit_tx, edit_rx) = mpsc::channel();
         let ctx = cc.egui_ctx.clone();
         let initial = settings.data_dir_or_err();
         std::thread::spawn(move || worker(cmd_rx, evt_tx, ctx, initial));
@@ -814,6 +856,10 @@ impl FleetApp {
             view_rx,
             ftp_test_tx,
             ftp_test_rx,
+            edit_tx,
+            edit_rx,
+            next_edit_ticket: 0,
+            edit_runner: std::sync::Arc::new(snapshot_editor::apply_view_edit),
             label: String::new(),
             status,
             notices: Vec::new(),
@@ -908,7 +954,10 @@ impl FleetApp {
         }
     }
 
-    fn poll_views(&mut self) {
+    fn poll_views(&mut self, ctx: &egui::Context) {
+        while let Ok(done) = self.edit_rx.try_recv() {
+            self.finish_viewer_edit(ctx, done);
+        }
         while let Ok(load) = self.view_rx.try_recv() {
             if self.viewers.finish(&load.file, load.result) {
                 self.viewers.set_edit(&load.file, load.edit);
@@ -1053,7 +1102,7 @@ impl eframe::App for FleetApp {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
         self.poll();
-        self.poll_views();
+        self.poll_views(ctx);
         self.transplant.sync(&self.cameras);
         self.restore.sync(&self.cameras);
         self.restore_ext.sync(&self.cameras);
@@ -1250,8 +1299,8 @@ impl FleetApp {
                 self.send(Cmd::Discover);
             }
             MenuAction::Transplant => self.transplant.open = true,
-            MenuAction::Restore => self.restore.open = true,
-            MenuAction::RestoreExtended => self.restore_ext.open = true,
+            MenuAction::Restore => self.restore.pick.open = true,
+            MenuAction::RestoreExtended => self.restore_ext.pick.open = true,
             MenuAction::Check => self.check.open = true,
             MenuAction::Firmware => self.firmware.open = true,
             MenuAction::About => self.about_open = true,
@@ -1597,13 +1646,48 @@ impl FleetApp {
             }
             _ => {}
         }
-        let result = snapshot_editor::apply_view_edit(&data_dir, file, &req, &snapshot_editor::now_rfc3339());
         let Some(viewer) = self.viewers.find_mut(file) else { return };
+        // One change in flight per window, and none while the file is being read again: the controls are disabled then,
+        // so a request that gets here anyway is refused, never queued or run beside the other (they could reorder).
+        if !viewer.controls_enabled() {
+            viewer.edit_notice = Some((Level::Warn, "The last change is still being saved; try again when it has finished.".to_string()));
+            if let Some(k) = snapshot_editor::field_key(&req) {
+                viewer.edit_ui.forget(&k);
+            }
+            return;
+        }
+        self.next_edit_ticket += 1;
+        let ticket = self.next_edit_ticket;
+        viewer.saving = Some(ticket);
+        if let Err(e) = spawn_view_edit(self.edit_runner.clone(), data_dir, file.to_string(), ticket, req.clone(), self.edit_tx.clone(), ctx.clone()) {
+            viewer.saving = None;
+            viewer.edit_notice = Some((Level::Error, format!("The change was not saved: the thread to save it could not be started ({e}).")));
+            if let Some(k) = snapshot_editor::field_key(&req) {
+                viewer.edit_ui.forget(&k);
+            }
+        }
+    }
+
+    /// A change to an edited copy has been written (or refused): say so in its window, and read the file again if it
+    /// changed. Dropped unless the window is still waiting for this very change: it may have been closed, or closed and
+    /// opened again, while the thread ran.
+    fn finish_viewer_edit(&mut self, ctx: &egui::Context, done: ViewEditDone) {
+        let ViewEditDone { file, ticket, req, result } = done;
+        let data_dir = self.settings.data_dir.clone();
+        let Some(viewer) = self.viewers.find_mut(&file) else { return };
+        if viewer.saving != Some(ticket) {
+            return;
+        }
+        viewer.saving = None;
         match result {
             Ok(applied) if applied.changed => {
                 viewer.edit_notice = Some((Level::Info, applied.change));
+                let Some(data_dir) = data_dir else {
+                    viewer.edit_notice = Some((Level::Warn, "Saved, but the data directory is unknown now, so the file cannot be read again; close and reopen this window.".to_string()));
+                    return;
+                };
                 viewer.reloading = true;
-                if let Err(e) = spawn_view_load(data_dir, file.to_string(), self.view_tx.clone(), ctx.clone()) {
+                if let Err(e) = spawn_view_load(data_dir, file.clone(), self.view_tx.clone(), ctx.clone()) {
                     viewer.reloading = false;
                     viewer.edit_notice = Some((Level::Warn, format!("Saved, but the file could not be read again ({e}); close and reopen this window.")));
                 }
@@ -1693,9 +1777,9 @@ fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) -> Optio
     let mut asked: Option<ViewEdit> = None;
     // Taken out for the frame so the rows can stay borrowed from the viewer while the controls change it.
     let mut edit_ui = std::mem::take(&mut viewer.edit_ui);
-    let controls_enabled = !viewer.reloading;
+    let controls_enabled = viewer.controls_enabled();
     if let Some(model) = &viewer.edit {
-        snapshot_editor::draw_edit_header(ui, &viewer.file, model, viewer.edit_notice.as_ref(), viewer.reloading);
+        snapshot_editor::draw_edit_header(ui, &viewer.file, model, viewer.edit_notice.as_ref(), !controls_enabled);
     }
     ui.horizontal(|ui| {
         ui.label("Filter:");
@@ -7764,6 +7848,7 @@ mod tests {
         let (evt_tx, evt_rx) = mpsc::channel();
         let (view_tx, view_rx) = mpsc::channel();
         let (ftp_test_tx, ftp_test_rx) = mpsc::channel();
+        let (edit_tx, edit_rx) = mpsc::channel();
         let settings = SettingsState {
             path: dir.path().join("settings.json"),
             data_dir: Some(dir.path().to_path_buf()),
@@ -7782,6 +7867,10 @@ mod tests {
             view_rx,
             ftp_test_tx,
             ftp_test_rx,
+            edit_tx,
+            edit_rx,
+            next_edit_ticket: 0,
+            edit_runner: std::sync::Arc::new(snapshot_editor::apply_view_edit),
             label: String::new(),
             status: Status::new(Level::Info, ""),
             notices: Vec::new(),
@@ -7886,7 +7975,7 @@ mod tests {
             app.do_menu_action(&ctx, MenuAction::Check);
             app.do_menu_action(&ctx, MenuAction::Firmware);
             app.do_menu_action(&ctx, MenuAction::About);
-            assert!(app.prefs_open && app.transplant.open && app.restore.open && app.check.open);
+            assert!(app.prefs_open && app.transplant.open && app.restore.pick.open && app.check.open);
             assert!(app.firmware.open && app.about_open);
         }
     }
