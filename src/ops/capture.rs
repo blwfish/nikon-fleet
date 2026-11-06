@@ -55,28 +55,49 @@ pub fn capture<P: CameraPort + ?Sized>(
     name_lookup: &HashMap<u32, String>,
     snap: &mut Snapshot,
 ) -> CaptureStats {
-    let mut stats = CaptureStats::default();
-    for cap in port.capabilities() {
-        if cap.operations & OP_GET == 0 {
-            stats.skipped_no_get += 1;
-            continue;
-        }
-        let name = property_key(name_lookup, cap.id);
-        match port.read_capability(cap.id) {
-            Ok(value) => {
-                if !name_lookup.contains_key(&cap.id) {
-                    stats.unknown_schema += 1;
+    // The whole read pass, as one span: how long it took and how many reads succeeded, failed or were skipped. The
+    // individual reads are `read_cap` spans inside it (in the SDK layer), so a hang in one shows there.
+    crate::diag::scoped_with(
+        crate::diag::Subsystem::Snapshot,
+        "capture_reads",
+        crate::diag::Class::Top,
+        &[("capabilities", crate::diag::Val::U64(port.capabilities().len() as u64))],
+        |_span| {
+        let mut stats = CaptureStats::default();
+        for cap in port.capabilities() {
+            if cap.operations & OP_GET == 0 {
+                stats.skipped_no_get += 1;
+                continue;
+            }
+            let name = property_key(name_lookup, cap.id);
+            match port.read_capability(cap.id) {
+                Ok(value) => {
+                    if !name_lookup.contains_key(&cap.id) {
+                        stats.unknown_schema += 1;
+                    }
+                    snap.insert(name, cap.id, value);
+                    stats.read_ok += 1;
                 }
-                snap.insert(name, cap.id, value);
-                stats.read_ok += 1;
-            }
-            Err(e) => {
-                stats.read_err += 1;
-                stats.failed.push(FailedRead { code: cap.id, name, error: e.to_string() });
+                Err(e) => {
+                    stats.read_err += 1;
+                    stats.failed.push(FailedRead { code: cap.id, name, error: e.to_string() });
+                }
             }
         }
-    }
-    stats
+        stats
+        },
+        |st| {
+            (
+                crate::diag::Outcome::Ok,
+                vec![
+                    ("read_ok", crate::diag::Val::U64(st.read_ok as u64)),
+                    ("read_err", crate::diag::Val::U64(st.read_err as u64)),
+                    ("skipped_no_get", crate::diag::Val::U64(st.skipped_no_get as u64)),
+                    ("unknown_schema", crate::diag::Val::U64(st.unknown_schema as u64)),
+                ],
+            )
+        },
+    )
 }
 
 #[cfg(test)]

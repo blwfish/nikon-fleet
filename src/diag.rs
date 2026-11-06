@@ -1136,7 +1136,15 @@ pub fn render(traces: &[ProcessTrace], now_ms: u64, last_n: usize) -> String {
     }
     let mut out = String::new();
     for t in traces {
-        let role = t.inflight.as_ref().map(|f| f.role.as_str()).or_else(|| t.entries.first().map(|e| e.subsystem.as_str())).unwrap_or("?");
+        // The process's role: from its in-flight file if it has one, else from its `start` event (the entry's own
+        // subsystem is `diag`, which says nothing), else the first entry's subsystem.
+        let start_role = t.entries.iter().find(|e| e.kind == Kind::Event && e.op == OP_START).and_then(|e| {
+            e.fields.iter().find_map(|(k, v)| match (k.as_str(), v) {
+                ("role", Val::Text(r)) => Some(r.as_str()),
+                _ => None,
+            })
+        });
+        let role = t.inflight.as_ref().map(|f| f.role.as_str()).or(start_role).or_else(|| t.entries.first().map(|e| e.subsystem.as_str())).unwrap_or("?");
         out.push_str(&format!("pid {} ({role}): {} entr{}", t.pid, t.entries.len(), if t.entries.len() == 1 { "y" } else { "ies" }));
         if t.malformed_lines > 0 {
             out.push_str(&format!(", {} unreadable line(s) (a line cut off by a kill is normal)", t.malformed_lines));

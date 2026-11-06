@@ -709,3 +709,15 @@ fn the_free_scoped_functions_just_run_the_body_when_diagnostics_are_off() {
     let v = scoped_with(Subsystem::Snapshot, "x", Class::Top, &[], |_| 9u8, |_| panic!("judge must not run when diagnostics are off"));
     assert_eq!(v, 9);
 }
+
+#[test]
+fn the_report_names_a_finished_process_by_the_role_in_its_start_event_not_by_diag() {
+    let dir = tempdir().unwrap();
+    let mut c = Config::new(dir.path().to_path_buf(), Subsystem::Gui);
+    c.pid = 4090;
+    let d = Diag::new(c).unwrap();
+    d.event(Subsystem::Diag, OP_START, &[("role", Val::text("gui"))]);
+    d.shutdown(0);
+    let text = render(&load(dir.path(), &|_| Some(false)).unwrap(), unix_ms(), 10);
+    assert!(text.starts_with("pid 4090 (gui):"), "{text}");
+}
