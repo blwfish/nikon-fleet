@@ -713,12 +713,13 @@ fn without_init_the_global_calls_do_nothing_and_do_not_fail() {
 
 #[test]
 fn pid_alive_says_yes_for_this_process_and_no_for_one_that_cannot_exist() {
-    #[cfg(unix)]
+    // Unix (kill with signal 0) and Windows (OpenProcess / GetExitCodeProcess) both answer.
+    #[cfg(any(unix, windows))]
     {
         assert_eq!(pid_alive(std::process::id()), Some(true));
         assert_eq!(pid_alive(0x7fff_fffe), Some(false));
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     assert_eq!(pid_alive(std::process::id()), None);
 }
 
