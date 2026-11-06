@@ -75,8 +75,10 @@ live capture is MAID only, so a reference's section would otherwise show as a di
   Headline, Object name, City, State, Country, Category, Supplemental categories, Byline, Byline title, Writer/editor,
   Credit, Source. An empty preset is 72 bytes. Slots 1..10 are presets; 11..13 are a 20-byte record of kind 2 whose
   meaning is unknown. Read from a preset the owner typed in at the camera ("A", one to three characters per field).
-  The Z6III capture notes describe different leading entries (`""` and `"1"`); a Z 9 refused that with `0xA210`, so
-  a Z6III must be read before the layout is called general.
+  Same layout on a Z6III (verified 2026-11-06: its preset 1, left from the July NX Field test, decodes unchanged, and a
+  write of a new preset to an empty slot read back identical, then was restored). The July notes' "two leading entries,
+  `""` and `1`" are this header's last zero u32 and the preset's name `1`; omitting the 8 header bytes before them is what
+  a Z 9 refused with `0xA210`.
 - **IPTC write experiments on the Z 9 (2026-11-06; empty slot, baseline restored byte for byte).**
   `vendor-write-iptc` writes a slot; `vendor-set-iptc-preset` selects `0xD060`.
   - Slots 1..10 read as 72 bytes (`01 00 00 00 c9 00 01 00 00 00` then zeros); slots 11..13 read as 20 bytes
@@ -88,5 +90,7 @@ live capture is MAID only, so a reference's section would otherwise show as a di
     only selects or accepts a registered preset, and all thirteen here are empty.
   - The failed attempt had a 16-byte header, one u32 too many; with the 12-byte header the write is stored.
   - Selecting a preset (`0xD060`) was `AccessDenied` while every preset was empty; not retried with a preset in use.
-- **Other bodies.** Only a Z 9 has been captured with this section. Z6III (expect 5 properties, FTP, IPTC) and Z 5
-  (expect `not_supported` for the IPTC preset at least, FTP and IPTC `not_on_model`) still need a run each.
+- **Other bodies.** A Z 9 and a Z6III have been captured with this section (the Z6III by both the CLI and the worker:
+  200 properties, 5 extended properties, 3 FTP profiles, 13 IPTC slots, identical diffs). The Z 5 still needs a run
+  (expect FTP and IPTC `not_on_model`, and the IPTC preset `not_supported`). A second Z 9 would also show whether the
+  section differs between bodies of one model.

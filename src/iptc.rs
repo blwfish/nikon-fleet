@@ -15,9 +15,11 @@
 //! An empty preset is the 12-byte header and 15 zero lengths: 72 bytes. Slot 0 is a directory (a u32 count, then one
 //! record per slot), not a preset.
 //!
-//! The stored form is the camera's own bytes; this module only reads and builds them. The Z6III capture in
-//! `docs/nx-field-session-2026-07-09.md` describes a different leading pair of entries; that layout was refused with
-//! `0xA210` by a Z 9, so the two bodies (or the read and write directions) may differ and a Z6III must be checked.
+//! The stored form is the camera's own bytes; this module only reads and builds them. Same layout on a Z 9 and a
+//! Z6III (a preset on the Z6III, left from the July NX Field test, holds `Captions`, `Id`, `Headline`, ... and decodes
+//! with this code unchanged). The July capture notes describe "two leading entries, an empty string and `1`": that is
+//! this header's last zero u32 and the preset's name `1`. A write that left out the 8 header bytes before them was
+//! refused with `0xA210` by a Z 9.
 
 use serde::Serialize;
 
