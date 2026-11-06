@@ -19,8 +19,13 @@
 //! | each stored FTP profile (`0x90ED(n)`, `n < count`) | `raw-only`: the whole blob, hex. The decoded fields are derived when shown, by `decode_ftp_profile`, so the password lives in one place only |
 //! | the FTP list header (`0x90EB`: count, limit, active slot, device name) | `extracted` |
 //! | the FTP list beyond [`crate::ptp_usb::FTP_LIST_MAX_READ`] profiles | `dropped-with-reason`: the camera reports a limit of 20; a larger count is a number this code does not trust, and [`FtpStore::truncated`] says so |
+//! | the FTP list header's `guid` (16 bytes), `header` and `trailer` words (`0x90EB`) | `dropped-with-reason`: `ptp_usb::FtpProfileInfo` documents the layout as inferred, not documented; `header` (200) and `trailer` (500) were the same in every reply seen, and the guid's meaning is unknown. Nothing restores or compares them; the profile blobs are what a restore writes |
+//! | the FTP device name's string anomalies (`PtpString::anomalies`) | `dropped-with-reason`: [`FtpStore::device_name`] is informational (shown, never written or compared), so a name that decoded with anomalies is stored as its text only |
 //! | each IPTC slot (`0x9412(n)`, `n` from 1 to the directory's count) | `raw-only`: the whole record, hex. Decoded when shown (`crate::iptc`); a slot of another record kind is kept as such |
+//! | the IPTC directory (`0x9412(0)`) beyond its first `u32`, the slot count | `dropped-with-reason`: the bytes after the count are of unknown meaning (the wire form was inferred from an NX capture and has not been run against a body), and nothing restores or diffs them |
 //! | IPTC slots past [`IPTC_READ_MAX`] | `dropped-with-reason`: the count is the camera's and is not trusted past the cap; [`IptcStore::truncated`] says so |
+//! | a vendor read's `warnings` and `response_params` (every `ExtendedSource` read) | `dropped-with-reason`: the source trait returns bytes only. The warning is "this model is not surveyed", and the fleet's bodies are surveyed, so it is empty for them; a body that is not would be recorded as clean |
+//! | the session's identity beyond model and USB serial (`usb_warnings`, the DeviceInfo dataset) | `dropped-with-reason`: [`ReadFrom`] is used only to check the data came from the body the snapshot is of; the rest is diagnostic and the MAID capture records its own |
 //!
 //! Passwords are stored (the point is to be able to restore them) and shown masked unless the user
 //! asks; see `DecodedFtpProfile::with_secrets_masked`.
@@ -31,12 +36,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::iptc::{IptcRecord, decode_iptc_slot};
 use crate::ptp_usb::{
-    FtpListState, PtpResponseCode, PtpUsbError, PtpUsbSession, decode_ftp_profile,
+    FtpListState, FtpWriteOutcome, IptcWriteOutcome, PtpResponseCode, PtpUsbError, PtpUsbSession, decode_ftp_profile,
     decode_ptp_string_value,
 };
 
-/// PTP response `DevicePropNotSupported`.
-const RESP_DEVICE_PROP_NOT_SUPPORTED: u16 = 0x200A;
+/// PTP response `DevicePropNotSupported`: the one definition (the property sweep uses it too). A test checks it
+/// against the name `ptp_usb` gives the code.
+pub(crate) const RESP_DEVICE_PROP_NOT_SUPPORTED: u16 = 0x200A;
 
 /// How a raw-PTP property is turned into a stored value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,11 +104,20 @@ pub struct ExtendedProp {
 }
 
 /// One stored FTP profile: the blob exactly as `0x90ED` returned it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` does not print the blob: it holds the password and the Wi-Fi key, and every type that holds one (the
+/// store, the section, the snapshot) prints through this. The file (`Serialize`) is where the blob is kept, on purpose.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FtpProfileEntry {
     pub slot: u32,
     /// Lowercase hex, no separators. Holds the password.
     pub hex: String,
+}
+
+impl std::fmt::Debug for FtpProfileEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FtpProfileEntry").field("slot", &self.slot).field("hex", &format_args!("<{} byte(s) hidden>", self.hex.len() / 2)).finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +221,19 @@ impl Extended {
         }
     }
 
+    /// Every entry of [`Self::props`] sits under the key its own code gives ([`prop_key`]). Edit and restore look a
+    /// property up by key; diff and display go by the code inside, so a hand-edited file where they disagree would be
+    /// read two ways. Checked when a snapshot is loaded.
+    pub fn check_keys(&self) -> Result<(), String> {
+        for (key, p) in &self.props {
+            let expected = u16::try_from(p.code).map(prop_key);
+            if expected.as_deref() != Ok(key.as_str()) {
+                return Err(format!("extended.props entry {key:?} holds property code {:#x}, which belongs under {}", p.code, expected.unwrap_or_else(|_| "no key (not a 16-bit code)".to_string())));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether this was read from the body the snapshot says it is of. Only a mismatch that can be seen
     /// refuses: a side with no USB serial is not evidence of a different body.
     pub fn check_body(&self, model: &str, serial: &str) -> Result<(), String> {
@@ -307,7 +335,7 @@ impl<T: crate::ptp_usb::BulkTransport> ExtendedSink for PtpUsbSession<T> {
 
     fn write_iptc(&mut self, slot: u32, data: &[u8]) -> Result<bool, PtpUsbError> {
         let out = self.write_iptc_slot(slot, data, false)?;
-        Ok(matches!(&out.after, Ok(after) if after.data == data))
+        Ok(iptc_write_verified(&out, data))
     }
 
     fn delete_all_ftp(&mut self) -> Result<u32, PtpUsbError> {
@@ -315,8 +343,20 @@ impl<T: crate::ptp_usb::BulkTransport> ExtendedSink for PtpUsbSession<T> {
     }
 
     fn add_ftp(&mut self, blob: &[u8], count_before: u32) -> Result<bool, PtpUsbError> {
-        self.write_ftp_profile_blob_verified(count_before, 1, blob, false).map(|o| o.verification.is_verified())
+        self.write_ftp_profile_blob_verified(count_before, 1, blob, false).map(|o| ftp_write_verified(&o))
     }
+}
+
+/// Whether an IPTC slot write is verified: the read after the accepted write succeeded and holds exactly what was
+/// sent. A failed read-back is not verified (the write happened; nothing confirms it).
+pub(crate) fn iptc_write_verified(out: &IptcWriteOutcome, sent: &[u8]) -> bool {
+    matches!(&out.after, Ok(after) if after.data == sent)
+}
+
+/// Whether a guarded FTP profile write is verified: its own read-back found slot 0 holding the profile sent and the
+/// count it should leave. Every other outcome (a mismatch, an undecodable read-back, a failed one) is not.
+pub(crate) fn ftp_write_verified(out: &FtpWriteOutcome) -> bool {
+    out.verification.is_verified()
 }
 
 fn failed(e: &PtpUsbError) -> (String, String) {
@@ -334,7 +374,9 @@ fn prop_state(kind: PropKind, bytes: Vec<u8>) -> PropState {
 }
 
 /// Read everything this module knows how to read from `src`. Never fails as a whole: each item records
-/// its own outcome, so a body that lacks a feature, or one read that fails, does not cost the rest.
+/// its own outcome, so a body that lacks a feature, or one read that fails, does not cost the other items. The
+/// granularity is the item: the FTP list and the IPTC slots are each read whole, and a failed read inside one
+/// (any one profile, any one slot) records `ReadFailed` for that whole section, not just the entry.
 pub fn read_extended<S: ExtendedSource + ?Sized>(src: &mut S) -> Extended {
     let read_from = match src.identity() {
         Ok(x) => x,
@@ -412,10 +454,22 @@ pub struct ExtendedSummary {
     pub ftp: String,
     /// How many profiles were stored, when the list was read.
     pub ftp_profiles: Option<usize>,
+    /// Of those, how many do not decode (kept as raw hex, which a restore refuses to write).
+    #[serde(default)]
+    pub ftp_profiles_undecodable: Option<usize>,
+    /// The list was read only in part (`FtpStore::truncated`).
+    #[serde(default)]
+    pub ftp_truncated: bool,
     /// `not_read`, `not_on_model`, `read_failed` or `read`.
     pub iptc: String,
     /// How many IPTC presets hold text, when the slots were read.
     pub iptc_presets_in_use: Option<usize>,
+    /// Of the slots read, how many could not be decoded at all (not counted as in use).
+    #[serde(default)]
+    pub iptc_slots_undecodable: Option<usize>,
+    /// The slots were read only in part (`IptcStore::truncated`).
+    #[serde(default)]
+    pub iptc_truncated: bool,
     /// Set when the data was read but not kept, and why (a different body than the snapshot's).
     pub dropped: Option<String>,
 }
@@ -423,18 +477,20 @@ pub struct ExtendedSummary {
 impl Extended {
     pub fn summary(&self) -> ExtendedSummary {
         let count = |f: fn(&PropState) -> bool| self.props.values().filter(|p| f(&p.state)).count();
-        let (ftp, ftp_profiles) = match &self.ftp {
-            FtpState::NotOnModel => ("not_on_model", None),
-            FtpState::ReadFailed { .. } => ("read_failed", None),
-            FtpState::Read(store) => ("read", Some(store.profiles.len())),
+        let (ftp, ftp_profiles, ftp_profiles_undecodable, ftp_truncated) = match &self.ftp {
+            FtpState::NotOnModel => ("not_on_model", None, None, false),
+            FtpState::ReadFailed { .. } => ("read_failed", None, None, false),
+            FtpState::Read(store) => ("read", Some(store.profiles.len()), Some(store.profiles.iter().filter(|p| p.decode().is_err()).count()), store.truncated),
         };
-        let (iptc, iptc_presets_in_use) = match &self.iptc {
-            IptcState::NotRead => ("not_read", None),
-            IptcState::NotOnModel => ("not_on_model", None),
-            IptcState::ReadFailed { .. } => ("read_failed", None),
+        let (iptc, iptc_presets_in_use, iptc_slots_undecodable, iptc_truncated) = match &self.iptc {
+            IptcState::NotRead => ("not_read", None, None, false),
+            IptcState::NotOnModel => ("not_on_model", None, None, false),
+            IptcState::ReadFailed { .. } => ("read_failed", None, None, false),
             IptcState::Read(store) => (
                 "read",
                 Some(store.slots.iter().filter(|s| matches!(s.decode(), Ok(IptcRecord::Preset(p)) if !p.is_empty())).count()),
+                Some(store.slots.iter().filter(|s| s.decode().is_err()).count()),
+                store.truncated,
             ),
         };
         ExtendedSummary {
@@ -443,8 +499,12 @@ impl Extended {
             props_failed: count(|s| matches!(s, PropState::ReadFailed { .. })),
             ftp: ftp.to_string(),
             ftp_profiles,
+            ftp_profiles_undecodable,
+            ftp_truncated,
             iptc: iptc.to_string(),
             iptc_presets_in_use,
+            iptc_slots_undecodable,
+            iptc_truncated,
             dropped: None,
         }
     }
@@ -745,5 +805,142 @@ mod tests {
         let mut anon = e.clone();
         anon.read_from.usb_serial = String::new();
         assert!(anon.check_body("Z 9", "anything").is_ok(), "no USB serial on the raw side likewise");
+    }
+
+    // ── the write adapter's verdicts (the only place `verified` is decided for IPTC and FTP writes) ──
+
+    fn read_of(data: &[u8]) -> crate::ptp_usb::VendorRead {
+        crate::ptp_usb::VendorRead { data: data.to_vec(), response_params: vec![], warnings: vec![] }
+    }
+
+    fn iptc_outcome(after: Result<crate::ptp_usb::VendorRead, PtpUsbError>) -> IptcWriteOutcome {
+        IptcWriteOutcome { before: read_of(&[0]), response_params: vec![], warnings: vec![], after }
+    }
+
+    #[test]
+    fn an_iptc_write_is_verified_only_when_the_read_back_holds_exactly_what_was_sent() {
+        let sent = [1u8, 2, 3];
+        assert!(iptc_write_verified(&iptc_outcome(Ok(read_of(&sent))), &sent), "the read-back is what was sent");
+        for (what, after) in [
+            ("one byte different", Ok(read_of(&[1, 2, 4]))),
+            ("a prefix of it", Ok(read_of(&[1, 2]))),
+            ("it with a byte more", Ok(read_of(&[1, 2, 3, 0]))),
+            ("empty", Ok(read_of(&[]))),
+            ("the read-back failed", Err(PtpUsbError::NoDataPhase { op: 0x9412 })),
+        ] {
+            assert!(!iptc_write_verified(&iptc_outcome(after), &sent), "{what} must not read as verified");
+        }
+        // the unchanged old content is not a verification either: `before` is not consulted
+        let o = IptcWriteOutcome { before: read_of(&sent), response_params: vec![], warnings: vec![], after: Err(PtpUsbError::NoDataPhase { op: 0x9412 }) };
+        assert!(!iptc_write_verified(&o, &sent));
+    }
+
+    fn ftp_outcome(verification: crate::ptp_usb::FtpWriteVerification) -> FtpWriteOutcome {
+        FtpWriteOutcome {
+            receipt: crate::ptp_usb::FtpWriteReceipt { response_params: vec![], reply_matched_command: true },
+            kind: crate::ptp_usb::FtpWriteKind::Add,
+            count_before: 1,
+            verification,
+        }
+    }
+
+    #[test]
+    fn an_ftp_write_is_verified_only_by_the_verified_read_back_and_never_by_the_other_three() {
+        use crate::ptp_usb::FtpWriteVerification as V;
+        assert!(ftp_write_verified(&ftp_outcome(V::Verified { count_after: 2 })));
+        assert!(!ftp_write_verified(&ftp_outcome(V::Mismatch { count_after: 2, count_expected: 3, differing_fields: vec!["host"] })));
+        assert!(!ftp_write_verified(&ftp_outcome(V::ReadBackUndecodable { error: PtpUsbError::NoDataPhase { op: 0x90ED } })));
+        assert!(!ftp_write_verified(&ftp_outcome(V::ReadBackFailed { error: PtpUsbError::NoDataPhase { op: 0x90ED } })));
+    }
+
+    // ── what must not leak, what is one definition ──
+
+    #[test]
+    fn debug_output_of_everything_that_holds_a_profile_blob_hides_the_blob() {
+        let blob_hex = "deadbeef0123456789abcdef";
+        let entry = FtpProfileEntry { slot: 3, hex: blob_hex.into() };
+        let store = FtpStore { count: 1, limit: 20, active_slot: Some(0), device_name: "Z_9_1".into(), truncated: false, profiles: vec![entry.clone()] };
+        let ext = Extended {
+            read_from: ReadFrom { model: "Z 9".into(), usb_serial: "1".into() },
+            props: BTreeMap::new(),
+            ftp: FtpState::Read(store.clone()),
+            iptc: IptcState::NotRead,
+        };
+        let mut snap = crate::snapshot::Snapshot::new(
+            crate::snapshot::Camera { model: "Z 9".into(), serial: "1".into(), firmware: "1".into() },
+            crate::snapshot::Transport::Usb,
+            "2026-11-06T00:00:00Z".into(),
+        );
+        snap.extended = Some(ext.clone());
+        for (what, dump) in [("entry", format!("{entry:?}")), ("store", format!("{store:?}")), ("state", format!("{:?}", ext.ftp)), ("section", format!("{ext:?}")), ("snapshot", format!("{snap:?}")), ("pretty", format!("{snap:#?}"))] {
+            assert!(!dump.contains(blob_hex) && !dump.contains("deadbeef"), "{what}: {dump}");
+            assert!(dump.contains("12 byte(s) hidden"), "{what} says a profile is there, and how big: {dump}");
+        }
+        assert!(format!("{entry:?}").contains("slot: 3") && format!("{entry:?}").contains("12 byte(s) hidden"), "the slot and the size are shown");
+        // the file still carries it: that is where it is kept
+        assert!(serde_json::to_string(&entry).unwrap().contains(blob_hex));
+    }
+
+    #[test]
+    fn device_prop_not_supported_is_the_code_ptp_usb_names_that() {
+        assert_eq!(PtpResponseCode(RESP_DEVICE_PROP_NOT_SUPPORTED).to_string(), "DevicePropNotSupported (0x200a)");
+    }
+
+    #[test]
+    fn a_props_key_must_be_the_one_its_code_gives() {
+        let mut e = read_extended(&mut z9());
+        assert!(e.check_keys().is_ok());
+        let moved = e.props.remove("0xd072").unwrap();
+        e.props.insert("0xd073x".into(), moved);
+        assert!(e.check_keys().unwrap_err().contains("0xd073x"), "a key that is not its code's");
+        let mut e = read_extended(&mut z9());
+        e.props.get_mut("0xd072").unwrap().code = 0xD073;
+        assert!(e.check_keys().unwrap_err().contains("0xd073"), "a code that is not its key's");
+        let mut e = read_extended(&mut z9());
+        e.props.get_mut("0xd072").unwrap().code = 0x1_D072;
+        assert!(e.check_keys().is_err(), "a code that is not 16 bits has no key");
+    }
+
+    // ── the summary ──
+
+    #[test]
+    fn the_summary_counts_what_it_could_not_decode_and_says_when_a_list_is_partial() {
+        // z9()'s FTP blobs and IPTC slots are placeholders that decode to nothing
+        let s = read_extended(&mut z9()).summary();
+        assert_eq!((s.ftp_profiles, s.ftp_profiles_undecodable, s.ftp_truncated), (Some(2), Some(2), false));
+        assert_eq!((s.iptc_presets_in_use, s.iptc_slots_undecodable, s.iptc_truncated), (Some(0), Some(2), false));
+        // a real preset slot decodes; an empty one is decoded and not in use, so neither is "undecodable"
+        let preset = |name: &str| {
+            crate::iptc::encode_iptc_preset(&crate::iptc::IptcPreset { name: name.into(), fields: vec![String::new(); 14] }).unwrap()
+        };
+        let mut f = z9();
+        f.iptc = Ok((2, vec![(1, preset("Race")), (2, preset(""))]));
+        let s = read_extended(&mut f).summary();
+        assert_eq!((s.iptc_presets_in_use, s.iptc_slots_undecodable), (Some(1), Some(0)));
+        // truncation shows in the summary too
+        let mut f = z9();
+        f.iptc = Ok((IPTC_READ_MAX + 1, vec![(1, preset("Race"))]));
+        f.ftp = Ok(list(&[&[1]], FTP_LIST_MAX_READ + 1, 0));
+        let s = read_extended(&mut f).summary();
+        assert!(s.iptc_truncated && s.ftp_truncated);
+        // sections that were not read have no counts
+        let s = Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, "t", "d").summary();
+        assert_eq!((s.ftp_profiles_undecodable, s.iptc_slots_undecodable, s.ftp_truncated, s.iptc_truncated), (None, None, false, false));
+        // a summary written before these fields existed reads with them absent
+        let mut v = serde_json::to_value(read_extended(&mut z9()).summary()).unwrap();
+        for k in ["ftp_profiles_undecodable", "ftp_truncated", "iptc_slots_undecodable", "iptc_truncated"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        let old: ExtendedSummary = serde_json::from_value(v).unwrap();
+        assert_eq!((old.ftp_profiles_undecodable, old.ftp_truncated), (None, false));
+    }
+
+    #[test]
+    fn two_empty_identities_pass_check_body_and_a_restore_does_not_rely_on_that() {
+        // Pinned, not endorsed: a section read when the raw session would not open has an empty ReadFrom (it records
+        // the failure), and it is attached to whatever snapshot it was read for. The restore path decides the body
+        // from the live camera (`restore_extended`'s same-body check), not from this.
+        let e = Extended::all_failed(ReadFrom { model: String::new(), usb_serial: String::new() }, "t", "d");
+        assert!(e.check_body("Z 9", "1").is_ok() && e.check_body("", "").is_ok());
     }
 }

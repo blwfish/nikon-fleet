@@ -61,12 +61,43 @@ pub fn checked_reference_filename(model: &str, serial: &str) -> Result<String, P
     Ok(crate::ops::list::reference_filename(model, serial))
 }
 
+/// Create a NEW file at `path` that only its owner can read or write (`0600` on unix, set by the `open` call itself,
+/// so there is no moment at which the file exists with the process's default mode), failing with `AlreadyExists` if
+/// anything (a symlink included) is already there. The way to create a file that holds a camera FTP password: a
+/// snapshot, a restore point, a reference, an archive of them. The mode is capped by the umask, never widened by it.
+/// Where the platform has no modes (Windows) the directory's own permissions apply and this is `create_new`.
+pub fn create_new_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(PRIVATE_FILE_MODE);
+    }
+    options.open(path)
+}
+
+/// The mode of a file that holds a secret: owner read/write only.
+#[cfg(unix)]
+pub const PRIVATE_FILE_MODE: u32 = 0o600;
+
 /// Write `bytes` to `path` so a reader sees the old file or the whole new one, never half: a
 /// temporary file in the same directory (a name no other writer in this process or another can
 /// pick), synced to disk, then a rename over `path`. The temporary file is removed when any step
 /// fails. The directory must exist. When `path` is a symlink the file it points to is replaced and
 /// the link is kept (a dotfile-managed settings.json stays managed).
+///
+/// **Permissions (unix):** the temporary file is created `0600` ([`create_new_private`]) before any byte is
+/// written to it, and the rename carries that mode to `path`, so a file written here is owner-only whatever the
+/// umask and whatever mode the file it replaced had. Snapshots, restore points and references hold FTP passwords;
+/// the settings file is private too, which costs it nothing.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_observed(path, bytes, &|_| {})
+}
+
+/// [`write_atomic`] that calls `before_publish` with the temporary file's path after the bytes are written and
+/// synced and before the rename, so a test can look at the one file that exists in that window.
+fn write_atomic_observed(path: &Path, bytes: &[u8], before_publish: &dyn Fn(&Path)) -> std::io::Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -76,15 +107,29 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         _ => path.to_path_buf(),
     };
     let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(
-        ".{}.{}.{}.tmp",
-        target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let written = std::fs::File::create(&tmp)
-        .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
-        .and_then(|()| std::fs::rename(&tmp, &target));
+    // `create_new`: never reuse (and so never keep the mode of) a stale temporary left by a process that died with
+    // the same pid.
+    let (mut file, tmp) = loop {
+        let tmp = dir.join(format!(
+            ".{}.{}.{}.tmp",
+            target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match create_new_private(&tmp) {
+            Ok(f) => break (f, tmp),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map(|()| drop(file))
+        .and_then(|()| {
+            before_publish(&tmp);
+            std::fs::rename(&tmp, &target)
+        });
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp); // best effort; `written` is the error to report
     }
@@ -433,5 +478,91 @@ mod tests {
         let tags: std::collections::BTreeSet<_> = all.iter().map(PathError::tag).collect();
         assert_eq!(tags.len(), all.len());
         assert!(all.iter().all(|e| !e.to_string().is_empty()));
+    }
+
+    // ── owner-only files (unix): snapshots, restore points and references hold FTP passwords ──
+
+    /// Run `body` with the process umask at 0, so the mode a file gets is the one the code asked for and a default
+    /// `File::create` would be 0666. The umask is process-wide: one test at a time, restored afterwards.
+    #[cfg(unix)]
+    fn with_umask_zero<R>(body: impl FnOnce() -> R) -> R {
+        use std::sync::Mutex;
+        static UMASK: Mutex<()> = Mutex::new(());
+        let _guard = UMASK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: umask only swaps the process's file-creation mask; it is restored before the guard drops.
+        let old = unsafe { libc::umask(0) };
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        unsafe { libc::umask(old) };
+        match out {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_is_owner_only_from_the_moment_it_exists_even_with_a_umask_of_zero() {
+        with_umask_zero(|| {
+            let d = TempDir::new().unwrap();
+            let p = d.path().join("secret.json");
+            let f = create_new_private(&p).unwrap();
+            // Nothing has been written yet: the mode is the creation mode, not a later chmod.
+            assert_eq!(fs::metadata(&p).unwrap().len(), 0);
+            assert_eq!(mode_of(&p), 0o600);
+            drop(f);
+            // Never replaces: a second create of the same name, and one over a symlink, are AlreadyExists.
+            assert_eq!(create_new_private(&p).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+            let link = d.path().join("link");
+            std::os::unix::fs::symlink(d.path().join("nowhere"), &link).unwrap();
+            assert_eq!(create_new_private(&link).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+            assert!(fs::symlink_metadata(d.path().join("nowhere")).is_err(), "nothing was created through the dangling link");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_stages_in_an_owner_only_temp_and_publishes_an_owner_only_file() {
+        with_umask_zero(|| {
+            let d = TempDir::new().unwrap();
+            let p = d.path().join("snap.json");
+            let seen = std::cell::Cell::new(None);
+            write_atomic_observed(&p, b"password=hunter2", &|tmp| {
+                // The one file that exists in the window between the write and the rename.
+                assert_eq!(fs::read(tmp).unwrap(), b"password=hunter2", "the content is complete in the temporary");
+                seen.set(Some(mode_of(tmp)));
+            })
+            .unwrap();
+            assert_eq!(seen.get(), Some(0o600), "the temporary file was never group- or world-readable");
+            assert_eq!(mode_of(&p), 0o600);
+            // Replacing a file that WAS world-readable makes it private (it may hold secrets written by an older version).
+            fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+            assert_eq!(mode_of(&p), 0o644);
+            write_atomic(&p, b"new").unwrap();
+            assert_eq!(mode_of(&p), 0o600);
+            assert_eq!(fs::read(&p).unwrap(), b"new");
+            // Through a symlink the link is kept and the file it points at is the private one.
+            let link = d.path().join("link.json");
+            std::os::unix::fs::symlink(&p, &link).unwrap();
+            write_atomic(&link, b"via link").unwrap();
+            assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+            assert_eq!(mode_of(&p), 0o600);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_write_is_still_owner_only() {
+        with_umask_zero(|| {
+            let d = TempDir::new().unwrap();
+            let p = d.path().join("empty");
+            write_atomic(&p, b"").unwrap();
+            assert_eq!(mode_of(&p), 0o600);
+        });
     }
 }

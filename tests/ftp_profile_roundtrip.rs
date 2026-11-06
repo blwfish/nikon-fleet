@@ -24,32 +24,42 @@ fn every_real_profile_is_written_back_byte_for_byte() {
     }
 }
 
+/// One edit, and how to put back just the field it touched (from the original).
+type Edit = (&'static str, fn(&mut DecodedFtpProfile), fn(&mut DecodedFtpProfile, &DecodedFtpProfile));
+
+const EDITS: [Edit; 9] = [
+    ("profile_name", |d| d.profile_name.push('X'), |d, o| d.profile_name = o.profile_name.clone()),
+    ("ssid_24ghz", |d| d.ssid_24ghz.push('X'), |d, o| d.ssid_24ghz = o.ssid_24ghz.clone()),
+    ("ssid_5ghz", |d| d.ssid_5ghz.push('X'), |d, o| d.ssid_5ghz = o.ssid_5ghz.clone()),
+    ("host", |d| d.host = "files.example.org".into(), |d, o| d.host = o.host.clone()),
+    ("folder", |d| d.folder = "/incoming".into(), |d, o| d.folder = o.folder.clone()),
+    ("username", |d| d.username.push('X'), |d, o| d.username = o.username.clone()),
+    ("password", |d| d.password.push('X'), |d, o| d.password = o.password.clone()),
+    ("ftp_port", |d| d.ftp_port = 2222, |d, o| d.ftp_port = o.ftp_port),
+    ("option_flags", |d| d.option_flags ^= 0x0008, |d, o| d.option_flags = o.option_flags),
+];
+
+/// For every real blob and every edit: what is written reads back as what was set; and putting back only the field
+/// that was edited, in the decoded result, gives the original profile and (written again) the original bytes. That
+/// second half is what says no OTHER field moved: comparing the result with the same edit applied to a clone, as this
+/// test once did, cannot see a second field changing, because both sides would change it the same way.
 #[test]
 fn changing_one_field_changes_that_field_and_nothing_else() {
-    let (name, blob) = real_blobs().into_iter().next().unwrap();
-    let original = decode_ftp_profile(&blob).unwrap();
-    type Edit = (&'static str, fn(&mut DecodedFtpProfile));
-    let edits: [Edit; 9] = [
-        ("profile_name", |d| d.profile_name.push('X')),
-        ("ssid_24ghz", |d| d.ssid_24ghz.push('X')),
-        ("ssid_5ghz", |d| d.ssid_5ghz.push('X')),
-        ("host", |d| d.host = "files.example.org".into()),
-        ("folder", |d| d.folder = "/incoming".into()),
-        ("username", |d| d.username.push('X')),
-        ("password", |d| d.password.push('X')),
-        ("ftp_port", |d| d.ftp_port = 2222),
-        ("option_flags", |d| d.option_flags ^= 0x0008),
-    ];
-    for (what, edit) in edits {
-        let mut d = original.clone();
-        edit(&mut d);
-        let new_blob = encode_decoded_ftp_profile(&d).unwrap_or_else(|e| panic!("{name} / {what}: {e}"));
-        let decoded = decode_ftp_profile(&new_blob).unwrap_or_else(|e| panic!("{name} / {what}: the result does not decode: {e}"));
-        assert_eq!(decoded, d, "{what}: what is written reads back as what was set");
-        let mut expect = original.clone();
-        edit(&mut expect);
-        assert_eq!(decoded, expect, "{what}");
-        assert_ne!(new_blob, blob, "{what} changed something");
+    let blobs = real_blobs();
+    assert!(blobs.len() >= 6, "more than one real profile: the fixture holds {}", blobs.len());
+    for (name, blob) in blobs {
+        let original = decode_ftp_profile(&blob).unwrap();
+        for (what, edit, restore) in EDITS {
+            let mut d = original.clone();
+            edit(&mut d);
+            let new_blob = encode_decoded_ftp_profile(&d).unwrap_or_else(|e| panic!("{name} / {what}: {e}"));
+            let mut decoded = decode_ftp_profile(&new_blob).unwrap_or_else(|e| panic!("{name} / {what}: the result does not decode: {e}"));
+            assert_eq!(decoded, d, "{name} / {what}: what is written reads back as what was set");
+            assert_ne!(new_blob, blob, "{name} / {what} changed something");
+            restore(&mut decoded, &original);
+            assert_eq!(decoded, original, "{name} / {what}: something besides the edited field changed");
+            assert_eq!(encode_decoded_ftp_profile(&decoded).unwrap(), blob, "{name} / {what}: and the bytes are the original's again");
+        }
     }
 }
 

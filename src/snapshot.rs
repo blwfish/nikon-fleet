@@ -98,7 +98,8 @@ pub struct DerivedFrom {
     pub source_captured_at: String,
     pub source_label: Option<String>,
     /// When this copy was made. The copy keeps the source's `captured_at` (the values were read then), so this is
-    /// what its file name and its place in time are built from.
+    /// what its file name is built from (two copies of one snapshot would otherwise share a name). Listings order
+    /// by `captured_at`, which the copy shares with its source: a copy sorts beside the snapshot it came from.
     pub created_at: String,
     pub last_edited_at: String,
     /// Oldest first; carries over the source's own edits when the source was itself an edited copy.
@@ -176,6 +177,12 @@ fn link_or_rename(link: Link<'_>, tmp: &Path, dest: &Path) -> std::io::Result<()
     }
 }
 
+/// Create `dest` holding all of `bytes`, or not at all, never replacing anything: the one way a new file is
+/// published here (a snapshot capture, a property sweep). See [`Snapshot::save_new`] for the steps.
+pub(crate) fn write_new_whole(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    publish_new(dest, bytes, &write_synced, &link_no_replace)
+}
+
 /// Create `dest` holding all of `bytes`, or not at all, never replacing anything. See
 /// [`Snapshot::save_new`]. The temporary file is gone when this returns, success or not.
 fn publish_new(dest: &Path, bytes: &[u8], write: StageWrite<'_>, publish: Publish<'_>) -> std::io::Result<()> {
@@ -184,10 +191,11 @@ fn publish_new(dest: &Path, bytes: &[u8], write: StageWrite<'_>, publish: Publis
 
     let dir = dest.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    // `create_new`: never reuse a stale temporary left by a process that died with the same pid.
+    // `create_new`: never reuse a stale temporary left by a process that died with the same pid. Private
+    // (0600 on unix) from creation: a snapshot holds FTP passwords (finding 06).
     let (mut file, tmp) = loop {
         let tmp = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-        match fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+        match crate::ops::paths::create_new_private(&tmp) {
             Ok(f) => break (f, tmp),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -276,7 +284,7 @@ impl Snapshot {
     /// any step leaves neither the file nor the temporary.
     pub fn save_new<P: AsRef<Path>>(&self, path: P) -> Result<(), SnapshotError> {
     crate::diag::scoped(crate::diag::Subsystem::Snapshot, "save_new", crate::diag::Class::Top, &[], |_span| {
-            publish_new(path.as_ref(), self.to_pretty_json()?.as_bytes(), &write_synced, &link_no_replace)?;
+            write_new_whole(path.as_ref(), self.to_pretty_json()?.as_bytes())?;
             Ok(())
     })
     }
@@ -293,6 +301,9 @@ impl Snapshot {
                 found: snap.format_version,
                 expected: CURRENT_FORMAT_VERSION,
             });
+        }
+        if let Some(why) = snap.extended.as_ref().and_then(|e| e.check_keys().err()) {
+            return Err(SnapshotError::Json(<serde_json::Error as serde::de::Error>::custom(why)));
         }
         Ok(snap)
     }
@@ -427,6 +438,25 @@ mod tests {
         // nothing previously exercised.
         let err = Snapshot::from_json(r#"{"camera": {"model": "Z 9""#).unwrap_err();
         assert!(matches!(err, SnapshotError::Json(_)), "expected Json error, got {err:?}");
+    }
+
+    #[test]
+    fn an_extended_prop_filed_under_another_codes_key_is_refused_on_load() {
+        use crate::extended::{Extended, ExtendedProp, FtpState, IptcState, PropState, ReadFrom};
+        let build = |key: &str, code: u32| {
+            let mut s = sample_snapshot();
+            let mut props = BTreeMap::new();
+            props.insert(key.to_string(), ExtendedProp { code, name: "Artist".into(), state: PropState::Text { text: "x".into() } });
+            s.extended = Some(Extended { read_from: ReadFrom { model: "Z 9".into(), usb_serial: "1".into() }, props, ftp: FtpState::NotOnModel, iptc: IptcState::NotRead });
+            s.to_pretty_json().unwrap()
+        };
+        assert!(Snapshot::from_json(&build("0xd072", 0xD072)).is_ok(), "key and code agree");
+        for (key, code) in [("0xd073", 0xD072), ("0xd072", 0xD073), ("artist", 0xD072)] {
+            let text = build(key, code);
+            let e = Snapshot::from_json(&text).unwrap_err();
+            assert!(matches!(e, SnapshotError::Json(_)) && e.to_string().contains("extended.props"), "{key}/{code:#x}: {e}");
+            assert!(SnapshotSummary::from_json(&text).is_err(), "a listing shows no file that loading would refuse");
+        }
     }
 
     #[test]

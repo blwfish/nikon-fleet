@@ -14,11 +14,24 @@
 //! What a camera does with a profile that has a changed port, folder or protocol is **not verified**: reading one
 //! back from a camera that took it is the check, and has not been done. The checks here are the encoder's own limits
 //! and character rules, and "has a name and a server".
+//!
+//! **Required fields.** `vendor-write-ftp` refuses a profile that lacks any of six fields
+//! ([`ptp_usb::ftp_profile_missing_fields`], the one list). The editor deliberately does not: the cameras make
+//! profiles without a login (two of the real blobs in `tests/fixtures/ftp_profile_vectors.json` have an empty
+//! username and password), so refusing them here, or when a restore plans them, would refuse profiles a camera made.
+//! What the editor does instead is say so: when a profile it adds or edits lacks something `vendor-write-ftp` would
+//! require, the edit's result says which ([`write_gate_note`]). Whether a camera accepts such a profile written back
+//! is **not verified**.
+//!
+//! **A new profile's camera address.** [`template`] is the encoder's blank profile, which carries the capture rig's
+//! camera address (192.168.66.87/24) and option bits `0x0005`. A body's own profiles can differ (one real blob has
+//! 10.0.0.251/24, another has no stored address). What a camera does with the template's address on a different network
+//! is **not verified**; a profile added here says it took the template's.
 
 use crate::extended::{hex_decode, hex_encode};
-use crate::ptp_usb::{DecodedFtpProfile, FtpEncoding, FtpField, FtpProfile, PtpUsbError, decode_ftp_profile, encode_decoded_ftp_profile, encode_ftp_profile};
+use crate::ptp_usb::{DecodedFtpProfile, FtpField, FtpProfile, PtpUsbError, decode_ftp_profile, encode_decoded_ftp_profile, encode_ftp_profile, ftp_profile_missing_fields};
 use crate::snapshot::Snapshot;
-use crate::snapshot_edit::{Applied, EditRefusal, ensure_editable, finish, ftp_store_mut, profile_label, renumber};
+use crate::snapshot_edit::{Applied, EditRefusal, ensure_editable, finish, ftp_store, ftp_store_mut, renumber};
 
 /// The option bit that makes a profile SFTP (confirmed on one profile whose menu says SFTP).
 pub const SFTP_BIT: u16 = 0x0008;
@@ -133,9 +146,31 @@ fn encoder_words(e: &PtpUsbError) -> String {
     }
 }
 
-/// The text fields whose wire form holds ASCII only, by [`FtpField`] (the encoder refuses anything else typed in them).
+/// The text fields whose wire form holds ASCII only, by [`FtpField`]. The encoder leaves this rule to the caller (a
+/// profile a camera made may hold more than it writes), so this check is the only judge of it; the question itself is
+/// the layout's (`FtpEncoding::encoder_ascii_only`), asked here and not re-spelled.
 fn ascii_only(field: FtpField) -> bool {
-    field.spec().encoding() == FtpEncoding::AsciiU32Len
+    field.spec().encoding().encoder_ascii_only()
+}
+
+/// The names of the required fields of `d` that are empty, by the list `vendor-write-ftp` applies
+/// ([`ftp_profile_missing_fields`]); empty when it has them all.
+pub fn missing_for_write(d: &DecodedFtpProfile) -> Vec<&'static str> {
+    ftp_profile_missing_fields(&d.profile_name, &d.ssid_24ghz, &d.ssid_5ghz, &d.host, &d.username, &d.password)
+}
+
+/// Words for an edit's result when it leaves `d` lacking required fields that `before` did not lack (all of them,
+/// for a new profile: `before` is empty-handed there). Empty when there is nothing to say. Never holds a value.
+fn write_gate_note(before: &[&str], d: &DecodedFtpProfile) -> String {
+    let now: Vec<&str> = missing_for_write(d).into_iter().filter(|m| !before.contains(m)).collect();
+    if now.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; note: vendor-write-ftp would refuse this profile (no {}); a restore does not check that, because cameras make such profiles",
+            now.join(", ")
+        )
+    }
 }
 
 /// Apply `f` to `d`, naming the fields that changed (never their values). Checks the fields that change, and the
@@ -220,8 +255,8 @@ pub fn template() -> DecodedFtpProfile {
     decode_ftp_profile(&blob).expect("what the encoder writes always decodes")
 }
 
-fn decoded_at(snap: &mut Snapshot, index: usize) -> Result<(DecodedFtpProfile, usize), EditRefusal> {
-    let store = ftp_store_mut(snap)?;
+fn decoded_at(snap: &Snapshot, index: usize) -> Result<(DecodedFtpProfile, usize), EditRefusal> {
+    let store = ftp_store(snap)?;
     let len = store.profiles.len();
     let p = store.profiles.get(index).ok_or(EditRefusal::FtpIndex { index, len })?;
     let d = hex_decode(&p.hex)
@@ -231,8 +266,8 @@ fn decoded_at(snap: &mut Snapshot, index: usize) -> Result<(DecodedFtpProfile, u
     Ok((d, len))
 }
 
-/// The fields of the profile at `index`, for the editor to show.
-pub fn profile_view(snap: &mut Snapshot, index: usize) -> Result<ProfileView, EditRefusal> {
+/// The fields of the profile at `index`, for the editor to show. Reads any snapshot, a capture included.
+pub fn profile_view(snap: &Snapshot, index: usize) -> Result<ProfileView, EditRefusal> {
     decoded_at(snap, index).map(|(d, _)| ProfileView::of(&d))
 }
 
@@ -240,7 +275,9 @@ pub fn profile_view(snap: &mut Snapshot, index: usize) -> Result<ProfileView, Ed
 pub fn ftp_set_fields(snap: &mut Snapshot, index: usize, f: &ProfileFields, now: &str) -> Result<Applied, EditRefusal> {
     ensure_editable(snap)?;
     let (mut d, _) = decoded_at(snap, index)?;
-    let label = profile_label(&hex_encode(&encode_decoded_ftp_profile(&d).unwrap_or_default()), index);
+    // `d` decoded, so its name is known; no need to encode it and decode it again to find it.
+    let label = format!("{:?}", d.profile_name);
+    let missing_before = missing_for_write(&d);
     let changed = apply_fields(&mut d, f)?;
     let item = format!("ftp:edit:{index}");
     if changed.is_empty() {
@@ -250,11 +287,11 @@ pub fn ftp_set_fields(snap: &mut Snapshot, index: usize, f: &ProfileFields, now:
     let store = ftp_store_mut(snap)?;
     store.profiles[index].hex = hex_encode(&blob);
     let renamed = if changed.contains(&"name") { format!(" (now {:?})", d.profile_name) } else { String::new() };
-    let change = format!("FTP profile {label}{renamed}: {} changed", changed.join(", "));
+    let change = format!("FTP profile {label}{renamed}: {} changed{}", changed.join(", "), write_gate_note(&missing_before, &d));
     Ok(finish(snap, now, Applied { changed: true, item, change }))
 }
 
-fn insert_profile(snap: &mut Snapshot, d: &DecodedFtpProfile, at: usize, what: &str, now: &str) -> Result<Applied, EditRefusal> {
+fn insert_profile(snap: &mut Snapshot, d: &DecodedFtpProfile, at: usize, what: &str, note: &str, now: &str) -> Result<Applied, EditRefusal> {
     let blob = encode_decoded_ftp_profile(d).map_err(|e| bad(encoder_words(&e)))?;
     let store = ftp_store_mut(snap)?;
     if store.profiles.len() >= store.limit as usize {
@@ -268,7 +305,7 @@ fn insert_profile(snap: &mut Snapshot, d: &DecodedFtpProfile, at: usize, what: &
         // An empty list reports no active profile; one with a profile reports slot 0 (every reply seen).
         store.active_slot = Some(0);
     }
-    let change = format!("FTP profile {:?} {what} at position {at}; {} in the list", d.profile_name, store.profiles.len());
+    let change = format!("FTP profile {:?} {what} at position {at}; {} in the list{note}", d.profile_name, store.profiles.len());
     Ok(finish(snap, now, Applied { changed: true, item: "ftp:add".to_string(), change }))
 }
 
@@ -278,7 +315,9 @@ pub fn ftp_add(snap: &mut Snapshot, f: &ProfileFields, position: Option<usize>, 
     let len = ftp_store_mut(snap)?.profiles.len();
     let mut d = template();
     apply_fields(&mut d, f)?;
-    insert_profile(snap, &d, position.unwrap_or(len), "added", now)
+    // Nothing of the template is the person's: say that its camera address was not chosen (unverified on a camera).
+    let note = format!("{}; its camera address and option bits are the template's (unverified on a camera)", write_gate_note(&[], &d));
+    insert_profile(snap, &d, position.unwrap_or(len), "added", &note, now)
 }
 
 /// Copy the profile at `index` to the position after it, under `name` (default: its name and " copy"), optionally
@@ -288,8 +327,9 @@ pub fn ftp_duplicate(snap: &mut Snapshot, index: usize, name: Option<&str>, chan
     let (mut d, _) = decoded_at(snap, index)?;
     let new_name = name.map(str::to_string).or_else(|| changes.name.clone()).unwrap_or_else(|| format!("{} copy", d.profile_name));
     let f = ProfileFields { name: Some(new_name), ..changes.clone() };
+    let missing_before = missing_for_write(&d);
     apply_fields(&mut d, &f)?;
-    insert_profile(snap, &d, index + 1, "duplicated", now)
+    insert_profile(snap, &d, index + 1, "duplicated", &write_gate_note(&missing_before, &d), now)
 }
 
 #[cfg(test)]
@@ -494,7 +534,7 @@ mod tests {
     fn a_new_profile_starts_from_the_encoders_template_and_goes_where_asked() {
         let mut s = snapshot_with(&["alpha", "beta"], 20);
         let a = ftp_add(&mut s, &new_profile(), Some(1), NOW).unwrap();
-        assert_eq!(a.change, "FTP profile \"fresh\" added at position 1; 3 in the list");
+        assert!(a.change.starts_with("FTP profile \"fresh\" added at position 1; 3 in the list; "), "{}", a.change);
         assert_eq!(names(&s), ["alpha", "fresh", "beta"]);
         let v = view(&mut s, 1);
         assert_eq!((v.host.as_str(), v.port, v.protocol, v.proxy_port, v.folder.as_str()), ("ftp.fresh.test", 21, Protocol::Ftp, 8080, ""), "the template's defaults");
@@ -569,5 +609,131 @@ mod tests {
             assert!(!dump.contains(secret), "{dump}");
         }
         assert!(dump.contains("files.example.org"));
+    }
+
+    // ── the required-field list, the ASCII rule, the template ──
+
+    fn decoded_of(s: &Snapshot, i: usize) -> DecodedFtpProfile {
+        let Some(Extended { ftp: FtpState::Read(st), .. }) = &s.extended else { panic!() };
+        decode_ftp_profile(&hex_decode(&st.profiles[i].hex).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_write_gates_required_fields_are_named_for_a_new_profile_that_lacks_them_and_not_for_one_that_has_them() {
+        let mut s = snapshot_with(&["alpha"], 20);
+        // name and host only: the other four of the six are missing, in the gate's own order and words
+        let a = ftp_add(&mut s, &ProfileFields { name: Some("n".into()), host: Some("h".into()), ..Default::default() }, None, NOW).unwrap();
+        assert!(a.change.contains("no SSID (2.4GHz), SSID (5GHz), username, password"), "{}", a.change);
+        assert!(a.change.contains("a restore does not check that"), "{}", a.change);
+        // all six: nothing to say about the gate
+        let full = ProfileFields { wifi_name: Some("w".into()), wifi_key: Some("k".into()), ..new_profile() };
+        let a = ftp_add(&mut s, &full, None, NOW).unwrap();
+        assert!(!a.change.contains("vendor-write-ftp"), "{}", a.change);
+        // the note never carries a value
+        assert!(!a.change.contains("hunter2") && !log(&s).contains("hunter2"));
+    }
+
+    #[test]
+    fn an_edit_is_told_about_a_required_field_it_emptied_and_not_about_one_the_profile_already_lacked() {
+        let mut s = snapshot_with(&["alpha"], 20);
+        // a profile the camera made without a login: edit the host, say nothing about the login it never had
+        let anon = ProfileFields { username: Some("".into()), password: Some("".into()), ..Default::default() };
+        let a = ftp_set_fields(&mut s, 0, &anon, NOW).unwrap();
+        assert!(a.change.contains("no username, password"), "emptying them is the edit's doing: {}", a.change);
+        let a = ftp_set_fields(&mut s, 0, &ProfileFields { host: Some("elsewhere.test".into()), ..Default::default() }, NOW).unwrap();
+        assert!(!a.change.contains("vendor-write-ftp"), "the login was already absent: {}", a.change);
+        // a copy of it lacks the same and is not told again; a copy that blanks one more field is
+        let a = ftp_duplicate(&mut s, 0, None, &ProfileFields::default(), NOW).unwrap();
+        assert!(!a.change.contains("vendor-write-ftp"), "{}", a.change);
+        let a = ftp_duplicate(&mut s, 0, None, &ProfileFields { wifi_name: Some("".into()), ..Default::default() }, NOW).unwrap();
+        assert!(a.change.contains("no SSID (2.4GHz)") && !a.change.contains("username"), "{}", a.change);
+    }
+
+    #[test]
+    fn an_empty_text_is_a_value_and_none_is_no_request() {
+        let mut s = snapshot_with(&["alpha"], 20);
+        let a = ftp_set_fields(&mut s, 0, &ProfileFields { password: Some(String::new()), ..Default::default() }, NOW).unwrap();
+        assert!(a.changed && a.change.contains("password changed"), "{}", a.change);
+        assert_eq!(view(&mut s, 0).password, "", "Some(\"\") clears it");
+        let none = ftp_set_fields(&mut s, 0, &ProfileFields { username: None, ..Default::default() }, NOW).unwrap();
+        assert!(!none.changed && view(&mut s, 0).username == "fleet", "None leaves it");
+        let again = ftp_set_fields(&mut s, 0, &ProfileFields { password: Some(String::new()), ..Default::default() }, NOW).unwrap();
+        assert!(!again.changed, "clearing what is already empty is not a change");
+    }
+
+    /// The ASCII rule is the wire layout's: a text field refuses non-ASCII exactly where the layout says its form holds
+    /// ASCII only, and takes it where the form is UTF-16 (the host, the folder). Asked of every text field the editor
+    /// offers, against `FtpEncoding::encoder_ascii_only` as the independent judge.
+    #[test]
+    fn each_text_field_refuses_non_ascii_exactly_where_the_layout_says_its_form_is_ascii_only() {
+        type Set = fn(&mut ProfileFields, String);
+        let slots: [(&str, Option<FtpField>, Set); 7] = [
+            ("name", Some(FtpField::ProfileName), |f, v| f.name = Some(v)),
+            ("Wi-Fi name", Some(FtpField::Ssid24Ghz), |f, v| f.wifi_name = Some(v)),
+            ("Wi-Fi key", Some(FtpField::Ssid5Ghz), |f, v| f.wifi_key = Some(v)),
+            ("host", Some(FtpField::Host), |f, v| f.host = Some(v)),
+            ("folder", None, |f, v| f.folder = Some(v)),
+            ("username", Some(FtpField::Username), |f, v| f.username = Some(v)),
+            ("password", Some(FtpField::Password), |f, v| f.password = Some(v)),
+        ];
+        for (label, field, set) in slots {
+            let mut s = snapshot_with(&["alpha"], 20);
+            let mut f = ProfileFields::default();
+            set(&mut f, "caf\u{e9}".to_string());
+            let r = ftp_set_fields(&mut s, 0, &f, NOW);
+            let ascii_only_form = field.is_some_and(|fl| fl.spec().encoding().encoder_ascii_only());
+            match r {
+                Err(e) => {
+                    assert!(ascii_only_form && e.to_string().contains("ASCII"), "{label}: refused but its form is not ASCII-only, or for another reason: {e}");
+                }
+                Ok(_) => assert!(!ascii_only_form, "{label}: its form is ASCII-only and the editor took non-ASCII"),
+            }
+        }
+        // And the two UTF-16 ones read back what was typed.
+        let mut s = snapshot_with(&["alpha"], 20);
+        ftp_set_fields(&mut s, 0, &ProfileFields { folder: Some("/caf\u{e9}".into()), host: Some("h\u{e9}.test".into()), ..Default::default() }, NOW).unwrap();
+        let v = view(&mut s, 0);
+        assert_eq!((v.folder.as_str(), v.host.as_str()), ("/caf\u{e9}", "h\u{e9}.test"));
+    }
+
+    #[test]
+    fn a_folder_longer_than_its_wire_form_holds_is_refused_by_the_encoder_with_its_name() {
+        let mut s = snapshot_with(&["alpha"], 20);
+        let before = serde_json::to_string(&s).unwrap();
+        ftp_set_fields(&mut s, 0, &ProfileFields { folder: Some("f".repeat(254)), ..Default::default() }, NOW).unwrap();
+        let e = ftp_set_fields(&mut s, 0, &ProfileFields { folder: Some("f".repeat(256)), ..Default::default() }, NOW).unwrap_err();
+        assert!(e.to_string().contains("folder"), "{e}");
+        assert_ne!(serde_json::to_string(&s).unwrap(), before, "the 254-unit folder was taken, the 256-unit one left it as it was");
+        assert_eq!(view(&mut s, 0).folder.len(), 254);
+    }
+
+    #[test]
+    fn the_sftp_bit_and_the_decoders_is_sftp_agree_for_every_option_bit() {
+        let mut d = template();
+        for bit in 0..16 {
+            for set in [false, true] {
+                d.option_flags = if set { 1u16 << bit } else { 0xFFFF & !(1u16 << bit) };
+                assert_eq!(d.is_sftp(), d.option_flags & SFTP_BIT != 0, "flags {:#06x}", d.option_flags);
+            }
+        }
+    }
+
+    #[test]
+    fn the_template_is_the_encoders_blank_profile_with_the_capture_rigs_camera_address() {
+        // Pinned so that the value a new profile starts from is visible in a diff when it changes (finding: a new
+        // profile can be restored to any body with the capture rig's address; unverified on a camera).
+        let t = template();
+        assert_eq!((t.camera_network, t.option_flags, t.ftp_port, t.second_port), (crate::ptp_usb::FtpCameraNetwork::CAPTURED, 0x0005, 21, 8080));
+        let mut s = snapshot_with(&["alpha"], 20);
+        ftp_add(&mut s, &new_profile(), None, NOW).unwrap();
+        assert_eq!(decoded_of(&s, 1).camera_network, crate::ptp_usb::FtpCameraNetwork::CAPTURED);
+        // a duplicate keeps the original's, whatever it is
+        let mut other = decoded_of(&s, 0);
+        other.camera_network = crate::ptp_usb::FtpCameraNetwork { ipv4: [10, 0, 0, 251], prefix_len: 24 };
+        if let Some(Extended { ftp: FtpState::Read(st), .. }) = &mut s.extended {
+            st.profiles[0].hex = hex_encode(&encode_decoded_ftp_profile(&other).unwrap());
+        }
+        ftp_duplicate(&mut s, 0, None, &ProfileFields::default(), NOW).unwrap();
+        assert_eq!(decoded_of(&s, 1).camera_network.ipv4, [10, 0, 0, 251]);
     }
 }

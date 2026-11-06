@@ -4201,7 +4201,10 @@ fn export_via_temp(
 ) -> Result<(), String> {
     let name = dest.file_name().ok_or_else(|| format!("{} is not a file path", dest.display()))?;
     let tmp = dest.with_file_name(format!(".{}.{}.partial", name.to_string_lossy(), std::process::id()));
-    let file = fs::File::create(&tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+    // A backup holds every snapshot, FTP passwords included: private (0600 on unix) from creation. A
+    // leftover of a crashed export by this same pid is removed first (`create_new` refuses to reuse it).
+    let _ = fs::remove_file(&tmp);
+    let file = nikon_fleet::ops::paths::create_new_private(&tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
     let finished = fill(file)
         .and_then(|f| f.sync_all().map(|()| ()).map_err(|e| format!("flushing {}: {e}", tmp.display())))
         .and_then(|()| fs::rename(&tmp, dest).map_err(|e| format!("moving the archive to {}: {e}", dest.display())));
@@ -4409,7 +4412,8 @@ fn create_new_with(path: &Path, write: impl FnOnce(&mut fs::File) -> std::io::Re
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
-    let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+    // Imported snapshots can hold FTP passwords: private (0600 on unix) like every other snapshot file.
+    let mut file = match nikon_fleet::ops::paths::create_new_private(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(CreateOutcome::Exists),
         Err(e) => return Err(format!("creating {}: {e}", path.display())),

@@ -7,7 +7,8 @@
 //! block's properties with their type, get/set flag, default, current value and allowed values. Two sweeps of
 //! the same body, with one menu setting changed between them, differ in exactly that setting's descriptor.
 //!
-//! Nothing here writes: the only operation sent is `GetDevicePropDesc`. See `docs/property-sweep.md`.
+//! Nothing here writes: besides opening and closing the session and reading DeviceInfo (the session's own, once),
+//! the only operation sent is `GetDevicePropDesc`. See `docs/property-sweep.md`.
 //!
 //! Source of the data and what is done with each part (the data-capture rule):
 //!
@@ -17,10 +18,11 @@
 //! | DevicePropertyCode | extracted; one that is not the code asked for is a fault, not silently accepted |
 //! | DataType | extracted |
 //! | GetSet | extracted |
-//! | FactoryDefaultValue, CurrentValue | extracted: hex, plus an integer or text where the type has one |
+//! | FactoryDefaultValue, CurrentValue | extracted: hex, plus an integer or text where the type has one. An array has neither: it is `raw-only` (its hex, which the diff compares). A string that does not decode keeps its hex and says why in `text_fault` |
 //! | FormFlag, and the range or enumeration it announces | extracted |
 //! | bytes after the last field | kept (`trailing_hex`) |
-//! | a field the parser cannot read | the parse stops there; what was read before it is kept and `fault` says where |
+//! | a field the parser cannot read | the parse stops there; the default, the current value and the form flag are kept if read, and `fault` says where. A range is kept only whole; an enumeration keeps the values read before the fault |
+//! | a reply too short to hold the five-byte head | no `desc`; `raw_hex` is kept, the diff says "undecodable", and [`SweepDump::undecoded`] counts it |
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -30,13 +32,11 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use crate::extended::hex_encode;
+use crate::extended::{RESP_DEVICE_PROP_NOT_SUPPORTED, hex_encode};
 use crate::ptp_usb::{BulkTransport, PtpResponseCode, PtpUsbError, PtpUsbSession, decode_ptp_string_value, parse_propcode};
 
 pub const SWEEP_FORMAT_VERSION: u32 = 1;
 
-/// `DevicePropNotSupported`: the answer for a code the body does not have.
-const RESP_DEVICE_PROP_NOT_SUPPORTED: u16 = 0x200A;
 
 /// Consecutive replies that were not a clean answer (a wrong container, an out-of-order reply) after which the
 /// sweep stops: a session in that state is not telling the truth about what comes next.
@@ -151,6 +151,9 @@ pub struct PropValue {
     /// The text, for a string type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Why a string type's bytes did not decode as text (`hex` still holds them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_fault: Option<String>,
 }
 
 impl PropValue {
@@ -323,7 +326,7 @@ fn int_of(bytes: &[u8], signed: bool) -> Option<i64> {
 fn read_value(r: &mut Reader<'_>, dt: u16, what: &str) -> Result<PropValue, String> {
     if let Some((w, signed)) = scalar_width(dt) {
         let b = r.take(w, what)?;
-        return Ok(PropValue { hex: hex_encode(b), int: int_of(b, signed), text: None });
+        return Ok(PropValue { hex: hex_encode(b), int: int_of(b, signed), text: None, text_fault: None });
     }
     if dt == 0xFFFF {
         let start = r.pos;
@@ -331,8 +334,11 @@ fn read_value(r: &mut Reader<'_>, dt: u16, what: &str) -> Result<PropValue, Stri
         let body = r.take(if chars == 0 { 0 } else { chars * 2 }, what)?;
         let _ = body;
         let whole = &r.data[start..r.pos];
-        let text = decode_ptp_string_value(whole).ok();
-        return Ok(PropValue { hex: hex_encode(whole), int: None, text });
+        let (text, text_fault) = match decode_ptp_string_value(whole) {
+            Ok(t) => (Some(t), None),
+            Err(why) => (None, Some(why)),
+        };
+        return Ok(PropValue { hex: hex_encode(whole), int: None, text, text_fault });
     }
     if dt & 0xFFF0 == 0x4000 {
         let Some((w, _)) = scalar_width(dt & 0x000F) else {
@@ -345,7 +351,7 @@ fn read_value(r: &mut Reader<'_>, dt: u16, what: &str) -> Result<PropValue, Stri
             return Err(format!("{what}: an array of {count} element(s) of {w} byte(s) does not fit the {} byte(s) left", r.left()));
         }
         r.take(count * w, what)?;
-        return Ok(PropValue { hex: hex_encode(&r.data[start..r.pos]), int: None, text: None });
+        return Ok(PropValue { hex: hex_encode(&r.data[start..r.pos]), int: None, text: None, text_fault: None });
     }
     Err(format!("{what}: data type 0x{dt:04x} is not one this parser knows the width of"))
 }
@@ -393,7 +399,14 @@ fn read_body(r: &mut Reader<'_>, d: &mut PropDesc) -> Result<(), String> {
             }
             let mut values = Vec::with_capacity(count);
             for i in 0..count {
-                values.push(read_value(r, d.data_type, &format!("enumeration value {i}"))?);
+                match read_value(r, d.data_type, &format!("enumeration value {i}")) {
+                    Ok(v) => values.push(v),
+                    Err(why) => {
+                        // Keep what was read: the fault says where the rest stopped.
+                        d.form = Some(PropForm::Enum { values });
+                        return Err(why);
+                    }
+                }
             }
             PropForm::Enum { values }
         }
@@ -403,6 +416,15 @@ fn read_body(r: &mut Reader<'_>, d: &mut PropDesc) -> Result<(), String> {
 }
 
 // ── the dump ─────────────────────────────────────────────────────────────
+
+/// Where an aborted sweep stopped.
+#[derive(Clone, Copy)]
+enum Stop {
+    Never,
+    At(u16),
+    /// The file names a stop that is not a property code.
+    Unknown,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -472,21 +494,57 @@ pub enum SweepError {
 }
 
 impl SweepDump {
+    /// Where an aborted sweep stopped, parsed once.
+    fn stop(&self) -> Stop {
+        match &self.aborted {
+            None => Stop::Never,
+            Some(a) => parse_propcode(&a.at).map_or(Stop::Unknown, Stop::At),
+        }
+    }
+
     /// Whether this dump says anything about `code`: asked, and (for an aborted sweep) before the code it stopped at.
+    /// A dump that stopped somewhere that cannot be read says nothing about any code (it fails closed; `from_json`
+    /// refuses such a file, so this is only reachable for a dump built in memory).
     pub fn covers(&self, code: u16) -> bool {
-        if !self.ranges.iter().any(|r| r.contains(code)) {
-            return false;
+        self.coverage()(code)
+    }
+
+    /// [`Self::covers`] as a function, with the stop point parsed once (a diff asks for every code of every block).
+    fn coverage(&self) -> impl Fn(u16) -> bool + '_ {
+        let stop = self.stop();
+        move |code| {
+            self.ranges.iter().any(|r| r.contains(code))
+                && match stop {
+                    Stop::Never => true,
+                    Stop::At(at) => code < at,
+                    Stop::Unknown => false,
+                }
         }
-        match self.aborted.as_ref().and_then(|a| parse_propcode(&a.at).ok()) {
-            Some(at) => code < at,
-            None => true,
-        }
+    }
+
+    /// Entries whose answer is kept only as bytes: a present entry with no decoded descriptor, or one whose parse
+    /// stopped at a fault. A diff reads these by their bytes alone.
+    pub fn undecoded(&self) -> usize {
+        self.entries.values().filter(|e| matches!(e, SweepEntry::Present { desc: None, .. } | SweepEntry::Present { desc: Some(PropDesc { fault: Some(_), .. }), .. })).count()
     }
 
     pub fn from_json(text: &str) -> Result<SweepDump, SweepError> {
         let dump: SweepDump = serde_json::from_str(text)?;
         if dump.format_version != SWEEP_FORMAT_VERSION {
             return Err(SweepError::UnsupportedVersion { found: dump.format_version, expected: SWEEP_FORMAT_VERSION });
+        }
+        // The sweep writes every key and the stop point with `key(code)`; anything else is a hand-edited or damaged
+        // file, and a diff of it would leave entries out or cover codes it should not.
+        let bad = |what: &str, text: &str| SweepError::Json(<serde_json::Error as serde::de::Error>::custom(format!("{what} {text:?} is not a property code written as 0xNNNN (lower-case hex)")));
+        for k in dump.entries.keys() {
+            if !parse_propcode(k).is_ok_and(|c| key(c) == *k) {
+                return Err(bad("entry key", k));
+            }
+        }
+        if let Some(a) = &dump.aborted {
+            if !parse_propcode(&a.at).is_ok_and(|c| key(c) == a.at) {
+                return Err(bad("aborted.at", &a.at));
+            }
         }
         Ok(dump)
     }
@@ -505,19 +563,14 @@ impl SweepDump {
     }
 
     /// Write to `dir` under [`Self::suggested_filename`], creating `dir`. Never replaces a file: a name already
-    /// taken is an error (two sweeps in one second with one label).
+    /// taken is an error (two sweeps in one second with one label). The file appears whole or not at all (staged in a
+    /// temporary and linked into place, the way a snapshot capture is written), so a crash cannot leave half a dump
+    /// under the real name, and a dump that cannot be serialized creates nothing.
     pub fn save_new(&self, dir: &Path) -> Result<PathBuf, SweepError> {
-        use std::io::Write;
+        let text = serde_json::to_string_pretty(self)?;
         std::fs::create_dir_all(dir)?;
         let path = dir.join(self.suggested_filename());
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
-        let text = serde_json::to_string_pretty(self)?;
-        let written = f.write_all(text.as_bytes()).and_then(|()| f.sync_all());
-        if let Err(e) = written {
-            // Half a dump is worse than none: a later diff would read it as a sweep that found less.
-            let _ = std::fs::remove_file(&path);
-            return Err(e.into());
-        }
+        crate::snapshot::write_new_whole(&path, text.as_bytes())?;
         Ok(path)
     }
 }
@@ -690,6 +743,8 @@ pub struct SweepDiff {
     /// Changes that also appear between the first dump and the noise dump: things that move by themselves
     /// (a clock, a counter, a battery level). Kept out of `changes` unless asked for.
     pub volatile: Vec<SweepChange>,
+    /// Entry keys that are not property codes, left out of the comparison. Empty for any dump `from_json` accepts.
+    pub bad_keys: Vec<String>,
 }
 
 fn answer_text(e: Option<&SweepEntry>) -> String {
@@ -764,29 +819,37 @@ fn entry_change(a: Option<&SweepEntry>, b: Option<&SweepEntry>) -> Option<(Chang
     }
 }
 
-fn changes_between(a: &SweepDump, b: &SweepDump) -> (u32, u32, Vec<SweepChange>) {
-    let in_a: u32 = a.ranges.iter().flat_map(|r| u32::from(r.lo)..=u32::from(r.hi)).filter(|c| a.covers(*c as u16)).count() as u32;
-    let both: u32 = a.ranges.iter().flat_map(|r| u32::from(r.lo)..=u32::from(r.hi)).filter(|c| a.covers(*c as u16) && b.covers(*c as u16)).count() as u32;
+/// What differs between two dumps over the codes both cover: how many codes both cover, how many only `a` does, the
+/// changes, and the entry keys that are not property codes (left out, and counted by the caller's report).
+fn changes_between(a: &SweepDump, b: &SweepDump) -> (u32, u32, Vec<SweepChange>, Vec<String>) {
+    let (cov_a, cov_b) = (a.coverage(), b.coverage());
+    let in_a: u32 = a.ranges.iter().flat_map(|r| u32::from(r.lo)..=u32::from(r.hi)).filter(|c| cov_a(*c as u16)).count() as u32;
+    let both: u32 = a.ranges.iter().flat_map(|r| u32::from(r.lo)..=u32::from(r.hi)).filter(|c| cov_a(*c as u16) && cov_b(*c as u16)).count() as u32;
     let mut codes: BTreeSet<&String> = a.entries.keys().collect();
     codes.extend(b.entries.keys());
     let mut out = Vec::new();
+    let mut bad_keys = Vec::new();
     for k in codes {
-        let Ok(code) = parse_propcode(k) else { continue };
-        if !(a.covers(code) && b.covers(code)) {
+        let Ok(code) = parse_propcode(k) else {
+            bad_keys.push(k.clone());
+            continue;
+        };
+        if !(cov_a(code) && cov_b(code)) {
             continue;
         }
         if let Some((kind, details)) = entry_change(a.entries.get(k), b.entries.get(k)) {
             out.push(SweepChange { code: k.clone(), kind, details });
         }
     }
-    (both, in_a - both, out)
+    (both, in_a - both, out, bad_keys)
 }
 
 /// Compare two dumps over the codes both cover. With `noise` (a third sweep of the same body in the same state as
 /// `a`), changes that `a` and `noise` also show are volatile: set aside, or kept in `changes` if `keep_volatile`.
 pub fn diff_sweeps(a: &SweepDump, b: &SweepDump, noise: Option<&SweepDump>, keep_volatile: bool) -> SweepDiff {
-    let (compared, only_a, mut changes) = changes_between(a, b);
-    let only_b: u32 = b.ranges.iter().flat_map(|r| u32::from(r.lo)..=u32::from(r.hi)).filter(|c| b.covers(*c as u16) && !a.covers(*c as u16)).count() as u32;
+    let (compared, only_a, mut changes, bad_keys) = changes_between(a, b);
+    let (cov_a, cov_b) = (a.coverage(), b.coverage());
+    let only_b: u32 = b.ranges.iter().flat_map(|r| u32::from(r.lo)..=u32::from(r.hi)).filter(|c| cov_b(*c as u16) && !cov_a(*c as u16)).count() as u32;
     let mut volatile = Vec::new();
     if let Some(n) = noise {
         let moving: BTreeSet<String> = changes_between(a, n).2.into_iter().map(|c| c.code).collect();
@@ -796,7 +859,7 @@ pub fn diff_sweeps(a: &SweepDump, b: &SweepDump, noise: Option<&SweepDump>, keep
             volatile = moved;
         }
     }
-    SweepDiff { compared, not_compared: only_a + only_b, changes, volatile }
+    SweepDiff { compared, not_compared: only_a + only_b, changes, volatile, bad_keys }
 }
 
 impl SweepDiff {
@@ -814,6 +877,15 @@ impl SweepDiff {
             if let Some(ab) = &d.aborted {
                 s.push_str(&format!("note: dump {label} stopped at {}: {}\n", ab.at, ab.reason));
             }
+        }
+        for (label, d) in [("A", a), ("B", b)] {
+            let n = d.undecoded();
+            if n > 0 {
+                s.push_str(&format!("note: dump {label} holds {n} answer(s) kept only as bytes (not fully decoded); they are compared by their bytes\n"));
+            }
+        }
+        if !self.bad_keys.is_empty() {
+            s.push_str(&format!("note: {} entr(y/ies) left out because the key is not a property code: {}\n", self.bad_keys.len(), self.bad_keys.join(", ")));
         }
         s.push_str(&format!("compared {} code(s) both cover", self.compared));
         if self.not_compared > 0 {
@@ -1147,7 +1219,9 @@ mod tests {
 
     #[test]
     fn only_device_prop_not_supported_means_not_there_and_its_neighbours_are_refusals() {
-        assert_eq!(RESP_DEVICE_PROP_NOT_SUPPORTED, 0x200A, "the PTP response code, pinned against the table in ISO 15740");
+        // Judged by the name `ptp_usb` gives the code (an independent table), and by the Fake's own literal above,
+        // not against a copy of the constant's value.
+        assert_eq!(PtpResponseCode(RESP_DEVICE_PROP_NOT_SUPPORTED).to_string(), "DevicePropNotSupported (0x200a)");
         let mut f = Fake::new();
         f.table.insert(0xD000, Err(FailKind::Refuse(0x2009))); // InvalidObjectHandle
         f.table.insert(0xD001, Err(FailKind::Refuse(0x200B))); // InvalidDevicePropFormat
@@ -1189,6 +1263,8 @@ mod tests {
         let d = default_ranges();
         assert_eq!(normalize(&d), d);
         assert!(d.iter().any(|b| b.contains(0xD072)) && d.iter().any(|b| b.contains(0xD100)) && d.iter().any(|b| b.contains(0x5001)));
+        // docs/property-sweep.md says how many codes this asks; 256 + 1280.
+        assert_eq!(d.iter().map(|b| b.count()).sum::<u32>(), 1536);
     }
 
     // ── the dump ──
@@ -1335,5 +1411,111 @@ mod tests {
         c.body.firmware = "C:5.40".into();
         let t = diff_sweeps(&a, &c, None, false).to_text(&a, &c);
         assert!(t.contains("firmware differs") && !t.contains("different bodies"), "{t}");
+    }
+
+    // ── findings: coverage, loading, partial forms, string faults, saving ──
+
+    #[test]
+    fn a_dump_covers_the_codes_before_where_it_stopped_and_the_boundary_is_the_stop_itself() {
+        let mut d = dump_with(&[], &[r(0xD000, 0xD0FF)]);
+        assert!(d.covers(0xD000) && d.covers(0xD0FF) && !d.covers(0xD100) && !d.covers(0xCFFF), "no stop: the whole block, nothing outside");
+        d.aborted = Some(Aborted { at: "0xd080".into(), reason: "timeout".into() });
+        assert!(d.covers(0xD07F), "just below the stop");
+        assert!(!d.covers(0xD080), "at the stop: it is the code that was being asked, not covered");
+        assert!(!d.covers(0xD081), "just above");
+        d.aborted = Some(Aborted { at: "0xd000".into(), reason: "first code".into() });
+        assert!(!d.covers(0xD000), "stopped at the very first code: nothing covered");
+    }
+
+    #[test]
+    fn a_stop_that_is_not_a_property_code_covers_nothing_and_a_file_with_one_is_refused() {
+        let mut d = dump_with(&[], &[r(0xD000, 0xD0FF)]);
+        d.aborted = Some(Aborted { at: "somewhere".into(), reason: "x".into() });
+        assert!(!(0xD000..=0xD0FFu16).any(|c| d.covers(c)), "unknown stop point: fail closed, not 'covers everything'");
+        let text = serde_json::to_string(&d).unwrap();
+        let e = SweepDump::from_json(&text).unwrap_err();
+        assert!(matches!(e, SweepError::Json(_)) && e.to_string().contains("aborted.at"), "{e}");
+        // an upper-case or decimal spelling of a real code is not the form the sweep writes either
+        for at in ["0xD080", "53376"] {
+            d.aborted = Some(Aborted { at: at.into(), reason: "x".into() });
+            assert!(SweepDump::from_json(&serde_json::to_string(&d).unwrap()).is_err(), "{at}");
+        }
+        d.aborted = Some(Aborted { at: "0xd080".into(), reason: "x".into() });
+        assert!(SweepDump::from_json(&serde_json::to_string(&d).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn an_entry_key_that_is_not_the_canonical_code_is_refused_on_load_and_counted_if_it_gets_to_a_diff() {
+        let good = dump_with(&[(0xD010, enum_with_current(0xD010, 1))], &[r(0xD000, 0xD0FF)]);
+        assert!(SweepDump::from_json(&serde_json::to_string(&good).unwrap()).is_ok());
+        for bad in ["0xD010", "junk", "", "0xd01"] {
+            let mut d = good.clone();
+            let e = d.entries.remove("0xd010").unwrap();
+            d.entries.insert(bad.to_string(), e);
+            let err = SweepDump::from_json(&serde_json::to_string(&d).unwrap()).unwrap_err();
+            assert!(err.to_string().contains("entry key"), "{bad:?}: {err}");
+        }
+        // built in memory it still cannot vanish silently
+        let mut b = good.clone();
+        b.entries.insert("junk".into(), enum_with_current(0xD011, 1));
+        let diff = diff_sweeps(&good, &b, None, false);
+        assert_eq!(diff.bad_keys, ["junk"]);
+        assert!(diff.to_text(&good, &b).contains("junk"), "and the report says so");
+        assert!(diff_sweeps(&good, &good, None, false).bad_keys.is_empty());
+    }
+
+    #[test]
+    fn answers_kept_only_as_bytes_are_counted_and_the_diff_says_so() {
+        let mut d = dump_with(&[(0xD010, enum_with_current(0xD010, 1))], &[r(0xD000, 0xD0FF)]);
+        assert_eq!(d.undecoded(), 0);
+        d.entries.insert(key(0xD011), present(vec![0x11, 0xD0, 2], 0xD011)); // shorter than the five-byte head
+        d.entries.insert(key(0xD012), present(desc_bytes(0xD012, 2, 1, &[0], &[1], &[9]), 0xD012)); // a bad form flag
+        d.entries.insert(key(0xD013), SweepEntry::Refused { code: 0x2002, name: "x".into() });
+        assert_eq!(d.undecoded(), 2, "the short reply and the faulted one; a refusal is an answer");
+        let text = diff_sweeps(&d, &d, None, false).to_text(&d, &d);
+        assert!(text.contains("dump A holds 2 answer(s) kept only as bytes"), "{text}");
+        let clean = dump_with(&[(0xD010, enum_with_current(0xD010, 1))], &[r(0xD000, 0xD0FF)]);
+        assert!(!diff_sweeps(&clean, &clean, None, false).to_text(&clean, &clean).contains("kept only as bytes"));
+    }
+
+    #[test]
+    fn an_enumeration_cut_short_keeps_the_values_read_before_the_cut_and_a_range_is_kept_only_whole() {
+        // u16 enumeration announcing 3 values with 5 bytes after the count: two whole values, then one byte
+        let cut = desc_bytes(1, 4, 1, &[0, 0], &[1, 0], &[2, 3, 0, 0, 0, 1, 0, 2]);
+        let d = parse_prop_desc(&cut, 1).unwrap();
+        assert!(d.fault.as_ref().unwrap().contains("enumeration value 2"), "{d:?}");
+        let Some(PropForm::Enum { values }) = &d.form else { panic!("the values read are kept: {:?}", d.form) };
+        assert_eq!(values.iter().map(|v| v.int.unwrap()).collect::<Vec<_>>(), [0, 1]);
+        assert!(d.current.is_some(), "and the current value");
+        // a range cut before its step has no form (stated in the module's table)
+        let range = desc_bytes(1, 2, 1, &[0], &[1], &[1, 0, 9]);
+        let r = parse_prop_desc(&range, 1).unwrap();
+        assert!(r.fault.as_ref().unwrap().contains("range step") && r.form.is_none(), "{r:?}");
+    }
+
+    #[test]
+    fn a_string_that_does_not_decode_says_why_and_a_good_one_has_no_fault() {
+        // type 0xFFFF; a count of 3 units with 2 bytes: the reader refuses it before decoding
+        let good = parse_prop_desc(&desc_bytes(1, 0xFFFF, 1, &[2, b'h', 0, 0, 0], &[0], &[0]), 1).unwrap();
+        let cur = good.default.as_ref().unwrap();
+        assert!(cur.text.is_some() && cur.text_fault.is_none(), "{good:?}");
+        // one unit whose two bytes are an unpaired high surrogate: read whole, but not text
+        let bad = parse_prop_desc(&desc_bytes(1, 0xFFFF, 1, &[1, 0x00, 0xD8], &[0], &[0]), 1).unwrap();
+        let v = bad.default.as_ref().unwrap();
+        assert!(v.text.is_none() && v.text_fault.is_some(), "{v:?}");
+        assert_eq!(v.show(), format!("bytes {}", v.hex), "shown as bytes, hex kept");
+    }
+
+    #[test]
+    fn a_saved_dump_leaves_no_temporary_beside_it_whether_it_was_new_or_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dump_with(&[(0xD010, enum_with_current(0xD010, 1))], &[r(0xD000, 0xD0FF)]);
+        let p = d.save_new(dir.path()).unwrap();
+        assert!(d.save_new(dir.path()).is_err());
+        let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, [p.file_name().unwrap().to_string_lossy().into_owned()], "only the dump: {names:?}");
+        // the directory is made when it is missing
+        let nested = dir.path().join("a").join("b");
+        assert!(d.save_new(&nested).unwrap().starts_with(&nested));
     }
 }

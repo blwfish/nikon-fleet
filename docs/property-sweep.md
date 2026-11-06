@@ -14,7 +14,8 @@ rest. Asking for every code in a block lists the block's properties with their d
 default, current value and allowed values (a range or an enumeration). Two sweeps of one body with one menu setting
 changed between them differ in exactly that setting's descriptor.
 
-It sends nothing but `GetDevicePropDesc`. It cannot change the camera.
+Besides what any session does (open it, read DeviceInfo once, close it), it sends nothing but `GetDevicePropDesc`. It cannot
+change the camera.
 
 ## Procedure (one sitting, body attached over USB, nothing else holding it)
 
@@ -47,7 +48,7 @@ owner-data restore cover it.
 ## Output
 
 `vendor-sweep` prints the counts (asked / present / not supported / refused / no usable answer) and the file path.
-The default blocks are `0x5000-0x50FF` and `0xD000-0xD4FF` (about 1 800 codes); `--range LO-HI` (repeatable, `0x` hex
+The default blocks are `0x5000-0x50FF` and `0xD000-0xD4FF` (1 536 codes: 256 and 1 280); `--range LO-HI` (repeatable, `0x` hex
 or decimal, inclusive, merged when overlapping or touching) names others, for example `--range 0xD000-0xDFFF` if a
 setting is not found in the default vendor block.
 
@@ -55,7 +56,16 @@ Each code asked is recorded as exactly one of: *present* (the descriptor bytes a
 the code, and the decoded fields), *refused* (a response code other than `0x200A`), *no usable answer* (the exchange
 failed), or *not supported*, which is the absence of an entry and is counted. The decoded fields are the code, data
 type, get/set flag, default, current value, the range or enumeration and any bytes after them. A field the parser
-cannot read ends the parse there; what came before it is kept and `fault` says why. The raw bytes are always kept.
+cannot read ends the parse there; what came before it is kept and `fault` says why (a range is kept only whole; an
+enumeration keeps the values read before the fault). The raw bytes are always kept. A string that does not decode as
+text keeps its bytes and says why (`text_fault`); an array is kept as bytes only, and the diff compares those. A reply
+too short to hold the five-byte head has no decoded descriptor at all: `vendor-sweep-diff` says how many answers a
+dump holds only as bytes.
+
+A file is written whole or not at all (staged beside the final name and linked into place, as a snapshot capture is),
+and a name already taken is an error. Loading a dump refuses one whose entry keys, or whose stop point, are not codes
+written as `0xNNNN` in lower case: those can only come from a hand edit or damage, and a diff of one would leave
+entries out or cover codes it should not.
 
 ## When it stops
 

@@ -77,8 +77,9 @@ impl ExitKind {
 pub const EXIT_ALREADY_ARCHIVED: i32 = ExitKind::AlreadyArchived.code();
 
 /// Exit status 4: a camera write that failed after the data had been sent to the camera, so it may or may not have
-/// changed (`vendor-write-ftp`, `vendor-write-ftp-blob` and `vendor-set-string`: [`PtpUsbError::FtpWriteIndeterminate`],
-/// [`PtpUsbError::PropWriteIndeterminate`]). Distinct from the plain failure (1) a script is allowed to retry blindly:
+/// changed (`vendor-write-ftp`, `vendor-write-ftp-blob`, `vendor-set-string` and the IPTC write:
+/// [`PtpUsbError::FtpWriteIndeterminate`], [`PtpUsbError::PropWriteIndeterminate`],
+/// [`PtpUsbError::IptcWriteIndeterminate`]). Distinct from the plain failure (1) a script is allowed to retry blindly:
 /// this one needs a look at the camera first.
 pub const EXIT_WRITE_INDETERMINATE: i32 = ExitKind::WriteIndeterminate.code();
 
@@ -264,10 +265,11 @@ mod tests {
             PtpUsbError::PropNotWritable { propcode: 1, get_set: 0 },
             PtpUsbError::PropValueBad { propcode: 1, why: "w".into() },
             PtpUsbError::PropWriteIndeterminate { propcode: 0xD090, cause: cause() },
+            PtpUsbError::IptcWriteIndeterminate { cause: cause() },
         ]
     }
 
-    /// Whether `e` is one of the two "data was sent, then it failed" variants, spelled out apart from the production
+    /// Whether `e` is one of the three "data was sent, then it failed" variants, spelled out apart from the production
     /// match so the two can disagree and a test fail.
     fn is_indeterminate_variant(e: &PtpUsbError) -> bool {
         matches!(
@@ -324,9 +326,9 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_two_write_indeterminate_variants_are_status_4_and_every_other_variant_is_1() {
+    fn exactly_the_three_write_indeterminate_variants_are_status_4_and_every_other_variant_is_1() {
         let all = every_variant();
-        assert!(all.len() >= 39, "the list covers every variant ({} listed)", all.len());
+        assert!(all.len() >= 40, "the list covers every variant ({} listed)", all.len());
         let mut indeterminate = 0;
         for e in all {
             let want = if is_indeterminate_variant(&e) {
@@ -338,7 +340,7 @@ mod tests {
             let any = anyhow::Error::new(e);
             assert_eq!(exit_code_for(&any), want, "{any:?}");
         }
-        assert_eq!(indeterminate, 2, "the FTP write and the property write");
+        assert_eq!(indeterminate, 3, "the FTP write, the property write and the IPTC write");
     }
 
     #[test]
@@ -350,6 +352,8 @@ mod tests {
         assert_eq!(exit_code_for(&wrapped), EXIT_WRITE_INDETERMINATE, "a context layer does not hide the cause");
         let ftp = anyhow::Error::new(PtpUsbError::FtpWriteIndeterminate { cause: cause() }).context("writing the profile");
         assert_eq!(exit_code_for(&ftp), EXIT_WRITE_INDETERMINATE);
+        let iptc = anyhow::Error::new(PtpUsbError::IptcWriteIndeterminate { cause: cause() }).context("writing the IPTC slot");
+        assert_eq!(exit_code_for(&iptc), EXIT_WRITE_INDETERMINATE);
         // An error that is not the camera's, and a camera error that is a definite refusal, are plain failures.
         assert_eq!(exit_code_for(&anyhow::anyhow!("boom")), 1);
         let refused = anyhow::Error::new(PtpUsbError::PropNotWritable { propcode: 0xD090, get_set: 0 });

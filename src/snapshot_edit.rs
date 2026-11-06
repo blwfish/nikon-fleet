@@ -14,9 +14,14 @@
 //!
 //! Edits are recorded in `derived_from.edits`, oldest first, without any password or key.
 //!
-//! Not here yet: changing the fields of an FTP profile, adding one, or duplicating one. Those need a writer
-//! that can produce a profile blob from fields, and the existing encoder fixes the server port, folder and
-//! protocol; deleting and reordering profiles need no encoder and are here.
+//! The FTP profile list is edited here (delete, move); the fields of a profile, adding one and duplicating one are in
+//! [`crate::ftp_edit`], which writes through the same guards.
+//!
+//! **Why a capture cannot be changed by a forgotten check.** Every public editor starts with [`ensure_editable`], and
+//! that is the check a person reads. It is not the only one: the three ways this module reaches a snapshot's
+//! contents for writing ([`property_mut`], [`extended_mut`], and [`ftp_store_mut`] through it) each refuse a snapshot that is
+//! not a copy, so an editor added later that forgot its first line still cannot modify a capture while it goes
+//! through them. A test lists the public editors from the source and fails for one it does not exercise.
 
 use serde_json::{Number, Value};
 use thiserror::Error;
@@ -197,7 +202,7 @@ pub fn set_enum_value(snap: &mut Snapshot, name: &str, value: i64, now: &str) ->
         return Ok(Applied { changed: false, item, change: format!("already {value}") });
     }
     let change = format!("{}: {} -> {value}", short(name), old_value.map_or("(no current value)".to_string(), |v| v.to_string()));
-    if let Some(o) = snap.properties.get_mut(name).and_then(|p| p.value.as_object_mut()) {
+    if let Some(o) = property_mut(snap, name)?.value.as_object_mut() {
         o.insert("value_index".into(), Value::from(position as u64));
     }
     Ok(finish(snap, now, Applied { changed: true, item, change }))
@@ -243,7 +248,7 @@ pub fn set_range_value(snap: &mut Snapshot, name: &str, value: f64, now: &str) -
             return Ok(Applied { changed: false, item, change: format!("already {}", num(snapped)) });
         }
         let change = format!("{}: {} -> {}", short(name), old.unwrap_or_else(|| "(no current value)".to_string()), num(snapped));
-        if let Some(o) = snap.properties.get_mut(name).and_then(|p| p.value.as_object_mut()) {
+        if let Some(o) = property_mut(snap, name)?.value.as_object_mut() {
             o.insert("value_index".into(), Value::from(index as u64));
         }
         return Ok(finish(snap, now, Applied { changed: true, item, change }));
@@ -258,7 +263,7 @@ pub fn set_range_value(snap: &mut Snapshot, name: &str, value: f64, now: &str) -
     }
     let change = format!("{}: {} -> {}", short(name), old.map_or("(no current value)".to_string(), num), num(value));
     let n = Number::from_f64(value).ok_or_else(|| not_allowed(name, "that is not a number".to_string()))?;
-    if let Some(o) = snap.properties.get_mut(name).and_then(|p| p.value.as_object_mut()) {
+    if let Some(o) = property_mut(snap, name)?.value.as_object_mut() {
         o.insert("value".into(), Value::Number(n));
     }
     Ok(finish(snap, now, Applied { changed: true, item, change }))
@@ -283,9 +288,7 @@ pub fn set_number(snap: &mut Snapshot, name: &str, text: &str, now: &str) -> Res
         return Ok(Applied { changed: false, item, change: format!("already {new}") });
     }
     let change = format!("{}: {old} -> {new}", short(name));
-    if let Some(p) = snap.properties.get_mut(name) {
-        p.value = Value::Number(new);
-    }
+    property_mut(snap, name)?.value = Value::Number(new);
     Ok(finish(snap, now, Applied { changed: true, item, change }))
 }
 
@@ -306,9 +309,7 @@ pub fn set_bool(snap: &mut Snapshot, name: &str, text: &str, now: &str) -> Resul
         return Ok(Applied { changed: false, item, change: format!("already {new}") });
     }
     let change = format!("{}: {old} -> {new}", short(name));
-    if let Some(p) = snap.properties.get_mut(name) {
-        p.value = Value::Bool(new);
-    }
+    property_mut(snap, name)?.value = Value::Bool(new);
     Ok(finish(snap, now, Applied { changed: true, item, change }))
 }
 
@@ -368,8 +369,16 @@ pub fn resolve_extended_item(text: &str) -> Result<u16, EditRefusal> {
     })
 }
 
+/// The extended section for writing. Refuses a snapshot that is not a copy (see the module comment).
 fn extended_mut(snap: &mut Snapshot) -> Result<&mut Extended, EditRefusal> {
+    ensure_editable(snap)?;
     snap.extended.as_mut().ok_or(EditRefusal::NoExtendedSection)
+}
+
+/// A property of the snapshot for writing. Refuses a snapshot that is not a copy (see the module comment).
+fn property_mut<'a>(snap: &'a mut Snapshot, name: &str) -> Result<&'a mut PropertyEntry, EditRefusal> {
+    ensure_editable(snap)?;
+    snap.properties.get_mut(name).ok_or_else(|| EditRefusal::NoSuchProperty { name: name.to_string() })
 }
 
 fn ext_name(code: u16) -> &'static str {
@@ -455,12 +464,13 @@ pub fn set_switch(snap: &mut Snapshot, code: u16, value: u8, now: &str) -> Resul
         }
     };
     let item = format!("switch:{}", prop_key(code));
-    let new_hex = format!("{value:02x}");
-    if before == new_hex {
+    // Compared as the byte it is, not as text: a hand-edited "0A" holds the value 10 that "0a" does.
+    let was_byte = u8::from_str_radix(&before, 16).ok();
+    if was_byte == Some(value) {
         return Ok(Applied { changed: false, item, change: format!("already {value}") });
     }
-    prop.state = PropState::Bytes { hex: new_hex };
-    let was = u8::from_str_radix(&before, 16).map_or(before.clone(), |b| b.to_string());
+    prop.state = PropState::Bytes { hex: format!("{value:02x}") };
+    let was = was_byte.map_or(before.clone(), |b| b.to_string());
     let change = format!("{name}: {was} -> {value}");
     Ok(finish(snap, now, Applied { changed: true, item, change }))
 }
@@ -512,15 +522,43 @@ pub fn set_iptc_field(snap: &mut Snapshot, slot: u32, field: &str, text: &str, n
 
 // ── FTP profile list ─────────────────────────────────────────────────────
 
+/// Why the FTP list of `state` cannot be rearranged or read as a whole list: not on the model, not read, or read only
+/// in part. (`Read` and whole is not a refusal; callers match it first.)
+fn ftp_refusal(state: &FtpState) -> EditRefusal {
+    match state {
+        FtpState::Read(_) => EditRefusal::FtpUnavailable {
+            why: "the snapshot read only part of the list (the camera reported more than were read), so the rest cannot be rearranged".to_string(),
+        },
+        FtpState::NotOnModel => EditRefusal::FtpUnavailable { why: "this model has no FTP profiles".to_string() },
+        FtpState::ReadFailed { tag, .. } => EditRefusal::FtpUnavailable { why: format!("reading them failed ({tag})") },
+    }
+}
+
+/// Ok when `state` is a list read whole.
+fn ftp_whole(state: &FtpState) -> Result<(), EditRefusal> {
+    match state {
+        FtpState::Read(store) if !store.truncated => Ok(()),
+        other => Err(ftp_refusal(other)),
+    }
+}
+
+/// The FTP list of any snapshot, to read (a capture's included), when it was read whole.
+pub(crate) fn ftp_store(snap: &Snapshot) -> Result<&crate::extended::FtpStore, EditRefusal> {
+    let ext = snap.extended.as_ref().ok_or(EditRefusal::NoExtendedSection)?;
+    ftp_whole(&ext.ftp)?;
+    match &ext.ftp {
+        FtpState::Read(store) => Ok(store),
+        other => Err(ftp_refusal(other)),
+    }
+}
+
+/// The FTP list for writing; refuses a snapshot that is not a copy (through [`extended_mut`]).
 pub(crate) fn ftp_store_mut(snap: &mut Snapshot) -> Result<&mut crate::extended::FtpStore, EditRefusal> {
     let ext = extended_mut(snap)?;
+    ftp_whole(&ext.ftp)?;
     match &mut ext.ftp {
-        FtpState::Read(store) if store.truncated => Err(EditRefusal::FtpUnavailable {
-            why: "the snapshot read only part of the list (the camera reported more than were read), so the rest cannot be rearranged".to_string(),
-        }),
         FtpState::Read(store) => Ok(store),
-        FtpState::NotOnModel => Err(EditRefusal::FtpUnavailable { why: "this model has no FTP profiles".to_string() }),
-        FtpState::ReadFailed { tag, .. } => Err(EditRefusal::FtpUnavailable { why: format!("reading them failed ({tag})") }),
+        other => Err(ftp_refusal(other)),
     }
 }
 
@@ -680,6 +718,9 @@ pub struct OwnerView {
     pub switches: Vec<OwnerSwitch>,
     /// The presets that can be edited (other record kinds are left out); `Err` says why there are none to offer.
     pub iptc: Result<Vec<IptcPresetView>, String>,
+    /// The slots left out of [`Self::iptc`] and why (another record kind, or unreadable): slot and reason. A slot that
+    /// is not offered is not hidden.
+    pub iptc_not_offered: Vec<(u32, String)>,
     /// The FTP profile names in list order; `Err` says why the list cannot be rearranged.
     pub ftp: Result<Vec<String>, String>,
 }
@@ -720,13 +761,21 @@ pub fn owner_view(snap: &Snapshot) -> Option<OwnerView> {
             OwnerSwitch { code, name: ext_name(code), value, max, note }
         })
         .collect();
+    let mut iptc_not_offered = Vec::new();
     let iptc = match &ext.iptc {
         IptcState::Read(store) => Ok(store
             .slots
             .iter()
             .filter_map(|s| match s.decode() {
                 Ok(IptcRecord::Preset(p)) => Some(IptcPresetView { slot: s.slot, name: p.name, fields: p.fields }),
-                _ => None,
+                Ok(IptcRecord::Other { kind, .. }) => {
+                    iptc_not_offered.push((s.slot, format!("a record of kind {kind}")));
+                    None
+                }
+                Err(why) => {
+                    iptc_not_offered.push((s.slot, format!("unreadable ({why})")));
+                    None
+                }
             })
             .collect()),
         IptcState::NotRead => Err("the snapshot was taken before IPTC presets were captured".to_string()),
@@ -739,7 +788,7 @@ pub fn owner_view(snap: &Snapshot) -> Option<OwnerView> {
         FtpState::NotOnModel => Err("this model has no FTP profiles".to_string()),
         FtpState::ReadFailed { tag, .. } => Err(format!("reading them failed ({tag})")),
     };
-    Some(OwnerView { strings, switches, iptc, ftp })
+    Some(OwnerView { strings, switches, iptc, iptc_not_offered, ftp })
 }
 
 #[cfg(test)]
@@ -878,23 +927,73 @@ mod tests {
         assert_eq!(d.created_at, LATER);
     }
 
+    /// Every public editor, by name, run on a capture. The names are checked against the source below, so an editor
+    /// added to either file and not added here fails `every_public_editor_in_the_source_is_in_the_capture_table`.
+    #[allow(clippy::type_complexity)]
+    fn editors() -> Vec<(&'static str, Box<dyn Fn(&mut Snapshot) -> Result<(), EditRefusal>>)> {
+        use crate::ftp_edit::{ProfileFields, ftp_add, ftp_duplicate, ftp_set_fields};
+        let ok = |r: Result<Applied, EditRefusal>| r.map(|_| ());
+        vec![
+            ("set_enum_value", Box::new(move |s| ok(set_enum_value(s, VR, 0, NOW)))),
+            ("set_range_value", Box::new(move |s| ok(set_range_value(s, "kNkMAIDCapability_ExposureComp", 1.0, NOW)))),
+            ("set_number", Box::new(move |s| ok(set_number(s, "kNkMAIDCapability_ElectronicVR", "0", NOW)))),
+            ("set_bool", Box::new(move |s| ok(set_bool(s, "kNkMAIDCapability_Flag", "false", NOW)))),
+            ("set_property_text", Box::new(|s| set_property_text(s, "ElectronicVR", "0", NOW).map(|_| ()))),
+            ("set_owner_string", Box::new(move |s| ok(set_owner_string(s, 0xD072, "X", NOW)))),
+            ("set_switch", Box::new(move |s| ok(set_switch(s, 0xD053, 0, NOW)))),
+            ("set_iptc_field", Box::new(move |s| ok(set_iptc_field(s, 1, "headline", "X", NOW)))),
+            ("ftp_delete", Box::new(move |s| ok(ftp_delete(s, 0, NOW)))),
+            ("ftp_move", Box::new(move |s| ok(ftp_move(s, 0, 1, NOW)))),
+            ("ftp_set_fields", Box::new(move |s| ok(ftp_set_fields(s, 0, &ProfileFields { host: Some("x.test".into()), ..Default::default() }, NOW)))),
+            ("ftp_add", Box::new(move |s| ok(ftp_add(s, &ProfileFields { name: Some("n".into()), host: Some("h".into()), ..Default::default() }, None, NOW)))),
+            ("ftp_duplicate", Box::new(move |s| ok(ftp_duplicate(s, 0, None, &ProfileFields::default(), NOW)))),
+        ]
+    }
+
     #[test]
     fn a_snapshot_read_from_a_camera_cannot_be_edited_by_any_function() {
-        let mut s = captured();
-        let before = s.clone();
-        let nope = |r: Result<Applied, EditRefusal>| assert!(matches!(r, Err(EditRefusal::NotACopy)), "{r:?}");
-        nope(set_enum_value(&mut s, "kNkMAIDCapability_VibrationReduction", 0, NOW));
-        nope(set_range_value(&mut s, "kNkMAIDCapability_ExposureComp", 1.0, NOW));
-        nope(set_number(&mut s, "kNkMAIDCapability_ElectronicVR", "0", NOW));
-        nope(set_bool(&mut s, "kNkMAIDCapability_Flag", "false", NOW));
-        nope(set_owner_string(&mut s, 0xD072, "X", NOW));
-        nope(set_switch(&mut s, 0xD053, 0, NOW));
-        nope(set_iptc_field(&mut s, 1, "headline", "X", NOW));
-        nope(ftp_delete(&mut s, 0, NOW));
-        nope(ftp_move(&mut s, 0, 1, NOW));
-        assert!(matches!(set_property_text(&mut s, "ElectronicVR", "0", NOW), Err(EditRefusal::NotACopy)));
-        assert_eq!(s, before, "nothing about it changed");
+        for (name, edit) in editors() {
+            let mut s = captured();
+            let before = s.clone();
+            assert!(matches!(edit(&mut s), Err(EditRefusal::NotACopy)), "{name} did not refuse a capture");
+            assert_eq!(s, before, "{name} changed a capture");
+        }
         assert_eq!(EditRefusal::NotACopy.tag(), "not_a_copy");
+    }
+
+    /// The public functions of the two editor files that take `snap: &mut Snapshot`, from the source text.
+    fn public_editors_in_the_source() -> std::collections::BTreeSet<String> {
+        [include_str!("snapshot_edit.rs"), include_str!("ftp_edit.rs")]
+            .iter()
+            .flat_map(|src| src.lines())
+            .filter_map(|l| {
+                let rest = l.strip_prefix("pub fn ")?;
+                let (name, args) = rest.split_once('(')?;
+                args.starts_with("snap: &mut Snapshot").then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_public_editor_in_the_source_is_in_the_capture_table() {
+        let listed: std::collections::BTreeSet<String> = editors().into_iter().map(|(n, _)| n.to_string()).collect();
+        let in_source = public_editors_in_the_source();
+        assert!(in_source.len() >= 12, "the scan found the editors at all: {in_source:?}");
+        assert_eq!(in_source, listed, "a public editor taking `snap: &mut Snapshot` is missing from `editors()` (or listed but gone)");
+    }
+
+    /// Even an editor that forgot `ensure_editable` cannot change a capture through the accessors this module offers.
+    #[test]
+    fn the_accessors_that_reach_for_writing_refuse_a_capture_on_their_own() {
+        let mut s = captured();
+        assert!(matches!(property_mut(&mut s, VR), Err(EditRefusal::NotACopy)));
+        assert!(matches!(extended_mut(&mut s), Err(EditRefusal::NotACopy)));
+        assert!(matches!(ftp_store_mut(&mut s), Err(EditRefusal::NotACopy)));
+        // reading is not writing: a capture's list can be read
+        assert_eq!(ftp_store(&s).unwrap().profiles.len(), 3);
+        let mut c = edited();
+        assert!(property_mut(&mut c, VR).is_ok() && extended_mut(&mut c).is_ok() && ftp_store_mut(&mut c).is_ok());
+        assert!(matches!(property_mut(&mut c, "nope"), Err(EditRefusal::NoSuchProperty { .. })));
     }
 
     #[test]
@@ -1063,6 +1162,17 @@ mod tests {
             assert!(matches!(e, EditRefusal::BadText { .. }) && e.to_string().contains(&format!("at most {max}")), "{e}");
         }
         assert_eq!(OWNER_STRING_MAX_CHARS.map(|(_, m)| m), [36, 54, 36], "the measured limits, pinned");
+        // The limit is in characters, not bytes: an e-acute is one character (Latin-1) and two bytes of UTF-8.
+        for (code, max) in OWNER_STRING_MAX_CHARS {
+            let mut s = edited();
+            if code == 0xD090 {
+                ext_state(&mut s, 0xD090, PropState::Text { text: String::new() });
+            }
+            let at_limit = "\u{e9}".repeat(max);
+            assert!(at_limit.len() == 2 * max && set_owner_string(&mut s, code, &at_limit, NOW).is_ok(), "{max} accented characters ({} bytes) fit {code:#06x}", at_limit.len());
+            let over = "\u{e9}".repeat(max + 1);
+            assert!(matches!(set_owner_string(&mut s, code, &over, NOW), Err(EditRefusal::BadText { .. })), "{} accented characters do not", max + 1);
+        }
         let mut s = edited();
         assert!(set_owner_string(&mut s, 0xD072, "", NOW).is_ok(), "empty is allowed (it clears the field)");
     }
@@ -1119,6 +1229,47 @@ mod tests {
         let a = set_switch(&mut s, 0xD060, max, NOW).unwrap();
         assert!(!a.changed);
         assert_eq!(set_switch(&mut s, 0xD072, 0, NOW).unwrap_err().tag(), "unknown_item", "a string is not a switch");
+    }
+
+    /// The four per-property tables name the same properties. A code in one and not another would plan as "the snapshot
+    /// holds no value" (restore) or be offered for editing and refused (here), with nothing noticing.
+    #[test]
+    fn the_per_property_tables_agree_on_codes_names_and_kinds() {
+        use crate::extended::PropKind;
+        use crate::ptp_usb::STRING_PROPS;
+        use std::collections::BTreeMap;
+        let extended: BTreeMap<u16, (&str, PropKind)> = EXTENDED_PROPS.iter().map(|&(c, n, k)| (c, (n, k))).collect();
+        assert_eq!(extended.len(), EXTENDED_PROPS.len(), "no code twice in EXTENDED_PROPS");
+        let strings: BTreeMap<u16, &str> = STRING_PROPS.iter().copied().collect();
+        let bytes: BTreeMap<u16, &str> = BYTE_PROPS.iter().map(|&(c, n, _)| (c, n)).collect();
+        assert!(strings.keys().all(|c| !bytes.contains_key(c)), "a code is a string or a byte, not both");
+        // the write tables, together, are exactly the read table
+        let written: std::collections::BTreeSet<u16> = strings.keys().chain(bytes.keys()).copied().collect();
+        assert_eq!(written, extended.keys().copied().collect(), "EXTENDED_PROPS vs STRING_PROPS + BYTE_PROPS");
+        for (&code, &(name, kind)) in &extended {
+            let (table, expected) = match kind {
+                PropKind::Text => (&strings, "STRING_PROPS"),
+                PropKind::Bytes => (&bytes, "BYTE_PROPS"),
+            };
+            assert_eq!(table.get(&code), Some(&name), "{code:#06x} {name} ({kind:?}) must be in {expected} under that name");
+        }
+        // the editor's limits cover exactly the text properties
+        let limited: std::collections::BTreeSet<u16> = OWNER_STRING_MAX_CHARS.iter().map(|&(c, _)| c).collect();
+        assert_eq!(limited, strings.keys().copied().collect(), "OWNER_STRING_MAX_CHARS vs STRING_PROPS");
+        assert_eq!(OWNER_STRING_MAX_CHARS.len(), strings.len(), "no code twice in OWNER_STRING_MAX_CHARS");
+    }
+
+    #[test]
+    fn a_switch_is_compared_as_the_byte_it_holds_not_as_text() {
+        // A hand-edited upper-case "0A" is the value 10: setting 10 is not a change, and 11 is, from 10.
+        let mut s = edited();
+        ext_state(&mut s, 0xD060, PropState::Bytes { hex: "0A".into() });
+        let a = set_switch(&mut s, 0xD060, 10, NOW).unwrap();
+        assert!(!a.changed, "{a:?}");
+        assert!(matches!(&ext(&s).props["0xd060"].state, PropState::Bytes { hex } if hex == "0A"), "left exactly as it was");
+        let a = set_switch(&mut s, 0xD060, 11, NOW).unwrap();
+        assert!(a.changed && a.change.contains("10 -> 11"), "{a:?}");
+        assert!(matches!(&ext(&s).props["0xd060"].state, PropState::Bytes { hex } if hex == "0b"));
     }
 
     #[test]
@@ -1279,9 +1430,7 @@ mod tests {
         ftp_delete(&mut s, 0, NOW).unwrap();
         ftp_move(&mut s, 0, 1, NOW).unwrap();
         let text = serde_json::to_string(&s.derived_from).unwrap();
-        for secret in ["hunter2-secret", "key-secret-12345"] {
-            assert!(!text.contains(secret), "{secret} in the log");
-        }
+        assert_no_secret_anywhere(&text, &captured());
         assert!(text.contains("beta"), "a profile name is not a secret and is what makes the log readable");
     }
 
@@ -1377,13 +1526,46 @@ mod tests {
         assert_eq!(v.switches.iter().map(|w| (w.code, w.value, w.max)).collect::<Vec<_>>(), [(0xD053, Some(1), 1), (0xD060, Some(0), 13)]);
         let presets = v.iptc.as_ref().unwrap();
         assert_eq!(presets.iter().map(|p| (p.slot, p.name.as_str())).collect::<Vec<_>>(), [(1, "Race"), (2, "")], "slot 3 is another record kind and is not offered");
+        assert_eq!(v.iptc_not_offered.len(), 1, "the slot that is not offered is not hidden: {:?}", v.iptc_not_offered);
+        assert!(v.iptc_not_offered[0].0 == 3 && v.iptc_not_offered[0].1.contains("kind"), "{:?}", v.iptc_not_offered);
         assert_eq!(presets[0].fields.len(), IPTC_FIELDS.len());
         assert_eq!(presets[0].fields[2], "Hello");
         assert_eq!(v.ftp.as_ref().unwrap(), &["\"alpha\"", "\"beta\"", "\"gamma\""]);
-        let dump = format!("{v:?}");
+        assert_no_secret_anywhere(&format!("{v:?}"), &edited());
+    }
+
+    /// Fails if `text` carries a stored profile's blob (as the hex the snapshot keeps), or a secret of it in any of the
+    /// shapes a leak takes: the plain text, its ASCII bytes in hex, its UTF-16 bytes in hex. (A check for the plain
+    /// text alone cannot fail for a view that holds only names.)
+    fn assert_no_secret_anywhere(text: &str, snap: &Snapshot) {
+        let lower = text.to_lowercase();
+        let hex_ascii = |s: &str| hex_encode(s.as_bytes());
+        let hex_utf16 = |s: &str| hex_encode(&s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>());
+        let mut needles: Vec<(String, String)> = Vec::new();
         for secret in ["hunter2-secret", "key-secret-12345"] {
-            assert!(!dump.contains(secret), "{secret}");
+            needles.push((format!("{secret} as text"), secret.to_string()));
+            needles.push((format!("{secret} as ASCII hex"), hex_ascii(secret)));
+            needles.push((format!("{secret} as UTF-16 hex"), hex_utf16(secret)));
         }
+        let FtpState::Read(st) = &snap.extended.as_ref().unwrap().ftp else { panic!() };
+        for p in &st.profiles {
+            needles.push(("a profile's stored blob".to_string(), p.hex.clone()));
+        }
+        for (what, needle) in needles {
+            assert!(!lower.contains(&needle.to_lowercase()), "{what} is in: {text}");
+        }
+    }
+
+    /// The check above can fail: it sees a view that leaks the blob, the ASCII hex, or the plain text.
+    #[test]
+    fn the_secret_check_catches_each_shape_of_leak() {
+        let s = edited();
+        let FtpState::Read(st) = &s.extended.as_ref().unwrap().ftp else { panic!() };
+        for leak in [st.profiles[1].hex.clone(), hex_encode(b"hunter2-secret"), "x hunter2-secret x".to_string()] {
+            let caught = std::panic::catch_unwind(|| assert_no_secret_anywhere(&leak, &captured()));
+            assert!(caught.is_err(), "a leak went unseen: {leak}");
+        }
+        assert_no_secret_anywhere("\"alpha\", \"beta\"", &s);
     }
 
     #[test]
@@ -1404,9 +1586,6 @@ mod tests {
         let artist = v.strings.iter().find(|x| x.code == 0xD072).unwrap();
         assert!(artist.text.is_some() && artist.note.as_deref().unwrap().contains("not read"), "a failed read can be given a value");
         assert!(v.switches.iter().find(|x| x.code == 0xD053).unwrap().value.is_none());
-        if let FtpState::Read(st) = &mut edited().extended.as_mut().unwrap().ftp {
-            st.truncated = true;
-        }
         let mut t = edited();
         if let FtpState::Read(st) = &mut t.extended.as_mut().unwrap().ftp {
             st.truncated = true;

@@ -18,9 +18,12 @@
 //! source from `Fixed` to a caller field (which also needs that field added to `FtpField` and
 //! `FtpProfile`), add, drop or reorder entries. Nothing else repeats a tag byte, a section name, an
 //! encoder constant or a secret flag; the tests in `ftp_layout/tests.rs` pin that by building such
-//! variants from a copy of the table. **Writing the folder form to a camera stays off**: the table
-//! fixes the folder to the empty string, because no hardware experiment has shown what a camera does
-//! with one.
+//! variants from a copy of the table. **The folder**: the table's default encoder
+//! ([`encode_ftp_profile`](super::encode_ftp_profile)) still fixes it to the empty string, but a profile that
+//! was read and edited ([`encode_decoded_ftp_profile`](super::encode_decoded_ftp_profile)) is written with the
+//! folder it holds, and snapshot editing and restore send such blobs to a camera. What a camera does with a
+//! folder written by this program has **not been verified on hardware** (the 331-byte form is known from a
+//! capture of NX Field's own write); reading the profile back after a restore is the check.
 //!
 //! The *limits* of the caller-supplied text fields (and their display names) are a separate table,
 //! [`FTP_PROFILE_FIELDS`](super::FTP_PROFILE_FIELDS), because the GUIs need them without the wire

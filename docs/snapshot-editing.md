@@ -1,8 +1,9 @@
 # Editing a copy of a snapshot
 
 Code: `src/snapshot_edit.rs` (the rules, on a value), `src/ops/edit_snapshot.rs` (the files), CLI `nikon-fleet edit …`.
-Built 2026-11-06 (step 1 of the snapshot editor: library and CLI; step 2: the GUI, below; the FTP profile field editor and
-the FTP test are later steps). Needs no camera.
+Built 2026-11-06 (step 1 of the snapshot editor: library and CLI; step 2: the GUI, below; the FTP profile field editor
+(`src/ftp_edit.rs`, `docs/ftp-profiles.md`) and the FTP test came after). Needs no camera. Nothing here has been run
+against a camera: what a camera does with an edited copy that is restored to it is **unverified**.
 
 ## The rule
 
@@ -13,7 +14,15 @@ was copied from, when the source was captured, when the copy was made and last e
 it "edited" in `ls` (`[edited copy]`) and in the listing JSON (`"edited": true`, absent for a captured snapshot). Every
 edit function refuses a snapshot without it, so a caller that forgot to check still cannot change a captured one.
 
-- The copy keeps the source's `captured_at` (the values were read then) and is named, and ordered, by `created_at`.
+That guarantee does not rest on each editor remembering a first line. The three ways the editors reach a snapshot's
+contents for writing (a property, the extended section, the FTP list) each refuse a snapshot that is not a copy, and a
+test lists the public editors from the source text and fails for one it does not run against a capture. What it does
+not defend against: a person adding `derived_from` to a captured file by hand (the marker is a field in the file; the
+rule guards against mistakes, not against editing your own data directory).
+
+- The copy keeps the source's `captured_at` (the values were read then). Its file name is built from `created_at`, so
+  two copies of one snapshot do not share a name; listings order by `captured_at`, so a copy sorts beside its source
+  (it ties with it on that time).
 - Edited copies stay editable in place; captured snapshots and references do not.
 - An edited copy **cannot become a reference** (`ref set` refuses it): a reference is what `check` compares a body to.
 - A copy's label may not start `mcp-` (the MCP server counts its own captures and restore points by that prefix).
@@ -32,7 +41,7 @@ edit function refuses a snapshot without it, so a caller that forgot to check st
 | Artist, Copyright, Image comment | `edit set-string FILE ITEM TEXT` | Latin-1, no control characters (the write's own check), at most 36 / 54 / 36 characters (measured on Z 9, Z6III, Z 5) |
 | EnableCopyright, IPTC preset select | `edit set-switch FILE ITEM VALUE` | 0..=1, 0..=13 (the write's own limits) |
 | an IPTC preset's name or a field | `edit set-iptc FILE SLOT FIELD TEXT` | slot exists and is a preset; no NUL |
-| the FTP profile list | `edit ftp-delete FILE INDEX`, `edit ftp-move FILE FROM TO` | index exists; the list was read whole; slots and count renumbered; the active slot always names a profile |
+| the FTP profile list | `edit ftp-delete FILE INDEX`, `edit ftp-move FILE FROM TO` | index exists; the list was read whole; slots and count renumbered; the active slot never names a slot past the end |
 | (history) | `edit log FILE` | |
 
 Not editable: strings, dates, arrays and other shapes; properties the restore never copies (`code_policy`). The fields of an FTP
@@ -44,10 +53,25 @@ whether this firmware takes the value, the length limits of IPTC fields, the act
 
 No password or key is written to the edit log; a profile is named by its stored name.
 
+**The active FTP profile** is the slot number the camera reported when the snapshot was read. Delete and move keep that
+number as it is (it stays in range; an emptied list has none), not the profile it pointed at. That is deliberate: a
+restore cannot set the active profile, and what the camera reports is not a setting (its slot has stayed 0 in the
+replies seen), so following a profile around would invent a value; the edited copy may show a different "active
+profile" than the capture, and that difference is not something a restore will change.
+
+**Required fields and the template (FTP profiles).** `vendor-write-ftp` refuses a profile missing any of six fields
+(`ptp_usb::ftp_profile_missing_fields`). The editor does not, and a restore does not check it either: cameras make
+profiles without a login (two real blobs in the test fixtures), so a rule that refused them would refuse profiles a
+camera made. When an edit leaves a profile lacking something `vendor-write-ftp` would require, the result says so.
+A new profile starts from the encoder's template, which carries the capture rig's camera address (192.168.66.87/24) and
+option bits `0x0005`; the result says the profile took the template's address. What a camera does with that address on
+another network, or with a profile that has no login or no Wi-Fi name, written by a restore, is **not verified**.
+
 ## Concurrency
 
 An in-place edit reads the file, changes it, and replaces it whole (`write_atomic`). Two editors working on one file at
-once (two windows, or the GUI and the CLI) would have the second overwrite the first's change; there is no lock.
+once (two windows, or the GUI and the CLI) would have the second overwrite the first's change; there is no lock and no
+check that the file is still the one that was read (a known gap, in `src/ops/edit_snapshot.rs`, not fixed).
 
 ## In the GUI (step 2)
 

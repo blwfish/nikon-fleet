@@ -110,10 +110,11 @@ const OP_GET_DEVICE_PROP_DESC: u16 = 0x1014;
 /// alone, encoded per the property's data type (a string is `[u8 count incl. NUL][UTF-16LE]`).
 const OP_GET_DEVICE_PROP_VALUE: u16 = 0x1015;
 /// Standard PTP `SetDevicePropValue`: one param (the property code) and a data-out phase holding the
-/// value. Used here only for the three string properties in [`STRING_PROPS`].
+/// value. Used here for the three string properties in [`STRING_PROPS`] and the two one-byte properties in
+/// [`BYTE_PROPS`]; every other property code is refused before anything is sent.
 const OP_SET_DEVICE_PROP_VALUE: u16 = 0x1016;
 /// `0x9412` — IPTC profile read, the pair of `0x9413` (write). One param, the slot (NX Field sent `1`, and `0` when
-/// the IPTC screen opened); the data phase is the profile. Never sent over USB before 2026-11-06.
+/// the IPTC screen opened); the data phase is the profile. First sent over USB on 2026-11-06 (a Z 9 and a Z6III).
 const OP_IPTC_READ: u16 = 0x9412;
 /// `0x9413` — IPTC profile write. One param, the slot; data-out is the profile as `[u32 length incl. NUL][UTF-8][NUL]`
 /// entries (length 0: empty, no bytes). Worked over USB on a Z6III by replaying a captured blob (2026-09-06); the
@@ -122,9 +123,12 @@ const OP_IPTC_WRITE: u16 = 0x9413;
 /// Models an IPTC write has been confirmed on (a Z6III 2026-09-06 by replay; a Z 9 and a Z6III 2026-11-06 by a new
 /// preset written to an empty slot and read back identical). Anything else needs the explicit override.
 pub const IPTC_WRITE_CONFIRMED_MODELS: &[&str] = &["Z 9", "Z6_3"];
-/// The IPTC preset selector: a u8, read-write, 0..=13 on a Z 9 and a Z6III.
+/// The IPTC preset selector: a u8, read-write, 0..=13 on a Z 9 and a Z6III (the range the selector reports).
 const PROP_IPTC_PRESET: u16 = 0xD060;
-/// The highest value the selector takes (13 presets; 0 is none).
+/// The highest value the selector takes, as the cameras report it (0 is none). Only slots 1..=10 are IPTC presets;
+/// slots 11..=13 are records of kind 2 whose meaning is unknown (`docs/extended-snapshot.md`), so what selecting
+/// 11..=13 does is UNVERIFIED. Restore replays a value the camera itself reported; `edit set-switch` accepts up to
+/// this maximum.
 pub const IPTC_PRESET_MAX: u8 = 13;
 /// `EnableCopyright`: a u8 switch, 0 or 1.
 const PROP_ENABLE_COPYRIGHT: u16 = 0xD053;
@@ -553,6 +557,76 @@ pub(crate) fn check_string_write_gate(model: &str, propcode: u16, models: &[&str
     }
     if !confirmed.contains(&propcode) {
         return Err(PtpUsbError::PropWriteUnconfirmed { propcode, model: model.to_string() });
+    }
+    Ok(())
+}
+
+/// The camera-free refusals of a byte-property write, in the order [`PtpUsbSession::set_byte_property`] makes them: the
+/// property is one of [`BYTE_PROPS`] ([`PtpUsbError::PropWriteUnsupported`]), `value` is at most its maximum
+/// ([`PtpUsbError::PropValueBad`]), and the model is in that property's [`BYTE_PROP_WRITE_MODELS`] entry unless
+/// `force_unconfirmed_model` ([`PtpUsbError::UnconfirmedModel`]). The ONE statement of this gate: the session calls it
+/// before sending, and a restore planner calls it to decide whether an item is a write or a skip, so the two cannot
+/// disagree about what the session will accept.
+pub fn check_byte_property_write(model: &str, propcode: u16, value: u8, force_unconfirmed_model: bool) -> Result<(), PtpUsbError> {
+    let bad = |why: String| PtpUsbError::PropValueBad { propcode, why };
+    let Some(&(_, name, max)) = BYTE_PROPS.iter().find(|(c, ..)| *c == propcode) else {
+        let allowed = BYTE_PROPS.iter().map(|(c, n, _)| format!("{c:#06x} {n}")).collect::<Vec<_>>().join(", ");
+        return Err(PtpUsbError::PropWriteUnsupported { propcode, allowed });
+    };
+    if value > max {
+        return Err(bad(format!("{value} is above the highest value {name} takes, {max}")));
+    }
+    let models: &[&str] = BYTE_PROP_WRITE_MODELS.iter().find(|(c, _)| *c == propcode).map_or(&[], |(_, m)| m);
+    if !force_unconfirmed_model && !models.contains(&model) {
+        return Err(PtpUsbError::UnconfirmedModel(model.to_string()));
+    }
+    Ok(())
+}
+
+/// Whether an IPTC slot write has been confirmed on `model` ([`IPTC_WRITE_CONFIRMED_MODELS`]); what
+/// [`PtpUsbSession::write_iptc_slot`] requires without `force_unconfirmed_model`. The one place the list is consulted.
+pub fn iptc_write_confirmed(model: &str) -> bool {
+    IPTC_WRITE_CONFIRMED_MODELS.contains(&model)
+}
+
+/// The camera-free refusals of a string-property write: the property is one of [`STRING_PROPS`], the (model, property)
+/// gate (unless `force_unconfirmed_model`), and the text ([`encode_owner_string`]: Latin-1, no control characters,
+/// at most 255 units). Returns the encoded value. What [`PtpUsbSession::plan_string_property`] runs before it reads the
+/// descriptor, exposed so a restore planner decides "write or skip" with the session's own check instead of a copy.
+pub fn check_string_property_write(
+    model: &str,
+    propcode: u16,
+    text: &str,
+    force_unconfirmed_model: bool,
+) -> Result<Vec<u8>, PtpUsbError> {
+    check_string_prop_known(propcode)?;
+    if !force_unconfirmed_model {
+        check_string_write_gate(model, propcode, STRING_PROP_WRITE_MODELS, STRING_PROP_WRITE_CONFIRMED_PROPS)?;
+    }
+    encode_owner_string(text).map_err(|why| PtpUsbError::PropValueBad { propcode, why })
+}
+
+/// The descriptor checks that precede a property write: the descriptor is long enough to hold the get/set flag, it is
+/// for `propcode`, its data type is `data_type` when one is given (the string properties: `0xFFFF`), and the get/set
+/// flag says read-write NOW (`0x01`; the camera makes some properties writable only in some states).
+fn check_prop_desc(propcode: u16, desc: &[u8], data_type: Option<u16>) -> Result<(), PtpUsbError> {
+    let bad = |why: String| PtpUsbError::PropValueBad { propcode, why };
+    // PropCode u16, DataType u16, GetSet u8: 5 bytes before anything variable.
+    if desc.len() < 5 {
+        return Err(bad(format!("descriptor is {} byte(s), too short to hold the get/set flag", desc.len())));
+    }
+    let echoed = u16::from_le_bytes([desc[0], desc[1]]);
+    if echoed != propcode {
+        return Err(bad(format!("the descriptor is for property {echoed:#06x}, not the one asked for")));
+    }
+    if let Some(want) = data_type {
+        let got = u16::from_le_bytes([desc[2], desc[3]]);
+        if got != want {
+            return Err(bad(format!("descriptor data type is {got:#06x}, not the expected {want:#06x}")));
+        }
+    }
+    if desc[4] != 0x01 {
+        return Err(PtpUsbError::PropNotWritable { propcode, get_set: desc[4] });
     }
     Ok(())
 }
@@ -1142,7 +1216,8 @@ fn encode_data(code: u16, transaction_id: u32, data: &[u8]) -> Result<Vec<u8>, P
 /// arrives, so a wrongly strict check there would report failure for a
 /// write that took effect. A deviation is not discarded, though: it is
 /// recorded on the [`Reply`] and reported in [`FtpWriteReceipt`]. Move them
-/// to `Enforce` once their replies have been captured.
+/// to `Enforce` once their replies have been captured. The IPTC read and write (`0x9412`, `0x9413`) are
+/// `Unchecked` too, and report their deviations as warnings (`VendorRead::warnings`, `IptcWriteOutcome::warnings`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TxidCheck {
     Enforce,
@@ -1824,6 +1899,25 @@ pub enum ReplyDeviation {
     DataOp { got: u16 },
 }
 
+/// Human text for what a [`TxidCheck::Unchecked`] reply did differently from its command, from the typed deviations
+/// (never from a message): one warning per deviation and one for containers of an unknown kind. Empty for a clean reply.
+fn deviation_warnings(what: &str, reply: &Reply) -> Vec<String> {
+    let mut out: Vec<String> = reply
+        .deviations
+        .iter()
+        .map(|d| match d {
+            ReplyDeviation::TransactionId { got } => {
+                format!("{what}: a reply carried transaction id {got}, not the command's (tolerated: no capture of this op's replies is known to echo it)")
+            }
+            ReplyDeviation::DataOp { got } => format!("{what}: a data container carried operation code {got:#06x}, not the command's"),
+        })
+        .collect();
+    if reply.unrecognized_containers > 0 {
+        out.push(format!("{what}: {} container(s) of a kind this module does not know were skipped", reply.unrecognized_containers));
+    }
+    out
+}
+
 /// What one transaction collected.
 #[derive(Debug)]
 struct Reply {
@@ -2054,22 +2148,23 @@ pub struct IptcWriteOutcome {
     pub response_params: Vec<u32>,
     /// `Err` when the read after an accepted write failed: the write still happened.
     pub after: Result<VendorRead, PtpUsbError>,
+    /// What the write's own reply did differently from its command (the replies of `0x9413` are not checked for the
+    /// command's transaction id), and the unsurveyed-model note. Not failures.
+    pub warnings: Vec<String>,
 }
 
-/// IPTC entries as the `0x9413` data phase carries them: each `[u32 LE length incl. NUL][UTF-8][NUL]`, an empty one
-/// just a zero length.
+/// A preset-kind record for the `0x9413` data phase, built from raw `entries`: the 12-byte header every slot carries
+/// ([`crate::iptc::iptc_preset_header`]; a Z 9 refused a write without it, `0xA210`), then each entry as
+/// `[u32 LE length incl. NUL][UTF-8][NUL]` (an empty one just a zero length). Not a second encoder: it is
+/// [`crate::iptc::encode_preset_record`], the one the preset encoder is built on (a test feeds both the same entries).
+/// For the experimental `vendor-write-iptc`; a caller with text it has not checked uses `encode_preset_record`, which
+/// returns an error where this panics.
+///
+/// # Panics
+/// If an entry holds a NUL or is 4 GiB long. A command-line argument can be neither, and the panic comes before any
+/// camera is opened.
 pub fn encode_iptc_entries(entries: &[&str]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for e in entries {
-        if e.is_empty() {
-            out.extend_from_slice(&0u32.to_le_bytes());
-        } else {
-            out.extend_from_slice(&(e.len() as u32 + 1).to_le_bytes());
-            out.extend_from_slice(e.as_bytes());
-            out.push(0);
-        }
-    }
-    out
+    crate::iptc::encode_preset_record(entries.iter().copied()).expect("an entry from the command line has no NUL and is far below 4 GiB")
 }
 
 /// What [`PtpUsbSession::set_byte_property`] did. `Ok` from the camera is not proof: compare `read_back` with `written`.
@@ -2080,6 +2175,17 @@ pub struct BytePropReceipt {
     pub previous: Vec<u8>,
     pub written: u8,
     pub read_back: Result<Vec<u8>, PtpUsbError>,
+    /// Things worth telling the user that are not failures: a body outside [`KNOWN_MODELS`], a read-back that failed.
+    pub warnings: Vec<String>,
+}
+
+/// What [`PtpUsbSession::plan_byte_property`] found: the write would be accepted by every check made before sending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BytePropPlan {
+    pub propcode: u16,
+    /// The property's single byte now.
+    pub previous: Vec<u8>,
+    pub warnings: Vec<String>,
 }
 
 impl BytePropReceipt {
@@ -2699,6 +2805,27 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         self.transact_within(op, params, data_out, check, self.transaction_timeout)
     }
 
+    /// [`Self::transact`] for a transaction that CHANGES the camera: its data-out container is how it does that. A
+    /// failure after that container was handed to the pipe (`data_phase_started`) may have taken effect, so it is
+    /// turned into the caller's "may or may not have taken effect" variant (`indeterminate`, which receives the
+    /// underlying error as its cause); a failure before it (the command itself was refused, short-written or never
+    /// encoded, or the session was already unusable) sent no data and is returned as it is. The one place that
+    /// decides which side of the line an error falls on, shared by the FTP, string-property, byte-property and IPTC
+    /// writes.
+    fn transact_write(
+        &mut self,
+        op: u16,
+        params: &[u32],
+        data: &[u8],
+        check: TxidCheck,
+        indeterminate: impl FnOnce(Box<PtpUsbError>) -> PtpUsbError,
+    ) -> Result<Reply, PtpUsbError> {
+        match self.transact(op, params, Some(data), check) {
+            Err(e) if self.data_phase_started => Err(indeterminate(Box::new(e))),
+            other => other,
+        }
+    }
+
     fn transact_within(
         &mut self,
         op: u16,
@@ -2981,18 +3108,22 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         Ok(VendorRead { data: reply.data, response_params: reply.params, warnings })
     }
 
-    /// `0x9412(slot)`: the IPTC profile in `slot`, undecoded. EXPERIMENTAL and read-only; the wire form is
-    /// inferred from an NX Field capture, never sent over USB before. An OK answer with no data container is
+    /// `0x9412(slot)`: the IPTC profile in `slot`, undecoded. Read-only; sent over USB on a Z 9 and a Z6III from
+    /// 2026-11-06 (the wire form was inferred from an NX Field capture). An OK answer with no data container is
     /// [`PtpUsbError::NoDataPhase`].
     pub fn read_iptc_slot(&mut self, slot: u32) -> Result<VendorRead, PtpUsbError> {
-        let warnings: Vec<String> = unsurveyed_model_warning(self.model(), "the IPTC read").into_iter().collect();
+        let mut warnings: Vec<String> = unsurveyed_model_warning(self.model(), "the IPTC read").into_iter().collect();
         let reply = self.transact_ok_with_data(OP_IPTC_READ, &[slot], None, TxidCheck::Unchecked)?;
+        warnings.extend(deviation_warnings("the IPTC read (0x9412)", &reply));
         Ok(VendorRead { data: reply.data, response_params: reply.params, warnings })
     }
 
     /// `0x9412(0)` (the directory: a u32 count first) and then `0x9412(n)` for `n` in `1..=min(count, max)`. Read-only,
-    /// one transaction per slot. A directory that does not begin with a count is [`PtpUsbError::NoDataPhase`]'s sibling
-    /// problem and is reported as a short read; the first failing slot ends the read with its error.
+    /// one transaction per slot. A directory shorter than the count is reported as [`PtpUsbError::NoDataPhase`] (the
+    /// closest typed variant: there is no usable data, though some bytes came). The first failing slot ends the read with
+    /// its error and the slots already read are dropped with it. Returned: the count the directory states and the slots
+    /// read, so the caller derives "truncated" itself (`count > max`); the directory's bytes after the count and the
+    /// per-read warnings ([`VendorRead::warnings`]) are not returned.
     pub fn read_iptc_slots(&mut self, max: u32) -> Result<(u32, Vec<(u32, Vec<u8>)>), PtpUsbError> {
         let directory = self.read_iptc_slot(0)?;
         let count = directory
@@ -3022,11 +3153,19 @@ impl<T: BulkTransport> PtpUsbSession<T> {
             FtpProbeOutcome::NotSent { cause } => return Err(cause),
             FtpProbeOutcome::Indeterminate { cause, .. } => return Err(PtpUsbError::FtpWriteIndeterminate { cause: Box::new(cause) }),
         }
-        probe.after.map(|state| state.info.count)
+        // The camera acknowledged the delete (OK): the list is probably gone, and the read that would confirm it is
+        // what failed. That is not "nothing changed": it is an acked write whose effect cannot be confirmed, the same
+        // class as a lost reply, so exit 4 and a look at the camera, never a plain failure a script may retry.
+        match probe.after {
+            Ok(state) => Ok(state.info.count),
+            Err(cause) => Err(PtpUsbError::FtpWriteIndeterminate { cause: Box::new(cause) }),
+        }
     }
 
-    /// EXPERIMENTAL. `0x9412(slot)`, then `0x9413(slot)` with `data`, then `0x9412(slot)` again, in one session: what
-    /// the slot held, whether the camera accepted the write, and what it holds now. Nothing is verified or interpreted.
+    /// `0x9412(slot)`, then `0x9413(slot)` with `data`, then `0x9412(slot)` again, in one session: what
+    /// the slot held, whether the camera accepted the write, and what it holds now. `data` is sent as given and the
+    /// result is not interpreted or compared here (the restore path does that). A write of a preset to an empty slot,
+    /// read back identical, is confirmed on a Z 9 and a Z6III (2026-11-06); other writes are not.
     /// Refused before anything is sent for a model outside [`IPTC_WRITE_CONFIRMED_MODELS`] unless
     /// `force_unconfirmed_model`. A reply that never came is an `Err` and the camera MAY have changed; read the slot
     /// again in a new session.
@@ -3036,46 +3175,56 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         data: &[u8],
         force_unconfirmed_model: bool,
     ) -> Result<IptcWriteOutcome, PtpUsbError> {
-        if !force_unconfirmed_model && !IPTC_WRITE_CONFIRMED_MODELS.contains(&self.model()) {
+        if !force_unconfirmed_model && !iptc_write_confirmed(self.model()) {
             return Err(PtpUsbError::UnconfirmedModel(self.model().to_string()));
         }
         let before = self.read_iptc_slot(slot)?;
-        let reply = match self.transact(OP_IPTC_WRITE, &[slot], Some(data), TxidCheck::Unchecked) {
-            Ok(reply) => reply,
-            Err(e) if self.data_phase_started => return Err(PtpUsbError::IptcWriteIndeterminate { cause: Box::new(e) }),
-            Err(e) => return Err(e),
-        };
+        let reply = self.transact_write(OP_IPTC_WRITE, &[slot], data, TxidCheck::Unchecked, |cause| PtpUsbError::IptcWriteIndeterminate { cause })?;
         Self::require_ok(OP_IPTC_WRITE, reply.code)?;
+        let warnings = deviation_warnings("the IPTC write (0x9413)", &reply);
         let after = self.read_iptc_slot(slot);
-        Ok(IptcWriteOutcome { before, response_params: reply.params, after })
+        Ok(IptcWriteOutcome { before, response_params: reply.params, after, warnings })
     }
 
-    /// Write one of the [`BYTE_PROPS`] with `SetDevicePropValue`: the value before, the write, the value read back.
+    /// Everything [`Self::set_byte_property`] checks before it sends the value, and nothing more: the camera-free
+    /// refusals of [`check_byte_property_write`] (known property, value in range, model gate), then the
+    /// descriptor (the property must be read-write NOW: a Z 9 answered `AccessDenied` to a `0xD060` write while all
+    /// its presets were empty, which the get/set flag shows before anything is sent; see [`check_prop_desc`]) and the
+    /// current value (one byte). A dry run uses this alone, so it refuses exactly what the real write would refuse.
+    /// Nothing is sent that changes the camera. UNVERIFIED on hardware: the descriptor read ahead of a byte write has
+    /// not been run on a camera, and the data type the camera reports for these two properties is not checked
+    /// (it is not known to be the standard UINT8).
+    pub fn plan_byte_property(&mut self, propcode: u16, value: u8, force_unconfirmed_model: bool) -> Result<BytePropPlan, PtpUsbError> {
+        check_byte_property_write(self.model(), propcode, value, force_unconfirmed_model)?;
+        let desc = self.get_device_prop_desc(propcode)?;
+        check_prop_desc(propcode, &desc.data, None)?;
+        let before = self.get_device_prop_value(propcode)?;
+        if before.data.len() != 1 {
+            return Err(PtpUsbError::PropValueBad {
+                propcode,
+                why: format!("its current value is {} byte(s), not the one byte this writes", before.data.len()),
+            });
+        }
+        Ok(BytePropPlan { propcode, previous: before.data, warnings: desc.warnings })
+    }
+
+    /// Write one of the [`BYTE_PROPS`] with `SetDevicePropValue`: [`Self::plan_byte_property`] (checks, descriptor, the
+    /// value before), the write, the value read back.
     /// Changes the camera (`0xD060` changes which IPTC profile is embedded in photos); the caller keeps `previous`
     /// to put it back. The value is range-checked before anything is sent. Gate: [`BYTE_PROP_WRITE_MODELS`] for the
-    /// property, unless `force_unconfirmed_model`.
+    /// property, unless `force_unconfirmed_model`. A failure after the value went out is
+    /// [`PtpUsbError::PropWriteIndeterminate`]; one before it (a refused command) is the plain error.
     pub fn set_byte_property(&mut self, propcode: u16, value: u8, force_unconfirmed_model: bool) -> Result<BytePropReceipt, PtpUsbError> {
-        let bad = |why: String| PtpUsbError::PropValueBad { propcode, why };
-        let Some(&(_, name, max)) = BYTE_PROPS.iter().find(|(c, ..)| *c == propcode) else {
-            let allowed = BYTE_PROPS.iter().map(|(c, n, _)| format!("{c:#06x} {n}")).collect::<Vec<_>>().join(", ");
-            return Err(PtpUsbError::PropWriteUnsupported { propcode, allowed });
-        };
-        if value > max {
-            return Err(bad(format!("{value} is above the highest value {name} takes, {max}")));
-        }
-        let models: &[&str] = BYTE_PROP_WRITE_MODELS.iter().find(|(c, _)| *c == propcode).map_or(&[], |(_, m)| m);
-        if !force_unconfirmed_model && !models.contains(&self.model()) {
-            return Err(PtpUsbError::UnconfirmedModel(self.model().to_string()));
-        }
-        let previous = self.get_device_prop_value(propcode)?.data;
-        let reply = match self.transact(OP_SET_DEVICE_PROP_VALUE, &[u32::from(propcode)], Some(&[value]), TxidCheck::Enforce) {
-            Ok(reply) => reply,
-            Err(e) if self.data_phase_started => return Err(PtpUsbError::PropWriteIndeterminate { propcode, cause: Box::new(e) }),
-            Err(e) => return Err(e),
-        };
+        let BytePropPlan { previous, mut warnings, .. } = self.plan_byte_property(propcode, value, force_unconfirmed_model)?;
+        let reply = self.transact_write(OP_SET_DEVICE_PROP_VALUE, &[u32::from(propcode)], &[value], TxidCheck::Enforce, |cause| {
+            PtpUsbError::PropWriteIndeterminate { propcode, cause }
+        })?;
         Self::require_ok(OP_SET_DEVICE_PROP_VALUE, reply.code)?;
         let read_back = self.get_device_prop_value(propcode).map(|r| r.data);
-        Ok(BytePropReceipt { propcode, previous, written: value, read_back })
+        if let Err(e) = &read_back {
+            warnings.push(format!("the write was accepted but reading it back failed ({e}); the value is unconfirmed"));
+        }
+        Ok(BytePropReceipt { propcode, previous, written: value, read_back, warnings })
     }
 
     /// [`Self::set_byte_property`] for the IPTC preset selector (`0xD060`).
@@ -3114,29 +3263,11 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         text: &str,
         force_unconfirmed_model: bool,
     ) -> Result<StringPropPlan, PtpUsbError> {
-        check_string_prop_known(propcode)?;
-        if !force_unconfirmed_model {
-            check_string_write_gate(self.model(), propcode, STRING_PROP_WRITE_MODELS, STRING_PROP_WRITE_CONFIRMED_PROPS)?;
-        }
         let bad = |why: String| PtpUsbError::PropValueBad { propcode, why };
-        let data = encode_owner_string(text).map_err(&bad)?;
+        let data = check_string_property_write(self.model(), propcode, text, force_unconfirmed_model)?;
 
         let desc = self.get_device_prop_desc(propcode)?;
-        // PropCode u16, DataType u16 (0xFFFF = string), GetSet u8: 5 bytes before anything variable.
-        if desc.data.len() < 5 {
-            return Err(bad(format!("descriptor is {} byte(s), too short to hold the get/set flag", desc.data.len())));
-        }
-        let echoed = u16::from_le_bytes([desc.data[0], desc.data[1]]);
-        if echoed != propcode {
-            return Err(bad(format!("the descriptor is for property {echoed:#06x}, not the one asked for")));
-        }
-        let data_type = u16::from_le_bytes([desc.data[2], desc.data[3]]);
-        if data_type != 0xFFFF {
-            return Err(bad(format!("descriptor data type is {data_type:#06x}, not the string type 0xffff")));
-        }
-        if desc.data[4] != 0x01 {
-            return Err(PtpUsbError::PropNotWritable { propcode, get_set: desc.data[4] });
-        }
+        check_prop_desc(propcode, &desc.data, Some(0xFFFF))?;
         let before = self.get_device_prop_value(propcode)?;
         let previous = decode_ptp_string_value(&before.data).map_err(|e| bad(format!("the current value does not decode ({e})")))?;
         Ok(StringPropPlan { propcode, previous, data, warnings: desc.warnings })
@@ -3164,13 +3295,9 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         let StringPropPlan { previous, data, mut warnings, .. } =
             self.plan_string_property(propcode, text, force_unconfirmed_model)?;
 
-        let reply = match self.transact(OP_SET_DEVICE_PROP_VALUE, &[u32::from(propcode)], Some(&data), TxidCheck::Enforce) {
-            Ok(reply) => reply,
-            Err(e) if self.data_phase_started => {
-                return Err(PtpUsbError::PropWriteIndeterminate { propcode, cause: Box::new(e) })
-            }
-            Err(e) => return Err(e),
-        };
+        let reply = self.transact_write(OP_SET_DEVICE_PROP_VALUE, &[u32::from(propcode)], &data, TxidCheck::Enforce, |cause| {
+            PtpUsbError::PropWriteIndeterminate { propcode, cause }
+        })?;
         Self::require_ok(OP_SET_DEVICE_PROP_VALUE, reply.code)?;
 
         let read_back = match self.get_device_prop_value(propcode) {
@@ -3357,11 +3484,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     fn send_ftp_blob(&mut self, params: [u32; 2], blob: &[u8]) -> Result<FtpWriteReceipt, PtpUsbError> {
         let setup = self.ftp_setup_step()?;
 
-        let reply = match self.transact(OP_FTP_PROFILE_WRITE, &params, Some(blob), TxidCheck::Unchecked) {
-            Ok(reply) => reply,
-            Err(e) if self.data_phase_started => return Err(PtpUsbError::FtpWriteIndeterminate { cause: Box::new(e) }),
-            Err(e) => return Err(e),
-        };
+        let reply = self.transact_write(OP_FTP_PROFILE_WRITE, &params, blob, TxidCheck::Unchecked, |cause| PtpUsbError::FtpWriteIndeterminate { cause })?;
         Self::require_ok(OP_FTP_PROFILE_WRITE, reply.code)?;
         let reply_matched_command = setup.deviations.is_empty() && reply.deviations.is_empty();
         Ok(FtpWriteReceipt { response_params: reply.params, reply_matched_command })
@@ -5235,13 +5358,27 @@ mod tests {
     }
 
     #[test]
-    fn iptc_entries_are_length_prefixed_with_the_nul_counted_and_an_empty_one_is_just_a_zero() {
-        assert_eq!(encode_iptc_entries(&[]), Vec::<u8>::new());
-        assert_eq!(encode_iptc_entries(&[""]), [0, 0, 0, 0]);
-        assert_eq!(encode_iptc_entries(&["1"]), [2, 0, 0, 0, b'1', 0]);
-        assert_eq!(encode_iptc_entries(&["", "ab", ""]), [0, 0, 0, 0, 3, 0, 0, 0, b'a', b'b', 0, 0, 0, 0, 0]);
+    fn the_raw_iptc_entries_record_is_the_preset_header_then_the_shared_entry_encoding() {
+        // The header a Z 9 insists on (0xA210 without it), then each entry [u32 len incl. NUL][bytes][NUL], empty = 0.
+        let header = [0x01, 0, 0, 0, 0xC9, 0, 0x01, 0, 0, 0, 0, 0];
+        let with_header = |tail: &[u8]| [header.as_slice(), tail].concat();
+        assert_eq!(encode_iptc_entries(&[]), header);
+        assert_eq!(encode_iptc_entries(&[""]), with_header(&[0, 0, 0, 0]));
+        assert_eq!(encode_iptc_entries(&["1"]), with_header(&[2, 0, 0, 0, b'1', 0]));
+        assert_eq!(encode_iptc_entries(&["", "ab", ""]), with_header(&[0, 0, 0, 0, 3, 0, 0, 0, b'a', b'b', 0, 0, 0, 0, 0]));
         // Length counts bytes, not characters.
-        assert_eq!(encode_iptc_entries(&["é"]), [3, 0, 0, 0, 0xC3, 0xA9, 0]);
+        assert_eq!(encode_iptc_entries(&["é"]), with_header(&[3, 0, 0, 0, 0xC3, 0xA9, 0]));
+    }
+
+    #[test]
+    fn the_raw_entries_encoder_and_the_preset_encoder_agree_on_the_same_entries() {
+        // Parity of the two callers of the one entry encoder: the 15 entries of a preset, fed to both.
+        let name = "Race";
+        let fields: Vec<String> = (0..crate::iptc::IPTC_FIELDS.len()).map(|i| if i % 3 == 0 { String::new() } else { format!("f{i}é") }).collect();
+        let preset = crate::iptc::IptcPreset { name: name.to_string(), fields: fields.clone() };
+        let mut entries: Vec<&str> = vec![name];
+        entries.extend(fields.iter().map(String::as_str));
+        assert_eq!(encode_iptc_entries(&entries), crate::iptc::encode_iptc_preset(&preset).unwrap());
     }
 
     #[test]
@@ -5289,23 +5426,355 @@ mod tests {
         assert!(t.sent().is_empty());
     }
 
+    /// The replies a byte-property write gets, in order: the descriptor (`flag` is its get/set byte), the value before
+    /// (`previous`), the answer to the write (`set_reply`), and the value read back.
+    fn byte_write_script(propcode: u16, flag: u8, previous: &[u8], set_reply: Step, read_back: &[u8]) -> Vec<Step> {
+        vec![
+            data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(propcode, 0x0002, flag)),
+            resp(RESP_OK),
+            data_c(OP_GET_DEVICE_PROP_VALUE, previous),
+            resp(RESP_OK),
+            set_reply,
+            data_c(OP_GET_DEVICE_PROP_VALUE, read_back),
+            resp(RESP_OK),
+        ]
+    }
+
     #[test]
-    fn selecting_an_iptc_preset_reads_writes_and_reads_back() {
-        let (mut s, t) = session(
-            vec![data_c(OP_GET_DEVICE_PROP_VALUE, &[0]), resp(RESP_OK), resp(RESP_OK), data_c(OP_GET_DEVICE_PROP_VALUE, &[1]), resp(RESP_OK)],
-            "Z6_3",
-        );
+    fn selecting_an_iptc_preset_reads_the_descriptor_and_the_value_writes_and_reads_back() {
+        let (mut s, t) = session(byte_write_script(PROP_IPTC_PRESET, 1, &[0], resp(RESP_OK), &[1]), "Z6_3");
         let r = s.set_iptc_preset(1, false).unwrap();
         assert_eq!((r.previous.clone(), r.written, r.verified()), (vec![0], 1, true));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let cmds: Vec<u16> = t.sent().iter().filter(|(k, ..)| *k == CONTAINER_COMMAND).map(|c| c.1).collect();
+        assert_eq!(cmds, [OP_GET_DEVICE_PROP_DESC, OP_GET_DEVICE_PROP_VALUE, OP_SET_DEVICE_PROP_VALUE, OP_GET_DEVICE_PROP_VALUE]);
         let sent = t.sent();
         let set = sent.iter().find(|(k, op, ..)| *k == CONTAINER_DATA && *op == OP_SET_DEVICE_PROP_VALUE).expect("value sent");
         assert_eq!(set.3, [1]);
         // A read-back that disagrees is not verified.
+        let (mut s, _t) = session(byte_write_script(PROP_IPTC_PRESET, 1, &[0], resp(RESP_OK), &[0]), "Z6_3");
+        assert!(!s.set_iptc_preset(1, false).unwrap().verified());
+    }
+
+    #[test]
+    fn a_byte_read_back_that_fails_is_unverified_and_says_so() {
+        let mut script = byte_write_script(PROP_ENABLE_COPYRIGHT, 1, &[0], resp(RESP_OK), &[1]);
+        script.truncate(5); // nothing for the read-back: the script runs dry and the read times out
+        let (mut s, _t) = session(script, "Z 5");
+        let r = s.set_byte_property(PROP_ENABLE_COPYRIGHT, 1, false).unwrap();
+        assert!(!r.verified());
+        assert!(r.read_back.is_err());
+        assert!(r.warnings.iter().any(|w| w.contains("reading it back failed")), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn a_byte_write_is_refused_before_it_is_sent_when_the_descriptor_says_read_only_or_is_not_for_the_property() {
+        // The get/set flag: only 0x01 is read-write. 0 and 2 are the neighbours (a Z 9 answered AccessDenied to a 0xD060
+        // write while its presets were empty).
+        for flag in [0u8, 2, 0xFF] {
+            let (mut s, t) = session(byte_write_script(PROP_IPTC_PRESET, flag, &[0], resp(RESP_OK), &[1]), "Z6_3");
+            let err = s.set_iptc_preset(1, false).unwrap_err();
+            assert!(matches!(err, PtpUsbError::PropNotWritable { propcode: 0xD060, get_set } if get_set == flag), "{flag}: {err:?}");
+            assert!(!t.sent().iter().any(|(_, op, ..)| *op == OP_SET_DEVICE_PROP_VALUE), "nothing was written ({flag})");
+        }
+        // A descriptor for another property, and one too short to hold the flag.
+        let (mut s, t) = session(byte_write_script(0xD061, 1, &[0], resp(RESP_OK), &[1]), "Z6_3");
+        assert!(matches!(s.set_iptc_preset(1, false).unwrap_err(), PtpUsbError::PropValueBad { .. }));
+        assert!(!t.sent().iter().any(|(_, op, ..)| *op == OP_SET_DEVICE_PROP_VALUE));
+        let (mut s, _t) = session(vec![data_c(OP_GET_DEVICE_PROP_DESC, &[0x60, 0xD0, 0x02, 0x00]), resp(RESP_OK)], "Z6_3");
+        assert!(matches!(s.set_iptc_preset(1, false).unwrap_err(), PtpUsbError::PropValueBad { .. }), "4 bytes: no flag");
+        // The data type the camera reports is NOT checked (unverified what it is): any type with the flag passes.
+        let mut script = byte_write_script(PROP_IPTC_PRESET, 1, &[0], resp(RESP_OK), &[1]);
+        script[0] = data_c(OP_GET_DEVICE_PROP_DESC, &prop_desc(PROP_IPTC_PRESET, 0x0004, 1));
+        let (mut s, _t) = session(script, "Z6_3");
+        assert!(s.set_iptc_preset(1, false).unwrap().verified());
+    }
+
+    #[test]
+    fn a_byte_property_whose_current_value_is_not_one_byte_is_not_written() {
+        for previous in [&[][..], &[0, 0][..]] {
+            let (mut s, t) = session(byte_write_script(PROP_IPTC_PRESET, 1, previous, resp(RESP_OK), &[1]), "Z6_3");
+            let err = s.set_iptc_preset(1, false).unwrap_err();
+            assert!(matches!(err, PtpUsbError::PropValueBad { propcode: 0xD060, .. }), "{previous:?}: {err:?}");
+            assert!(!t.sent().iter().any(|(_, op, ..)| *op == OP_SET_DEVICE_PROP_VALUE));
+        }
+    }
+
+    #[test]
+    fn the_byte_plan_reads_and_writes_nothing_that_changes_the_camera() {
+        let (mut s, t) = session(byte_write_script(PROP_ENABLE_COPYRIGHT, 1, &[1], resp(RESP_OK), &[1]), "Z 5");
+        let plan = s.plan_byte_property(PROP_ENABLE_COPYRIGHT, 0, false).unwrap();
+        assert_eq!((plan.propcode, plan.previous), (0xD053, vec![1]));
+        assert!(!t.sent().iter().any(|(_, op, ..)| *op == OP_SET_DEVICE_PROP_VALUE), "a plan is a dry run");
+    }
+
+    // ── write-may-have-taken-effect: before the data phase is a plain error, after it is indeterminate ──
+    //
+    // One helper (`transact_write`) decides it for the FTP, string, byte and IPTC writes. Each is driven twice with a
+    // fake whose pipe takes only 5 bytes of one write: the write that carries the COMMAND (nothing sent yet), and the
+    // write that carries the DATA (sent). `write_caps` is per write call, front first; `usize::MAX` takes it all.
+
+    /// The first `nth_write_short` writes go through whole; the next takes `taken` bytes only.
+    fn caps(nth_write_short: usize, taken: usize) -> VecDeque<usize> {
+        let mut v = VecDeque::from(vec![usize::MAX; nth_write_short]);
+        v.push_back(taken);
+        v
+    }
+    /// A pipe that takes 5 bytes of a command container (shorter than its 12-byte header).
+    const CUT_COMMAND: usize = 5;
+    /// A pipe that takes exactly the 12-byte header of a data container and none of its payload.
+    const CUT_DATA: usize = 12;
+
+    /// Whether any write put a DATA container for `op` on the pipe, even a cut one (its header says what it is). Reads
+    /// the raw writes: `sent()` insists on whole containers.
+    fn data_sent(t: &ScriptedTransport, op: u16) -> bool {
+        t.0.borrow().writes.iter().any(|(_, raw)| {
+            raw.len() >= 8 && u16::from_le_bytes([raw[4], raw[5]]) == CONTAINER_DATA && u16::from_le_bytes([raw[6], raw[7]]) == op
+        })
+    }
+
+    #[test]
+    fn a_byte_write_whose_command_fails_is_not_indeterminate_and_one_whose_data_fails_is() {
+        // writes: 0 desc cmd, 1 value cmd, 2 SET cmd, 3 SET data.
+        let (mut s, t) = session(byte_write_script(PROP_IPTC_PRESET, 1, &[0], resp(RESP_OK), &[1]), "Z6_3");
+        s.handle.0.borrow_mut().write_caps = caps(2, CUT_COMMAND);
+        let err = s.set_iptc_preset(1, false).unwrap_err();
+        assert!(matches!(err, PtpUsbError::ShortWrite { written: 5, .. }), "{err:?}");
+        assert_eq!(crate::exit_status::write_kind_of_ptp_usb_error(&err), crate::exit_status::ExitKind::Failure);
+        assert!(!data_sent(&t, OP_SET_DEVICE_PROP_VALUE), "the value never went out");
+
+        let (mut s, t) = session(byte_write_script(PROP_IPTC_PRESET, 1, &[0], resp(RESP_OK), &[1]), "Z6_3");
+        s.handle.0.borrow_mut().write_caps = caps(3, CUT_DATA);
+        let err = s.set_iptc_preset(1, false).unwrap_err();
+        assert!(matches!(&err, PtpUsbError::PropWriteIndeterminate { propcode: 0xD060, cause } if matches!(**cause, PtpUsbError::ShortWrite { written: 12, .. })), "{err:?}");
+        assert_eq!(crate::exit_status::write_kind_of_ptp_usb_error(&err), crate::exit_status::ExitKind::WriteIndeterminate);
+        assert!(data_sent(&t, OP_SET_DEVICE_PROP_VALUE), "the data container was handed to the pipe");
+    }
+
+    #[test]
+    fn a_byte_write_whose_reply_is_lost_is_indeterminate() {
+        // The case the finding names: the value went out and the reply never came.
+        let (mut s, t) = session(byte_write_script(PROP_ENABLE_COPYRIGHT, 1, &[0], Step::Err(rusb::Error::Timeout), &[1]), "Z 5");
+        let err = s.set_byte_property(PROP_ENABLE_COPYRIGHT, 1, false).unwrap_err();
+        assert!(matches!(&err, PtpUsbError::PropWriteIndeterminate { propcode: 0xD053, cause } if matches!(**cause, PtpUsbError::Usb(rusb::Error::Timeout))), "{err:?}");
+        assert!(data_sent(&t, OP_SET_DEVICE_PROP_VALUE), "the value did go out");
+        // A camera that ANSWERS non-OK is a definite refusal, not indeterminate.
+        let (mut s, _t) = session(byte_write_script(PROP_ENABLE_COPYRIGHT, 1, &[0], resp(0x200F), &[1]), "Z 5");
+        let err = s.set_byte_property(PROP_ENABLE_COPYRIGHT, 1, false).unwrap_err();
+        assert!(matches!(err, PtpUsbError::OperationFailed { op: OP_SET_DEVICE_PROP_VALUE, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn an_iptc_write_whose_command_fails_is_not_indeterminate_and_one_whose_data_fails_is() {
+        // writes: 0 read cmd, 1 WRITE cmd, 2 WRITE data.
+        let script = || vec![data_c(OP_IPTC_READ, &[1]), resp(RESP_OK), resp(RESP_OK)];
+        let (mut s, t) = session(script(), "Z6_3");
+        s.handle.0.borrow_mut().write_caps = caps(1, CUT_COMMAND);
+        let err = s.write_iptc_slot(1, &[9], false).unwrap_err();
+        assert!(matches!(err, PtpUsbError::ShortWrite { written: 5, .. }), "a refusal before any data is a plain failure: {err:?}");
+        assert_eq!(crate::exit_status::write_kind_of_ptp_usb_error(&err), crate::exit_status::ExitKind::Failure);
+        assert!(!data_sent(&t, OP_IPTC_WRITE));
+
+        let (mut s, t) = session(script(), "Z6_3");
+        s.handle.0.borrow_mut().write_caps = caps(2, CUT_DATA);
+        let err = s.write_iptc_slot(1, &[9], false).unwrap_err();
+        assert!(data_sent(&t, OP_IPTC_WRITE), "the data container was handed to the pipe");
+        assert!(matches!(&err, PtpUsbError::IptcWriteIndeterminate { cause } if matches!(**cause, PtpUsbError::ShortWrite { written: 12, .. })), "{err:?}");
+        assert_eq!(crate::exit_status::write_kind_of_ptp_usb_error(&err), crate::exit_status::ExitKind::WriteIndeterminate);
+    }
+
+    #[test]
+    fn a_string_write_whose_command_fails_is_not_indeterminate_and_one_whose_data_fails_is() {
+        // writes: 0 desc cmd, 1 value cmd, 2 SET cmd, 3 SET data.
+        let (mut s, t) = session(set_script(1, "a", RESP_OK, "b"), "Z 9");
+        s.handle.0.borrow_mut().write_caps = caps(2, CUT_COMMAND);
+        let err = s.set_string_property(0xD090, "b", false).unwrap_err();
+        assert!(matches!(err, PtpUsbError::ShortWrite { written: 5, .. }), "{err:?}");
+        assert!(!data_sent(&t, OP_SET_DEVICE_PROP_VALUE));
+
+        let (mut s, _t) = session(set_script(1, "a", RESP_OK, "b"), "Z 9");
+        s.handle.0.borrow_mut().write_caps = caps(3, CUT_DATA);
+        let err = s.set_string_property(0xD090, "b", false).unwrap_err();
+        assert!(matches!(err, PtpUsbError::PropWriteIndeterminate { propcode: 0xD090, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn an_ftp_write_whose_command_fails_is_not_indeterminate_and_one_whose_data_fails_is() {
+        // send_ftp_blob: 0 setup cmd, 1 setup data, 2 WRITE cmd, 3 WRITE data.
+        let script = || vec![resp(RESP_OK), resp(RESP_OK)];
+        let (mut s, t) = session(script(), "Z 9");
+        s.handle.0.borrow_mut().write_caps = caps(2, CUT_COMMAND);
+        let err = s.send_ftp_blob([0, 0], &[1, 2, 3]).unwrap_err();
+        assert!(matches!(err, PtpUsbError::ShortWrite { written: 5, .. }), "{err:?}");
+        assert!(!data_sent(&t, OP_FTP_PROFILE_WRITE));
+
+        let (mut s, _t) = session(script(), "Z 9");
+        s.handle.0.borrow_mut().write_caps = caps(3, CUT_DATA);
+        let err = s.send_ftp_blob([0, 0], &[1, 2, 3]).unwrap_err();
+        assert!(matches!(err, PtpUsbError::FtpWriteIndeterminate { .. }), "{err:?}");
+    }
+
+    // ── the pre-send gates, one statement each ───────────────────────────
+
+    #[test]
+    fn the_byte_gate_helper_is_exact_at_the_maximum_for_each_property() {
+        for &(code, name, max) in &BYTE_PROPS {
+            let model = BYTE_PROP_WRITE_MODELS.iter().find(|(c, _)| *c == code).unwrap().1[0];
+            assert!(check_byte_property_write(model, code, max, false).is_ok(), "{name} at its maximum {max}");
+            assert!(check_byte_property_write(model, code, 0, false).is_ok(), "{name} at 0");
+            assert!(matches!(check_byte_property_write(model, code, max + 1, false), Err(PtpUsbError::PropValueBad { .. })), "{name} one above");
+            assert!(matches!(check_byte_property_write(model, code, max + 1, true), Err(PtpUsbError::PropValueBad { .. })), "forcing the model does not lift the range");
+            assert!(matches!(check_byte_property_write("Z 8", code, max, false), Err(PtpUsbError::UnconfirmedModel(_))));
+            assert!(check_byte_property_write("Z 8", code, max, true).is_ok(), "forced");
+            assert!(matches!(check_byte_property_write("", code, 0, false), Err(PtpUsbError::UnconfirmedModel(_))), "empty model");
+        }
+        assert!(matches!(check_byte_property_write("Z 5", 0xD072, 0, true), Err(PtpUsbError::PropWriteUnsupported { .. })), "a string property is not a byte one");
+        // Both gates in one call: the range is judged before the model.
+        assert!(matches!(check_byte_property_write("Z 8", PROP_ENABLE_COPYRIGHT, 2, false), Err(PtpUsbError::PropValueBad { .. })));
+    }
+
+    #[test]
+    fn the_session_accepts_a_byte_write_exactly_when_the_gate_helper_does() {
+        // Parity over model x property x value x force: whatever `check_byte_property_write` says is what the session
+        // does with the same inputs (a refusal sends nothing; an acceptance goes on to read the descriptor).
+        let mut accepted = 0;
+        let mut refused = 0;
+        for model in ["Z 5", "Z6_3", "Z 9", "Z 8", ""] {
+            for &(code, _, max) in &BYTE_PROPS {
+                for value in [0, 1, max, max + 1] {
+                    for force in [false, true] {
+                        let gate = check_byte_property_write(model, code, value, force);
+                        let (mut s, t) = session(byte_write_script(code, 1, &[0], resp(RESP_OK), &[value]), model);
+                        let got = s.set_byte_property(code, value, force);
+                        match gate {
+                            Ok(()) => {
+                                accepted += 1;
+                                assert!(got.is_ok(), "{model} {code:#x} {value} force={force}: gate accepts, session says {got:?}");
+                            }
+                            Err(want) => {
+                                refused += 1;
+                                let err = got.unwrap_err();
+                                assert_eq!(err.tag(), want.tag(), "{model} {code:#x} {value} force={force}");
+                                assert!(t.sent().is_empty(), "a gate refusal sends nothing ({model} {code:#x} {value})");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(accepted > 5 && refused > 20, "{accepted} accepted, {refused} refused");
+    }
+
+    #[test]
+    fn the_iptc_gate_helper_is_the_session_gate() {
+        for model in ["Z 9", "Z6_3", "Z 5", "Z 8", "", "z 9"] {
+            let (mut s, t) = session(vec![], model);
+            let sent_nothing_and_refused = matches!(s.write_iptc_slot(1, &[1], false), Err(PtpUsbError::UnconfirmedModel(_))) && t.sent().is_empty();
+            assert_eq!(!iptc_write_confirmed(model), sent_nothing_and_refused, "{model:?}");
+        }
+        assert!(iptc_write_confirmed("Z 9") && iptc_write_confirmed("Z6_3"));
+    }
+
+    #[test]
+    fn the_string_gate_helper_refuses_what_plan_string_property_refuses_before_it_reads_anything() {
+        for model in ["Z 9", "Z6_3", "Z 5", "Z 8"] {
+            for text in ["ok", "é", "ÿ", "Ā", "tab\there", &"x".repeat(254), &"x".repeat(255)] {
+                for force in [false, true] {
+                    let helper = check_string_property_write(model, 0xD090, text, force);
+                    let (mut s, t) = session(set_script(1, "a", RESP_OK, "b"), model);
+                    let plan = s.plan_string_property(0xD090, text, force);
+                    if let Err(want) = helper {
+                        let got = plan.unwrap_err();
+                        assert_eq!(got.tag(), want.tag(), "{model} {text:?} force={force}");
+                        assert!(t.sent().is_empty(), "refused before any I/O");
+                    } else {
+                        assert!(plan.is_ok(), "{model} {text:?} force={force}: {plan:?}");
+                    }
+                }
+            }
+        }
+        // The thresholds of the text: 254 units + NUL = 255 fits, 255 + NUL = 256 does not; U+00FF is Latin-1, U+0100 is not.
+        assert!(check_string_property_write("Z 9", 0xD090, &"x".repeat(254), false).is_ok());
+        assert!(check_string_property_write("Z 9", 0xD090, &"x".repeat(255), false).is_err());
+        assert!(check_string_property_write("Z 9", 0xD090, "\u{ff}", false).is_ok());
+        assert!(check_string_property_write("Z 9", 0xD090, "\u{100}", false).is_err());
+        assert!(check_string_property_write("Z 9", 0xD090, "", false).is_ok(), "empty text is a value (clears the property)");
+        assert!(matches!(check_string_property_write("Z 9", 0xD060, "x", true), Err(PtpUsbError::PropWriteUnsupported { .. })));
+    }
+
+    #[test]
+    fn every_model_list_of_a_camera_write_gate_is_inside_the_surveyed_registry() {
+        // Drift guard for the lists that decide what a camera may be sent: a name that is not a surveyed model (a typo,
+        // a spelling "Z6III" for "Z6_3") would silently gate nothing in or everything out.
+        let lists: Vec<(&str, Vec<&str>)> = vec![
+            ("FTP_WRITE_CONFIRMED_MODELS", FTP_WRITE_CONFIRMED_MODELS.to_vec()),
+            ("IPTC_WRITE_CONFIRMED_MODELS", IPTC_WRITE_CONFIRMED_MODELS.to_vec()),
+            ("STRING_PROP_WRITE_MODELS", STRING_PROP_WRITE_MODELS.to_vec()),
+            ("BYTE_PROP_WRITE_MODELS", BYTE_PROP_WRITE_MODELS.iter().flat_map(|(_, m)| m.iter().copied()).collect()),
+        ];
+        for (name, models) in lists {
+            assert!(!models.is_empty(), "{name}");
+            for m in models {
+                assert!(KNOWN_MODELS.contains(&m) && sdk_model_name(m).is_some(), "{name} lists {m:?}, which is not in KNOWN_MODELS");
+            }
+        }
+        // One entry per byte property, and nothing for a code that is not one.
+        let codes: Vec<u16> = BYTE_PROPS.iter().map(|(c, ..)| *c).collect();
+        let gate_codes: Vec<u16> = BYTE_PROP_WRITE_MODELS.iter().map(|(c, _)| *c).collect();
+        assert_eq!(codes, gate_codes, "BYTE_PROPS and BYTE_PROP_WRITE_MODELS list the same properties in the same order");
+    }
+
+    // ── delete-all: an acknowledged delete whose follow-up read fails ────
+
+    #[test]
+    fn delete_all_acknowledged_but_the_list_cannot_be_read_afterwards_is_indeterminate_not_a_plain_failure() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(RESP_OK)); // 0x90EA answered OK: the list is probably gone
+        replies.push(Step::Err(rusb::Error::Timeout)); // and the read that would confirm it fails
+        let (mut s, t) = session(replies, "Z 9");
+        let err = s.delete_all_ftp_profiles().unwrap_err();
+        assert!(matches!(&err, PtpUsbError::FtpWriteIndeterminate { cause } if !matches!(**cause, PtpUsbError::OperationFailed { .. })), "{err:?}");
+        assert_eq!(crate::exit_status::write_kind_of_ptp_usb_error(&err), crate::exit_status::ExitKind::WriteIndeterminate);
+        assert_eq!(sent_op_codes(&t).iter().filter(|o| **o == 0x90EA).count(), 1, "the delete did go out, once");
+    }
+
+    #[test]
+    fn delete_all_the_camera_refuses_stays_a_plain_failure_even_when_the_list_read_after_fails_too() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(0x2005)); // OperationNotSupported: a definite refusal
+        replies.push(Step::Err(rusb::Error::Timeout));
+        let (mut s, _t) = session(replies, "Z 9");
+        let err = s.delete_all_ftp_profiles().unwrap_err();
+        assert!(matches!(err, PtpUsbError::OperationFailed { op: 0x90EA, code: PtpResponseCode(0x2005) }), "{err:?}");
+    }
+
+    // ── deviations of the unchecked IPTC replies are reported ────────────
+
+    #[test]
+    fn an_iptc_read_reply_with_the_wrong_transaction_id_is_read_but_warns() {
         let (mut s, _t) = session(
-            vec![data_c(OP_GET_DEVICE_PROP_VALUE, &[0]), resp(RESP_OK), resp(RESP_OK), data_c(OP_GET_DEVICE_PROP_VALUE, &[0]), resp(RESP_OK)],
+            vec![Step::Bytes(container(CONTAINER_DATA, OP_IPTC_READ, 777, &[1, 2])), Step::Bytes(container(CONTAINER_RESPONSE, RESP_OK, 777, &[]))],
             "Z6_3",
         );
-        assert!(!s.set_iptc_preset(1, false).unwrap().verified());
+        let r = s.read_iptc_slot(1).unwrap();
+        assert_eq!(r.data, [1, 2]);
+        assert!(r.warnings.iter().any(|w| w.contains("transaction id 777")), "{:?}", r.warnings);
+        // A clean reply has none.
+        let (mut s, _t) = session(vec![data_c(OP_IPTC_READ, &[1, 2]), resp(RESP_OK)], "Z6_3");
+        assert!(s.read_iptc_slot(1).unwrap().warnings.is_empty());
+    }
+
+    #[test]
+    fn an_iptc_write_reply_with_the_wrong_transaction_id_succeeds_and_warns() {
+        let (mut s, _t) = session(
+            vec![data_c(OP_IPTC_READ, &[1]), resp(RESP_OK), Step::Bytes(container(CONTAINER_RESPONSE, RESP_OK, 555, &[])), data_c(OP_IPTC_READ, &[2]), resp(RESP_OK)],
+            "Z6_3",
+        );
+        let out = s.write_iptc_slot(1, &[9], false).unwrap();
+        assert!(out.warnings.iter().any(|w| w.contains("transaction id 555")), "{:?}", out.warnings);
+        assert_eq!(out.after.unwrap().data, [2]);
     }
 
     // ── model gate ───────────────────────────────────────────────────────
