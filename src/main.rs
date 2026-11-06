@@ -232,15 +232,22 @@ enum Cmd {
     /// long it had been open, whether the process is still running, and what ran just before. Reads
     /// only; starts no diagnostics of its own.
     DiagReport(DiagReportArgs),
-    /// EXPERIMENTAL. Send ONE bare operation (no parameters, no data) from a
-    /// short fixed list (0x90E9, 0x90EA, 0x90EC, 0x90EF in the FTP-profile
-    /// range, and 0x9FFF as a control that should not exist) and print the
-    /// response, with the profile list and selected index read before and
-    /// after. What these ops do is unknown; one of them may delete a profile
-    /// or change the selection, which the before/after listing shows. A call
-    /// that gets no reply can stall the USB pipe or poison the session, in
-    /// which case the "after" listing is unavailable and `vendor-read-ftp`
-    /// must be run again.
+    /// EXPERIMENTAL. Send ONE operation from a short fixed list (0x90E9, 0x90EA,
+    /// 0x90EC, 0x90EF in the FTP-profile range, and 0x9FFF as a control that
+    /// should not exist), optionally with up to two parameters and up to 32
+    /// bytes of data-out, and print the response, with the stored profile list
+    /// (every profile, and what 0x90EB reports) read before and after and the
+    /// differences named. Only 0x9FFF, the control, is read-only. The others are
+    /// treated as writes: they need a model confirmed for FTP-profile writes (or
+    /// --force-unconfirmed-model), and 0x90EA (DELETES ALL stored profiles, no
+    /// confirmation asked by the camera) and 0x90EF N (DELETES profile N) are
+    /// sent only when named again with --allow-destructive-op, e.g. `vendor-probe-op
+    /// 0x90EA --allow-destructive-op 0x90EA`. 0x90E9 and 0x90EC are unexplained
+    /// (0x90EC with data blanked a Z 9's stored device name). A call that gets no
+    /// reply can stall the USB pipe or poison the session, in which case the
+    /// "after" listing is unavailable, the op may or may not have taken effect,
+    /// and the command exits 4 (the code of an indeterminate write): run
+    /// `vendor-read-ftp` in a new session to see the list.
     VendorProbeOp(VendorProbeOpArgs),
 }
 
@@ -696,6 +703,17 @@ struct VendorProbeOpArgs {
     /// session.
     #[arg(long)]
     setup: bool,
+    /// Required to send 0x90EA (deletes ALL stored FTP profiles) or 0x90EF
+    /// (deletes the profile it is given): name the op again here, e.g.
+    /// `--allow-destructive-op 0x90EA`. Naming one op does not allow the other,
+    /// and the value must be the op being sent.
+    #[arg(long, value_parser = nikon_fleet::ptp_usb::parse_propcode)]
+    allow_destructive_op: Option<u16>,
+    /// Send an op other than the control to a model not confirmed for FTP-profile
+    /// writes. The same gate as vendor-write-ftp-blob; it never replaces
+    /// --allow-destructive-op.
+    #[arg(long)]
+    force_unconfirmed_model: bool,
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
     serial: Option<String>,
@@ -1828,32 +1846,105 @@ fn cmd_vendor_op_support(args: &VendorOpSupportArgs) -> Result<()> {
     Ok(())
 }
 
-/// Send one bare op from the fixed probe list and print the list before and after.
+/// Send one op from the fixed probe list and print the list before and after.
 fn cmd_vendor_probe_op(args: &VendorProbeOpArgs) -> Result<()> {
+    probe_op_with(args, CameraLock::acquire, usb_camera_list, |lock, serial, data, consent| {
+        nikon_fleet::ptp_usb::probe_ftp_op_locked(lock, serial, args.op, args.setup, &args.params, data, consent)
+    })
+}
+
+/// [`cmd_vendor_probe_op`] with the lock, the USB listing and the probe injected, so what happens before
+/// the camera is touched is testable. Everything that needs no camera is refused first
+/// (`check_ftp_probe_request`, the function the library applies again): the destructive ops are not sent
+/// without `--allow-destructive-op` naming them, and any op but the control passes the FTP-write model
+/// gate inside the library. The lock is not taken for a request that is refused.
+fn probe_op_with(
+    args: &VendorProbeOpArgs,
+    acquire_lock: impl FnOnce() -> Result<CameraLock, nikon_fleet::camera_lock::LockError>,
+    attached: impl FnOnce() -> Vec<UsbCameraInfo>,
+    probe: impl FnOnce(
+        CameraLock,
+        Option<&str>,
+        Option<&[u8]>,
+        nikon_fleet::ptp_usb::FtpProbeConsent,
+    ) -> Result<nikon_fleet::ptp_usb::FtpOpProbe, nikon_fleet::ptp_usb::PtpUsbError>,
+) -> Result<()> {
     let data = args.data.as_deref().map(parse_hex_bytes).transpose().map_err(|e| anyhow::anyhow!("--data: {e}"))?;
-    let probe = vendor_locked_target(CameraLock::acquire, args.serial.as_deref(), usb_camera_list)
-        .and_then(|(lock, serial)| {
-            nikon_fleet::ptp_usb::probe_ftp_op_locked(lock, serial.as_deref(), args.op, args.setup, &args.params, data.as_deref()).map_err(anyhow::Error::new)
-        })
+    let consent = nikon_fleet::ptp_usb::FtpProbeConsent {
+        force_unconfirmed_model: args.force_unconfirmed_model,
+        destructive_op: args.allow_destructive_op,
+    };
+    nikon_fleet::ptp_usb::check_ftp_probe_request(args.op, &args.params, data.as_deref(), consent)
+        .with_context(|| format!("probing operation 0x{:04x}", args.op))?;
+    let result = vendor_locked_target(acquire_lock, args.serial.as_deref(), attached)
+        .and_then(|(lock, serial)| probe(lock, serial.as_deref(), data.as_deref(), consent).map_err(anyhow::Error::new))
         .with_context(|| format!("probing operation 0x{:04x} over USB PTP", args.op))?;
+    report_probe(&result)
+}
+
+/// Print a finished probe. A probe whose reply was lost after the op went out ends the command with
+/// [`probe_indeterminate_error`], not success.
+fn report_probe(probe: &nikon_fleet::ptp_usb::FtpOpProbe) -> Result<()> {
     for w in &probe.warnings {
         eprintln!("warning: {w}");
     }
-    println!("{}", ftp_probe_text(&probe));
-    Ok(())
+    println!("{}", ftp_probe_text(probe));
+    match probe_indeterminate_error(probe) {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
 }
 
-/// What `vendor-probe-op` prints: the response verbatim and whether the profile list changed.
+/// The failure a probe whose reply was lost after the op went out must end the command with: exit status
+/// `EXIT_WRITE_INDETERMINATE`, never a success (the camera may have acted). `None` for a probe that got an
+/// answer or never sent the op.
+fn probe_indeterminate_error(probe: &nikon_fleet::ptp_usb::FtpOpProbe) -> Option<ExitCodeError> {
+    let nikon_fleet::ptp_usb::FtpProbeOutcome::Indeterminate { data_sent, cause } = &probe.outcome else {
+        return None;
+    };
+    Some(ExitCodeError {
+        code: EXIT_WRITE_INDETERMINATE,
+        message: format!(
+            "operation 0x{:04x} was sent{} and no usable reply came ({cause}): the camera may have acted on it. \
+             Run vendor-read-ftp from a new session to see what it holds before repeating anything",
+            probe.op,
+            if *data_sent { " with its data-out" } else { "" }
+        ),
+    })
+}
+
+/// What `vendor-probe-op` prints: the response verbatim, the profile list before and after, and every
+/// difference between them by name (never by value: the profiles hold a password).
 fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
-    use nikon_fleet::ptp_usb::{hex_bytes, FtpListState, PtpResponseCode};
+    use nikon_fleet::ptp_usb::{hex_bytes, FtpListChange, FtpListState, FtpProbeOutcome, PtpResponseCode, ReplyDeviation};
     fn list(s: &FtpListState) -> String {
         let items: Vec<String> = s
-            .names
+            .entries
             .iter()
             .enumerate()
-            .map(|(i, n)| if i as u32 == s.selected { format!("[{i}] {n} (selected)") } else { format!("[{i}] {n}") })
+            .map(|(i, e)| {
+                let name = match &e.decoded {
+                    Some(d) => d.profile_name.clone(),
+                    None => format!("(undecodable, {} bytes)", e.raw.len()),
+                };
+                if i as u32 == s.info.slot { format!("[{i}] {name} (selected)") } else { format!("[{i}] {name}") }
+            })
             .collect();
-        format!("{} profile(s): {}", s.count, items.join(", "))
+        let mut out = format!(
+            "{} profile(s), limit {}, selected index {}, device name {:?}: {}",
+            s.info.count,
+            s.info.limit,
+            s.info.slot,
+            s.info.device_name.text,
+            items.join(", ")
+        );
+        if s.truncated {
+            out.push_str(&format!(" (only the first {} were read)", s.entries.len()));
+        }
+        if s.undecodable_count() > 0 {
+            out.push_str(&format!(" [{} undecodable]", s.undecodable_count()));
+        }
+        out
     }
     let mut args = if p.params.is_empty() {
         String::new()
@@ -1869,22 +1960,60 @@ fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
         args,
         if p.setup_first { " after the 0x90E8 setup" } else if p.params.is_empty() && p.data.is_none() { " bare" } else { "" }
     );
-    match &p.reply {
-        Ok(r) => {
+    match &p.outcome {
+        FtpProbeOutcome::Replied(r) => {
             out.push_str(&format!("response {}", PtpResponseCode(r.response_code)));
+            if !r.response_params.is_empty() {
+                out.push_str(&format!(", response parameters {:?}", r.response_params));
+            }
             if r.data_containers == 0 {
                 out.push_str(", no data phase");
             } else {
                 out.push_str(&format!(", {} byte(s) in {} data container(s): {}", r.data.len(), r.data_containers, hex_bytes(&r.data)));
             }
+            for d in &r.deviations {
+                match d {
+                    ReplyDeviation::TransactionId { got } => {
+                        out.push_str(&format!("\nnote: a reply container carried transaction id {got}, not the command's"));
+                    }
+                    ReplyDeviation::DataOp { got } => {
+                        out.push_str(&format!("\nnote: a data container carried operation code 0x{got:04x}, not the command's"));
+                    }
+                }
+            }
+            if r.unrecognized_containers > 0 {
+                out.push_str(&format!("\nnote: {} container(s) of an unknown kind were skipped", r.unrecognized_containers));
+            }
         }
-        Err(e) => out.push_str(&format!("NO USABLE REPLY: {e}")),
+        FtpProbeOutcome::NotSent { cause } => out.push_str(&format!("NOT SENT: {cause}")),
+        FtpProbeOutcome::Indeterminate { data_sent, cause } => out.push_str(&format!(
+            "NO USABLE REPLY after the op was sent{} ({cause}). THE CAMERA MAY HAVE ACTED ON IT",
+            if *data_sent { " with its data-out" } else { "" }
+        )),
     }
     out.push_str(&format!("\nbefore: {}", list(&p.before)));
     match &p.after {
         Ok(a) => {
             out.push_str(&format!("\nafter:  {}", list(a)));
-            out.push_str(if *a == p.before { "\nthe profile list is unchanged" } else { "\n*** the profile list CHANGED ***" });
+            let changes = p.before.changes_to(a);
+            if changes.is_empty() {
+                out.push_str("\nthe profile list is unchanged");
+            } else {
+                out.push_str("\n*** the profile list CHANGED ***");
+                for c in changes {
+                    out.push_str(&match c {
+                        FtpListChange::Info(f) => format!("\n  {} differs", f.name()),
+                        FtpListChange::ProfileChanged { index, fields } if fields.is_empty() => {
+                            format!("\n  profile [{index}]: its bytes differ (no decoded field accounts for it)")
+                        }
+                        FtpListChange::ProfileChanged { index, fields } => {
+                            format!("\n  profile [{index}]: {} differ", fields.join(", "))
+                        }
+                        FtpListChange::ProfileAdded { index } => format!("\n  profile [{index}] is new"),
+                        FtpListChange::ProfileRemoved { index } => format!("\n  profile [{index}] is gone"),
+                    });
+                }
+            }
         }
         Err(e) => out.push_str(&format!("\nafter:  could not be read in this session ({e}); run vendor-read-ftp to see the list")),
     }
@@ -2007,8 +2136,21 @@ fn vendor_op_query_text(q: &nikon_fleet::ptp_usb::VendorOpQuery) -> String {
             hex_bytes(&q.data)
         ));
     }
-    if !q.reply_matched_command {
-        line.push_str("\nnote: the reply carried a different transaction id or operation code than the command");
+    if !q.response_params.is_empty() {
+        line.push_str(&format!("\nresponse parameters: {:?}", q.response_params));
+    }
+    for d in &q.deviations {
+        match d {
+            nikon_fleet::ptp_usb::ReplyDeviation::TransactionId { got } => {
+                line.push_str(&format!("\nnote: a reply container carried transaction id {got}, not the command's"));
+            }
+            nikon_fleet::ptp_usb::ReplyDeviation::DataOp { got } => {
+                line.push_str(&format!("\nnote: a data container carried operation code 0x{got:04x}, not the command's"));
+            }
+        }
+    }
+    if q.unrecognized_containers > 0 {
+        line.push_str(&format!("\nnote: {} container(s) of an unknown kind were skipped", q.unrecognized_containers));
     }
     line
 }
@@ -5486,11 +5628,15 @@ mod tests {
     #[test]
     fn vendor_read_prints_the_data_on_stdout_and_each_warning_on_stderr() {
         use nikon_fleet::ptp_usb::VendorRead;
-        let clean = vendor_read_output(0xd053, &VendorRead { data: vec![0xde, 0xad], warnings: vec![] });
+        let clean = vendor_read_output(0xd053, &VendorRead { data: vec![0xde, 0xad], response_params: vec![], warnings: vec![] });
         assert_eq!(clean, ("0xd053: 2 byte(s): de ad".to_string(), vec![]));
         let warned = vendor_read_output(
             0x5001,
-            &VendorRead { data: vec![], warnings: vec!["model \"Z 8\" is not surveyed".into(), "second".into()] },
+            &VendorRead {
+                data: vec![],
+                response_params: vec![],
+                warnings: vec!["model \"Z 8\" is not surveyed".into(), "second".into()],
+            },
         );
         assert_eq!(warned.0, "0x5001: 0 byte(s): ");
         assert_eq!(warned.1, ["warning: model \"Z 8\" is not surveyed", "warning: second"], "one line per warning, none dropped");
@@ -5586,6 +5732,9 @@ mod tests {
             data: vec![1, 1, 0],
             data_containers: 1,
             reply_matched_command: true,
+            response_params: vec![],
+            deviations: vec![],
+            unrecognized_containers: 0,
             warnings: vec![],
         };
         assert_eq!(vendor_op_query_text(&base), "0x944C(0x90ed, 0): response OK (0x2001), 3 byte(s) in 1 data container(s): 01 01 00");
@@ -5595,8 +5744,266 @@ mod tests {
         assert!(!text.contains("is supported") && !text.contains("yes"), "no verdict, only the code and bytes: {text}");
         let empty_phase = VendorOpQuery { data: vec![], ..base.clone() };
         assert!(vendor_op_query_text(&empty_phase).contains("0 byte(s) in 1 data container(s)"), "an empty data phase is not 'no data phase'");
-        let mismatched = VendorOpQuery { reply_matched_command: false, ..base };
-        assert!(vendor_op_query_text(&mismatched).contains("\nnote:"));
+        // The reply is the finding for this op: its parameters, how it deviated and any skipped container are printed.
+        use nikon_fleet::ptp_usb::ReplyDeviation;
+        let mismatched = VendorOpQuery {
+            reply_matched_command: false,
+            deviations: vec![ReplyDeviation::TransactionId { got: 7 }, ReplyDeviation::DataOp { got: 0x90ec }],
+            response_params: vec![5, 6],
+            unrecognized_containers: 2,
+            ..base
+        };
+        let text = vendor_op_query_text(&mismatched);
+        assert!(text.contains("response parameters: [5, 6]"), "{text}");
+        assert!(text.contains("transaction id 7") && text.contains("operation code 0x90ec"), "{text}");
+        assert!(text.contains("2 container(s) of an unknown kind"), "{text}");
+    }
+
+    // ── vendor-probe-op (b7d3#07, #16, #17, #18) ─────────────────────────
+
+    fn probe_args(extra: &[&str]) -> VendorProbeOpArgs {
+        use clap::Parser;
+        let mut argv = vec!["nikon-fleet", "vendor-probe-op"];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).unwrap().cmd {
+            Cmd::VendorProbeOp(a) => a,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn vendor_probe_op_parses_the_destructive_opt_in_and_the_model_flag_apart() {
+        let plain = probe_args(&["0x90EA"]);
+        assert_eq!((plain.op, plain.allow_destructive_op, plain.force_unconfirmed_model), (0x90EA, None, false));
+        let named = probe_args(&["0x90EA", "--allow-destructive-op", "0x90EA", "--force-unconfirmed-model"]);
+        assert_eq!((named.allow_destructive_op, named.force_unconfirmed_model), (Some(0x90EA), true));
+        assert!(probe_args(&["0x9FFF"]).allow_destructive_op.is_none());
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["nikon-fleet", "vendor-probe-op", "0x90EA", "--allow-destructive-op"]).is_err(), "the flag names an op");
+    }
+
+    #[test]
+    fn a_destructive_probe_that_is_not_named_is_refused_before_the_camera_is_touched() {
+        use nikon_fleet::ptp_usb::PtpUsbError;
+        // Refused with the typed error and exit status 1: not a USB error (no camera is looked for in
+        // this test), not a model error, and not a success.
+        for (extra, op) in [
+            (&["0x90EA"][..], 0x90EAu16),
+            (&["0x90EF", "--param", "1"][..], 0x90EF),
+            (&["0x90EA", "--allow-destructive-op", "0x90EF"][..], 0x90EA),
+            (&["0x90EF", "--param", "1", "--allow-destructive-op", "0x90EA"][..], 0x90EF),
+            (&["0x90EA", "--force-unconfirmed-model"][..], 0x90EA),
+        ] {
+            let e = refused_probe(extra);
+            assert!(
+                matches!(e.downcast_ref::<PtpUsbError>(), Some(PtpUsbError::FtpProbeDestructiveNotConfirmed { op: o, .. }) if *o == op),
+                "{extra:?}: {e:#}"
+            );
+            assert_eq!(exit_code_for(&e), 1);
+        }
+        // The other refusals that need no camera come out the same way.
+        let e = refused_probe(&["0x1016"]);
+        assert!(matches!(e.downcast_ref::<PtpUsbError>(), Some(PtpUsbError::FtpProbeOpNotAllowed { op: 0x1016 })), "{e:#}");
+        let e = refused_probe(&["0x90EC", "--data", &"aa".repeat(33)]);
+        assert!(matches!(e.downcast_ref::<PtpUsbError>(), Some(PtpUsbError::FtpProbeDataTooLong { len: 33 })), "{e:#}");
+    }
+
+    /// Run `vendor-probe-op` with a lock, a USB listing and a probe that fail the test if they are reached.
+    fn refused_probe(extra: &[&str]) -> anyhow::Error {
+        let touched = std::cell::Cell::new(false);
+        let e = probe_op_with(
+            &probe_args(extra),
+            || {
+                touched.set(true);
+                Err(nikon_fleet::camera_lock::LockError::NoPath)
+            },
+            || {
+                touched.set(true);
+                vec![]
+            },
+            |_, _, _, _| panic!("the probe ran for a refused request"),
+        )
+        .unwrap_err();
+        assert!(!touched.get(), "{extra:?}: the camera lock / USB bus was reached before the refusal");
+        e
+    }
+
+    #[test]
+    fn an_allowed_probe_reaches_the_camera_with_its_consent_and_a_lost_reply_ends_with_exit_four() {
+        use nikon_fleet::ptp_usb::{FtpProbeConsent, FtpProbeOutcome, FtpProbeReply, PtpUsbError};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("camera.lock");
+        let run = |extra: &[&str], outcome: FtpProbeOutcome| {
+            let seen = std::cell::RefCell::new(None);
+            let r = probe_op_with(
+                &probe_args(extra),
+                || nikon_fleet::camera_lock::CameraLock::acquire_at(&path),
+                Vec::new,
+                |_lock, _serial, data, consent| {
+                    *seen.borrow_mut() = Some((data.map(<[u8]>::to_vec), consent));
+                    let state = probe_state(0, 0xff, vec![]);
+                    Ok(probe_of(outcome, state.clone(), Ok(state)))
+                },
+            );
+            (r, seen.into_inner())
+        };
+        let replied = || {
+            FtpProbeOutcome::Replied(FtpProbeReply {
+                response_code: 0x2001,
+                response_params: vec![],
+                data: vec![],
+                data_containers: 0,
+                deviations: vec![],
+                unrecognized_containers: 0,
+            })
+        };
+        let (r, seen) = run(&["0x90EA", "--allow-destructive-op", "0x90EA", "--force-unconfirmed-model"], replied());
+        r.unwrap();
+        assert_eq!(seen.unwrap().1, FtpProbeConsent { force_unconfirmed_model: true, destructive_op: Some(0x90EA) });
+        let (r, seen) = run(&["0x90EC", "--data", "01 02"], replied());
+        r.unwrap();
+        let (data, consent) = seen.unwrap();
+        assert_eq!((data, consent), (Some(vec![1, 2]), FtpProbeConsent::default()));
+        // The reply was lost after the op went out: not success, and the code that says "look at the camera".
+        let lost = FtpProbeOutcome::Indeterminate { data_sent: false, cause: PtpUsbError::Usb(rusb::Error::Timeout) };
+        let (r, _) = run(&["0x90EA", "--allow-destructive-op", "0x90EA"], lost);
+        let e = r.unwrap_err();
+        assert_eq!(exit_code_for(&e), EXIT_WRITE_INDETERMINATE, "{e:#}");
+        // The op never left: an ordinary result, exit 0.
+        let unsent = FtpProbeOutcome::NotSent { cause: PtpUsbError::NoDevice };
+        run(&["0x9FFF"], unsent).0.unwrap();
+    }
+
+    #[test]
+    fn the_probe_help_names_every_probe_op_and_the_opt_in() {
+        // The help text is hand-written; the list it names is nikon_fleet::ptp_usb::FTP_PROBE_OPS. Nothing
+        // generates one from the other, so this fails when they drift.
+        let mut cmd = Cli::command();
+        let sub = cmd.find_subcommand_mut("vendor-probe-op").expect("the subcommand exists");
+        let help = sub.render_long_help().to_string();
+        let about = sub.get_long_about().or_else(|| sub.get_about()).map(|s| s.to_string()).unwrap_or_default();
+        let all = format!("{help}\n{about}");
+        for op in nikon_fleet::ptp_usb::FTP_PROBE_OPS {
+            assert!(all.to_lowercase().contains(&format!("0x{op:04x}")), "{op:#06x} is not in the help: {all}");
+        }
+        assert!(all.contains("--allow-destructive-op") && all.contains("--force-unconfirmed-model"), "{all}");
+        assert!(all.contains("DELETES ALL"), "the delete-everything op is described as what it is: {all}");
+        assert!(!all.contains("What these ops do is unknown"), "the old, understated wording is gone: {all}");
+    }
+
+    fn probe_state(count: u32, slot: u32, entries: Vec<nikon_fleet::ptp_usb::FtpListEntry>) -> nikon_fleet::ptp_usb::FtpListState {
+        nikon_fleet::ptp_usb::FtpListState {
+            info: nikon_fleet::ptp_usb::FtpProfileInfo {
+                header: 200,
+                count,
+                limit: 20,
+                slot,
+                guid: [0; 16],
+                device_name: ptp_str("Z_9_0000000"),
+                trailer: 500,
+            },
+            entries,
+            truncated: false,
+        }
+    }
+
+    fn probe_of(
+        outcome: nikon_fleet::ptp_usb::FtpProbeOutcome,
+        before: nikon_fleet::ptp_usb::FtpListState,
+        after: Result<nikon_fleet::ptp_usb::FtpListState, nikon_fleet::ptp_usb::PtpUsbError>,
+    ) -> nikon_fleet::ptp_usb::FtpOpProbe {
+        nikon_fleet::ptp_usb::FtpOpProbe {
+            op: 0x90EC,
+            risk: nikon_fleet::ptp_usb::FtpProbeRisk::Unexplained,
+            params: vec![],
+            data: Some(vec![1]),
+            setup_first: false,
+            before,
+            outcome,
+            after,
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn the_probe_text_reports_a_lost_reply_as_possibly_acted_on_and_says_whether_data_went_out() {
+        use nikon_fleet::ptp_usb::{FtpProbeOutcome, PtpUsbError};
+        let before = probe_state(0, 0xff, vec![]);
+        let lost = probe_of(
+            FtpProbeOutcome::Indeterminate { data_sent: true, cause: PtpUsbError::Usb(rusb::Error::Timeout) },
+            before.clone(),
+            Err(PtpUsbError::SessionPoisoned { cause: "x".into() }),
+        );
+        let text = ftp_probe_text(&lost);
+        let failure: anyhow::Error = probe_indeterminate_error(&lost).expect("a lost reply fails the command").into();
+        assert_eq!(exit_code_for(&failure), EXIT_WRITE_INDETERMINATE);
+        assert!(failure.to_string().contains("with its data-out") && failure.to_string().contains("may have acted"), "{failure}");
+        assert!(text.contains("NO USABLE REPLY after the op was sent with its data-out"), "{text}");
+        assert!(text.contains("MAY HAVE ACTED"), "{text}");
+        assert!(text.contains("after:  could not be read in this session"), "{text}");
+        let bare = probe_of(
+            FtpProbeOutcome::Indeterminate { data_sent: false, cause: PtpUsbError::Usb(rusb::Error::Pipe) },
+            before.clone(),
+            Err(PtpUsbError::SessionPoisoned { cause: "x".into() }),
+        );
+        let text = ftp_probe_text(&bare);
+        assert!(text.contains("after the op was sent (") && !text.contains("data-out ("), "{text}");
+        let unsent = probe_of(
+            FtpProbeOutcome::NotSent { cause: PtpUsbError::OperationFailed { op: 0x90E8, code: nikon_fleet::ptp_usb::PtpResponseCode(0x2002) } },
+            before.clone(),
+            Ok(before),
+        );
+        let text = ftp_probe_text(&unsent);
+        assert!(text.contains("NOT SENT") && !text.contains("MAY HAVE ACTED"), "{text}");
+        assert!(probe_indeterminate_error(&unsent).is_none(), "an op that never left is an ordinary result");
+        let failure: anyhow::Error = probe_indeterminate_error(&bare).unwrap().into();
+        assert!(!failure.to_string().contains("with its data-out"), "{failure}");
+    }
+
+    #[test]
+    fn the_probe_text_names_what_changed_without_printing_any_value() {
+        use nikon_fleet::ptp_usb::{FtpListEntry, FtpProbeOutcome, FtpProbeReply};
+        let readout = ftp_readout_with_profile();
+        let blob = readout.profile.as_ref().unwrap();
+        let decoded = blob.decoded.as_ref().unwrap().clone();
+        let entry = FtpListEntry { raw: blob.raw.clone(), decoded: Some(decoded.clone()) };
+        let mut other = decoded.clone();
+        other.password = "pw-changed-sentinel".into();
+        let changed = FtpListEntry { raw: vec![9; blob.raw.len()], decoded: Some(other) };
+        let reply = FtpProbeOutcome::Replied(FtpProbeReply {
+            response_code: 0x2001,
+            response_params: vec![3],
+            data: vec![],
+            data_containers: 0,
+            deviations: vec![nikon_fleet::ptp_usb::ReplyDeviation::TransactionId { got: 55 }],
+            unrecognized_containers: 1,
+        });
+        let mut after = probe_state(1, 0, vec![changed]);
+        after.info.device_name = ptp_str("");
+        let p = probe_of(reply, probe_state(1, 0, vec![entry]), Ok(after));
+        let text = ftp_probe_text(&p);
+        assert!(text.contains("response OK (0x2001), response parameters [3], no data phase"), "{text}");
+        assert!(text.contains("transaction id 55") && text.contains("1 container(s) of an unknown kind"), "{text}");
+        assert!(text.contains("*** the profile list CHANGED ***"), "{text}");
+        assert!(text.contains("device name differs"), "{text}");
+        assert!(text.contains("profile [0]: ") && text.contains("password"), "{text}");
+        assert!(!text.contains("pw-changed-sentinel") && !text.contains(&decoded.password), "no value is printed: {text}");
+        // An unchanged list says so, and an undecodable profile is counted.
+        let same = probe_state(1, 0, vec![FtpListEntry { raw: vec![1, 2, 3], decoded: None }]);
+        let p = probe_of(
+            FtpProbeOutcome::Replied(FtpProbeReply {
+                response_code: 0x2005,
+                response_params: vec![],
+                data: vec![],
+                data_containers: 0,
+                deviations: vec![],
+                unrecognized_containers: 0,
+            }),
+            same.clone(),
+            Ok(same),
+        );
+        let text = ftp_probe_text(&p);
+        assert!(text.contains("the profile list is unchanged") && text.contains("[1 undecodable]") && text.contains("(undecodable, 3 bytes)"), "{text}");
     }
 
     // ── device-info output ───────────────────────────────────────────────

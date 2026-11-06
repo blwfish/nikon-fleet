@@ -305,7 +305,9 @@ Later the same evening, over USB on the Z9: the `0x90EB` slot field is the index
 profile, `0x90EF(n)` deletes profile n, `0x90EA` deletes them all, and `0x90E9` / `0x90EC` exist but are
 unexplained. Three short `0x90EC` data payloads left the `0x90EB` device-name string (`Z_9_3023668`) empty,
 and it has not been restored; the camera kept working. See section 6 of that document, which records the
-original value; `vendor-probe-op` is the command that sends them.
+original value; `vendor-probe-op` is the command that sends them (it now needs a write-confirmed model or
+`--force-unconfirmed-model` for anything but the `0x9FFF` control, and `--allow-destructive-op <op>` for `0x90EA`
+and `0x90EF`, which delete; a lost reply is reported as indeterminate, exit 4).
 
 ## Experiments, cheapest first
 

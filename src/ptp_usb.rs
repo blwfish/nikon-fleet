@@ -229,6 +229,19 @@ fn ftp_write_confirmed(model: &str) -> bool {
     FTP_WRITE_CONFIRMED_MODELS.contains(&model)
 }
 
+/// The one warning for a camera outside [`KNOWN_MODELS`] (`None` for a surveyed model). `what` names the
+/// operation(s) whose behaviour on this body is unverified. The condition is membership of the registry,
+/// not "is a Z 9", so the text claims no more than that: each operation was captured on some of the
+/// surveyed bodies, and nothing is known about this one.
+fn unsurveyed_model_warning(model: &str, what: &str) -> Option<String> {
+    sdk_model_name(model).is_none().then(|| {
+        format!(
+            "camera model {model:?} is not one of the surveyed models ({KNOWN_MODELS:?}); the wire format and behaviour \
+             of {what} on it are unverified"
+        )
+    })
+}
+
 const CLAIM_RETRY_ATTEMPTS: u32 = 40;
 const CLAIM_RETRY_DELAY: Duration = Duration::from_millis(50);
 const BULK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -406,18 +419,23 @@ pub enum PtpUsbError {
          stalls the USB pipe, so it was not sent"
     )]
     FtpSlotOutOfRange { slot: u32, count: u32 },
-    #[error(
-        "operation 0x{op:04x} is not on the FTP-probe list (0x90E9, 0x90EA, 0x90EC, 0x90EF, and 0x9FFF as a \
-         control); it was not sent"
-    )]
+    #[error("operation 0x{op:04x} is not on the FTP-probe list ({}); it was not sent", ftp_probe_ops_text())]
     FtpProbeOpNotAllowed { op: u16 },
-    #[error("the FTP probe's data-out is limited to 32 bytes; {len} was not sent")]
+    #[error("the FTP probe's data-out is limited to {} bytes; {len} was not sent", FTP_PROBE_MAX_DATA)]
     FtpProbeDataTooLong { len: usize },
     #[error(
-        "the FTP probe takes at most 2 parameters and refuses 0xFFFFFFFF (an out-of-range slot value that \
-         hung a camera's network stack); {params:?} was not sent"
+        "the FTP probe takes at most {} parameters and refuses 0x{:X} (an out-of-range slot value that \
+         hung a camera's network stack); {params:?} was not sent",
+        FTP_PROBE_MAX_PARAMS,
+        FTP_PROBE_REFUSED_PARAM
     )]
     FtpProbeBadParams { params: Vec<u32> },
+    #[error(
+        "operation 0x{op:04x} {} and the probe sends it only when asked for by name: pass \
+         --allow-destructive-op 0x{op:04x} (and, off a confirmed model, --force-unconfirmed-model); it was not sent",
+        .risk.describe()
+    )]
+    FtpProbeDestructiveNotConfirmed { op: u16, risk: FtpProbeRisk },
     #[error("FTP profile field {field} is {len} {unit}, exceeds the {max}-{unit} limit")]
     FtpFieldTooLong { field: &'static str, len: usize, max: usize, unit: &'static str },
     #[error("FTP profile field {field} contains non-ASCII characters, which this encoding does not support")]
@@ -479,6 +497,112 @@ fn prop_write_unconfirmed_text(propcode: u16, model: &str) -> String {
 }
 
 impl PtpUsbError {
+    /// Raised by a transaction before it put a single byte on the pipe: the session was already unusable,
+    /// or the command could not be encoded. Anything else raised by `transact` may follow a command the
+    /// camera received.
+    fn nothing_was_sent(&self) -> bool {
+        matches!(
+            self,
+            PtpUsbError::SessionPoisoned { .. } | PtpUsbError::TooManyCommandParams { .. } | PtpUsbError::ContainerTooLarge { .. }
+        )
+    }
+
+    /// Closed machine-readable tag, one per variant. Exhaustive match: a new variant must be given a tag
+    /// before this compiles.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            PtpUsbError::NoDevice => "no_device",
+            PtpUsbError::AmbiguousDevice(_) => "ambiguous_device",
+            PtpUsbError::SerialNotFound { .. } => "serial_not_found",
+            PtpUsbError::DuplicateSerial { .. } => "duplicate_serial",
+            PtpUsbError::BodiesSkipped { .. } => "bodies_skipped",
+            PtpUsbError::Usb(_) => "usb",
+            PtpUsbError::CameraLock(_) => "camera_lock",
+            PtpUsbError::NoPtpInterface => "no_ptp_interface",
+            PtpUsbError::ClaimFailed { .. } => "claim_failed",
+            PtpUsbError::ShortContainer(_) => "short_container",
+            PtpUsbError::TruncatedContainer { .. } => "truncated_container",
+            PtpUsbError::ShortWrite { .. } => "short_write",
+            PtpUsbError::ContainerTooLarge { .. } => "container_too_large",
+            PtpUsbError::TooManyCommandParams { .. } => "too_many_command_params",
+            PtpUsbError::MisalignedResponseParams(_) => "misaligned_response_params",
+            PtpUsbError::TransactionTimedOut(_) => "transaction_timed_out",
+            PtpUsbError::TransactionDataTooLarge { .. } => "transaction_data_too_large",
+            PtpUsbError::SessionPoisoned { .. } => "session_poisoned",
+            PtpUsbError::OpenSessionFailed(_) => "open_session_failed",
+            PtpUsbError::OperationFailed { .. } => "operation_failed",
+            PtpUsbError::TransactionIdMismatch { .. } => "transaction_id_mismatch",
+            PtpUsbError::UnexpectedDataOp { .. } => "unexpected_data_op",
+            PtpUsbError::NoDataPhase { .. } => "no_data_phase",
+            PtpUsbError::DeviceInfoMalformed { .. } => "device_info_malformed",
+            PtpUsbError::FtpBlobMalformed { .. } => "ftp_blob_malformed",
+            PtpUsbError::FtpSlotOutOfRange { .. } => "ftp_slot_out_of_range",
+            PtpUsbError::FtpProbeOpNotAllowed { .. } => "ftp_probe_op_not_allowed",
+            PtpUsbError::FtpProbeDataTooLong { .. } => "ftp_probe_data_too_long",
+            PtpUsbError::FtpProbeBadParams { .. } => "ftp_probe_bad_params",
+            PtpUsbError::FtpProbeDestructiveNotConfirmed { .. } => "ftp_probe_destructive_not_confirmed",
+            PtpUsbError::FtpFieldTooLong { .. } => "ftp_field_too_long",
+            PtpUsbError::FtpFieldNotAscii { .. } => "ftp_field_not_ascii",
+            PtpUsbError::FtpFieldControlChar { .. } => "ftp_field_control_char",
+            PtpUsbError::FtpWriteIndeterminate { .. } => "ftp_write_indeterminate",
+            PtpUsbError::FtpWriteRefused { .. } => "ftp_write_refused",
+            PtpUsbError::UnconfirmedModel(_) => "unconfirmed_model",
+            PtpUsbError::PropWriteUnsupported { .. } => "prop_write_unsupported",
+            PtpUsbError::PropWriteUnconfirmed { .. } => "prop_write_unconfirmed",
+            PtpUsbError::PropNotWritable { .. } => "prop_not_writable",
+            PtpUsbError::PropValueBad { .. } => "prop_value_bad",
+            PtpUsbError::PropWriteIndeterminate { .. } => "prop_write_indeterminate",
+        }
+    }
+
+    /// What a transaction's diagnostics span records for this error: typed fields, never the `Display`
+    /// text. The tag is always there as `error_kind`; a transport error adds the closed `rusb` error name
+    /// (`usb_error`), a refused answer its operation and response code (`op`, `code`), the other
+    /// protocol faults their numbers. Nothing else is recorded, so a `Display` that grew a payload (a
+    /// string from the camera, a profile field) could not reach the record through here.
+    fn diag_fields(&self) -> Vec<(&'static str, crate::diag::Val)> {
+        use crate::diag::Val;
+        let mut f = vec![("error_kind", Val::text(self.tag()))];
+        match self {
+            PtpUsbError::Usb(e) => f.push(("usb_error", Val::text(&format!("{e:?}")))),
+            PtpUsbError::OperationFailed { op, code } => {
+                f.push(("op", Val::Hex(u64::from(*op))));
+                f.push(("code", Val::Hex(u64::from(code.0))));
+            }
+            PtpUsbError::NoDataPhase { op } => f.push(("op", Val::Hex(u64::from(*op)))),
+            PtpUsbError::TransactionIdMismatch { op, expected, got } => {
+                f.push(("op", Val::Hex(u64::from(*op))));
+                f.push(("expected", Val::U64(u64::from(*expected))));
+                f.push(("got", Val::U64(u64::from(*got))));
+            }
+            PtpUsbError::UnexpectedDataOp { op, got } => {
+                f.push(("op", Val::Hex(u64::from(*op))));
+                f.push(("got", Val::Hex(u64::from(*got))));
+            }
+            PtpUsbError::TransactionTimedOut(d) => f.push(("timeout_ms", Val::U64(u64::try_from(d.as_millis()).unwrap_or(u64::MAX)))),
+            PtpUsbError::TruncatedContainer { declared, got } => {
+                f.push(("declared", Val::U64(*declared as u64)));
+                f.push(("got", Val::U64(*got as u64)));
+            }
+            PtpUsbError::ShortWrite { written, expected } => {
+                f.push(("written", Val::U64(*written as u64)));
+                f.push(("expected", Val::U64(*expected as u64)));
+            }
+            PtpUsbError::TransactionDataTooLarge { got, limit } => {
+                f.push(("got", Val::U64(*got as u64)));
+                f.push(("limit", Val::U64(*limit as u64)));
+            }
+            PtpUsbError::ShortContainer(n) | PtpUsbError::MisalignedResponseParams(n) => f.push(("len", Val::U64(*n as u64))),
+            PtpUsbError::ContainerTooLarge { payload_len } => f.push(("len", Val::U64(*payload_len as u64))),
+            PtpUsbError::FtpWriteIndeterminate { cause } | PtpUsbError::PropWriteIndeterminate { cause, .. } => {
+                f.push(("cause_kind", Val::text(cause.tag())));
+            }
+            // Tag only: the remaining variants carry paths, serials, camera strings or no data that adds to the tag.
+            _ => {}
+        }
+        f
+    }
+
     /// Whether this failure, raised inside a transaction, leaves the bulk
     /// pipes in a known state. Only errors raised before any byte was sent
     /// (an unencodable command) or after the Response container was fully
@@ -1848,9 +1972,10 @@ pub fn decode_ftp_profile_spans(blob: &[u8]) -> Result<(DecodedFtpProfile, FtpSe
 // Session
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Something a reply did that [`TxidCheck::Unchecked`] let through.
+/// Something a reply did that [`TxidCheck::Unchecked`] let through: what the camera sent instead of
+/// what the command called for, kept as data so an experiment can read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplyDeviation {
+pub enum ReplyDeviation {
     TransactionId { got: u32 },
     DataOp { got: u16 },
 }
@@ -2048,6 +2173,9 @@ pub struct PropWriteReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VendorRead {
     pub data: Vec<u8>,
+    /// The parameters of the response container (none expected for a read; kept because a reply that
+    /// carries some is a finding).
+    pub response_params: Vec<u32>,
     /// Things worth telling the user that are not failures (an unsurveyed
     /// model). [`PtpUsbSession::read_vendor_property`] prints them to stderr.
     pub warnings: Vec<String>,
@@ -2075,6 +2203,14 @@ pub struct VendorOpQuery {
     /// code than the command (tolerated: no USB capture exists to hold a
     /// `0x944C` reply to).
     pub reply_matched_command: bool,
+    /// The parameters of the response container. For a query whose answer is the finding these are part
+    /// of it.
+    pub response_params: Vec<u32>,
+    /// Exactly how the reply departed from the command (the detail behind
+    /// [`Self::reply_matched_command`]): the transaction id or operation code it carried instead.
+    pub deviations: Vec<ReplyDeviation>,
+    /// Containers of a kind this module does not know that arrived and were skipped.
+    pub unrecognized_containers: u32,
     /// Things worth telling the user that are not failures.
     pub warnings: Vec<String>,
 }
@@ -2673,7 +2809,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
                 }
                 span.finish_with(outcome, &extra);
             }
-            Err(e) => span.finish_with(outcome, &[("error", crate::diag::Val::text(&e.to_string()))]),
+            Err(e) => span.finish_with(outcome, &e.diag_fields()),
         }
         if let Err(e) = &result
             && !e.leaves_stream_in_sync()
@@ -2867,6 +3003,41 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         Ok(())
     }
 
+    /// [`Self::transact`], then [`Self::require_ok`] on the answer: the pair every read and setup step
+    /// below needs. A camera that answers non-OK is [`PtpUsbError::OperationFailed`].
+    fn transact_ok(&mut self, op: u16, params: &[u32], data_out: Option<&[u8]>, check: TxidCheck) -> Result<Reply, PtpUsbError> {
+        let reply = self.transact(op, params, data_out, check)?;
+        Self::require_ok(op, reply.code)?;
+        Ok(reply)
+    }
+
+    /// [`Self::transact_ok`] for an operation whose answer must carry a data container: an OK answer with
+    /// none at all is [`PtpUsbError::NoDataPhase`], distinct from a data phase of zero bytes.
+    fn transact_ok_with_data(
+        &mut self,
+        op: u16,
+        params: &[u32],
+        data_out: Option<&[u8]>,
+        check: TxidCheck,
+    ) -> Result<Reply, PtpUsbError> {
+        let reply = self.transact_ok(op, params, data_out, check)?;
+        if reply.data_containers == 0 {
+            return Err(PtpUsbError::NoDataPhase { op });
+        }
+        Ok(reply)
+    }
+
+    /// The `0x90E8` setup transaction (fixed 3-byte data-out) that the FTP-profile ops are preceded by.
+    fn ftp_setup_step(&mut self) -> Result<Reply, PtpUsbError> {
+        self.transact_ok(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)
+    }
+
+    /// `0x90ED(slot)`: the stored profile's raw blob. The caller has checked `slot` against the stored
+    /// count (a read past the end stalls the pipe).
+    fn read_ftp_profile_reply(&mut self, slot: u32) -> Result<Reply, PtpUsbError> {
+        self.transact_ok_with_data(OP_FTP_PROFILE_READ, &[slot], None, TxidCheck::Unchecked)
+    }
+
     /// Read a vendor property via the `0x943B` wrapper. `propcode` is the
     /// raw `0xD0xx`/`0x5xxx` property code (without the `0x10000` flag —
     /// this adds it). Returns the property's raw bytes on success; any
@@ -2885,21 +3056,10 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// ([`PtpUsbError::NoDataPhase`]), distinct from a property whose data
     /// is empty.
     pub fn read_vendor_property_report(&mut self, propcode: u16) -> Result<VendorRead, PtpUsbError> {
-        let mut warnings = Vec::new();
-        if sdk_model_name(self.model()).is_none() {
-            warnings.push(format!(
-                "camera model {:?} is not one of the surveyed models ({:?}) for vendor-property reads; wire format may not match",
-                self.model(),
-                KNOWN_MODELS
-            ));
-        }
+        let warnings: Vec<String> = unsurveyed_model_warning(self.model(), "vendor-property reads").into_iter().collect();
         let param = 0x10000 | propcode as u32;
-        let reply = self.transact(OP_VENDOR_PROP_READ, &[param], None, TxidCheck::Enforce)?;
-        Self::require_ok(OP_VENDOR_PROP_READ, reply.code)?;
-        if reply.data_containers == 0 {
-            return Err(PtpUsbError::NoDataPhase { op: OP_VENDOR_PROP_READ });
-        }
-        Ok(VendorRead { data: reply.data, warnings })
+        let reply = self.transact_ok_with_data(OP_VENDOR_PROP_READ, &[param], None, TxidCheck::Enforce)?;
+        Ok(VendorRead { data: reply.data, response_params: reply.params, warnings })
     }
 
     /// Standard `GetDevicePropValue` (`0x1015`): the property's value bytes, undecoded. Read-only.
@@ -2918,20 +3078,9 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     }
 
     fn get_device_prop(&mut self, op: u16, propcode: u16) -> Result<VendorRead, PtpUsbError> {
-        let mut warnings = Vec::new();
-        if sdk_model_name(self.model()).is_none() {
-            warnings.push(format!(
-                "camera model {:?} is not one of the surveyed models ({:?}); property semantics may differ",
-                self.model(),
-                KNOWN_MODELS
-            ));
-        }
-        let reply = self.transact(op, &[u32::from(propcode)], None, TxidCheck::Enforce)?;
-        Self::require_ok(op, reply.code)?;
-        if reply.data_containers == 0 {
-            return Err(PtpUsbError::NoDataPhase { op });
-        }
-        Ok(VendorRead { data: reply.data, warnings })
+        let warnings: Vec<String> = unsurveyed_model_warning(self.model(), "standard property reads").into_iter().collect();
+        let reply = self.transact_ok_with_data(op, &[u32::from(propcode)], None, TxidCheck::Enforce)?;
+        Ok(VendorRead { data: reply.data, response_params: reply.params, warnings })
     }
 
     /// Everything [`Self::set_string_property`] checks before it sends the value, and nothing more: the
@@ -3038,14 +3187,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// wrong parameter on other ops, and the session recovers from it). It
     /// sends nothing but that one command: no data-out phase, no setup step.
     pub fn query_vendor_op(&mut self, target_op: u16) -> Result<VendorOpQuery, PtpUsbError> {
-        let mut warnings = Vec::new();
-        if sdk_model_name(self.model()).is_none() {
-            warnings.push(format!(
-                "camera model {:?} is not one of the surveyed models ({:?}); 0x944C was only captured on a Z 9",
-                self.model(),
-                KNOWN_MODELS
-            ));
-        }
+        let warnings: Vec<String> = unsurveyed_model_warning(self.model(), "0x944C").into_iter().collect();
         let reply = self.transact(
             OP_VENDOR_OP_QUERY,
             &[u32::from(target_op), VENDOR_OP_QUERY_PARAM2],
@@ -3058,6 +3200,9 @@ impl<T: BulkTransport> PtpUsbSession<T> {
             data: reply.data,
             data_containers: reply.data_containers,
             reply_matched_command: reply.deviations.is_empty(),
+            response_params: reply.params,
+            deviations: reply.deviations,
+            unrecognized_containers: reply.unrecognized_containers,
             warnings,
         })
     }
@@ -3067,11 +3212,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// answer with no data container at all is [`PtpUsbError::NoDataPhase`], and the dataset is
     /// parsed strictly ([`parse_device_info`]).
     pub fn get_device_info(&mut self) -> Result<DeviceInfoDataset, PtpUsbError> {
-        let reply = self.transact(OP_GET_DEVICE_INFO, &[], None, TxidCheck::Enforce)?;
-        Self::require_ok(OP_GET_DEVICE_INFO, reply.code)?;
-        if reply.data_containers == 0 {
-            return Err(PtpUsbError::NoDataPhase { op: OP_GET_DEVICE_INFO });
-        }
+        let reply = self.transact_ok_with_data(OP_GET_DEVICE_INFO, &[], None, TxidCheck::Enforce)?;
         parse_device_info(&reply.data)
     }
 
@@ -3128,13 +3269,8 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// `0x90E8` setup then `0x90EB`: the stored count and the selected slot, read-only. The reply
     /// flag is false when either reply did not match its command (tolerated, see [`TxidCheck`]).
     fn read_ftp_info_step(&mut self) -> Result<(FtpProfileInfo, bool), PtpUsbError> {
-        let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
-        Self::require_ok(OP_FTP_SETUP, setup.code)?;
-        let info_reply = self.transact(OP_FTP_PROFILE_INFO, &[], None, TxidCheck::Unchecked)?;
-        Self::require_ok(OP_FTP_PROFILE_INFO, info_reply.code)?;
-        if info_reply.data_containers == 0 {
-            return Err(PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_INFO });
-        }
+        let setup = self.ftp_setup_step()?;
+        let info_reply = self.transact_ok_with_data(OP_FTP_PROFILE_INFO, &[], None, TxidCheck::Unchecked)?;
         let info = parse_ftp_profile_info(&info_reply.data)?;
         Ok((info, setup.deviations.is_empty() && info_reply.deviations.is_empty()))
     }
@@ -3208,11 +3344,10 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         }
     }
 
-    /// `0x90E8` setup, then `0x90EE(params)` with `blob` as its data-out
-    /// phase. Shared by the encoder-built write and the raw-blob write.
+    /// `0x90E8` setup, then `0x90EE(params)` with `blob` as its data-out phase. Shared by the
+    /// encoder-built write and the raw-blob write.
     fn send_ftp_blob(&mut self, params: [u32; 2], blob: &[u8]) -> Result<FtpWriteReceipt, PtpUsbError> {
-        let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
-        Self::require_ok(OP_FTP_SETUP, setup.code)?;
+        let setup = self.ftp_setup_step()?;
 
         let reply = match self.transact(OP_FTP_PROFILE_WRITE, &params, Some(blob), TxidCheck::Unchecked) {
             Ok(reply) => reply,
@@ -3302,14 +3437,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// stored profiles, in an order that is not the menu's active one (the
     /// slot `0x90EB` reports stayed `0` across two different active profiles).
     pub fn read_ftp_profile_slot(&mut self, slot: Option<u32>) -> Result<FtpProfileReadout, PtpUsbError> {
-        let mut warnings = Vec::new();
-        if sdk_model_name(self.model()).is_none() {
-            warnings.push(format!(
-                "camera model {:?} is not one of the surveyed models ({:?}); the FTP-profile read was only captured on a Z 9",
-                self.model(),
-                KNOWN_MODELS
-            ));
-        }
+        let mut warnings: Vec<String> = unsurveyed_model_warning(self.model(), "the FTP-profile read").into_iter().collect();
         let (info, mut matched) = self.read_ftp_info_step()?;
 
         let wanted = match slot {
@@ -3327,11 +3455,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
             None => info.has_active_profile().then_some(info.slot),
         };
         let profile = if let Some(wanted) = wanted {
-            let reply = self.transact(OP_FTP_PROFILE_READ, &[wanted], None, TxidCheck::Unchecked)?;
-            Self::require_ok(OP_FTP_PROFILE_READ, reply.code)?;
-            if reply.data_containers == 0 {
-                return Err(PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_READ });
-            }
+            let reply = self.read_ftp_profile_reply(wanted)?;
             matched &= reply.deviations.is_empty();
             let decoded = decode_ftp_profile(&reply.data);
             Some(FtpProfileBlob { raw: reply.data, decoded })
@@ -3342,113 +3466,370 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     }
 }
 
-/// The only operations [`PtpUsbSession::probe_ftp_op`] will send: the unused numbers in the FTP range
-/// plus `0x9FFF`, which should not exist, as a control for "what does an op the camera does not
-/// have look like". All are sent with no parameters and no data.
-pub const FTP_PROBE_OPS: [u16; 5] = [0x90E9, 0x90EA, 0x90EC, 0x90EF, 0x9FFF];
-
-/// The camera's stored FTP profile list as the probe sees it: the count, the `0x90EB` slot field
-/// (the index of the selected profile, which follows that profile as the list is reordered) and
-/// the profile names in list order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FtpListState {
-    pub count: u32,
-    pub selected: u32,
-    pub names: Vec<String>,
+/// What is known about the damage a probe op can do. One closed classification, assigned in
+/// [`FTP_PROBE_OP_TABLE`] and nowhere else: the gates in [`check_ftp_probe_request`] and
+/// [`PtpUsbSession::probe_ftp_op`] read it, so no site re-encodes which ops delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtpProbeRisk {
+    /// `0x9FFF`: an op the camera does not have (`0x2005` OperationNotSupported at once, list unchanged).
+    /// The control; changes nothing.
+    Control,
+    /// `0x90E9`, `0x90EC`: they exist and their purpose is unknown. Sent with data, `0x90EC` blanked the
+    /// stored `0x90EB` device-name string on a Z 9 and nothing restored it; `0x90E9` sent bare wedged
+    /// the camera until a power cycle. Treated as writes.
+    Unexplained,
+    /// `0x90EA`: **deletes every stored FTP profile** (Z 9, 2026-07-10: count 4 to 0, no confirmation).
+    DeleteAll,
+    /// `0x90EF(n)`: **deletes stored profile `n`** (Z 9, 2026-07-10).
+    DeleteOne,
 }
 
-/// What one bare FTP-range op did. `reply` is the response code and data, or the error text if
-/// the transaction failed (a timeout or a pipe stall poisons the session, so `after` is then an
-/// error too and the list must be re-read with a fresh process).
+impl FtpProbeRisk {
+    /// The op deletes stored profiles; sending it needs the specific opt-in
+    /// ([`FtpProbeConsent::destructive_op`]) on top of the model gate.
+    pub fn is_destructive(self) -> bool {
+        matches!(self, FtpProbeRisk::DeleteAll | FtpProbeRisk::DeleteOne)
+    }
+
+    /// The op can change what the camera stores, so it passes the same model gate as the FTP writes
+    /// ([`FTP_WRITE_CONFIRMED_MODELS`] or `force_unconfirmed_model`). Only the control cannot.
+    pub fn may_change_camera(self) -> bool {
+        !matches!(self, FtpProbeRisk::Control)
+    }
+
+    /// What the op is known to do, for refusal text.
+    pub fn describe(self) -> &'static str {
+        match self {
+            FtpProbeRisk::Control => "does not exist on the camera (a control)",
+            FtpProbeRisk::Unexplained => "has an unknown purpose and has changed stored camera state",
+            FtpProbeRisk::DeleteAll => "deletes ALL stored FTP profiles",
+            FtpProbeRisk::DeleteOne => "deletes the stored FTP profile it is given",
+        }
+    }
+}
+
+/// The only operations [`PtpUsbSession::probe_ftp_op`] will send, each with what is known about it: the
+/// unused numbers in the FTP range plus `0x9FFF`, which should not exist, as a control for "what does an
+/// op the camera does not have look like". The one source of the allow-list ([`FTP_PROBE_OPS`] is derived
+/// from it) and of which entries are destructive.
+pub const FTP_PROBE_OP_TABLE: [(u16, FtpProbeRisk); 5] = [
+    (0x90E9, FtpProbeRisk::Unexplained),
+    (0x90EA, FtpProbeRisk::DeleteAll),
+    (0x90EC, FtpProbeRisk::Unexplained),
+    (0x90EF, FtpProbeRisk::DeleteOne),
+    (0x9FFF, FtpProbeRisk::Control),
+];
+
+/// The op codes of [`FTP_PROBE_OP_TABLE`].
+pub const FTP_PROBE_OPS: [u16; FTP_PROBE_OP_TABLE.len()] = {
+    let mut ops = [0u16; FTP_PROBE_OP_TABLE.len()];
+    let mut i = 0;
+    while i < ops.len() {
+        ops[i] = FTP_PROBE_OP_TABLE[i].0;
+        i += 1;
+    }
+    ops
+};
+
+/// A probe sends at most this many parameters.
+pub const FTP_PROBE_MAX_PARAMS: usize = 2;
+/// A probe's data-out is at most this many bytes.
+pub const FTP_PROBE_MAX_DATA: usize = 32;
+/// The parameter value a probe refuses: as a slot number it hung a camera's network stack.
+pub const FTP_PROBE_REFUSED_PARAM: u32 = u32::MAX;
+/// At most this many stored profiles are read for a before/after list. The camera reports a limit of 20;
+/// a count above this is a camera-supplied number this code does not trust, and the list says so
+/// ([`FtpListState::truncated`]).
+pub const FTP_LIST_MAX_READ: u32 = 32;
+
+/// The risk class of `op`, or `None` when it is not on [`FTP_PROBE_OP_TABLE`].
+pub fn ftp_probe_risk(op: u16) -> Option<FtpProbeRisk> {
+    FTP_PROBE_OP_TABLE.iter().find(|(o, _)| *o == op).map(|(_, r)| *r)
+}
+
+/// [`FTP_PROBE_OPS`] for refusal text, with the control marked.
+fn ftp_probe_ops_text() -> String {
+    FTP_PROBE_OP_TABLE
+        .iter()
+        .map(|(op, risk)| if *risk == FtpProbeRisk::Control { format!("0x{op:04x} as a control") } else { format!("0x{op:04x}") })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What the caller has agreed to for a probe, beyond the op being on the list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FtpProbeConsent {
+    /// Send an op that can change the camera to a model outside [`FTP_WRITE_CONFIRMED_MODELS`], like
+    /// `force_unconfirmed_model` on the FTP writes.
+    pub force_unconfirmed_model: bool,
+    /// The destructive op the caller names as the one it means to send. Must equal the op sent;
+    /// naming one op never opens another.
+    pub destructive_op: Option<u16>,
+}
+
+/// Every refusal that needs no camera, in the order the probe reports them: the op is on the list, the
+/// parameters and data are within their limits, and a destructive op was named by the caller. The one
+/// copy of these rules, used by [`PtpUsbSession::probe_ftp_op`] and [`probe_ftp_op_locked`] (which calls it
+/// before opening a session at all). Returns the op's [`FtpProbeRisk`].
+pub fn check_ftp_probe_request(
+    op: u16,
+    params: &[u32],
+    data: Option<&[u8]>,
+    consent: FtpProbeConsent,
+) -> Result<FtpProbeRisk, PtpUsbError> {
+    let Some(risk) = ftp_probe_risk(op) else {
+        return Err(PtpUsbError::FtpProbeOpNotAllowed { op });
+    };
+    if params.len() > FTP_PROBE_MAX_PARAMS || params.contains(&FTP_PROBE_REFUSED_PARAM) {
+        return Err(PtpUsbError::FtpProbeBadParams { params: params.to_vec() });
+    }
+    if let Some(d) = data
+        && d.len() > FTP_PROBE_MAX_DATA
+    {
+        return Err(PtpUsbError::FtpProbeDataTooLong { len: d.len() });
+    }
+    if risk.is_destructive() && consent.destructive_op != Some(op) {
+        return Err(PtpUsbError::FtpProbeDestructiveNotConfirmed { op, risk });
+    }
+    Ok(risk)
+}
+
+/// One stored profile as the probe read it. The raw bytes are kept (and compared) so a change the
+/// decoder has no field for still shows; `Debug` shows only their length, they hold the password.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FtpListEntry {
+    pub raw: Vec<u8>,
+    /// `None` when the blob does not decode.
+    pub decoded: Option<DecodedFtpProfile>,
+}
+
+impl std::fmt::Debug for FtpListEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FtpListEntry")
+            .field("raw", &format_args!("<{} byte(s) hidden>", self.raw.len()))
+            .field("decoded", &self.decoded)
+            .finish()
+    }
+}
+
+/// The camera's stored FTP profile list as the probe sees it: everything `0x90EB` reports (count, limit,
+/// the selected index, which follows its profile as the list is reordered, the GUID and the device-name
+/// string) and every profile read, in list order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtpListState {
+    pub info: FtpProfileInfo,
+    /// The first [`FTP_LIST_MAX_READ`] profiles at most, in list order.
+    pub entries: Vec<FtpListEntry>,
+    /// `info.count` is above [`FTP_LIST_MAX_READ`], so `entries` is a prefix of the list.
+    pub truncated: bool,
+}
+
+/// A field of the `0x90EB` reply, for [`FtpListChange::Info`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtpInfoField {
+    Header,
+    Count,
+    Limit,
+    Selected,
+    Guid,
+    DeviceName,
+    Trailer,
+    Truncated,
+}
+
+impl FtpInfoField {
+    pub fn name(self) -> &'static str {
+        match self {
+            FtpInfoField::Header => "header",
+            FtpInfoField::Count => "count",
+            FtpInfoField::Limit => "limit",
+            FtpInfoField::Selected => "selected index",
+            FtpInfoField::Guid => "GUID",
+            FtpInfoField::DeviceName => "device name",
+            FtpInfoField::Trailer => "trailer",
+            FtpInfoField::Truncated => "list truncated",
+        }
+    }
+}
+
+/// One difference between two [`FtpListState`]s. Names fields, never values: the profiles hold a password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FtpListChange {
+    /// A field of the `0x90EB` reply.
+    Info(FtpInfoField),
+    /// The profile at `index` differs. `fields` names the decoded fields that differ; it is empty when
+    /// the bytes differ and no named field explains it (a blob that does not decode, or a structural byte).
+    ProfileChanged { index: usize, fields: Vec<&'static str> },
+    ProfileAdded { index: usize },
+    ProfileRemoved { index: usize },
+}
+
+impl FtpListState {
+    /// Profiles that were read but do not decode.
+    pub fn undecodable_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.decoded.is_none()).count()
+    }
+
+    /// Everything that differs between `self` (before) and `after`; empty exactly when they are equal.
+    pub fn changes_to(&self, after: &FtpListState) -> Vec<FtpListChange> {
+        // Destructured without `..`: a new field of the info must be given a comparison to compile.
+        let FtpProfileInfo { header, count, limit, slot, guid, device_name, trailer } = &self.info;
+        let mut changes = Vec::new();
+        let mut info = |differs: bool, field| {
+            if differs {
+                changes.push(FtpListChange::Info(field));
+            }
+        };
+        info(*header != after.info.header, FtpInfoField::Header);
+        info(*count != after.info.count, FtpInfoField::Count);
+        info(*limit != after.info.limit, FtpInfoField::Limit);
+        info(*slot != after.info.slot, FtpInfoField::Selected);
+        info(*guid != after.info.guid, FtpInfoField::Guid);
+        info(*device_name != after.info.device_name, FtpInfoField::DeviceName);
+        info(*trailer != after.info.trailer, FtpInfoField::Trailer);
+        info(self.truncated != after.truncated, FtpInfoField::Truncated);
+        for index in 0..self.entries.len().max(after.entries.len()) {
+            match (self.entries.get(index), after.entries.get(index)) {
+                (Some(a), Some(b)) if a != b => {
+                    let fields = match (&a.decoded, &b.decoded) {
+                        (Some(x), Some(y)) => ftp_profile_differences(x, y),
+                        _ => Vec::new(),
+                    };
+                    changes.push(FtpListChange::ProfileChanged { index, fields });
+                }
+                (Some(_), Some(_)) => {}
+                (None, Some(_)) => changes.push(FtpListChange::ProfileAdded { index }),
+                (Some(_), None) => changes.push(FtpListChange::ProfileRemoved { index }),
+                (None, None) => unreachable!("index is below one of the two lengths"),
+            }
+        }
+        changes
+    }
+}
+
+/// What the camera did with a probed op. The transport result, typed: a lost reply is not a string.
+#[derive(Debug)]
+pub enum FtpProbeOutcome {
+    /// The camera answered. The code may be non-OK (that is data here, not an error).
+    Replied(FtpProbeReply),
+    /// Nothing of the probed op reached the camera: the `0x90E8` setup before it failed, or the session
+    /// was already unusable.
+    NotSent { cause: PtpUsbError },
+    /// The op's command went out (`data_sent`: and its data-out) and no usable reply came. The camera
+    /// may or may not have acted, whatever the op: a delete whose reply was lost still may have
+    /// deleted. The session is poisoned and the list must be re-read with a fresh process.
+    Indeterminate { data_sent: bool, cause: PtpUsbError },
+}
+
+/// What one probed FTP-range op did. `after` is an error when the session could not read the list again
+/// (a timeout or a pipe stall poisons it).
 #[derive(Debug)]
 pub struct FtpOpProbe {
     pub op: u16,
+    pub risk: FtpProbeRisk,
     pub params: Vec<u32>,
     /// Data-out sent with the op, if any.
     pub data: Option<Vec<u8>>,
     pub setup_first: bool,
     pub before: FtpListState,
-    pub reply: Result<FtpProbeReply, String>,
-    pub after: Result<FtpListState, String>,
+    pub outcome: FtpProbeOutcome,
+    pub after: Result<FtpListState, PtpUsbError>,
     pub warnings: Vec<String>,
 }
 
+impl FtpOpProbe {
+    /// The op's command went out and its effect is unknown: see [`FtpProbeOutcome::Indeterminate`].
+    pub fn is_indeterminate(&self) -> bool {
+        matches!(self.outcome, FtpProbeOutcome::Indeterminate { .. })
+    }
+}
+
+/// The camera's answer to a probed op, verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FtpProbeReply {
     pub response_code: u16,
+    /// The parameters of the response container.
+    pub response_params: Vec<u32>,
     pub data: Vec<u8>,
     pub data_containers: usize,
+    /// How the reply departed from the command (a different transaction id or operation code).
+    pub deviations: Vec<ReplyDeviation>,
+    /// Containers of a kind this module does not know that arrived and were skipped.
+    pub unrecognized_containers: u32,
 }
 
 impl<T: BulkTransport> PtpUsbSession<T> {
-    /// `0x90E8` setup, `0x90EB`, then `0x90ED(n)` for every stored profile. Read-only.
+    /// `0x90E8` setup, `0x90EB`, then `0x90ED(n)` for every stored profile (at most
+    /// [`FTP_LIST_MAX_READ`]). Read-only.
     fn ftp_list_state(&mut self) -> Result<FtpListState, PtpUsbError> {
-        let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
-        Self::require_ok(OP_FTP_SETUP, setup.code)?;
-        let info_reply = self.transact(OP_FTP_PROFILE_INFO, &[], None, TxidCheck::Unchecked)?;
-        Self::require_ok(OP_FTP_PROFILE_INFO, info_reply.code)?;
-        if info_reply.data_containers == 0 {
-            return Err(PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_INFO });
+        let (info, _) = self.read_ftp_info_step()?;
+        let truncated = info.count > FTP_LIST_MAX_READ;
+        let mut entries = Vec::new();
+        for n in 0..info.count.min(FTP_LIST_MAX_READ) {
+            let reply = self.read_ftp_profile_reply(n)?;
+            let decoded = decode_ftp_profile(&reply.data).ok();
+            entries.push(FtpListEntry { raw: reply.data, decoded });
         }
-        let info = parse_ftp_profile_info(&info_reply.data)?;
-        let mut names = Vec::new();
-        for n in 0..info.count {
-            let reply = self.transact(OP_FTP_PROFILE_READ, &[n], None, TxidCheck::Unchecked)?;
-            Self::require_ok(OP_FTP_PROFILE_READ, reply.code)?;
-            if reply.data_containers == 0 {
-                return Err(PtpUsbError::NoDataPhase { op: OP_FTP_PROFILE_READ });
-            }
-            names.push(match decode_ftp_profile(&reply.data) {
-                Ok(d) => d.profile_name,
-                Err(_) => format!("(undecodable, {} bytes)", reply.data.len()),
-            });
-        }
-        Ok(FtpListState { count: info.count, selected: info.slot, names })
+        Ok(FtpListState { info, entries, truncated })
     }
 
-    /// Send one bare op from [`FTP_PROBE_OPS`] (no parameters, no data), optionally right after the
-    /// `0x90E8` setup that the profile ops need, and report the profile list before and after.
-    /// EXPERIMENTAL: what these ops do is unknown, so the list is read first and again afterwards
-    /// and both are returned. The refused-op check happens before any I/O.
-    pub fn probe_ftp_op(&mut self, op: u16, setup_first: bool, params: &[u32], data: Option<&[u8]>) -> Result<FtpOpProbe, PtpUsbError> {
-        if !FTP_PROBE_OPS.contains(&op) {
-            return Err(PtpUsbError::FtpProbeOpNotAllowed { op });
+    /// Send one op from [`FTP_PROBE_OP_TABLE`] with the given parameters and data-out, optionally right
+    /// after the `0x90E8` setup that the profile ops need, and report the profile list before and after.
+    /// EXPERIMENTAL: what these ops do is mostly unknown, so the list is read first and again afterwards
+    /// and both are returned. Every refusal that needs no camera ([`check_ftp_probe_request`]) and the
+    /// model gate (any op but the control needs a model in [`FTP_WRITE_CONFIRMED_MODELS`] or
+    /// `consent.force_unconfirmed_model`, the gate the FTP writes use) happen before any I/O.
+    ///
+    /// A reply that never came is not an `Err`: the list read before is worth having, so it is
+    /// [`FtpProbeOutcome::Indeterminate`] (or [`FtpProbeOutcome::NotSent`] when the op never left).
+    pub fn probe_ftp_op(
+        &mut self,
+        op: u16,
+        setup_first: bool,
+        params: &[u32],
+        data: Option<&[u8]>,
+        consent: FtpProbeConsent,
+    ) -> Result<FtpOpProbe, PtpUsbError> {
+        let risk = check_ftp_probe_request(op, params, data, consent)?;
+        if risk.may_change_camera() && !consent.force_unconfirmed_model && !ftp_write_confirmed(&self.model) {
+            return Err(PtpUsbError::UnconfirmedModel(self.model.clone()));
         }
-        if params.len() > 2 || params.contains(&u32::MAX) {
-            return Err(PtpUsbError::FtpProbeBadParams { params: params.to_vec() });
-        }
-        if let Some(d) = data {
-            if d.len() > 32 {
-                return Err(PtpUsbError::FtpProbeDataTooLong { len: d.len() });
-            }
-        }
-        let mut warnings = Vec::new();
-        if sdk_model_name(self.model()).is_none() {
-            warnings.push(format!(
-                "camera model {:?} is not one of the surveyed models ({:?}); the FTP-profile ops were only captured on a Z 9",
-                self.model(),
-                KNOWN_MODELS
-            ));
-        }
+        let warnings: Vec<String> = unsurveyed_model_warning(self.model(), "the FTP-profile ops").into_iter().collect();
         let before = self.ftp_list_state()?;
-        let sent = (|| {
-            if setup_first {
-                let setup = self.transact(OP_FTP_SETUP, &[], Some(&FTP_SETUP_DATA), TxidCheck::Unchecked)?;
-                Self::require_ok(OP_FTP_SETUP, setup.code)?;
-            }
-            self.transact(op, params, data, TxidCheck::Unchecked)
-        })();
-        let reply = match sent {
-            Ok(r) => Ok(FtpProbeReply { response_code: r.code, data: r.data, data_containers: r.data_containers }),
-            Err(e) => Err(e.to_string()),
+        let setup = if setup_first { self.ftp_setup_step().map(drop) } else { Ok(()) };
+        let outcome = match setup {
+            Err(cause) => FtpProbeOutcome::NotSent { cause },
+            Ok(()) => match self.transact(op, params, data, TxidCheck::Unchecked) {
+                Ok(r) => FtpProbeOutcome::Replied(FtpProbeReply {
+                    response_code: r.code,
+                    response_params: r.params,
+                    data: r.data,
+                    data_containers: r.data_containers,
+                    deviations: r.deviations,
+                    unrecognized_containers: r.unrecognized_containers,
+                }),
+                Err(cause) if cause.nothing_was_sent() => FtpProbeOutcome::NotSent { cause },
+                Err(cause) => FtpProbeOutcome::Indeterminate { data_sent: self.data_phase_started, cause },
+            },
         };
-        let after = self.ftp_list_state().map_err(|e| e.to_string());
-        Ok(FtpOpProbe { op, params: params.to_vec(), data: data.map(<[u8]>::to_vec), setup_first, before, reply, after, warnings })
+        let after = self.ftp_list_state();
+        Ok(FtpOpProbe {
+            op,
+            risk,
+            params: params.to_vec(),
+            data: data.map(<[u8]>::to_vec),
+            setup_first,
+            before,
+            outcome,
+            after,
+            warnings,
+        })
     }
 }
 
 /// [`PtpUsbSession::probe_ftp_op`] for a caller already holding the [`CameraLock`]; see
-/// [`PtpUsbSession::open_locked`]. One probe per session.
+/// [`PtpUsbSession::open_locked`]. One probe per session. The requests that need no camera are refused
+/// before a session is opened.
 pub fn probe_ftp_op_locked(
     lock: CameraLock,
     serial: Option<&str>,
@@ -3456,18 +3837,23 @@ pub fn probe_ftp_op_locked(
     setup_first: bool,
     params: &[u32],
     data: Option<&[u8]>,
+    consent: FtpProbeConsent,
 ) -> Result<FtpOpProbe, PtpUsbError> {
-    if !FTP_PROBE_OPS.contains(&op) {
-        return Err(PtpUsbError::FtpProbeOpNotAllowed { op });
-    }
-    if params.len() > 2 || params.contains(&u32::MAX) {
-        return Err(PtpUsbError::FtpProbeBadParams { params: params.to_vec() });
-    }
-    if data.is_some_and(|d| d.len() > 32) {
-        return Err(PtpUsbError::FtpProbeDataTooLong { len: data.map_or(0, <[u8]>::len) });
-    }
-    let mut session = PtpUsbSession::open_locked(lock, serial)?;
-    session.probe_ftp_op(op, setup_first, params, data)
+    probe_ftp_op_opening(|| PtpUsbSession::open_locked(lock, serial), op, setup_first, params, data, consent)
+}
+
+/// [`probe_ftp_op_locked`] with the session's opening injected: the camera-free refusals come first, so
+/// `open` is not called for a request that was going to be refused.
+fn probe_ftp_op_opening<T: BulkTransport>(
+    open: impl FnOnce() -> Result<PtpUsbSession<T>, PtpUsbError>,
+    op: u16,
+    setup_first: bool,
+    params: &[u32],
+    data: Option<&[u8]>,
+    consent: FtpProbeConsent,
+) -> Result<FtpOpProbe, PtpUsbError> {
+    check_ftp_probe_request(op, params, data, consent)?;
+    open()?.probe_ftp_op(op, setup_first, params, data, consent)
 }
 
 impl<T: BulkTransport> Drop for PtpUsbSession<T> {
@@ -6082,7 +6468,9 @@ mod tests {
         let _ = s.transact(OP_GET_DEVICE_INFO, &[], None, TxidCheck::Unchecked);
         let e = d.snapshot().pop().unwrap();
         assert_eq!(e.outcome, Some(Outcome::Failed));
-        assert!(matches!(field(&e, "error"), Some(Val::Text(t)) if !t.is_empty()));
+        assert_eq!(field(&e, "error_kind"), Some(&Val::text("usb")));
+        assert_eq!(field(&e, "usb_error"), Some(&Val::text("NoDevice")));
+        assert!(field(&e, "error").is_none(), "the Display text is not recorded");
     }
 
     #[test]
@@ -6499,6 +6887,30 @@ mod tests {
         let q = s.query_vendor_op(0x90ED).unwrap();
         assert_eq!(q.warnings.len(), 1, "{:?}", q.warnings);
         assert_eq!(t.sent().len(), 1);
+    }
+
+    #[test]
+    fn query_vendor_op_keeps_the_response_parameters_the_deviation_detail_and_skipped_containers() {
+        // For 0x944C the reply is the finding: nothing of it may be dropped.
+        let (mut s, _t) = session(vec![Step::Stamped(vec![(CONTAINER_RESPONSE, 0x2005, [le(5), le(6)].concat())])], "Z 9");
+        let q = s.query_vendor_op(0x90ED).unwrap();
+        assert_eq!(q.response_params, vec![5, 6]);
+        assert!(q.deviations.is_empty() && q.reply_matched_command && q.unrecognized_containers == 0);
+        let (mut s, _t) = session(vec![Step::Bytes(container(CONTAINER_RESPONSE, RESP_OK, 777, &[]))], "Z 9");
+        let q = s.query_vendor_op(0x90ED).unwrap();
+        assert_eq!(q.deviations, vec![ReplyDeviation::TransactionId { got: 777 }]);
+        assert!(!q.reply_matched_command);
+        // A container of a kind this module does not know is skipped and counted.
+        let (mut s, _t) = session(vec![Step::Stamped(vec![(0x0009, 0x1234, vec![]), (CONTAINER_RESPONSE, RESP_OK, vec![])])], "Z 9");
+        assert_eq!(s.query_vendor_op(0x90ED).unwrap().unrecognized_containers, 1);
+    }
+
+    #[test]
+    fn a_property_read_keeps_the_response_parameters() {
+        let (mut s, _t) = session(vec![data_c(OP_GET_DEVICE_PROP_VALUE, &[1]), Step::Stamped(vec![(CONTAINER_RESPONSE, RESP_OK, le(3))])], "Z 9");
+        assert_eq!(s.get_device_prop_value(0xD053).unwrap().response_params, vec![3]);
+        let (mut s, _t) = session(vec![data_c(OP_VENDOR_PROP_READ, &[1]), Step::Stamped(vec![(CONTAINER_RESPONSE, RESP_OK, le(4))])], "Z 9");
+        assert_eq!(s.read_vendor_property_report(0xD053).unwrap().response_params, vec![4]);
     }
 
     #[test]
@@ -7406,18 +7818,445 @@ mod tests {
         ]
     }
 
+    /// Replies for one `ftp_list_state` read of a list holding `count` copies of `blob`.
+    fn list_state_replies_of(count: u32, blob: &[u8], selected: u32, name: &str) -> Vec<Step> {
+        let mut v = vec![resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(count, selected, name)), resp(RESP_OK)];
+        for _ in 0..count.min(FTP_LIST_MAX_READ) {
+            v.push(data_c(OP_FTP_PROFILE_READ, blob));
+            v.push(resp(RESP_OK));
+        }
+        v
+    }
+
+    fn sent_op_codes(t: &ScriptedTransport) -> Vec<u16> {
+        t.sent().iter().map(|(_, op, _, _)| *op).collect()
+    }
+
+    /// No consent beyond the op being on the list.
+    const NO_CONSENT: FtpProbeConsent = FtpProbeConsent { force_unconfirmed_model: false, destructive_op: None };
+
+    fn names(op: u16) -> FtpProbeConsent {
+        FtpProbeConsent { force_unconfirmed_model: false, destructive_op: Some(op) }
+    }
+
+    fn replied(p: &FtpOpProbe) -> &FtpProbeReply {
+        match &p.outcome {
+            FtpProbeOutcome::Replied(r) => r,
+            other => panic!("expected a reply, got {other:?}"),
+        }
+    }
+
+    // ── the probe's allow-list and its destructive ops (b7d3#07, #77) ───────
+
+    #[test]
+    fn the_probe_allow_list_and_its_risks_are_pinned_literally() {
+        // The list is what the camera may be sent from a command line: spelled out, so replacing one entry
+        // (0x90EA with 0x1016 SetDevicePropValue, say) fails here instead of passing a refused-ops test.
+        assert_eq!(FTP_PROBE_OPS, [0x90E9, 0x90EA, 0x90EC, 0x90EF, 0x9FFF]);
+        assert_eq!(
+            FTP_PROBE_OP_TABLE,
+            [
+                (0x90E9, FtpProbeRisk::Unexplained),
+                (0x90EA, FtpProbeRisk::DeleteAll),
+                (0x90EC, FtpProbeRisk::Unexplained),
+                (0x90EF, FtpProbeRisk::DeleteOne),
+                (0x9FFF, FtpProbeRisk::Control),
+            ]
+        );
+        assert_eq!((FTP_PROBE_MAX_PARAMS, FTP_PROBE_MAX_DATA, FTP_PROBE_REFUSED_PARAM), (2, 32, 0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn exactly_the_listed_ops_pass_the_request_check_and_every_other_u16_is_refused() {
+        let listed = [0x90E9u16, 0x90EA, 0x90EC, 0x90EF, 0x9FFF];
+        for op in 0..=u16::MAX {
+            // Name the op as destructive too, so only the list itself decides.
+            let r = check_ftp_probe_request(op, &[], None, names(op));
+            assert_eq!(r.is_ok(), listed.contains(&op), "{op:#06x}: {r:?}");
+            if !listed.contains(&op) {
+                assert!(matches!(r, Err(PtpUsbError::FtpProbeOpNotAllowed { op: o }) if o == op), "{op:#06x}");
+            }
+        }
+        // The neighbours that a one-digit slip would reach: the profile read/write/info ops and SetDevicePropValue.
+        for op in [0x90E8u16, 0x90EB, 0x90ED, 0x90EE, 0x90F0, 0x1016, 0x943B, 0x944C] {
+            assert!(matches!(check_ftp_probe_request(op, &[], None, names(op)), Err(PtpUsbError::FtpProbeOpNotAllowed { .. })), "{op:#06x}");
+        }
+    }
+
+    #[test]
+    fn only_the_two_delete_ops_are_destructive_and_each_has_to_be_named_for_itself() {
+        assert_eq!(ftp_probe_risk(0x90EA), Some(FtpProbeRisk::DeleteAll));
+        assert_eq!(ftp_probe_risk(0x90EF), Some(FtpProbeRisk::DeleteOne));
+        assert_eq!(ftp_probe_risk(0x1016), None);
+        let destructive: Vec<u16> = FTP_PROBE_OPS.iter().copied().filter(|o| ftp_probe_risk(*o).unwrap().is_destructive()).collect();
+        assert_eq!(destructive, [0x90EA, 0x90EF]);
+        for (op, other) in [(0x90EAu16, 0x90EFu16), (0x90EF, 0x90EA)] {
+            // Not named, naming nothing, naming the other delete op, naming an op that is not a delete, and
+            // the model flag alone: every one of them is refused with the op that was asked for.
+            for consent in [
+                NO_CONSENT,
+                names(other),
+                names(0x9FFF),
+                FtpProbeConsent { force_unconfirmed_model: true, destructive_op: None },
+            ] {
+                let r = check_ftp_probe_request(op, &[], None, consent);
+                assert!(
+                    matches!(r, Err(PtpUsbError::FtpProbeDestructiveNotConfirmed { op: o, .. }) if o == op),
+                    "{op:#06x} with {consent:?}: {r:?}"
+                );
+            }
+            assert!(check_ftp_probe_request(op, &[], None, names(op)).unwrap().is_destructive());
+        }
+        // The ops that are not deletes need no naming; naming another op does not matter to them.
+        for op in [0x90E9u16, 0x90EC, 0x9FFF] {
+            assert!(!check_ftp_probe_request(op, &[], None, NO_CONSENT).unwrap().is_destructive(), "{op:#06x}");
+            assert!(check_ftp_probe_request(op, &[], None, names(0x90EA)).is_ok(), "{op:#06x}");
+        }
+        // The refusal tells the person what to pass.
+        let text = check_ftp_probe_request(0x90EA, &[], None, NO_CONSENT).unwrap_err().to_string();
+        assert!(text.contains("deletes ALL stored FTP profiles") && text.contains("--allow-destructive-op 0x90ea"), "{text}");
+    }
+
+    #[test]
+    fn a_destructive_probe_that_is_not_named_sends_nothing_not_even_the_list_read() {
+        for (op, consent) in [(0x90EAu16, NO_CONSENT), (0x90EF, names(0x90EA)), (0x90EA, names(0x90EF))] {
+            let (mut s, t) = session(vec![], "Z 9");
+            let err = s.probe_ftp_op(op, false, &[1], None, consent).unwrap_err();
+            assert!(matches!(err, PtpUsbError::FtpProbeDestructiveNotConfirmed { .. }), "{err:?}");
+            assert!(t.sent().is_empty(), "the camera was written to: {:?}", t.sent());
+        }
+    }
+
+    #[test]
+    fn a_named_destructive_probe_is_sent_once_and_the_deletion_shows_in_the_change_list() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(RESP_OK)); // 0x90EA answered OK
+        replies.extend(list_state_replies_of(0, &blob, 0xff, "Z_9_0000000"));
+        let (mut s, t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90EA, false, &[], None, names(0x90EA)).unwrap();
+        assert_eq!(p.risk, FtpProbeRisk::DeleteAll);
+        assert_eq!(replied(&p).response_code, RESP_OK);
+        assert_eq!(sent_op_codes(&t).iter().filter(|o| **o == 0x90EA).count(), 1);
+        let changes = p.before.changes_to(p.after.as_ref().unwrap());
+        assert!(changes.contains(&FtpListChange::Info(FtpInfoField::Count)), "{changes:?}");
+        assert!(changes.contains(&FtpListChange::Info(FtpInfoField::Selected)), "{changes:?}");
+        assert!(changes.contains(&FtpListChange::ProfileRemoved { index: 0 }), "{changes:?}");
+    }
+
+    // ── the model gate on the probe ───────────────────────────────────────
+
+    #[test]
+    fn every_probe_op_but_the_control_needs_a_write_confirmed_model_or_the_force_flag() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        // "Z 5" is surveyed (reads work) but no FTP write was ever captured on it: not write-confirmed.
+        assert!(!ftp_write_confirmed("Z 5"));
+        for op in [0x90E9u16, 0x90EC] {
+            let (mut s, t) = session(vec![], "Z 5");
+            let err = s.probe_ftp_op(op, false, &[], Some(&[1]), NO_CONSENT).unwrap_err();
+            assert!(matches!(err, PtpUsbError::UnconfirmedModel(ref m) if m == "Z 5"), "{err:?}");
+            assert!(t.sent().is_empty(), "{op:#06x} reached the camera");
+        }
+        // A destructive op needs both: naming it does not stand in for the model gate.
+        let (mut s, t) = session(vec![], "Z 5");
+        assert!(matches!(s.probe_ftp_op(0x90EA, false, &[], None, names(0x90EA)).unwrap_err(), PtpUsbError::UnconfirmedModel(_)));
+        assert!(t.sent().is_empty());
+        // The force flag alone does not unlock a delete either.
+        let (mut s, t) = session(vec![], "Z 5");
+        let force = FtpProbeConsent { force_unconfirmed_model: true, destructive_op: None };
+        assert!(matches!(s.probe_ftp_op(0x90EA, false, &[], None, force).unwrap_err(), PtpUsbError::FtpProbeDestructiveNotConfirmed { .. }));
+        assert!(t.sent().is_empty());
+        // Both together: sent.
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(RESP_OK));
+        replies.extend(list_state_replies(&blob, 0));
+        let (mut s, t) = session(replies, "Z 5");
+        let both = FtpProbeConsent { force_unconfirmed_model: true, destructive_op: Some(0x90EA) };
+        s.probe_ftp_op(0x90EA, false, &[], None, both).unwrap();
+        assert!(sent_op_codes(&t).contains(&0x90EA));
+        // Both confirmed models pass the gate without the flag.
+        for model in FTP_WRITE_CONFIRMED_MODELS {
+            let mut replies = list_state_replies(&blob, 0);
+            replies.push(resp(0x2005));
+            replies.extend(list_state_replies(&blob, 0));
+            let (mut s, t) = session(replies, model);
+            s.probe_ftp_op(0x90EC, false, &[], None, NO_CONSENT).unwrap();
+            assert!(sent_op_codes(&t).contains(&0x90EC), "{model}");
+        }
+    }
+
+    #[test]
+    fn the_control_op_is_the_read_only_probe_and_works_on_any_model_without_flags() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        for model in ["Z 5", "Z 9", "Z6_3", "Z 99"] {
+            let mut replies = list_state_replies(&blob, 0);
+            replies.push(resp(0x2005));
+            replies.extend(list_state_replies(&blob, 0));
+            let (mut s, _t) = session(replies, model);
+            let p = s.probe_ftp_op(0x9FFF, false, &[], None, NO_CONSENT).unwrap();
+            assert_eq!(replied(&p).response_code, 0x2005, "{model}");
+            assert!(p.before.changes_to(p.after.as_ref().unwrap()).is_empty(), "{model}");
+            // The warning is the registry's, not "this was only captured on a Z 9".
+            assert_eq!(p.warnings.len(), usize::from(model == "Z 99"), "{model}: {:?}", p.warnings);
+        }
+    }
+
+    // ── limits, at / below / above (b7d3#81) ───────────────────────────────
+
+    #[test]
+    fn probe_parameter_count_is_limited_to_two() {
+        let ok = |params: &[u32]| check_ftp_probe_request(0x90EF, params, None, names(0x90EF)).is_ok();
+        assert!(ok(&[]));
+        assert!(ok(&[1]));
+        assert!(ok(&[1, 2]), "two is the limit and is allowed");
+        assert!(!ok(&[1, 2, 3]));
+        assert!(!ok(&[0; 4]));
+        assert!(matches!(
+            check_ftp_probe_request(0x90EF, &[1, 2, 3], None, names(0x90EF)),
+            Err(PtpUsbError::FtpProbeBadParams { params }) if params == [1, 2, 3]
+        ));
+    }
+
+    #[test]
+    fn the_hang_value_is_refused_in_any_position_and_the_values_beside_it_are_not() {
+        let ok = |params: &[u32]| check_ftp_probe_request(0x90EF, params, None, names(0x90EF)).is_ok();
+        assert!(!ok(&[0xFFFF_FFFF]));
+        assert!(!ok(&[0, 0xFFFF_FFFF]));
+        assert!(!ok(&[0xFFFF_FFFF, 0]));
+        assert!(ok(&[0xFFFF_FFFE]), "one below the hang value");
+        assert!(ok(&[0, 0xFFFF_FFFE]));
+        assert!(ok(&[0x8000_0000]));
+    }
+
+    #[test]
+    fn probe_data_out_is_limited_to_32_bytes() {
+        let ok = |n: usize| check_ftp_probe_request(0x90EC, &[], Some(&vec![0xAA; n]), NO_CONSENT).is_ok();
+        assert!(ok(0), "an empty data-out is a data phase of zero bytes, allowed as before");
+        assert!(ok(1));
+        assert!(ok(31));
+        assert!(ok(32), "32 is the limit and is allowed");
+        assert!(!ok(33));
+        assert!(!ok(320));
+        assert!(matches!(
+            check_ftp_probe_request(0x90EC, &[], Some(&[0; 33]), NO_CONSENT),
+            Err(PtpUsbError::FtpProbeDataTooLong { len: 33 })
+        ));
+        // No data at all is not the same as an empty one, and neither is over the limit.
+        assert!(check_ftp_probe_request(0x90EC, &[], None, NO_CONSENT).is_ok());
+    }
+
+    #[test]
+    fn request_refusals_are_reported_in_a_fixed_order() {
+        // Off the list wins over everything; then parameters; then data; then the delete naming.
+        assert!(matches!(
+            check_ftp_probe_request(0x1016, &[1, 2, 3], Some(&[0; 40]), NO_CONSENT),
+            Err(PtpUsbError::FtpProbeOpNotAllowed { .. })
+        ));
+        assert!(matches!(
+            check_ftp_probe_request(0x90EA, &[1, 2, 3], Some(&[0; 40]), NO_CONSENT),
+            Err(PtpUsbError::FtpProbeBadParams { .. })
+        ));
+        assert!(matches!(
+            check_ftp_probe_request(0x90EA, &[1], Some(&[0; 40]), NO_CONSENT),
+            Err(PtpUsbError::FtpProbeDataTooLong { .. })
+        ));
+        assert!(matches!(
+            check_ftp_probe_request(0x90EA, &[1], Some(&[0; 4]), NO_CONSENT),
+            Err(PtpUsbError::FtpProbeDestructiveNotConfirmed { .. })
+        ));
+    }
+
+    #[test]
+    fn the_refusal_texts_are_built_from_the_one_table_and_the_limits() {
+        let text = PtpUsbError::FtpProbeOpNotAllowed { op: 0x1234 }.to_string();
+        for op in FTP_PROBE_OPS {
+            assert!(text.contains(&format!("0x{op:04x}")), "{op:#06x} missing from: {text}");
+        }
+        assert!(text.contains("0x9fff as a control"), "{text}");
+        assert!(PtpUsbError::FtpProbeDataTooLong { len: 40 }.to_string().contains("32 bytes"));
+        let bad = PtpUsbError::FtpProbeBadParams { params: vec![] }.to_string();
+        assert!(bad.contains("at most 2 parameters") && bad.contains("0xFFFFFFFF"), "{bad}");
+    }
+
+    #[test]
+    fn probe_ftp_op_locked_refuses_before_a_session_is_opened() {
+        let opened = std::cell::Cell::new(0u32);
+        let open = || {
+            opened.set(opened.get() + 1);
+            Ok(session(vec![], "Z 9").0)
+        };
+        let blob = vec![0xAA; 33];
+        let cases: Vec<(&str, u16, Vec<u32>, Option<&[u8]>, FtpProbeConsent)> = vec![
+            ("off the list", 0x1016, vec![], None, names(0x1016)),
+            ("too many parameters", 0x90EF, vec![1, 2, 3], None, names(0x90EF)),
+            ("the hang value", 0x90EF, vec![u32::MAX], None, names(0x90EF)),
+            ("data over the limit", 0x90EC, vec![], Some(&blob[..]), NO_CONSENT),
+            ("a delete nobody named", 0x90EA, vec![], None, NO_CONSENT),
+        ];
+        for (what, op, params, data, consent) in cases {
+            let err = probe_ftp_op_opening(open, op, false, &params, data, consent).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    PtpUsbError::FtpProbeOpNotAllowed { .. }
+                        | PtpUsbError::FtpProbeBadParams { .. }
+                        | PtpUsbError::FtpProbeDataTooLong { .. }
+                        | PtpUsbError::FtpProbeDestructiveNotConfirmed { .. }
+                ),
+                "{what}: {err:?}"
+            );
+            assert_eq!(opened.get(), 0, "{what}: a session was opened for a request that is refused");
+        }
+        // A request that passes goes on to open: the session's own error would come back from `open`.
+        let r = probe_ftp_op_opening(|| Err::<PtpUsbSession<ScriptedTransport>, _>(PtpUsbError::NoDevice), 0x9FFF, false, &[], None, NO_CONSENT);
+        assert!(matches!(r, Err(PtpUsbError::NoDevice)));
+    }
+
+    // ── the one unsurveyed-model warning (b7d3#33) ─────────────────────────
+
+    #[test]
+    fn the_unsurveyed_model_warning_is_one_helper_with_no_stale_z9_claim() {
+        for m in KNOWN_MODELS {
+            assert_eq!(unsurveyed_model_warning(m, "x"), None, "{m}");
+        }
+        for m in ["", "Z 50", "z 9", "Z6_3 "] {
+            let w = unsurveyed_model_warning(m, "the thing").unwrap_or_else(|| panic!("{m:?} is not surveyed"));
+            assert!(w.contains(&format!("{m:?}")) && w.contains("the thing") && w.contains("Z6_3"), "{w}");
+            assert!(!w.contains("only captured on a Z 9"), "the condition is registry membership, not 'is a Z 9': {w}");
+        }
+    }
+
+    #[test]
+    fn every_operation_that_warns_on_an_unsurveyed_model_gives_that_same_warning() {
+        let model = "Z 99";
+        let expect = |what: &str| unsurveyed_model_warning(model, what).unwrap();
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+
+        let (mut s, _t) = session(vec![data_c(OP_VENDOR_PROP_READ, &[1]), resp(RESP_OK)], model);
+        assert_eq!(s.read_vendor_property_report(0xD053).unwrap().warnings, [expect("vendor-property reads")]);
+
+        let (mut s, _t) = session(vec![data_c(OP_GET_DEVICE_PROP_VALUE, &[1]), resp(RESP_OK)], model);
+        assert_eq!(s.get_device_prop_value(0xD053).unwrap().warnings, [expect("standard property reads")]);
+
+        let (mut s, _t) = session(vec![resp(RESP_OK)], model);
+        assert_eq!(s.query_vendor_op(0x90ED).unwrap().warnings, [expect("0x944C")]);
+
+        let info = ftp_info_bytes(1, 0, "Z_99_0000000");
+        let (mut s, _t) = session(
+            vec![resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &info), resp(RESP_OK), data_c(OP_FTP_PROFILE_READ, &blob), resp(RESP_OK)],
+            model,
+        );
+        assert_eq!(s.read_ftp_profile_slot(Some(0)).unwrap().warnings, [expect("the FTP-profile read")]);
+
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(0x2005));
+        replies.extend(list_state_replies(&blob, 0));
+        let (mut s, _t) = session(replies, model);
+        assert_eq!(s.probe_ftp_op(0x9FFF, false, &[], None, NO_CONSENT).unwrap().warnings, [expect("the FTP-profile ops")]);
+    }
+
+    // ── typed diagnostics for a failed transaction (b7d3#31/#48) ───────────
+
+    fn every_ptp_usb_error() -> Vec<PtpUsbError> {
+        let path = std::path::PathBuf::from("/x");
+        vec![
+            PtpUsbError::NoDevice,
+            PtpUsbError::AmbiguousDevice(2),
+            PtpUsbError::SerialNotFound { requested: "S".into(), unreadable: vec![] },
+            PtpUsbError::DuplicateSerial { requested: "S".into(), count: 2 },
+            PtpUsbError::BodiesSkipped { skipped: vec!["a".into()] },
+            PtpUsbError::Usb(rusb::Error::Pipe),
+            PtpUsbError::CameraLock(LockError::Busy { path }),
+            PtpUsbError::NoPtpInterface,
+            PtpUsbError::ClaimFailed { attempts: 3, last_error: "secret-ish text".into() },
+            PtpUsbError::ShortContainer(3),
+            PtpUsbError::TruncatedContainer { declared: 9, got: 4 },
+            PtpUsbError::ShortWrite { written: 1, expected: 2 },
+            PtpUsbError::ContainerTooLarge { payload_len: 7 },
+            PtpUsbError::TooManyCommandParams { given: 6, max: 5 },
+            PtpUsbError::MisalignedResponseParams(5),
+            PtpUsbError::TransactionTimedOut(Duration::from_millis(1500)),
+            PtpUsbError::TransactionDataTooLarge { got: 10, limit: 5 },
+            PtpUsbError::SessionPoisoned { cause: "an earlier error's text".into() },
+            PtpUsbError::OpenSessionFailed(PtpResponseCode(0x201E)),
+            PtpUsbError::OperationFailed { op: 0x90EC, code: PtpResponseCode(0x2002) },
+            PtpUsbError::TransactionIdMismatch { op: 0x1001, expected: 3, got: 9 },
+            PtpUsbError::UnexpectedDataOp { op: 0x1001, got: 0x90EC },
+            PtpUsbError::NoDataPhase { op: 0x1001 },
+            PtpUsbError::DeviceInfoMalformed { field: "model", offset: 4, fault: DeviceInfoFault::Truncated { needed: 2, available: 1 } },
+            PtpUsbError::FtpBlobMalformed { what: "host", offset: 3, detail: "a camera-supplied detail".into() },
+            PtpUsbError::FtpSlotOutOfRange { slot: 3, count: 3 },
+            PtpUsbError::FtpProbeOpNotAllowed { op: 1 },
+            PtpUsbError::FtpProbeDataTooLong { len: 40 },
+            PtpUsbError::FtpProbeBadParams { params: vec![1, 2, 3] },
+            PtpUsbError::FtpProbeDestructiveNotConfirmed { op: 0x90EA, risk: FtpProbeRisk::DeleteAll },
+            PtpUsbError::FtpFieldTooLong { field: "host", len: 99, max: 50, unit: "bytes" },
+            PtpUsbError::FtpFieldNotAscii { field: "host" },
+            PtpUsbError::FtpFieldControlChar { field: "host" },
+            PtpUsbError::FtpWriteIndeterminate { cause: Box::new(PtpUsbError::Usb(rusb::Error::Timeout)) },
+            PtpUsbError::FtpWriteRefused { slot: 1, param2: 9, why: FtpWriteRefusal::SlotHangsCamera },
+            PtpUsbError::UnconfirmedModel("Z 5".into()),
+            PtpUsbError::PropWriteUnsupported { propcode: 1, allowed: "x".into() },
+            PtpUsbError::PropWriteUnconfirmed { propcode: 0xD072, model: "Z 9".into() },
+            PtpUsbError::PropNotWritable { propcode: 0xD090, get_set: 0 },
+            PtpUsbError::PropValueBad { propcode: 0xD090, why: "text from the caller".into() },
+            PtpUsbError::PropWriteIndeterminate { propcode: 0xD090, cause: Box::new(PtpUsbError::Usb(rusb::Error::Pipe)) },
+        ]
+    }
+
+    #[test]
+    fn every_ptp_usb_error_has_its_own_closed_tag_recorded_as_error_kind() {
+        let errs = every_ptp_usb_error();
+        let tags: std::collections::BTreeSet<_> = errs.iter().map(PtpUsbError::tag).collect();
+        assert_eq!(tags.len(), errs.len(), "tags are unique");
+        assert_eq!(errs.len(), 41, "a new PtpUsbError variant needs an entry here (tag() is exhaustive, this list is not)");
+        for e in &errs {
+            assert!(e.tag().chars().all(|c| c.is_ascii_lowercase() || c == '_'), "{}", e.tag());
+            assert_eq!(e.diag_fields()[0], ("error_kind", crate::diag::Val::text(e.tag())), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_transaction_error_is_recorded_by_typed_fields_never_by_its_display_text() {
+        use crate::diag::Val;
+        for e in every_ptp_usb_error() {
+            for (k, v) in e.diag_fields() {
+                if let Val::Text(t) = &v {
+                    assert!(["error_kind", "usb_error", "cause_kind"].contains(&k), "{k} is text for {e}");
+                    assert_ne!(t, &e.to_string(), "{k} must not be the Display text of {e}");
+                }
+            }
+        }
+        let get = |e: &PtpUsbError, k: &str| e.diag_fields().into_iter().find(|(n, _)| *n == k).map(|(_, v)| v);
+        let refused = PtpUsbError::OperationFailed { op: 0x90EC, code: PtpResponseCode(0x2002) };
+        assert_eq!((get(&refused, "op"), get(&refused, "code")), (Some(Val::Hex(0x90EC)), Some(Val::Hex(0x2002))));
+        let t = PtpUsbError::TransactionTimedOut(Duration::from_millis(1500));
+        assert_eq!(get(&t, "timeout_ms"), Some(Val::U64(1500)));
+        let mismatch = PtpUsbError::TransactionIdMismatch { op: 0x1001, expected: 3, got: 9 };
+        assert_eq!((get(&mismatch, "expected"), get(&mismatch, "got")), (Some(Val::U64(3)), Some(Val::U64(9))));
+        let wrapped = PtpUsbError::FtpWriteIndeterminate { cause: Box::new(PtpUsbError::Usb(rusb::Error::Timeout)) };
+        assert_eq!(get(&wrapped, "cause_kind"), Some(Val::text("usb")));
+        // A payload carried by the error never reaches the record.
+        let claim = PtpUsbError::ClaimFailed { attempts: 3, last_error: "secret-ish text".into() };
+        assert_eq!(claim.diag_fields().len(), 1);
+        let bad = PtpUsbError::PropValueBad { propcode: 0xD090, why: "text from the caller".into() };
+        assert_eq!(bad.diag_fields().len(), 1);
+    }
+
+    // ── what the probe reports ─────────────────────────────────────────────
+
     #[test]
     fn probe_ftp_op_refuses_an_op_off_the_list_before_any_io() {
         let (mut s, t) = session(vec![], "Z 9");
         assert!(matches!(
-            s.probe_ftp_op(0x90EE, false, &[], None).unwrap_err(),
+            s.probe_ftp_op(0x90EE, false, &[], None, NO_CONSENT).unwrap_err(),
             PtpUsbError::FtpProbeOpNotAllowed { op: 0x90EE }
         ));
         assert!(matches!(
-            s.probe_ftp_op(0x90ED, true, &[], None).unwrap_err(),
+            s.probe_ftp_op(0x90ED, true, &[], None, NO_CONSENT).unwrap_err(),
             PtpUsbError::FtpProbeOpNotAllowed { op: 0x90ED }
         ));
-        assert!(t.sent().iter().all(|(_, op, _, _)| *op != 0x90EE && *op != 0x90ED && *op != OP_FTP_SETUP));
+        assert!(t.sent().is_empty());
     }
 
     #[test]
@@ -7427,14 +8266,16 @@ mod tests {
         replies.push(resp(0x2005)); // OperationNotSupported
         replies.extend(list_state_replies(&blob, 0));
         let (mut s, t) = session(replies, "Z 9");
-        let p = s.probe_ftp_op(0x9FFF, false, &[], None).unwrap();
-        assert_eq!(p.reply.as_ref().unwrap().response_code, 0x2005);
-        assert_eq!(p.before, p.after.clone().unwrap());
-        assert_eq!(p.before.count, 1);
-        assert_eq!(p.before.selected, 0);
-        assert_eq!(p.before.names.len(), 1);
+        let p = s.probe_ftp_op(0x9FFF, false, &[], None, NO_CONSENT).unwrap();
+        assert_eq!(replied(&p).response_code, 0x2005);
+        assert_eq!(&p.before, p.after.as_ref().unwrap());
+        assert!(p.before.changes_to(p.after.as_ref().unwrap()).is_empty());
+        assert_eq!(p.before.info.count, 1);
+        assert_eq!(p.before.info.slot, 0);
+        assert_eq!(p.before.entries.len(), 1);
+        assert!(!p.before.truncated && p.before.undecodable_count() == 0);
         // Bare means nothing between the "before" read and the op: the op follows the last 0x90ED.
-        let ops: Vec<u16> = t.sent().iter().map(|(_, op, _, _)| *op).collect();
+        let ops = sent_op_codes(&t);
         assert_eq!(ops.iter().filter(|o| **o == 0x9FFF).count(), 1);
         let at = ops.iter().position(|o| *o == 0x9FFF).unwrap();
         assert_eq!(ops[at - 1], OP_FTP_PROFILE_READ, "no 0x90E8 setup between the read and the bare op");
@@ -7448,28 +8289,22 @@ mod tests {
         replies.push(resp(0x2005)); // the op
         replies.extend(list_state_replies(&blob, 0));
         let (mut s, t) = session(replies, "Z 9");
-        let p = s.probe_ftp_op(0x90E9, true, &[], None).unwrap();
+        let p = s.probe_ftp_op(0x90E9, true, &[], None, NO_CONSENT).unwrap();
         assert!(p.setup_first);
-        assert_eq!(p.reply.unwrap().response_code, 0x2005);
-        let ops: Vec<u16> = t.sent().iter().map(|(_, op, _, _)| *op).collect();
+        assert_eq!(replied(&p).response_code, 0x2005);
+        let ops = sent_op_codes(&t);
         let at = ops.iter().position(|o| *o == 0x90E9).expect("op sent");
         assert_eq!(ops[at - 1], OP_FTP_SETUP, "the setup immediately precedes the op");
     }
 
     #[test]
-    fn probe_ftp_op_sends_the_given_parameters_and_refuses_too_many_or_the_hang_value() {
-        let (mut s, t) = session(vec![], "Z 9");
-        for bad in [&[1u32, 2, 3][..], &[u32::MAX][..], &[0, u32::MAX][..]] {
-            assert!(matches!(s.probe_ftp_op(0x90EF, false, bad, None).unwrap_err(), PtpUsbError::FtpProbeBadParams { .. }));
-        }
-        assert!(t.sent().iter().all(|(_, op, _, _)| *op != 0x90EF && *op != OP_FTP_SETUP));
-
+    fn probe_ftp_op_sends_the_given_parameters() {
         let blob = hex::decode_hex(reference_ftp_blob_hex());
         let mut replies = list_state_replies(&blob, 0);
         replies.push(resp(RESP_OK));
         replies.extend(list_state_replies(&blob, 0));
         let (mut s, t) = session(replies, "Z 9");
-        let p = s.probe_ftp_op(0x90EF, false, &[1], None).unwrap();
+        let p = s.probe_ftp_op(0x90EF, false, &[1], None, names(0x90EF)).unwrap();
         assert_eq!(p.params, vec![1]);
         let sent = t.sent();
         let (_, _, _, payload) = sent.iter().find(|(_, op, _, _)| *op == 0x90EF).expect("op sent");
@@ -7477,20 +8312,13 @@ mod tests {
     }
 
     #[test]
-    fn probe_ftp_op_sends_data_out_under_the_same_transaction_and_caps_its_length() {
-        let (mut s, t) = session(vec![], "Z 9");
-        assert!(matches!(
-            s.probe_ftp_op(0x90EC, false, &[], Some(&[0u8; 33])).unwrap_err(),
-            PtpUsbError::FtpProbeDataTooLong { len: 33 }
-        ));
-        assert!(t.sent().iter().all(|(_, op, _, _)| *op != 0x90EC && *op != OP_FTP_SETUP));
-
+    fn probe_ftp_op_sends_data_out_under_the_same_transaction() {
         let blob = hex::decode_hex(reference_ftp_blob_hex());
         let mut replies = list_state_replies(&blob, 0);
         replies.push(resp(RESP_OK));
         replies.extend(list_state_replies(&blob, 0));
         let (mut s, t) = session(replies, "Z 9");
-        let p = s.probe_ftp_op(0x90EC, false, &[1], Some(&[0xAA, 0xBB])).unwrap();
+        let p = s.probe_ftp_op(0x90EC, false, &[1], Some(&[0xAA, 0xBB]), NO_CONSENT).unwrap();
         assert_eq!(p.data.as_deref(), Some(&[0xAA, 0xBB][..]));
         let sent = t.sent();
         let frames: Vec<_> = sent.iter().filter(|(_, op, _, _)| *op == 0x90EC).collect();
@@ -7498,6 +8326,98 @@ mod tests {
         assert_eq!(frames[0].2, frames[1].2, "same transaction id");
         assert_eq!(frames[1].3, vec![0xAA, 0xBB]);
     }
+
+    #[test]
+    fn probe_ftp_op_reports_the_reply_parameters_and_how_the_reply_deviated() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(Step::Stamped(vec![(CONTAINER_RESPONSE, RESP_OK, [le(7), le(9)].concat())]));
+        replies.extend(list_state_replies(&blob, 0));
+        let (mut s, _t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90EC, false, &[], None, NO_CONSENT).unwrap();
+        assert_eq!(replied(&p).response_params, vec![7, 9]);
+        assert!(replied(&p).deviations.is_empty());
+        // A reply that carries the wrong transaction id is tolerated and recorded with the id it carried.
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(Step::Bytes(container(CONTAINER_RESPONSE, RESP_OK, 4242, &[])));
+        replies.extend(list_state_replies(&blob, 0));
+        let (mut s, _t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90EC, false, &[], None, NO_CONSENT).unwrap();
+        assert_eq!(replied(&p).deviations, vec![ReplyDeviation::TransactionId { got: 4242 }]);
+    }
+
+    // ── a lost reply is a typed indeterminate result (b7d3#16) ─────────────
+
+    #[test]
+    fn a_reply_lost_after_data_out_is_indeterminate_with_the_cause_and_the_data_flag() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        // The scripted transport runs dry after the "before" read: the op's reply is a USB timeout.
+        let (mut s, t) = session(list_state_replies(&blob, 0), "Z 9");
+        let p = s.probe_ftp_op(0x90EC, false, &[], Some(&[0x01]), NO_CONSENT).unwrap();
+        match &p.outcome {
+            FtpProbeOutcome::Indeterminate { data_sent: true, cause: PtpUsbError::Usb(rusb::Error::Timeout) } => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(p.is_indeterminate());
+        assert!(sent_op_codes(&t).iter().filter(|o| **o == 0x90EC).count() == 2, "command and data container went out");
+        assert!(matches!(p.after, Err(PtpUsbError::SessionPoisoned { .. })), "the poisoned session cannot re-read the list: {:?}", p.after);
+        // Each cause is its own: a stalled pipe is not a timeout.
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(Step::Err(rusb::Error::Pipe));
+        let (mut s, _t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90EC, false, &[], Some(&[0x01]), NO_CONSENT).unwrap();
+        assert!(matches!(p.outcome, FtpProbeOutcome::Indeterminate { data_sent: true, cause: PtpUsbError::Usb(rusb::Error::Pipe) }), "{:?}", p.outcome);
+    }
+
+    #[test]
+    fn a_bare_op_whose_reply_is_lost_is_indeterminate_too_without_the_data_flag() {
+        // A delete with no reply may still have deleted: the command alone is enough.
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let (mut s, _t) = session(list_state_replies(&blob, 0), "Z 9");
+        let p = s.probe_ftp_op(0x90EA, false, &[], None, names(0x90EA)).unwrap();
+        assert!(
+            matches!(p.outcome, FtpProbeOutcome::Indeterminate { data_sent: false, cause: PtpUsbError::Usb(rusb::Error::Timeout) }),
+            "{:?}",
+            p.outcome
+        );
+    }
+
+    #[test]
+    fn a_failed_setup_means_the_probed_op_was_not_sent() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(0x2002)); // the setup is refused
+        replies.extend(list_state_replies(&blob, 0));
+        let (mut s, t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90EA, true, &[], None, names(0x90EA)).unwrap();
+        assert!(matches!(p.outcome, FtpProbeOutcome::NotSent { cause: PtpUsbError::OperationFailed { op: OP_FTP_SETUP, .. } }), "{:?}", p.outcome);
+        assert!(!p.is_indeterminate());
+        assert!(!sent_op_codes(&t).contains(&0x90EA), "the delete went out after a refused setup");
+        assert!(p.after.is_ok(), "a refused (completed) transaction does not poison the session");
+    }
+
+    #[test]
+    fn only_errors_raised_before_a_byte_is_written_count_as_nothing_sent() {
+        for e in [
+            PtpUsbError::SessionPoisoned { cause: String::new() },
+            PtpUsbError::TooManyCommandParams { given: 6, max: 5 },
+            PtpUsbError::ContainerTooLarge { payload_len: 1 },
+        ] {
+            assert!(e.nothing_was_sent(), "{e:?}");
+        }
+        for e in [
+            PtpUsbError::Usb(rusb::Error::Timeout),
+            PtpUsbError::Usb(rusb::Error::Pipe),
+            PtpUsbError::TransactionTimedOut(Duration::from_secs(1)),
+            PtpUsbError::ShortWrite { written: 1, expected: 2 },
+            PtpUsbError::OperationFailed { op: 0x90EC, code: PtpResponseCode(0x2002) },
+            PtpUsbError::NoDataPhase { op: 0x90EC },
+        ] {
+            assert!(!e.nothing_was_sent(), "{e:?}");
+        }
+    }
+
+    // ── the before/after list (b7d3#17) ────────────────────────────────────
 
     #[test]
     fn probe_ftp_op_reports_a_changed_list() {
@@ -7508,8 +8428,95 @@ mod tests {
         // becomes selected 5), so the two states differ.
         replies.extend(list_state_replies(&blob, 5));
         let (mut s, _t) = session(replies, "Z 9");
-        let p = s.probe_ftp_op(0x90EC, false, &[], None).unwrap();
-        assert_ne!(p.before, p.after.unwrap());
+        let p = s.probe_ftp_op(0x90EC, false, &[], None, NO_CONSENT).unwrap();
+        assert_eq!(p.before.changes_to(p.after.as_ref().unwrap()), vec![FtpListChange::Info(FtpInfoField::Selected)]);
+    }
+
+    #[test]
+    fn a_change_to_a_profile_field_or_the_device_name_shows_though_the_name_and_length_do_not() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        assert_eq!(decode_ftp_profile(&blob).unwrap().password, "12345678");
+        // Same profile name, same length: only the password's bytes differ.
+        let mut changed = blob.clone();
+        let at = changed.windows(8).position(|w| w == b"12345678").expect("the password is in the blob as ASCII");
+        changed[at..at + 8].copy_from_slice(b"87654321");
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(RESP_OK));
+        replies.extend(list_state_replies(&changed, 0));
+        let (mut s, _t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90EC, false, &[], Some(&[1]), NO_CONSENT).unwrap();
+        assert_ne!(p.before, *p.after.as_ref().unwrap(), "a changed password is not 'unchanged'");
+        assert_eq!(
+            p.before.changes_to(p.after.as_ref().unwrap()),
+            vec![FtpListChange::ProfileChanged { index: 0, fields: vec!["password"] }]
+        );
+        // The device-name string: the field the 0x90EC probes blanked on a Z 9.
+        let mut replies = list_state_replies(&blob, 0);
+        replies.push(resp(RESP_OK));
+        replies.extend(list_state_replies_of(1, &blob, 0, ""));
+        let (mut s, _t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90EC, false, &[], Some(&[1]), NO_CONSENT).unwrap();
+        assert_eq!(p.before.changes_to(p.after.as_ref().unwrap()), vec![FtpListChange::Info(FtpInfoField::DeviceName)]);
+    }
+
+    #[test]
+    fn an_undecodable_profile_is_counted_and_a_change_in_its_bytes_is_seen() {
+        let junk_a = vec![0x11u8; 40];
+        let junk_b = vec![0x22u8; 40];
+        let mut replies = list_state_replies(&junk_a, 0);
+        replies.push(resp(RESP_OK));
+        replies.extend(list_state_replies(&junk_b, 0));
+        let (mut s, _t) = session(replies, "Z 9");
+        let p = s.probe_ftp_op(0x90EC, false, &[], Some(&[1]), NO_CONSENT).unwrap();
+        assert_eq!(p.before.undecodable_count(), 1);
+        assert_eq!(p.before.entries[0].decoded, None);
+        assert_eq!(
+            p.before.changes_to(p.after.as_ref().unwrap()),
+            vec![FtpListChange::ProfileChanged { index: 0, fields: vec![] }],
+            "same length, both undecodable, different bytes"
+        );
+        // Debug shows the length of a profile's bytes, never the bytes.
+        let shown = format!("{:?}", p.before);
+        assert!(shown.contains("40 byte(s) hidden") && !shown.contains("17, 17"), "{shown}");
+    }
+
+    #[test]
+    fn the_list_read_is_capped_at_32_profiles_and_says_so() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        // At the cap: all read, not truncated. Below: all read. Above: the first 32, flagged, and the 33rd never asked for.
+        for (count, expect_read, expect_truncated) in [(31u32, 31usize, false), (32, 32, false), (33, 32, true), (u32::MAX, 32, true)] {
+            let (mut s, t) = session(list_state_replies_of(count, &blob, 0, "Z_9_0000000"), "Z 9");
+            let state = s.ftp_list_state().unwrap();
+            assert_eq!(state.entries.len(), expect_read, "count {count}");
+            assert_eq!(state.truncated, expect_truncated, "count {count}");
+            assert_eq!(state.info.count, count);
+            let reads: Vec<u32> = t
+                .sent()
+                .iter()
+                .filter(|(_, op, _, _)| *op == OP_FTP_PROFILE_READ)
+                .map(|(_, _, _, p)| u32::from_le_bytes(p[..4].try_into().unwrap()))
+                .collect();
+            assert_eq!(reads, (0..expect_read as u32).collect::<Vec<_>>(), "count {count}");
+        }
+    }
+
+    #[test]
+    fn a_list_that_is_truncated_in_one_read_and_not_the_other_differs() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let (mut a, _) = session(list_state_replies_of(32, &blob, 0, "N"), "Z 9");
+        let (mut b, _) = session(list_state_replies_of(33, &blob, 0, "N"), "Z 9");
+        let (sa, sb) = (a.ftp_list_state().unwrap(), b.ftp_list_state().unwrap());
+        let changes = sa.changes_to(&sb);
+        assert!(changes.contains(&FtpListChange::Info(FtpInfoField::Count)) && changes.contains(&FtpListChange::Info(FtpInfoField::Truncated)), "{changes:?}");
+    }
+
+    #[test]
+    fn a_state_equals_itself_and_has_no_changes() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let (mut a, _) = session(list_state_replies_of(2, &blob, 1, "N"), "Z 9");
+        let s = a.ftp_list_state().unwrap();
+        assert!(s.changes_to(&s.clone()).is_empty());
+        assert_eq!(s, s.clone());
     }
 
     #[test]

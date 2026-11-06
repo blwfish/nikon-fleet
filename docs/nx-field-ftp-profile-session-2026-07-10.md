@@ -228,9 +228,21 @@ new profile (`UsbPi`) at the front. The tool already allowed `slot == count`; it
 `vendor-probe-op OP [--param N]... [--data HEX] [--setup]` sends one op (with optional data-out of up to
 32 bytes) from a fixed list (`0x90E9`,
 `0x90EA`, `0x90EC`, `0x90EF`, and `0x9FFF` as a control that should not exist), at most two parameters
-and never `0xFFFFFFFF`. It reads the profile list and the selected index before and after. If the op gets
-no reply the session is unusable, so the "after" listing is then unavailable and `vendor-read-ftp` is run
-again. Results, Z9:
+and never `0xFFFFFFFF`. It reads the profile list and everything `0x90EB` reports before and after, and names
+each difference (never a value: the profiles hold a password). If the op gets no reply the session is unusable,
+so the "after" listing is then unavailable and `vendor-read-ftp` is run again.
+
+Because two of these ops delete (results below), the command is gated since 2026-11-05 (not run on hardware
+since): only `0x9FFF`, the control, is read-only. Any other op needs a model in `FTP_WRITE_CONFIRMED_MODELS` (Z 9,
+Z6III) or `--force-unconfirmed-model`, the gate `vendor-write-ftp-blob` uses. `0x90EA` (deletes all) and `0x90EF`
+(deletes one) are sent only when the op is named a second time, `--allow-destructive-op 0x90EA`; naming one does not
+allow the other, and the model flag does not replace it. The refusals, the op list, the 2-parameter and 32-byte
+limits and the `0xFFFFFFFF` ban are all checked before the camera is opened (`check_ftp_probe_request`). A reply
+that is lost after the op went out (with or without data-out) is an *indeterminate* result, not a success: the
+command prints what it read, says the camera may have acted, and exits 4 (the code of an indeterminate write). The
+list read before the op still prints.
+
+Results, Z9:
 
 | Call | Result |
 |---|---|
@@ -301,7 +313,8 @@ again. Results, Z9:
   the Wi-Fi client cause one at all (record the station's connected time before and after).
 - Porting the PTP/IP client into the Rust tool (something like `vendor-read-ftp --wifi IP`). The USB
   commands already cover read, add, replace, and (through `vendor-probe-op`) delete; there is no
-  dedicated delete command, and `vendor-probe-op` is deliberately restricted to a fixed op list.
+  dedicated delete command, and `vendor-probe-op` is deliberately restricted to a fixed op list and, for the two
+  delete ops, to `--allow-destructive-op` naming the op (see the gate described above).
 
 ## 8. What the Rust library now enforces (2026-11-05, not run on hardware)
 
