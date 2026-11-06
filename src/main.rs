@@ -4,7 +4,7 @@
 //! the command-line surface.
 
 mod cli_report;
-use cli_report::unrestored_error;
+use cli_report::not_written_error;
 // The MCP server's child process; it takes an inherited file descriptor, which Windows has no
 // equivalent of here (fleet-mcp is unix-only too).
 #[cfg(unix)]
@@ -3482,8 +3482,8 @@ fn restore_on_port<P: nikon_fleet::ops::port::CameraPort + ?Sized>(
         }
         // The plan is printed first and then a plan that names what cannot be restored fails the
         // command (exit 1): a reader of --json gets the plan either way and tests the plan's own
-        // `unrestorable` list, not the status.
-        if let Some(msg) = unrestored_error(named, &plan.unrestorable) {
+        // `will_not_write` list, not the status.
+        if let Some(msg) = not_written_error(named, &plan.will_not_write) {
             bail!("{msg}");
         }
         return Ok(());
@@ -4476,11 +4476,12 @@ mod tests {
     // ── targeted restore verdict ─────────────────────────────────────────
 
     #[test]
-    fn unrestored_error_is_none_only_when_everything_named_was_written() {
-        assert_eq!(unrestored_error(Some(3), &[]), None);
-        let one = unrestored_error(Some(1), &[("ISO".into(), "read_only")]).unwrap();
+    fn not_written_error_is_none_only_when_everything_named_was_written() {
+        use nikon_fleet::ops::restore::NotWritten;
+        assert_eq!(not_written_error(Some(3), &[]), None);
+        let one = not_written_error(Some(1), &[NotWritten::new("ISO", "read_only")]).unwrap();
         assert!(one.contains("1 of 1 named property was not written") && one.contains("ISO (read_only)"), "{one}");
-        let two = unrestored_error(Some(5), &[("A".into(), "never_copied"), ("B".into(), "write_failed")]).unwrap();
+        let two = not_written_error(Some(5), &[NotWritten::new("A", "never_copied"), NotWritten::new("B", "write_failed")]).unwrap();
         assert!(two.contains("2 of 5 named properties were not written"), "{two}");
         assert!(two.contains("A (never_copied), B (write_failed)"), "{two}");
     }
@@ -4489,8 +4490,9 @@ mod tests {
     fn a_full_restore_never_fails_for_routine_skips() {
         // Without --only a restore skips absent, read-only and state properties
         // all the time; that must not become an error.
-        let skips = [("A".to_string(), "read_only"), ("B".to_string(), "never_copied")];
-        assert_eq!(unrestored_error(None, &skips), None);
+        use nikon_fleet::ops::restore::NotWritten;
+        let skips = [NotWritten::new("A", "read_only"), NotWritten::new("B", "never_copied")];
+        assert_eq!(not_written_error(None, &skips), None);
     }
 
     // ── capture gate and baseline seeding ────────────────────────────────
@@ -6634,7 +6636,7 @@ mod tests {
             assert_eq!(exit_code_for(&e), 1, "a dry run keeps the plain failure: {e:?}");
             assert!(!in_hand);
             let plan: serde_json::Value = serde_json::from_str(p.json().expect("the plan is printed before the failure")).unwrap();
-            assert_eq!(plan["unrestorable"][0][0], "kNkMAIDCapability_NotOnThisBody", "{plan}");
+            assert_eq!(plan["will_not_write"][0]["name"], "kNkMAIDCapability_NotOnThisBody", "{plan}");
             assert!(w.cam.writes().is_empty());
         }
 

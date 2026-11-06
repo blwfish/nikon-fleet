@@ -176,14 +176,15 @@ Tell the person to send `docs/range-scales/<model>.json` and `<model>-report.md`
 ## For the maintainer (not for the assistant)
 
 To add a model once its report is in: put the report in `docs/range-scales/`, add it to `REPORTS` in
-`src/range_policy.rs` (tests), add the model string to each `VERIFIED_RANGES` entry that compare shows as
+`src/range_policy.rs` (tests), add the model string to each `RangeVerified` record in `src/code_policy.rs` (`CodePolicy::range_verified`) that compare shows as
 SAME and the person confirmed (a new set constant per distinct group of models), and run `cargo test`.
 The tests check the table against the reports in both directions, so a range that matches but is left
 off, or listed but not backed by a report, fails, with one exception: a scale shared by two models whose
-code is on `NEVER_TRANSPLANT` or `NEVER_TRANSLATED` is accepted (the table test asks `never_skip`). So a range that matched but failed the
-meaning check (infinity landing somewhere unexpected, for example) cannot just be left off: put it on
-`NEVER_TRANSLATED` if only carrying it between bodies is the trouble (a restore of the same body still
-works), or on `NEVER_TRANSPLANT` if it is state or a read-out and should never be copied.
+code has a `NeverCopy` or `NeverTranslate` record is accepted (the table test asks `never_skip`). So a range that matched but failed the
+meaning check (infinity landing somewhere unexpected, for example) cannot just be left off: give its code a
+`NeverTranslate` record in `src/code_policy.rs` if only carrying it between bodies is the trouble (a restore of the same body still
+works), or a `NeverCopy` record if it is state or a read-out and should never be copied. A code has one record, so
+this replaces any `RangeVerified` one.
 
 Making the MCP server capture the model is separate: add a row to `docs/firmware-archive-spec.md` §2 from
 the probe in step 1, then add the stripped USB product string to `KNOWN_MODELS` in `src/ops/cameras.rs`

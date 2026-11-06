@@ -32,7 +32,7 @@ use crate::ops::plan::NotTransferable;
 use crate::ops::port::CameraPort;
 use crate::ops::readback::{SideEffects, side_effects};
 use crate::ops::restore::{
-    Counts, PlanCaveat, RestoreRun, Source, StepOutcome, StepResult, Verdict, Verification, coherent_for_write, execute_from, readback_caveat, undo_set,
+    Counts, NotWritten, PlanCaveat, RestoreRun, Source, StepOutcome, StepResult, Verdict, Verification, coherent_for_write, execute_from, readback_caveat, undo_set,
     verify_with,
 };
 use crate::ops::worker::{PHASE_PLAN_VERIFIED, PHASE_READ_BACK, PHASE_RESTORE_POINT_WRITTEN, PHASE_WRITING};
@@ -139,7 +139,7 @@ pub struct RestorePlanReport {
     pub would_change: usize,
     pub steps: Vec<PlanStep>,
     /// Named by `only` but not writable: they would not be restored.
-    pub unrestorable: Vec<(String, &'static str)>,
+    pub will_not_write: Vec<NotWritten>,
     /// Properties this plan would write whose read-back cannot confirm the write (typed, see
     /// [`PlanCaveat`]): the snapshot cannot tell the two states the value stands for apart, so the
     /// plan names the case. Empty for almost every plan.
@@ -248,7 +248,7 @@ pub fn build_restore_plan<P: CameraPort + ?Sized>(
             only: input.only.map(|s| s.iter().cloned().collect()),
             counts: run.counts(),
             would_change,
-            unrestorable: if input.only.is_some() { run.unrestored() } else { Vec::new() },
+            will_not_write: if input.only.is_some() { run.not_written() } else { Vec::new() },
             caveats: plan_caveats(&steps, input.source, &input.target.model),
             steps,
             cannot_read: NOT_TRANSFERABLE,
@@ -334,7 +334,7 @@ pub struct RestoreApplyReport {
     pub written: Vec<String>,
     pub write_errors: Vec<WriteError>,
     /// Named by `only` but not written.
-    pub unrestored: Vec<(String, &'static str)>,
+    pub not_written: Vec<NotWritten>,
     /// Tallies over the whole run (properties not selected are counted, not listed in `steps`).
     pub counts: Counts,
     pub steps: Vec<StepResult>,
@@ -395,9 +395,9 @@ pub fn apply_restore<P: CameraPort + ?Sized>(
         //    lands here instead of making another restore point.
         if n_change == 0 {
             let dry = now_run;
-            let unrestored = if req.plan.only.is_some() { dry.unrestored() } else { Vec::new() };
+            let not_written = if req.plan.only.is_some() { dry.not_written() } else { Vec::new() };
             // Nothing to write, but a range left alone because its scale changed is not "verified".
-            let status = if !unrestored.is_empty() {
+            let status = if !not_written.is_empty() {
                 ApplyStatus::Failed
             } else if dry.counts().skipped_scale > 0 {
                 ApplyStatus::AppliedUnverified
@@ -412,7 +412,7 @@ pub fn apply_restore<P: CameraPort + ?Sized>(
                 restore_point_gate_waived: false,
                 written: Vec::new(),
                 write_errors: Vec::new(),
-                unrestored,
+                not_written,
                 counts: dry.counts(),
                 steps: dry.steps.into_iter().filter(|s| s.outcome != StepOutcome::NotSelected).collect(),
                 verification: None,
@@ -446,7 +446,7 @@ pub fn apply_restore<P: CameraPort + ?Sized>(
                 _ => None,
             })
             .collect();
-        let unrestored = if req.plan.only.is_some() { run.unrestored() } else { Vec::new() };
+        let not_written = if req.plan.only.is_some() { run.not_written() } else { Vec::new() };
 
         // 5. Read back and judge what was written against the snapshot.
         progress(PHASE_READ_BACK);
@@ -466,9 +466,9 @@ pub fn apply_restore<P: CameraPort + ?Sized>(
 
         // A settable range the body's scale no longer matches was left alone: that is a property the
         // restore did not put back, so on a full restore (where it is not named, hence not in
-        // `unrestored`) the result cannot be called verified.
+        // `not_written`) the result cannot be called verified.
         let scale_skipped = run.counts().skipped_scale > 0;
-        let status = if !write_errors.is_empty() || !unrestored.is_empty() || all_rejected {
+        let status = if !write_errors.is_empty() || !not_written.is_empty() || all_rejected {
             ApplyStatus::Failed
         } else if scale_skipped {
             ApplyStatus::AppliedUnverified
@@ -493,7 +493,7 @@ pub fn apply_restore<P: CameraPort + ?Sized>(
             restore_point_gate_waived: gate_waived,
             written: written.into_iter().collect(),
             write_errors,
-            unrestored,
+            not_written,
             counts: run.counts(),
             steps: run.steps.into_iter().filter(|s| s.outcome != StepOutcome::NotSelected).collect(),
             verification: Some(verification),
@@ -784,7 +784,7 @@ mod tests {
         assert_eq!(p.steps.len(), 4, "unselected properties are counted, not listed");
         assert!(p.steps.iter().all(|s| s.changes == Some(true)));
         assert_eq!(p.summary, "Z 9 T1: restore from Z_9_base.json: 4 properties would change; only: ".to_string() + &f.only.iter().cloned().collect::<Vec<_>>().join(", "));
-        assert!(p.unrestorable.is_empty());
+        assert!(p.will_not_write.is_empty());
         assert_eq!(dir_files(&w), Vec::<String>::new(), "a plan leaves no file behind");
     }
 
@@ -824,9 +824,37 @@ mod tests {
         let f = fixture(&w);
         let p = plan_of(&w, &f);
         assert_eq!(p.would_change, 3);
-        assert_eq!(p.unrestorable, vec![(w.targets[1].0.clone(), "read_only")]);
+        assert_eq!(p.will_not_write, vec![NotWritten::new(w.targets[1].0.clone(), "read_only")]);
         let all = build_restore_plan(&w.cam, &input(&f, None)).unwrap();
-        assert!(all.unrestorable.is_empty(), "an untargeted restore does not list every skip as a failure");
+        assert!(all.will_not_write.is_empty(), "an untargeted restore does not list every skip as a failure");
+    }
+
+    /// The restore reports have no schema file; this is the schema. A key added, dropped or renamed
+    /// in `RestorePlanReport` / `RestoreApplyReport` fails here, and the lists of properties a
+    /// targeted restore did not write are objects with named fields, not `[name, tag]` pairs.
+    #[test]
+    fn the_restore_reports_serialise_under_the_documented_keys_and_name_the_unwritten_properties() {
+        let w = world_with(|c, t| c.with(t[1].1, OP_GET, json!("ro")), 0);
+        let mut f = fixture(&w);
+        f.only = BTreeSet::from([w.targets[1].0.clone()]);
+        let plan = serde_json::to_value(plan_of(&w, &f)).unwrap();
+        let sorted_keys = |v: &serde_json::Value| {
+            let mut k = v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+            k.sort();
+            k
+        };
+        let mut want = ["caveats", "cannot_read", "counts", "digest", "only", "source", "source_label", "steps", "summary", "target", "will_not_write", "would_change"]
+            .map(String::from)
+            .to_vec();
+        want.sort();
+        assert_eq!(sorted_keys(&plan), want);
+        assert_eq!(plan["will_not_write"], json!([{"name": w.targets[1].0, "reason": "read_only"}]));
+        let report = serde_json::to_value(apply_planned(&w, &f).unwrap()).unwrap();
+        assert_eq!(report["not_written"], json!([{"name": w.targets[1].0, "reason": "read_only"}]));
+        for old in ["unrestorable", "unrestored"] {
+            assert!(plan.get(old).is_none() && report.get(old).is_none(), "{old} was renamed");
+        }
+        assert!(report.as_object().unwrap().contains_key("write_errors") && report.as_object().unwrap().contains_key("written"));
     }
 
     #[test]
@@ -943,7 +971,7 @@ mod tests {
         assert!(!r.no_op);
         assert_eq!(phases, ["plan_verified", "restore_point_written", "writing", "read_back"]);
         assert_eq!(r.written.len(), 4);
-        assert!(r.write_errors.is_empty() && r.unrestored.is_empty());
+        assert!(r.write_errors.is_empty() && r.not_written.is_empty());
         assert_eq!(r.verification.as_ref().unwrap().verdict, Verdict::Verified);
         assert!(r.side_effects.as_ref().unwrap().is_empty());
         assert_eq!(r.undo_set, r.written, "no side effects: the undo set is the written set");
@@ -993,7 +1021,7 @@ mod tests {
         .unwrap();
         assert_eq!(r.status, ApplyStatus::AppliedVerified);
         assert!(r.written.len() > 100, "an untargeted restore writes every writable property");
-        assert!(r.unrestored.is_empty(), "skips are not failures without --only");
+        assert!(r.not_written.is_empty(), "skips are not failures without --only");
     }
 
     #[test]
@@ -1024,7 +1052,7 @@ mod tests {
         let r = apply_planned(&w, &f).unwrap();
         assert!(r.no_op);
         assert_eq!(r.status, ApplyStatus::Failed);
-        assert_eq!(r.unrestored, vec![(w.targets[1].0.clone(), "read_only")]);
+        assert_eq!(r.not_written, vec![NotWritten::new(w.targets[1].0.clone(), "read_only")]);
         assert!(w.cam.writes().is_empty() && dir_files(&w).is_empty());
     }
 
@@ -1034,7 +1062,7 @@ mod tests {
         let f = fixture(&w);
         let r = apply_planned(&w, &f).unwrap();
         assert_eq!(r.written.len(), 3);
-        assert_eq!(r.unrestored, vec![(w.targets[1].0.clone(), "read_only")]);
+        assert_eq!(r.not_written, vec![NotWritten::new(w.targets[1].0.clone(), "read_only")]);
         assert_eq!(r.status, ApplyStatus::Failed, "what was asked for was not all done");
         assert_eq!(r.verification.as_ref().unwrap().verdict, Verdict::Verified, "what was written did take");
     }
@@ -1081,7 +1109,7 @@ mod tests {
     #[test]
     fn a_full_restore_that_leaves_a_range_alone_because_its_scale_changed_is_not_verified() {
         // The body's range is on a 751-step scale now, the snapshot's on 1225: the range is skipped
-        // (range_scale_differs). Not named, so not "unrestored"; but a settable property was not put
+        // (range_scale_differs). Not named, so not "not_written"; but a settable property was not put
         // back, so the result is applied_unverified, with the count saying why.
         let now = json!({"value": 0.0, "default": 0.0, "value_index": 100, "default_index": 0, "lower": 2500.0, "upper": 10000.0, "steps": 751});
         let w = world_with(|c, t| c.with(t[3].1, RW, now.clone()), 0);
@@ -1110,7 +1138,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r2.status, ApplyStatus::Failed);
-        assert_eq!(r2.unrestored, [(w.targets[3].0.clone(), "range_scale_differs")]);
+        assert_eq!(r2.not_written, [NotWritten::new(w.targets[3].0.clone(), "range_scale_differs")]);
     }
 
     #[test]
@@ -1153,7 +1181,7 @@ mod tests {
         let f = fixture(&w);
         let p = build_restore_plan(&w.cam, &input(&f, None)).unwrap();
         let r = run_all(&w, &f, &p).unwrap();
-        assert!(r.unrestored.is_empty());
+        assert!(r.not_written.is_empty());
         assert_eq!(r.write_errors.len(), 1);
         assert_eq!(r.status, ApplyStatus::Failed);
     }
@@ -1460,7 +1488,7 @@ mod tests {
         let r = run_policy(&w, &f, BodyPolicy::SameModel, GatePolicy::Strict).unwrap();
         assert!(w.cam.writes().iter().all(|(code, _)| *code != 33086), "ShootingLimit was written");
         assert_eq!(r.status, ApplyStatus::Failed, "a named property that cannot be restored is a failure");
-        assert!(r.unrestored.iter().any(|(n, why)| n.ends_with("ShootingLimit") && *why == "never_copied"));
+        assert!(r.not_written.iter().any(|n| n.name.ends_with("ShootingLimit") && n.reason == "never_copied"));
     }
 
     #[test]

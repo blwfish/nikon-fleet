@@ -3,7 +3,7 @@
 //! counting are testable without a camera; `main.rs` decides where each part is printed.
 
 use nikon_fleet::ops::apply::{ApplyReport, ApplyStatus, Readback};
-use nikon_fleet::ops::restore::{Counts, PlanCaveat, PlanCaveatKind, StepOutcome, StepResult, undo_command};
+use nikon_fleet::ops::restore::{Counts, NotWritten, PlanCaveat, PlanCaveatKind, StepOutcome, StepResult, undo_command};
 use nikon_fleet::ops::restore_flow::{PlanStep, RestoreApplyReport};
 use nikon_fleet::transplant::{Severity, SkipReason, Strategy, TransplantOutcome};
 
@@ -24,7 +24,7 @@ pub fn render_transplant(outcomes: &[TransplantOutcome], dry_run: bool) -> Trans
     let (mut literal, mut enum_label, mut enum_raw, mut range) = (0usize, 0usize, 0usize, 0usize);
     let (mut absent, mut read_only, mut unsupported_type, mut no_match) = (0usize, 0usize, 0usize, 0usize);
     let (mut type_mismatch, mut sdk_decode, mut name_mismatch, mut ambiguous) = (0usize, 0usize, 0usize, 0usize);
-    let (mut never, mut other) = (0usize, 0usize);
+    let (mut never, mut other, mut shape_mismatch) = (0usize, 0usize, 0usize);
     let (mut range_unverified, mut range_scale) = (0usize, 0usize);
     let mut raw_unconfirmed: Vec<(String, String)> = Vec::new();
     let mut literal_unconfirmed: Vec<(String, String)> = Vec::new();
@@ -42,7 +42,7 @@ pub fn render_transplant(outcomes: &[TransplantOutcome], dry_run: bool) -> Trans
                     Strategy::Literal => literal += 1,
                     Strategy::EnumByLabel => enum_label += 1,
                     Strategy::EnumByRawValue => enum_raw += 1,
-                    Strategy::RangeClamped => range += 1,
+                    Strategy::RangeByPosition => range += 1,
                 }
             }
             Err(reason) => {
@@ -53,7 +53,7 @@ pub fn render_transplant(outcomes: &[TransplantOutcome], dry_run: bool) -> Trans
                     SkipReason::NoMatchingOption => no_match += 1,
                     SkipReason::WriteFailed(_) => out.errors += 1,
                     SkipReason::EnumTypeMismatch { .. } => type_mismatch += 1,
-                    SkipReason::EnumUndecodedBySdk { .. } => sdk_decode += 1,
+                    SkipReason::UndecodedBySdk { .. } => sdk_decode += 1,
                     SkipReason::CapabilityNameMismatch { .. } => name_mismatch += 1,
                     SkipReason::AmbiguousLabel { .. } => ambiguous += 1,
                     // Policy skips, not problems: routine and numerous, so counted, not warned about one by one.
@@ -62,7 +62,11 @@ pub fn render_transplant(outcomes: &[TransplantOutcome], dry_run: bool) -> Trans
                     SkipReason::LiteralUnconfirmed { proposed } => literal_unconfirmed.push((o.name.clone(), proposed.clone())),
                     SkipReason::RangeUnverified { .. } => range_unverified += 1,
                     SkipReason::RangeScaleDiffers { .. } => range_scale += 1,
-                    SkipReason::UnsupportedValueShape | SkipReason::TargetReadFailed(_) | SkipReason::MalformedSource => other += 1,
+                    SkipReason::ShapeMismatch { .. } => shape_mismatch += 1,
+                    SkipReason::UnsupportedValueShape { .. }
+                    | SkipReason::RangeHasNoSpan
+                    | SkipReason::TargetReadFailed(_)
+                    | SkipReason::MalformedSource { .. } => other += 1,
                 }
                 // Whether to warn is the reason's own severity, not a second table here.
                 if matches!(reason.severity(), Severity::Warn | Severity::Error) {
@@ -75,10 +79,11 @@ pub fn render_transplant(outcomes: &[TransplantOutcome], dry_run: bool) -> Trans
     out.written = literal + enum_label + enum_raw + range;
     out.stdout.push_str(&format!(
         "{} written={} (literal={literal} enum-by-label={enum_label} \
-         enum-by-raw-value={enum_raw} range-clamped={range})\n  \
+         enum-by-raw-value={enum_raw} range-by-position={range})\n  \
          skipped(absent)={absent} skipped(read-only)={read_only} \
          skipped(unsupported-type)={unsupported_type} skipped(no-matching-option)={no_match} \
-         skipped(type-mismatch)={type_mismatch} skipped(sdk-decode-failure)={sdk_decode} \
+         skipped(type-mismatch)={type_mismatch} skipped(shape-mismatch)={shape_mismatch} \
+         skipped(sdk-decode-failure)={sdk_decode} \
          skipped(name-mismatch)={name_mismatch} skipped(ambiguous-label)={ambiguous} \
          skipped(never-copied)={never} skipped(raw-code-unconfirmed)={} \
          skipped(literal-unconfirmed)={} \
@@ -285,19 +290,19 @@ pub fn render_restore_apply(r: &RestoreApplyReport) -> String {
 /// The error for a targeted restore that did not write everything it was
 /// asked to: `named` is how many properties `--only` selected (`None` for a
 /// full restore, which skips many properties routinely and never fails for
-/// that), `unrestored` each named property that was not written (or, in a dry
+/// that), `not_written` each named property that was not written (or, in a dry
 /// run, would not be) with a closed reason tag. `None` when everything named
 /// was (or would be) written.
-pub fn unrestored_error(named: Option<usize>, unrestored: &[(String, &'static str)]) -> Option<String> {
+pub fn not_written_error(named: Option<usize>, not_written: &[NotWritten]) -> Option<String> {
     let named = named?;
-    if unrestored.is_empty() {
+    if not_written.is_empty() {
         return None;
     }
-    let list: Vec<String> = unrestored.iter().map(|(n, why)| format!("{n} ({why})")).collect();
+    let list: Vec<String> = not_written.iter().map(NotWritten::to_string).collect();
     Some(format!(
         "targeted restore incomplete: {} of {named} named propert{} not written: {}",
-        unrestored.len(),
-        if unrestored.len() == 1 { "y was" } else { "ies were" },
+        not_written.len(),
+        if not_written.len() == 1 { "y was" } else { "ies were" },
         list.join(", ")
     ))
 }
@@ -311,7 +316,7 @@ pub fn restore_failure(r: &RestoreApplyReport, named: Option<usize>, readback_fa
             r.write_errors.len()
         ));
     }
-    if let Some(msg) = unrestored_error(named, &r.unrestored) {
+    if let Some(msg) = not_written_error(named, &r.not_written) {
         return Some(msg);
     }
     if readback_failed {
@@ -338,13 +343,13 @@ pub fn refusal_hint(tag: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nikon_fleet::transplant::ResolvedChoice;
+    use nikon_fleet::transplant::{PlannedWrite, ResolvedChoice};
 
     fn copied(name: &str, code: u32, s: Strategy) -> TransplantOutcome {
-        TransplantOutcome { name: name.into(), code, result: Ok(s), choice: None, planned: None }
+        TransplantOutcome::copied(name, code, s, None, PlannedWrite { value: serde_json::json!(0), changes: None })
     }
     fn skipped(name: &str, code: u32, r: SkipReason) -> TransplantOutcome {
-        TransplantOutcome { name: name.into(), code, result: Err(r), choice: None, planned: None }
+        TransplantOutcome::skipped(name, code, r)
     }
 
     fn text(o: &[TransplantOutcome], dry: bool) -> TransplantText {
@@ -358,12 +363,12 @@ mod tests {
             copied("B", 2, Strategy::EnumByLabel),
             copied("C", 3, Strategy::EnumByLabel),
             copied("D", 4, Strategy::EnumByRawValue),
-            copied("E", 5, Strategy::RangeClamped),
+            copied("E", 5, Strategy::RangeByPosition),
         ];
         let dry = text(&o, true);
         assert_eq!(dry.written, 5);
         assert!(dry.stdout.contains("  would write  A [0x1]  via "));
-        assert!(dry.stdout.contains("Dry run: written=5 (literal=1 enum-by-label=2 enum-by-raw-value=1 range-clamped=1)"));
+        assert!(dry.stdout.contains("Dry run: written=5 (literal=1 enum-by-label=2 enum-by-raw-value=1 range-by-position=1)"));
         let real = text(&o, false);
         assert!(!real.stdout.contains("would write"), "a real run lists nothing per property");
         assert!(real.stdout.starts_with("Transplant complete: written=5"));
@@ -548,7 +553,7 @@ mod tests {
             restore_point_gate_waived: false,
             written: vec![],
             write_errors: vec![],
-            unrestored: vec![],
+            not_written: vec![],
             counts: Counts::default(),
             steps: vec![],
             verification: None,
@@ -595,7 +600,7 @@ mod tests {
         w.write_errors = vec![nikon_fleet::ops::apply::WriteError { name: "A".into(), message: "m".into() }];
         assert!(restore_failure(&w, None, false).unwrap().contains("1 capability write(s) failed"));
         let mut u = restore_report();
-        u.unrestored = vec![("B".into(), "read_only")];
+        u.not_written = vec![NotWritten::new("B", "read_only")];
         assert!(restore_failure(&u, Some(2), false).unwrap().contains("targeted restore incomplete: 1 of 2"));
         assert_eq!(restore_failure(&u, None, false), None, "a full restore never fails for routine skips");
         assert!(restore_failure(&ok, None, true).unwrap().contains("did not take effect"));
@@ -609,11 +614,11 @@ mod tests {
 
     #[test]
     fn unrestored_error_pluralises_and_lists_reasons() {
-        assert_eq!(unrestored_error(None, &[("A".into(), "absent_on_target")]), None);
-        assert_eq!(unrestored_error(Some(3), &[]), None);
-        let one = unrestored_error(Some(3), &[("A".into(), "read_only")]).unwrap();
+        assert_eq!(not_written_error(None, &[NotWritten::new("A", "absent_on_target")]), None);
+        assert_eq!(not_written_error(Some(3), &[]), None);
+        let one = not_written_error(Some(3), &[NotWritten::new("A", "read_only")]).unwrap();
         assert_eq!(one, "targeted restore incomplete: 1 of 3 named property was not written: A (read_only)");
-        let two = unrestored_error(Some(3), &[("A".into(), "read_only"), ("B".into(), "absent_on_target")]).unwrap();
+        let two = not_written_error(Some(3), &[NotWritten::new("A", "read_only"), NotWritten::new("B", "absent_on_target")]).unwrap();
         assert!(two.contains("2 of 3 named properties were not written") && two.contains("A (read_only), B (absent_on_target)"));
     }
 }

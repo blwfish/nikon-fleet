@@ -4,6 +4,7 @@
 //! Keeping the logic in `lib.rs` makes it directly testable and reusable.
 
 pub mod camera_lock;
+pub mod code_policy;
 mod config_parse;
 pub mod diag;
 pub mod diff;

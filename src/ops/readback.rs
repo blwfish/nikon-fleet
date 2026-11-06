@@ -148,7 +148,7 @@ pub fn residual(
 mod tests {
     use super::*;
     use crate::snapshot::{Camera, Transport};
-    use crate::transplant::NEVER_TRANSPLANT;
+    use crate::code_policy::never_copy_table;
     use serde_json::{Value, json};
 
     fn snap(props: &[(&str, u32, Value)]) -> Snapshot {
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn volatile_never_copy_and_default_index_noise_are_not_side_effects() {
-        let never = &NEVER_TRANSPLANT[0];
+        let never = &never_copy_table()[0];
         let before = snap(&[
             ("kNkMAIDCapability_AngleLevel", 10, json!(1)),
             ("kNkMAIDCapability_DateTime", 11, json!("a")),
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn residual_skips_volatile_and_never_copy_even_if_named() {
-        let never = &NEVER_TRANSPLANT[0];
+        let never = &never_copy_table()[0];
         let source = snap(&[("kNkMAIDCapability_AngleLevel", 10, json!(1)), (never.1, never.0, json!(0))]);
         let readback = snap(&[("kNkMAIDCapability_AngleLevel", 10, json!(5)), (never.1, never.0, json!(1))]);
         let written = set(&["kNkMAIDCapability_AngleLevel", never.1]);

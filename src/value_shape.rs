@@ -20,6 +20,72 @@ pub(crate) fn is_range_shape(value: &Value) -> bool {
     value.is_object() && value.get("lower").is_some() && value.get("upper").is_some()
 }
 
+/// What a snapshot or live value is, as a closed vocabulary. The one place the question "what
+/// kind of value is this?" is answered, so that a skip can say what it found instead of a
+/// string, and so that "enum", "range" and "number" mean here what `is_enum_shape` etc. mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueKind {
+    Null,
+    Bool,
+    Number,
+    String,
+    Enum,
+    Range,
+    /// `sdk::decode_value`'s `{"_type": "datetime"}` placeholder.
+    Datetime,
+    /// `sdk::decode_value`'s `{"_type": "array"}` placeholder.
+    Array,
+    /// Any other placeholder or object (`{"_unknown_type": ..}`, or a shape nothing here knows).
+    Other,
+}
+
+impl ValueKind {
+    /// The snake_case name, as serialized.
+    pub fn tag(self) -> &'static str {
+        match self {
+            ValueKind::Null => "null",
+            ValueKind::Bool => "bool",
+            ValueKind::Number => "number",
+            ValueKind::String => "string",
+            ValueKind::Enum => "enum",
+            ValueKind::Range => "range",
+            ValueKind::Datetime => "datetime",
+            ValueKind::Array => "array",
+            ValueKind::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for ValueKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.tag())
+    }
+}
+
+/// Classify `value`. Enum and range are decided by [`is_enum_shape`] / [`is_range_shape`]; a JSON
+/// array, or an object that is neither, is `Other` unless it is a named placeholder.
+pub fn value_kind(value: &Value) -> ValueKind {
+    if is_enum_shape(value) {
+        return ValueKind::Enum;
+    }
+    if is_range_shape(value) {
+        return ValueKind::Range;
+    }
+    match value {
+        Value::Null => ValueKind::Null,
+        Value::Bool(_) => ValueKind::Bool,
+        Value::Number(_) => ValueKind::Number,
+        Value::String(_) => ValueKind::String,
+        Value::Object(o) => match o.get("_type").and_then(Value::as_str) {
+            Some("datetime") => ValueKind::Datetime,
+            Some("array") => ValueKind::Array,
+            _ => ValueKind::Other,
+        },
+        Value::Array(_) => ValueKind::Other,
+    }
+}
+
 /// `lower`, `upper` and `steps` of a range-shaped value, or `None` if any is missing or not a
 /// number of the right kind (`null` included).
 pub(crate) fn range_scale(value: &Value) -> Option<(f64, f64, u64)> {
@@ -99,6 +165,32 @@ mod tests {
         assert!(!is_range_shape(&json!({"values": []})));
         assert!(!is_range_shape(&json!(5)));
         assert!(!is_enum_shape(&json!("Standard")));
+    }
+
+    #[test]
+    fn value_kind_names_every_shape_and_keeps_placeholders_apart() {
+        assert_eq!(value_kind(&json!(true)), ValueKind::Bool);
+        assert_eq!(value_kind(&json!(0)), ValueKind::Number);
+        assert_eq!(value_kind(&json!("")), ValueKind::String, "an empty string is still a string");
+        assert_eq!(value_kind(&Value::Null), ValueKind::Null);
+        assert_eq!(value_kind(&json!({"values": [1], "value_index": 0})), ValueKind::Enum);
+        assert_eq!(value_kind(&stepped(0.0, 10.0, 11, 3)), ValueKind::Range);
+        assert_eq!(value_kind(&json!({"_type": "datetime"})), ValueKind::Datetime);
+        assert_eq!(value_kind(&json!({"_type": "array"})), ValueKind::Array);
+        assert_eq!(value_kind(&json!({"_type": "something_new"})), ValueKind::Other);
+        assert_eq!(value_kind(&json!({"_unknown_type": 99})), ValueKind::Other);
+        assert_eq!(value_kind(&json!({})), ValueKind::Other);
+        assert_eq!(value_kind(&json!([1, 2])), ValueKind::Other);
+        // Every kind has a distinct tag and serializes as it.
+        let all = [
+            ValueKind::Null, ValueKind::Bool, ValueKind::Number, ValueKind::String, ValueKind::Enum,
+            ValueKind::Range, ValueKind::Datetime, ValueKind::Array, ValueKind::Other,
+        ];
+        let tags: std::collections::BTreeSet<&str> = all.iter().map(|k| k.tag()).collect();
+        assert_eq!(tags.len(), all.len());
+        for k in all {
+            assert_eq!(serde_json::to_value(k).unwrap(), json!(k.tag()));
+        }
     }
 
     #[test]

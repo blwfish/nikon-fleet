@@ -480,7 +480,7 @@ pub fn apply_transplant<P: CameraPort + ?Sized>(
                 // have changed.
                 Err(SkipReason::WriteFailed(msg)) => {
                     may_have_landed.insert(name.clone());
-                    write_errors.push(WriteError { name, message: msg.clone() });
+                    write_errors.push(WriteError { name, message: msg.to_string() });
                 }
                 // The dry run cannot see a write being rejected, and a full restore treats a kind the
                 // body will not take as routine (a few are on every run); so does this. Reported, and a
@@ -1169,7 +1169,7 @@ mod tests {
     fn the_undo_set_of_an_apply_with_a_read_only_side_effect_is_accepted_by_the_undo() {
         // Writing the first property makes a read-only property on the body change. It lands in the
         // side effects, and an undo that was told to put it back would have failed (a read-only
-        // property is skipped, an unrestored named property is a failure).
+        // property is skipped, an not_written named property is a failure).
         let probe = world();
         let read_only = baseline_for("Z 9").unwrap().readable[50].code;
         let w = world_with(
@@ -1186,7 +1186,7 @@ mod tests {
         let rp = Snapshot::load_from_file(w.dir.path().join(&r.restore_point.as_ref().unwrap().file)).unwrap();
         let only = crate::ops::restore::resolve_only(&r.undo_set, &rp.properties).expect("every undo_set name is in the restore point");
         let run = crate::ops::restore::execute(&w.cam, &rp.properties, Some(&only), false);
-        assert!(run.unrestored().is_empty(), "{:?}", run.unrestored());
+        assert!(run.not_written().is_empty(), "{:?}", run.not_written());
     }
 
     #[test]

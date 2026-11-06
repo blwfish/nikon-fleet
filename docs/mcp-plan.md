@@ -261,7 +261,10 @@ later behind writes with the same name-only rule).
 ### 5.1 Outcomes
 
 Each property yields `TransplantOutcome { name, code, result: Result<Strategy, SkipReason>,
-choice: Option<ResolvedChoice> }`. For the MCP both enums serialise as **closed string tags**, with
+choice: Option<ResolvedChoice>, planned: Option<PlannedWrite>, live_read_error: Option<ErrorText> }`, built
+with `TransplantOutcome::copied` / `::skipped` (a copied outcome has a planned write; a skipped one has neither
+choice nor planned write). `live_read_error` is present when the target's current value of a numeric property
+could not be read (the plan then shows `changes: null`, and now says why). For the MCP both enums serialise as **closed string tags**, with
 a separate typed detail field where one exists (e.g. `write_failed` + `detail`), never the Display
 text. The tag mapping is an **exhaustive `match` with no wildcard arm**, so a new variant fails to
 compile until mapped.
@@ -271,7 +274,7 @@ compile until mapped.
 | `literal` | scalar copied as-is |
 | `enum_by_label` | packed-string enum matched on the whole label |
 | `enum_by_raw_value` | enum matched by raw numeric code (weaker; see `raw_code_unconfirmed`) |
-| `range_clamped` | range position carried to the same position on the same scale (the name is from when it also clamped into a differing scale; that is now `range_scale_differs`, §5.3a). A range with no span (FocalLength, 0..0) is a read-out and is never copied |
+| `range_by_position` | range position carried to the same position on the same scale (it was `range_clamped`, from when it also clamped into a differing scale; that is now `range_scale_differs`, §5.3a, and nothing is clamped or rescaled). A range with no span (FocalLength, 0..0) is a read-out (`range_has_no_span`) and is never copied |
 
 | `SkipReason` tag | Routine? | Meaning |
 |---|---|---|
@@ -279,11 +282,16 @@ compile until mapped.
 | `read_only` | routine | target does not allow setting it |
 | `unsupported_write_type` | routine | SDK rejected the capability kind |
 | `no_matching_option` | **warn** | the source's choice does not exist on the target |
-| `unsupported_value_shape` | **warn** | not a scalar/enum/range this code can translate |
+| `unsupported_value_shape` | **warn** | not a scalar/enum/range this code can translate; `detail.kind` is `null`, `datetime`, `array` or `other` (`ValueKind`) |
+| `range_has_no_span` | **warn** | a range with the same number at both ends (FocalLength 0..0): a read-out, not a setting |
+| `shape_mismatch` | **warn** | the source and the target's live value are different kinds (`detail.source` / `detail.target`, a `ValueKind`): an enum or range onto a target holding something else, or a number onto an enum, range, string or null. Never written, and `allow_raw_code` does not override it |
 | `target_read_failed` | **warn** | the live read of the target failed (detail: SDK error) |
-| `malformed_source` | **warn** | corrupt or hand-edited snapshot value (includes pre-fix snapshots whose packed-string `values` are `[]`) |
+| `malformed_source` | **warn** | corrupt or hand-edited snapshot value (includes pre-fix snapshots whose packed-string `values` are `[]`); `detail.why` says which defect (`MalformedWhy`: `no_value_index`, `no_values`, `values_not_array`, `value_index_out_of_range`, `non_string_element`, `no_elem_bytes`, `unknown_elem_type`, `one_byte_per_element_without_type`, `range_scale`, `range_value`). Capturing again is the fix for all |
 | `write_failed` | **error** | the write itself failed (detail: SDK error) |
-| `enum_undecoded_by_sdk` | **warn** | SDK could not decode the options, or the selected label is the `"Resource String not found"` placeholder |
+
+SDK error text in `detail.message` carries `truncated` (boolean) and, when it was cut at 500 bytes, `original_bytes`; the
+`[truncated, N bytes total]` marker stays in the text for a person, but nothing needs to look for it.
+| `undecoded_by_sdk` | **warn** | SDK could not decode a value (the options of an enum, the scale of a range, an unrecognised `elem_type`), or the selected label is the `"Resource String not found"` placeholder; `detail.side` is `source` or `target` (it was `enum_undecoded_by_sdk`) |
 | `enum_type_mismatch` | **warn** | label enum on one side, raw-code on the other |
 | `capability_name_mismatch` | **warn** | the code has unrelated names on the two models |
 | `ambiguous_label` | **warn** | the chosen label repeats in either body's option list (e.g. `ISOControlSensitivity` lists most ISO values twice) |
@@ -303,13 +311,16 @@ field) and the plan still proceeds.
 
 ### 5.2 Never-copy table
 
-A second table, `NEVER_TRANSLATED` (today only `ShootingLimit`), holds real settings that read as a different
+All per-code policy lives in one table, `code_policy::CODE_POLICY`, with at most one record per code: a rule
+(`NeverCopy`, `NeverTranslate`, `RangeVerified`, or `Open`) and optional name aliases. It replaced three parallel
+tables (`NEVER_TRANSPLANT`, `NEVER_TRANSLATED`, `range_policy::VERIFIED_RANGES`) and the alias list; the paragraphs
+below describe the three kinds of record under their old table names. `NeverTranslate` (today only `ShootingLimit`) holds real settings that read as a different
 position per body. A transplant between bodies skips them; a restore of the body's own snapshot writes them; a
 restore of **another body's** snapshot (the CLI's `restore --serial`, `ops::restore::Source::OtherBody`) skips them
 too. Whether a snapshot is the body's own is decided from the serials: an empty serial or the `id-N` fallback never
 identifies a body, so it is treated as another body's (fail closed).
 
-`NEVER_TRANSPLANT` (code, name, reason) is the single source of truth, read by `precheck` in
+The `NeverCopy` records (code, name, reason) are the single source of truth, read by `precheck` in
 transplant **and** `restore_precheck` in restore through `never_copied`. It is checked before any
 live read or write and has no override. It holds properties that report what the body or session
 is doing, or lock it: `LockCamera`, `LiveViewStatus`, `CurrentItemID` (these two already failed
@@ -336,7 +347,7 @@ interpret. Caveat, not tested: a Z6III snapshot taken at infinity stores index 1
 A range is a position on a scale, and the same position need not mean the same thing on another body (F25: `ShootingLimit`,
 max shots per burst, has 0 to 200 on a Z 9 and a Z6III and reads infinity as index 0 on one and index 1 on the other, and
 the Z5 has 1 to 100 and no infinity). So copying a range between two **different** models is allowed only when the
-property is on `range_policy::VERIFIED_RANGES` for both models; a copy within one model is always allowed (the scale is the
+property is a `RangeVerified` record in `code_policy::CODE_POLICY` for both models; a copy within one model is always allowed (the scale is the
 same by identity). A model nobody has captured, such as a Z8, is refused until someone reads it and adds it:
 `range_unverified`, a policy skip with no override. Separately, whatever the models, a target whose live `lower`,
 `upper` or `steps` differ from the source's is `range_scale_differs` (exact comparison: these are SDK constants), so the

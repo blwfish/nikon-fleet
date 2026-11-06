@@ -28,8 +28,14 @@ use crate::ops::port::CameraPort;
 use crate::snapshot::{Camera, Snapshot};
 use crate::transplant::{CodeNameGuard, Severity, TransplantOptions, TransplantOutcome, transplant};
 
-/// Bump when the digest's input changes, so an old digest never matches a new one.
-pub const DIGEST_FORMAT: u32 = 1;
+/// Bump when the digest's input changes, so an old digest never matches a new one. The input
+/// includes each outcome's skip `tag` and its strategy tag, so renaming or splitting one of those
+/// changes it too.
+///
+/// 2: `range_clamped` became `range_by_position`; `unsupported_value_shape` was split into
+/// `range_has_no_span`, `shape_mismatch` and a kind; `enum_undecoded_by_sdk` became
+/// `undecoded_by_sdk`.
+pub const DIGEST_FORMAT: u32 = 2;
 
 pub struct PlanInput<'a> {
     pub source: &'a Snapshot,
@@ -218,7 +224,7 @@ pub fn build_plan<P: CameraPort + ?Sized>(port: &P, guard: &CodeNameGuard, input
 fn judge_plan(plan: &PlanReport) -> (crate::diag::Outcome, Vec<(&'static str, crate::diag::Val)>) {
     use crate::diag::{Outcome, Val};
     let total = plan.outcomes.len();
-    let unread = plan.counts.by_tag.get(crate::transplant::SkipReason::TargetReadFailed(String::new()).tag()).copied().unwrap_or(0);
+    let unread = plan.counts.by_tag.get(crate::transplant::SkipReason::TargetReadFailed(Default::default()).tag()).copied().unwrap_or(0);
     let outcome = if total > 0 && unread == total { Outcome::Failed } else { Outcome::Ok };
     (
         outcome,
@@ -474,12 +480,12 @@ mod tests {
         let last_routine = tags.iter().rposition(|t| matches!(*t, "read_only" | "absent_on_target")).unwrap();
         let first_policy = tags.iter().position(|t| *t == "literal_unconfirmed").unwrap();
         assert!(first_policy < last_routine, "policy before routine: {tags:?}");
-        // The enum whose target holds a non-enum is a warn-severity skip (`no_matching_option`); it
+        // The enum whose target holds a non-enum is a warn-severity skip (`shape_mismatch`); it
         // must exist, and come before the policy skips. (Error severity, `write_failed`, cannot occur
         // in a plan: nothing is written.)
         let first_warn = tags
             .iter()
-            .position(|t| *t == "target_read_failed" || *t == "no_matching_option" || *t == "enum_undecoded_by_sdk")
+            .position(|t| *t == "shape_mismatch")
             .unwrap_or_else(|| panic!("the fixture must produce a warn-severity skip: {tags:?}"));
         assert!(first_warn < first_policy, "warn before policy: {tags:?}");
     }
@@ -626,6 +632,7 @@ mod tests {
             result: Ok(Strategy::Literal),
             choice: None,
             planned,
+            live_read_error: None,
         };
         assert!(!would_change(&outcome(None)));
         assert!(would_change(&outcome(Some(PlannedWrite { value: json!(1), changes: None }))));
@@ -642,7 +649,30 @@ mod tests {
         let target = cam("Z 8", "T1");
         let o = opts(&["Num"]);
         let report = build_plan(&c, &guard(&entries), &PlanInput { source: &src, source_bytes: b"fixed source bytes", target: &target, options: &o });
-        assert_eq!(report.digest, "5a41695ba4fcfeade8091fd65a4229b7c494f201de6f091a469593a033de63da");
+        assert_eq!(report.digest, "a96a08c51f1ec0b978d1d7ff7050268646aeaf960b8d3e9fe7069461f39114e5");
+    }
+
+    /// The digest covers each outcome's strategy tag and skip tag by name, so a vocabulary change
+    /// (format 2 renamed `range_clamped`) must show up in a digest and not be absorbed. This plan
+    /// copies a range (`range_by_position`) and skips a number onto an enum (`shape_mismatch`).
+    #[test]
+    fn golden_digest_pins_the_range_and_shape_mismatch_tags() {
+        assert_eq!(DIGEST_FORMAT, 2, "bump it, and this test's golden, when the digest's input changes");
+        let rg = json!({"value": 0.0, "default": 0.0, "value_index": 612, "default_index": 612, "lower": 0.0, "upper": 1224.0, "steps": 1225});
+        let en = json!({"value_index": 0, "default_index": 0, "elem_count": 2, "elem_type": 2, "elem_bytes": 4, "values": [7, 8]});
+        let entries = vec![("Rng", 33049, rg.clone()), ("Mis", 9, json!(7))];
+        let c = FakeCamera::new().with(33049, RW, rg).with(9, RW, en);
+        let (src, _) = source_of("Z 9", &entries);
+        let target = cam("Z 9", "T1");
+        let caps: Vec<(&str, u32)> = entries.iter().map(|(n, c, _)| (*n, *c)).collect();
+        let g = CodeNameGuard::new(&parse_config(&[("Z 9", &caps)]), "Z 9", "Z 9").unwrap();
+        let o = opts(&["Mis"]);
+        let report = build_plan(&c, &g, &PlanInput { source: &src, source_bytes: b"fixed source bytes", target: &target, options: &o });
+        let tags: Vec<&str> = report.outcomes.iter().map(tag_of).collect();
+        assert_eq!(tags, ["shape_mismatch", "copied"], "outcomes are in the plan's own order");
+        let strategies: Vec<Option<&str>> = report.outcomes.iter().map(|o| o.result.as_ref().ok().map(|s| s.tag())).collect();
+        assert_eq!(strategies, [None, Some("range_by_position")]);
+        assert_eq!(report.digest, "b08c19c0a1411e9c267f7e64041c93ea279ffbb79b1d4e8544d6e1406f6ca95c");
     }
 
     // ── the plan span's judgement (diag) ─────────────────────────────────

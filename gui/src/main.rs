@@ -2834,6 +2834,8 @@ fn detail_text(detail: &Option<serde_json::Value>) -> String {
         return String::new();
     };
     map.iter()
+        // `truncated: false` is the common case and says nothing; `true` (and `original bytes`) are shown.
+        .filter(|(k, v)| !(k.as_str() == "truncated" && **v == serde_json::Value::Bool(false)))
         .map(|(k, v)| match v {
             serde_json::Value::String(s) => format!("{}: {s}", k.replace('_', " ")),
             other => format!("{}: {other}", k.replace('_', " ")),
@@ -7065,7 +7067,8 @@ mod tests {
     use nikon_fleet::ops::port::{FakeCamera, Failure};
     use nikon_fleet::sdk::{OP_GET, OP_SET};
     use nikon_fleet::transplant::{
-        CodeNameGuard, PlannedWrite, ResolvedChoice, SkipReason, Strategy, TransplantOptions, TransplantOutcome,
+        CodeNameGuard, MalformedWhy, PlannedWrite, ResolvedChoice, Side, SkipReason, Strategy, TransplantOptions,
+        TransplantOutcome, ValueKind,
     };
 
     const TP_FILE: &str = "2026-10-27T100000Z_Z6_3_SRC.json";
@@ -7086,17 +7089,17 @@ mod tests {
     }
 
     fn copied(name: &str, code: u32, strategy: Strategy, choice: Option<ResolvedChoice>, changes: Option<bool>) -> TransplantOutcome {
-        TransplantOutcome {
-            name: format!("kNkMAIDCapability_{name}"),
+        TransplantOutcome::copied(
+            format!("kNkMAIDCapability_{name}"),
             code,
-            result: Ok(strategy),
+            strategy,
             choice,
-            planned: Some(PlannedWrite { value: serde_json::json!(0), changes }),
-        }
+            PlannedWrite { value: serde_json::json!(0), changes },
+        )
     }
 
     fn skipped(name: &str, code: u32, reason: SkipReason) -> TransplantOutcome {
-        TransplantOutcome { name: format!("kNkMAIDCapability_{name}"), code, result: Err(reason), choice: None, planned: None }
+        TransplantOutcome::skipped(format!("kNkMAIDCapability_{name}"), code, reason)
     }
 
     fn choice(target: u64, current: u64) -> Option<ResolvedChoice> {
@@ -7214,11 +7217,13 @@ mod tests {
             SkipReason::ReadOnly,
             SkipReason::UnsupportedWriteType,
             SkipReason::NoMatchingOption,
-            SkipReason::UnsupportedValueShape,
+            SkipReason::UnsupportedValueShape { kind: ValueKind::Datetime },
+            SkipReason::RangeHasNoSpan,
+            SkipReason::ShapeMismatch { source: ValueKind::Number, target: ValueKind::Enum },
             SkipReason::TargetReadFailed("x".into()),
-            SkipReason::MalformedSource,
+            SkipReason::MalformedSource { why: MalformedWhy::NoValues },
             SkipReason::WriteFailed("x".into()),
-            SkipReason::EnumUndecodedBySdk { side: "source", reason: "x".into() },
+            SkipReason::UndecodedBySdk { side: Side::Source, reason: "x".into() },
             SkipReason::EnumTypeMismatch { source_elem_type: 7, target_elem_type: 5 },
             SkipReason::CapabilityNameMismatch { source_names: "A".into(), target_names: "B".into() },
             SkipReason::AmbiguousLabel { label: "125".into(), source_count: 2, target_count: 1 },
@@ -7247,6 +7252,15 @@ mod tests {
         for o in parsed.outcomes.iter().filter(|o| o.needs_opt_in()) {
             assert_eq!(o.reason.as_ref().unwrap().severity, Severity::Policy);
         }
+    }
+
+    #[test]
+    fn a_truncated_error_text_says_so_to_a_person_and_an_intact_one_does_not() {
+        let detail = |r: SkipReason| Some(serde_json::to_value(r).unwrap()["detail"].clone());
+        let whole = detail_text(&detail(SkipReason::WriteFailed("-125".into())));
+        assert_eq!(whole, "message: -125", "an intact message shows no truncation noise");
+        let cut = detail_text(&detail(SkipReason::WriteFailed(nikon_fleet::transplant::ErrorText::capped("e".repeat(600), 500))));
+        assert!(cut.contains("truncated: true") && cut.contains("original bytes: 600"), "{cut}");
     }
 
     #[test]

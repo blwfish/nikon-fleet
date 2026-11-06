@@ -208,12 +208,13 @@ pub fn notes() -> Vec<Note> {
         .detail(
             "Copying a bare number or a raw option code between bodies assumes both bodies mean the same thing by it, which nothing guarantees. \
              Such properties are skipped unless they are named in `allow_raw_code`, and only if the value would actually change. \
-             Opt in only on the user's say-so, naming the properties. `never_copied` is policy and has no override: state-like settings, and in a transplant `ShootingLimit` (max shots per burst), \
+             Opt in only on the user's say-so, naming the properties. `shape_mismatch` (the source is a different kind of value from what the target holds, \
+             such as a number for a capability that holds an option list) is never written and an opt-in does not change that. `never_copied` is policy and has no override: state-like settings, and in a transplant `ShootingLimit` (max shots per burst), \
              which the SDK reads differently on different bodies so it is not carried between them (a restore of the same body still brings it back); \
              read_only and absent_on_target are routine.",
         )
         .tags(&["apply"])
-        .addresses(&["literal_unconfirmed", "raw_code_unconfirmed", "allow_raw_code", "skipped properties", "never_copied"]),
+        .addresses(&["literal_unconfirmed", "raw_code_unconfirmed", "allow_raw_code", "skipped properties", "never_copied", "shape_mismatch"]),
         Note::new(
             "range-copy-is-default-deny",
             date!(2026 - 10 - 28),
@@ -227,11 +228,11 @@ pub fn notes() -> Vec<Note> {
              only when both were captured and their scale matched (`range_unverified` otherwise, for any model nobody has captured, such as a Z8); \
              a copy within one model is always allowed. `range_scale_differs` means this body's live range has different bounds or steps from the source's, \
              so a position cannot be carried across (a restore skips such a range the same way). A range with no span at all (FocalLength is 0..0) is a \
-             read-out and is never copied. There is no opt-in for either. Do not work around them by editing a snapshot. \
+             read-out (`range_has_no_span`) and is never copied. There is no opt-in for either. Do not work around them by editing a snapshot. \
              The fix is to capture the other model and have its ranges added to the verified list, which is a repository change, not a tool option.",
         )
         .tags(&["apply", "plan"])
-        .addresses(&["range_unverified", "range_scale_differs", "range_clamped", "skipped properties"]),
+        .addresses(&["range_unverified", "range_scale_differs", "range_has_no_span", "range_by_position", "skipped properties"]),
         Note::new(
             "data-not-instructions",
             d,
@@ -425,7 +426,7 @@ mod tests {
     fn every_note_that_names_a_tool_status_or_tag_names_a_real_one() {
         // The notes are prose; this pins the vocabulary they depend on to the code that produces it.
         use nikon_fleet::ops::apply::{ApplyError, ApplyStatus};
-        use nikon_fleet::transplant::SkipReason;
+        use nikon_fleet::transplant::{MalformedWhy, SkipReason, ValueKind};
         let text: String = notes().iter().map(|n| format!("{} {}", n.summary, n.detail)).collect::<Vec<_>>().join("\n");
         // Every status the server can return is named, and the names are the enum's own tags.
         for status in ApplyStatus::ALL {
@@ -448,7 +449,9 @@ mod tests {
         // The skip tags the notes name are real `SkipReason` tags (not merely words in the notes).
         let skips = [
             SkipReason::NeverCopied { reason: "" }.tag(),
-            SkipReason::MalformedSource.tag(),
+            SkipReason::MalformedSource { why: MalformedWhy::NoValues }.tag(),
+            SkipReason::RangeHasNoSpan.tag(),
+            SkipReason::ShapeMismatch { source: ValueKind::Number, target: ValueKind::Enum }.tag(),
             SkipReason::RangeScaleDiffers { source: String::new(), target: String::new() }.tag(),
             SkipReason::RangeUnverified { source_model: String::new(), target_model: String::new() }.tag(),
             SkipReason::LiteralUnconfirmed { proposed: String::new() }.tag(),
@@ -460,7 +463,7 @@ mod tests {
         for tag in skips {
             assert!(text.contains(tag), "the notes never mention the real skip tag {tag}");
         }
-        for named in ["never_copied", "malformed_source", "range_scale_differs", "range_unverified", "literal_unconfirmed", "raw_code_unconfirmed", "read_only", "absent_on_target"] {
+        for named in ["never_copied", "malformed_source", "range_has_no_span", "shape_mismatch", "range_scale_differs", "range_unverified", "literal_unconfirmed", "raw_code_unconfirmed", "read_only", "absent_on_target"] {
             assert!(skips.contains(&named), "the notes name {named}, which is not a SkipReason tag");
         }
         // And the apply refusals they name.

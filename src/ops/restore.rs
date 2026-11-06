@@ -4,7 +4,7 @@
 //! table, so anything changed on the camera after the snapshot was taken is
 //! overwritten. A snapshot of *another* body (the CLI's `restore --serial` onto a second
 //! body of one model) also leaves out the settings that read as a different position per
-//! body ([`transplant::NEVER_TRANSLATED`], i.e. `ShootingLimit`); see [`Source`]. A range
+//! body ([`code_policy::CopyRule::NeverTranslate`], i.e. `ShootingLimit`); see [`Source`]. A range
 //! is written back only onto the scale it was read on. A targeted restore (`--only`) writes back just the named
 //! properties and leaves everything else alone; that is the undo of a
 //! transplant (docs/mcp-plan.md §5.6): restore the properties the apply wrote
@@ -28,9 +28,9 @@ use crate::value_shape::{is_range_shape, is_stepped_range, range_scale, range_va
 /// Why a snapshot property is not written back by `restore`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreSkip {
-    /// On [`transplant::NEVER_TRANSPLANT`] (it reports body/session state, or locks it, rather
+    /// On [`crate::code_policy::CopyRule::NeverCopy`] (it reports body/session state, or locks it, rather
     /// than holding a setting), or, for a snapshot of another body ([`Source::OtherBody`]), on
-    /// [`transplant::NEVER_TRANSLATED`] (a setting that reads as a different position per body).
+    /// [`crate::code_policy::CopyRule::NeverTranslate`] (a setting that reads as a different position per body).
     /// The same tables `transplant` uses, so the two commands cannot disagree about what is state. A
     /// restore point must not generate errors for properties the camera
     /// refuses to set (`CurrentItemID` and `LiveViewStatus` failed -125 on
@@ -82,7 +82,7 @@ impl RestoreSkip {
 
 /// Whose settings a restore is carrying: the body's own, or another body's.
 ///
-/// [`transplant::NEVER_TRANSLATED`] settings read as different positions on different bodies, so
+/// [`crate::code_policy::CopyRule::NeverTranslate`] settings read as different positions on different bodies, so
 /// they come back only when the snapshot is of the very body being restored. A snapshot of another
 /// body of the same model (the CLI's `restore --serial`) carries nothing the target can interpret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,14 +388,35 @@ impl RestoreRun {
 
     /// Selected properties that were not (or, in a dry run, would not be)
     /// written, with a closed reason tag. Meaningful for a targeted restore.
-    pub fn unrestored(&self) -> Vec<(String, &'static str)> {
+    pub fn not_written(&self) -> Vec<NotWritten> {
         self.steps
             .iter()
             .filter(|s| {
                 !matches!(s.outcome, StepOutcome::NotSelected | StepOutcome::Written | StepOutcome::WouldWrite)
             })
-            .map(|s| (s.name.clone(), s.outcome.tag()))
+            .map(|s| NotWritten::new(s.name.clone(), s.outcome.tag()))
             .collect()
+    }
+}
+
+/// A property a targeted restore (`only`) named that was not written (in a plan: will not be), and
+/// why, as the closed tag of the step that skipped it (`RestoreSkip` / `StepOutcome::tag`). Named
+/// fields rather than a `[name, tag]` pair so the JSON says what each element is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotWritten {
+    pub name: String,
+    pub reason: String,
+}
+
+impl NotWritten {
+    pub fn new(name: impl Into<String>, reason: &str) -> Self {
+        NotWritten { name: name.into(), reason: reason.to_string() }
+    }
+}
+
+impl std::fmt::Display for NotWritten {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.name, self.reason)
     }
 }
 
@@ -776,11 +797,11 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    // ── restore_precheck (moved from main.rs; shares NEVER_TRANSPLANT) ───
+    // ── restore_precheck (moved from main.rs; shares code_policy) ───
 
     #[test]
     fn precheck_skips_every_never_transplant_code_even_when_writable() {
-        for (code, name, _) in transplant::NEVER_TRANSPLANT {
+        for (code, name, _) in &crate::code_policy::never_copy_table() {
             let c = cap(*code, OP_GET | OP_SET);
             let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(*code, &c)]);
             assert_eq!(restore_precheck(&caps, *code).err(), Some(RestoreSkip::NeverCopied), "{name}");
@@ -801,7 +822,7 @@ mod tests {
     fn precheck_restores_shooting_limit_like_its_neighbours() {
         // A restore returns a body to what the same body stored, so there is nothing to interpret and
         // the setting comes back (user decision, 2026-10-28). Only a transplant between bodies refuses it
-        // (`NEVER_TRANSLATED`). At, below and above the code.
+        // (`NeverTranslate`). At, below and above the code.
         for code in [33085, 33086, 33087] {
             let c = cap(code, OP_GET | OP_SET);
             let caps: HashMap<u32, &CapabilityInfo> = HashMap::from([(code, &c)]);
@@ -815,7 +836,7 @@ mod tests {
 
     #[test]
     fn precheck_policy_skip_wins_over_absent_and_read_only() {
-        let code = transplant::NEVER_TRANSPLANT[0].0;
+        let code = crate::code_policy::never_copy_table()[0].0;
         let empty: HashMap<u32, &CapabilityInfo> = HashMap::new();
         assert_eq!(restore_precheck(&empty, code).err(), Some(RestoreSkip::NeverCopied));
         let ro = cap(code, OP_GET);
@@ -825,7 +846,7 @@ mod tests {
 
     #[test]
     fn precheck_ordinary_codes_keep_their_existing_behaviour() {
-        let denied: BTreeSet<u32> = transplant::NEVER_TRANSPLANT.iter().map(|(c, _, _)| *c).collect();
+        let denied: BTreeSet<u32> = crate::code_policy::never_copy_table().iter().map(|(c, _, _)| *c).collect();
         let near: Vec<u32> = denied.iter().flat_map(|c| [c - 1, c + 1]).filter(|c| !denied.contains(c)).collect();
         assert!(!near.is_empty());
         for code in near {
@@ -842,10 +863,10 @@ mod tests {
     #[test]
     fn every_ambiguous_readback_is_a_property_a_restore_of_the_same_body_writes() {
         // The caveat table must name a property the other tables know under the same code and name,
-        // or it describes nothing: ShootingLimit is on NEVER_TRANSLATED (restored only onto its own body).
+        // or it describes nothing: ShootingLimit is a NeverTranslate record (restored only onto its own body).
         for &(code, _, _) in AMBIGUOUS_READBACKS {
-            let (c, name, _) = transplant::NEVER_TRANSLATED.iter().find(|(c, _, _)| *c == code).expect("listed code is a known property");
-            assert_eq!((*c, *name), (33086, "kNkMAIDCapability_ShootingLimit"));
+            let (c, name, _) = crate::code_policy::never_translate_table().into_iter().find(|(c, _, _)| *c == code).expect("listed code is a known property");
+            assert_eq!((c, name), (33086, "kNkMAIDCapability_ShootingLimit"));
         }
         assert_eq!(AMBIGUOUS_READBACKS, &[(33086, "Z6_3", 1)]);
         assert_eq!(PlanCaveatKind::ReadbackCannotConfirm.tag(), "readback_cannot_confirm");
@@ -939,7 +960,7 @@ mod tests {
 
     /// Snapshot with: A writable, B writable, C read-only, D absent on the camera, L never-copied.
     fn fixture() -> (BTreeMap<String, PropertyEntry>, Vec<CapabilityInfo>) {
-        let never = transplant::NEVER_TRANSPLANT[0].0;
+        let never = crate::code_policy::never_copy_table()[0].0;
         (
             props(&[("A", 100), ("B", 200), ("C", 300), ("D", 400), ("L", never)]),
             vec![cap(100, OP_GET | OP_SET), cap(200, OP_GET | OP_SET), cap(300, OP_GET), cap(never, OP_GET | OP_SET)],
@@ -1056,7 +1077,7 @@ mod tests {
 
     #[test]
     fn a_full_restore_writes_every_writable_property_and_only_those() {
-        let never = transplant::NEVER_TRANSPLANT[0].0;
+        let never = crate::code_policy::never_copy_table()[0].0;
         let cam = FakeCamera::new()
             .with(1, RW, json!(0))
             .with(2, RW, json!(0))
@@ -1129,7 +1150,7 @@ mod tests {
         assert_eq!(cam.writes(), [(1, json!(10))]);
         assert_eq!(cam.value(2), Some(json!(0)), "B differs from the snapshot and is left alone");
         assert_eq!(run.counts().not_selected, 1);
-        assert!(run.unrestored().is_empty());
+        assert!(run.not_written().is_empty());
     }
 
     #[test]
@@ -1226,7 +1247,7 @@ mod tests {
         let c = run.counts();
         assert_eq!((c.written, c.errors, c.skipped_type), (1, 1, 1));
         assert_eq!(run.written_names(), BTreeSet::from(["C".to_string()]), "a failed write is not written");
-        assert_eq!(run.unrestored(), [("A".to_string(), "write_failed"), ("B".to_string(), "unsupported_write_type")]);
+        assert_eq!(run.not_written(), [NotWritten::new("A", "write_failed"), NotWritten::new("B", "unsupported_write_type")]);
     }
 
     #[test]
@@ -1235,7 +1256,7 @@ mod tests {
         let snap = snapshot_of(&[("A", 1, 10), ("C", 3, 30), ("D", 4, 40)]);
         let only = BTreeSet::from(["A".to_string(), "C".to_string()]);
         let run = execute(&cam, &snap.properties, Some(&only), false);
-        assert_eq!(run.unrestored(), [("C".to_string(), "read_only")], "D was not asked for");
+        assert_eq!(run.not_written(), [NotWritten::new("C", "read_only")], "D was not asked for");
     }
 
     #[test]
@@ -1575,7 +1596,7 @@ mod tests {
         snap.insert("A_Range", 1, stepped(612));
         let only = BTreeSet::from(["A_Range".to_string()]);
         let run = execute(&cam, &snap.properties, Some(&only), false);
-        assert_eq!(run.unrestored(), [("A_Range".to_string(), "range_scale_differs")]);
+        assert_eq!(run.not_written(), [NotWritten::new("A_Range", "range_scale_differs")]);
     }
 
     #[test]

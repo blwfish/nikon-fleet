@@ -225,7 +225,7 @@ pub(crate) struct RestorePlanJson {
     pub(crate) would_change: usize,
     pub(crate) steps: Vec<RestoreStepJson>,
     /// Named by `only` but not writable: they would not be restored.
-    pub(crate) unrestorable: Vec<(String, String)>,
+    pub(crate) will_not_write: Vec<nikon_fleet::ops::restore::NotWritten>,
     /// Writes this plan would make whose read-back cannot confirm them (the library's own typed
     /// caveat). Absent from a plan made by a build that predates the field.
     #[serde(default)]
@@ -265,7 +265,7 @@ pub(crate) struct RestoreApplyJson {
     pub(crate) restore_point_gate_waived: bool,
     pub(crate) written: Vec<String>,
     pub(crate) write_errors: Vec<WriteErrorJson>,
-    pub(crate) unrestored: Vec<(String, String)>,
+    pub(crate) not_written: Vec<nikon_fleet::ops::restore::NotWritten>,
     pub(crate) counts: RestoreCountsJson,
     pub(crate) steps: Vec<RestoreStepResultJson>,
     pub(crate) verification: Option<VerificationJson>,
@@ -375,7 +375,7 @@ impl PlannedRestore {
     /// the plan is for more, or it names what cannot be restored (a new plan, limited to the ticks,
     /// no longer names it).
     pub(crate) fn can_plan_selection(&self) -> bool {
-        !self.selected.is_empty() && (self.selection_diverged() || !self.plan.unrestorable.is_empty())
+        !self.selected.is_empty() && (self.selection_diverged() || !self.plan.will_not_write.is_empty())
     }
 
     /// Why this plan cannot be offered for confirmation, if it cannot. The one gate: the button, the
@@ -391,8 +391,8 @@ impl PlannedRestore {
         if changing == 0 {
             return Some("This plan would change nothing, so there is nothing to restore.".to_string());
         }
-        if !self.plan.unrestorable.is_empty() {
-            let list: Vec<String> = self.plan.unrestorable.iter().map(|(n, why)| format!("{} ({})", short_name(n), why.replace('_', " "))).collect();
+        if !self.plan.will_not_write.is_empty() {
+            let list: Vec<String> = self.plan.will_not_write.iter().map(|n| format!("{} ({})", short_name(&n.name), n.reason.replace('_', " "))).collect();
             return Some(format!(
                 "These were named but cannot be restored, so this plan cannot be applied: {}. Narrow the selection or restore everything.",
                 list.join(", ")
@@ -670,8 +670,8 @@ pub(crate) fn restore_report_lines(r: &RestoreApplyJson) -> Vec<(Level, String)>
     for e in &r.write_errors {
         line(Level::Error, format!("Write failed: {}: {}", short_name(&e.name), printable_text(&e.message)));
     }
-    if !r.unrestored.is_empty() {
-        let list: Vec<String> = r.unrestored.iter().map(|(n, why)| format!("{} ({why})", short_name(n))).collect();
+    if !r.not_written.is_empty() {
+        let list: Vec<String> = r.not_written.iter().map(|n| format!("{} ({})", short_name(&n.name), n.reason)).collect();
         line(Level::Error, format!("Named but NOT written: {}", list.join(", ")));
     }
     let rejected = r.steps.iter().filter(|s| s.outcome.tag == StepTag::UnsupportedWriteType).count();
@@ -1396,7 +1396,7 @@ mod tests {
     use nikon_fleet::ops::apply::{EXIT_REFUSED_BEFORE_WRITE, EXIT_STALE_PLAN};
     use nikon_fleet::ops::baseline::{GatePolicy, baseline_for};
     use nikon_fleet::ops::port::{FakeCamera, Failure};
-    use nikon_fleet::ops::restore::{RestoreSkip, StepOutcome};
+    use nikon_fleet::ops::restore::{NotWritten, RestoreSkip, StepOutcome};
     use nikon_fleet::ops::restore_flow::{
         BodyPolicy, RestoreApplyRequest, RestorePlanInput, apply_restore, build_restore_plan,
     };
@@ -1763,13 +1763,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Named properties that cannot be restored: the plan is printed, then the command ends 1.
         let w = world();
-        let mut unrestorable: serde_json::Value = serde_json::from_str(&plan_text(&w, None)).unwrap();
-        unrestorable["unrestorable"] = serde_json::json!([["kNkMAIDCapability_X", "read_only"]]);
-        fs::write(dir.path().join("plan.json"), unrestorable.to_string()).unwrap();
+        let mut will_not_write: serde_json::Value = serde_json::from_str(&plan_text(&w, None)).unwrap();
+        will_not_write["will_not_write"] = serde_json::json!([{"name": "kNkMAIDCapability_X", "reason": "read_only"}]);
+        fs::write(dir.path().join("plan.json"), will_not_write.to_string()).unwrap();
         let cli = recording_cli(dir.path(), &format!("cat '{}/plan.json'\necho 'targeted restore incomplete' >&2\nexit 1", dir.path().display()));
         let scan = || scan_of(vec![usb("Z 9", "T1")]);
         let (plan, _) = restore_plan_via(&cli, Path::new("/d"), &request(None), &scan, T).unwrap();
-        assert_eq!(plan.unrestorable, [("kNkMAIDCapability_X".to_string(), "read_only".to_string())]);
+        assert_eq!(plan.will_not_write, [NotWritten::new("kNkMAIDCapability_X", "read_only")]);
 
         let busy = recording_cli(dir.path(), "echo 'camera busy' >&2\nexit 1");
         let e = restore_plan_via(&busy, Path::new("/d"), &request(None), &scan, T).unwrap_err();
@@ -1937,7 +1937,7 @@ mod tests {
         // a change count of zero is not
         assert!(!PlannedRestore::new(request.clone(), plan_of(&world_with(&[0, 1, 2], &[], None)), all_shown(), String::new(), false).applicable());
         let mut named = plan_of(&world());
-        named.unrestorable = vec![("kNkMAIDCapability_X".into(), "read_only".into())];
+        named.will_not_write = vec![NotWritten::new("kNkMAIDCapability_X", "read_only")];
         assert!(!PlannedRestore::new(request, named, all_shown(), String::new(), false).applicable());
     }
 
@@ -2523,15 +2523,15 @@ mod tests {
         let w = world();
         let (mut ui, cameras) = ui_for(&w);
         let mut p = planned_of(&ui).clone();
-        p.plan.unrestorable = vec![("kNkMAIDCapability_X".into(), "read_only".into())];
+        p.plan.will_not_write = vec![NotWritten::new("kNkMAIDCapability_X", "read_only")];
         assert!(!p.selection_diverged(), "everything that changes is ticked");
-        assert!(p.can_plan_selection(), "and a new plan without the unrestorable name is still possible");
+        assert!(p.can_plan_selection(), "and a new plan without the will_not_write name is still possible");
         assert!(!p.applicable());
         // nothing ticked: still not possible
         p.selected.clear();
         assert!(!p.can_plan_selection());
         // through the window
-        ui.stage = Stage::Planned(PlannedRestore { plan: RestorePlanJson { unrestorable: vec![("kNkMAIDCapability_X".into(), "read_only".into())], ..planned_of(&ui).plan.clone() }, ..planned_of(&ui).clone() });
+        ui.stage = Stage::Planned(PlannedRestore { plan: RestorePlanJson { will_not_write: vec![NotWritten::new("kNkMAIDCapability_X", "read_only")], ..planned_of(&ui).plan.clone() }, ..planned_of(&ui).clone() });
         assert!(matches!(ui.plan_selection(&cameras), Ok(Cmd::Plan(_))));
     }
 
@@ -2837,7 +2837,7 @@ mod tests {
         let lines = |r: &RestoreApplyJson| restore_report_lines(r);
         let l = lines(&report_with(|v| v["side_effects"] = json!({"changed": ["kNkMAIDCapability_A"], "vanished": ["kNkMAIDCapability_B"], "appeared": ["kNkMAIDCapability_C"]})));
         assert!(says(&l, Level::Warn, "Changed without being written: A (changed), B (vanished), C (appeared)"), "{l:?}");
-        let l = lines(&report_with(|v| v["unrestored"] = json!([["kNkMAIDCapability_A", "read_only"]])));
+        let l = lines(&report_with(|v| v["not_written"] = json!([{"name": "kNkMAIDCapability_A", "reason": "read_only"}])));
         assert!(says(&l, Level::Error, "Named but NOT written: A (read_only)"), "{l:?}");
         let l = lines(&report_with(|v| v["restore_point_gate_waived"] = json!(true)));
         assert!(says(&l, Level::Warn, "did not pass the model's completeness check"), "{l:?}");
@@ -3035,7 +3035,7 @@ mod tests {
         // a plan that is blocked, and one that names what cannot be restored
         app.restore.stage = Stage::Idle;
         let mut blocked = arrived(&w, None);
-        blocked.0.unrestorable = vec![("kNkMAIDCapability_X".into(), "read_only".into())];
+        blocked.0.will_not_write = vec![NotWritten::new("kNkMAIDCapability_X", "read_only")];
         blocked.2 = SourceView { loaded: false, note: Some("gone".into()), ..SourceView::default() };
         app.restore.stage = Stage::Planning(request.clone());
         app.restore.plan_arrived(request, Ok(blocked));

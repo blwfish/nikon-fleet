@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Range scale reports: the evidence behind range_policy::VERIFIED_RANGES.
+"""Range scale reports: the evidence behind the RangeVerified records in code_policy::CODE_POLICY.
 
     range_scales.py dump SNAPSHOT.json [--out REPORT.json]
         Reduce a snapshot to its numeric ranges (code, lower, upper, steps, default_index, value_index)
