@@ -22,9 +22,11 @@
 //! writes, built from scratch via [`FtpProfile`]/[`encode_ftp_profile`] —
 //! its data-blob layout was mapped by diffing three real captured
 //! instances, and the encoder is verified byte-for-byte against two of them
-//! in tests; the third, a 331-byte variant with an extra optional field, is
-//! not modelled). `0x9413` (IPTC profile write) is not — its data-blob
-//! preamble couldn't be decoded from existing captures (only two instances
+//! in tests; the third, a 331-byte variant with a folder string, is decoded
+//! but not written: the blob layout is one table, [`ftp_layout::FTP_LAYOUT`],
+//! from which the encoder, the decoder and the write gate are all driven, so
+//! enabling that form is an edit of the table). `0x9413` (IPTC profile write)
+//! is not — its data-blob preamble couldn't be decoded from existing captures (only two instances
 //! exist anywhere and they're byte-identical), so there's no way to construct
 //! arbitrary IPTC content safely yet. See the doc's open items.
 //!
@@ -1168,6 +1170,9 @@ fn decode_response_params(payload: &[u8]) -> Result<Vec<u32>, PtpUsbError> {
         .collect())
 }
 
+#[cfg(test)]
+mod ftp_golden;
+
 // ─────────────────────────────────────────────────────────────────────────
 // 0x90EE FTP-profile blob
 //
@@ -1185,35 +1190,12 @@ fn decode_response_params(payload: &[u8]) -> Result<Vec<u32>, PtpUsbError> {
 // camera's own menu.
 // ─────────────────────────────────────────────────────────────────────────
 
-const FTP_BLOB_HEADER: [u8; 2] = [0xf4, 0x01];
+pub mod ftp_layout;
+pub use ftp_layout::{FtpSecretSpan, FtpSecretSpans};
 
-/// The 82 bytes between the profile-name field and the SSID section, which
-/// every real capture carried byte-identically, decoded (the field map in
-/// the doc calls it "unresolved"):
-///
-/// - two UTF-16 strings, `"00000000T000000"` each (a date-time shape,
-///   all zeros), each `[u8 length 16][16 UTF-16LE units]`: 66 bytes;
-/// - then 16 bytes: tag `02 03`, `03`, **`57 42 a8 c0`**, `18`, and eight
-///   zero bytes. `57 42 a8 c0` read as a little-endian `u32` is
-///   `c0.a8.42.57` = 192.168.66.87, the Z 9's own address on the capture rig
-///   (the doc's header names it), and `0x18` is 24: an IPv4 address and a
-///   /24 prefix length.
-///
-/// So the part that varied nowhere in three captures only because all three
-/// came from one rig is the address of that rig's camera. [`FtpCameraNetwork`]
-/// is that part as a parameter. What the camera does with it (does it set a
-/// static address? is it ignored?) is **not known**; the default stays the
-/// captured value because writing zeros or another address was never tried.
-const FTP_TEMPLATE_TIMESTAMP_PLACEHOLDER: &str = "00000000T000000";
-const FTP_TEMPLATE_NETWORK_TAG: [u8; 3] = [0x02, 0x03, 0x03];
-const FTP_TEMPLATE_NETWORK_PAD: [u8; 8] = [0; 8];
-/// Length in bytes of the template block [`encode_template_block`] writes.
-#[cfg(test)]
-const FTP_TEMPLATE_LEN: usize = 82;
-
-/// The address-shaped part of the 82-byte template block (see
-/// [`FTP_TEMPLATE_TIMESTAMP_PLACEHOLDER`]'s notes): an IPv4 address and prefix
-/// length. [`FtpCameraNetwork::CAPTURED`] is what all three captures carried.
+/// The address-shaped part of the 82-byte template block (see the notes on
+/// [`ftp_layout::FTP_LAYOUT`]): an IPv4 address and prefix length.
+/// [`FtpCameraNetwork::CAPTURED`] is what all three captures carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FtpCameraNetwork {
     /// Dotted-quad octets in reading order, e.g. `[192, 168, 66, 87]`. (On
@@ -1229,31 +1211,12 @@ impl FtpCameraNetwork {
     pub const CAPTURED: FtpCameraNetwork = FtpCameraNetwork { ipv4: [192, 168, 66, 87], prefix_len: 24 };
 }
 
-const FTP_TAG_SSID_24GHZ: [u8; 4] = [0x03, 0x00, 0x01, 0x00];
-/// The first byte of that tag is `03` in every July/November capture and in
-/// what the encoder writes, but `00` in profiles that began life in the
-/// camera's own menu (seen 2026-07-11 on a Z 9: the profiles `NxProfile` and
-/// `FtpPi`, both lineally derived from one made on the camera). The decoder
-/// accepts either and keeps the byte as [`DecodedFtpProfile::ssid24_lead`].
-const FTP_TAG_SSID_24GHZ_LEADS: [u8; 2] = [0x03, 0x00];
-const FTP_TAG_SSID_5GHZ: [u8; 2] = [0x04, 0x04];
-const FTP_TAG_HOST: u8 = 0x01;
-const FTP_TAG_USERNAME: [u8; 3] = [0x00, 0x15, 0x00];
-const FTP_TAG_PORT_SECTION: [u8; 2] = [0x05, 0x00];
-const FTP_PORT_SECTION_PAD: [u8; 5] = [0, 0, 0, 0, 0];
-const FTP_IPV6_PLACEHOLDER: &str = "0000:0000:0000:0000:0000:0000:0000:0000";
-/// Appears once, immediately after the *first* of the three IPv6-placeholder
-/// fields only (not after the second) — asymmetric in every real capture we
-/// have. Meaning unknown; copied verbatim.
-const FTP_IPV6_FIELD1_SEPARATOR: u8 = 0x40;
-const FTP_BLOB_TRAILER: u8 = 0x81;
-
 const FTP_PROFILE_NAME_MAX_UNITS: usize = 253; // + null terminator = 254, the most a 1-byte length prefix allows here
 const FTP_SSID_MAX_BYTES: usize = 32; // 802.11
 const FTP_HOST_MAX_UNITS: usize = 199; // + null terminator = 200; a guess, the prefix would allow 254
 const FTP_CREDENTIAL_MAX_BYTES: usize = 64; // generous; real usernames/passwords are far shorter
 
-/// How a field's value is laid out on the wire.
+/// How a text value is laid out on the wire. Stated once, per value, in [`ftp_layout::FTP_LAYOUT`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FtpEncoding {
     /// `[u32 length in bytes, no null][content]`. The encoder writes ASCII only; the decoder reads
@@ -1261,6 +1224,10 @@ pub enum FtpEncoding {
     AsciiU32Len,
     /// `[u8 length in UTF-16 units incl. null][utf16le content + null]`.
     Utf16U8Len,
+    /// [`Self::Utf16U8Len`], except that the encoder writes the empty string as the single count byte
+    /// `00` (no null terminator), as the 317- and 325-byte captures carry the folder. The decoder reads
+    /// both forms of an empty string.
+    Utf16U8LenOptional,
 }
 
 /// The unit a field's limit is expressed in.
@@ -1314,9 +1281,9 @@ pub struct FtpFieldSpec {
     pub key: &'static str,
     /// Name for a "missing field(s)" message.
     pub display_name: &'static str,
-    pub encoding: FtpEncoding,
     /// Longest value accepted, in [`FtpFieldSpec::unit`]s of *content* (the
-    /// null terminator of a UTF-16 field is not counted).
+    /// null terminator of a UTF-16 field is not counted). The unit is that of
+    /// [`Self::encoding`], which the layout states.
     pub max_len: usize,
     /// Whether surrounding whitespace is ignored when checking the field is
     /// non-empty. The password is checked as typed: a leading or trailing
@@ -1325,11 +1292,13 @@ pub struct FtpFieldSpec {
 }
 
 impl FtpFieldSpec {
+    /// The wire form of this field, as [`ftp_layout::FTP_LAYOUT`] states it (the one place it is).
+    pub fn encoding(&self) -> FtpEncoding {
+        ftp_layout::encoding_of(ftp_layout::FTP_LAYOUT, self.field).expect("FTP_LAYOUT places every FtpField (pinned by a test)")
+    }
+
     pub fn unit(&self) -> FtpLenUnit {
-        match self.encoding {
-            FtpEncoding::AsciiU32Len => FtpLenUnit::Bytes,
-            FtpEncoding::Utf16U8Len => FtpLenUnit::Utf16Units,
-        }
+        self.encoding().unit()
     }
 }
 
@@ -1340,7 +1309,6 @@ pub const FTP_PROFILE_FIELDS: [FtpFieldSpec; 6] = [
         field: FtpField::ProfileName,
         key: "profile_name",
         display_name: "profile name",
-        encoding: FtpEncoding::Utf16U8Len,
         max_len: FTP_PROFILE_NAME_MAX_UNITS,
         trimmed_for_required_check: true,
     },
@@ -1348,7 +1316,6 @@ pub const FTP_PROFILE_FIELDS: [FtpFieldSpec; 6] = [
         field: FtpField::Ssid24Ghz,
         key: "ssid_24ghz",
         display_name: "SSID (2.4GHz)",
-        encoding: FtpEncoding::AsciiU32Len,
         max_len: FTP_SSID_MAX_BYTES,
         trimmed_for_required_check: true,
     },
@@ -1356,7 +1323,6 @@ pub const FTP_PROFILE_FIELDS: [FtpFieldSpec; 6] = [
         field: FtpField::Ssid5Ghz,
         key: "ssid_5ghz",
         display_name: "SSID (5GHz)",
-        encoding: FtpEncoding::AsciiU32Len,
         max_len: FTP_SSID_MAX_BYTES,
         trimmed_for_required_check: true,
     },
@@ -1364,7 +1330,6 @@ pub const FTP_PROFILE_FIELDS: [FtpFieldSpec; 6] = [
         field: FtpField::Host,
         key: "host",
         display_name: "host",
-        encoding: FtpEncoding::Utf16U8Len,
         max_len: FTP_HOST_MAX_UNITS,
         trimmed_for_required_check: true,
     },
@@ -1372,7 +1337,6 @@ pub const FTP_PROFILE_FIELDS: [FtpFieldSpec; 6] = [
         field: FtpField::Username,
         key: "username",
         display_name: "username",
-        encoding: FtpEncoding::AsciiU32Len,
         max_len: FTP_CREDENTIAL_MAX_BYTES,
         trimmed_for_required_check: true,
     },
@@ -1380,7 +1344,6 @@ pub const FTP_PROFILE_FIELDS: [FtpFieldSpec; 6] = [
         field: FtpField::Password,
         key: "password",
         display_name: "password",
-        encoding: FtpEncoding::AsciiU32Len,
         max_len: FTP_CREDENTIAL_MAX_BYTES,
         trimmed_for_required_check: false,
     },
@@ -1451,33 +1414,8 @@ impl FtpProfile {
     }
 }
 
-/// Check `value` against `spec`: ASCII-only where the wire format is ASCII,
-/// no control characters, and within the limit (in the spec's own unit).
-fn validate_field(spec: &FtpFieldSpec, value: &str) -> Result<(), PtpUsbError> {
-    if spec.encoding == FtpEncoding::AsciiU32Len && !value.is_ascii() {
-        return Err(PtpUsbError::FtpFieldNotAscii { field: spec.key });
-    }
-    if value.chars().any(char::is_control) {
-        return Err(PtpUsbError::FtpFieldControlChar { field: spec.key });
-    }
-    let len = match spec.encoding {
-        FtpEncoding::AsciiU32Len => value.len(),
-        FtpEncoding::Utf16U8Len => value.encode_utf16().count(),
-    };
-    if len > spec.max_len {
-        return Err(PtpUsbError::FtpFieldTooLong {
-            field: spec.key,
-            len,
-            max: spec.max_len,
-            unit: spec.unit().label(),
-        });
-    }
-    Ok(())
-}
-
 /// `[u8 length in UTF-16 units incl. null][utf16le content + null]`, no
-/// validation: the profile-name and host fields' layout, and the template
-/// block's two placeholder strings.
+/// validation: the layout of [`FtpEncoding::Utf16U8Len`].
 fn utf16_u8_len_bytes(units: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + (units.len() + 1) * 2);
     out.push((units.len() + 1) as u8);
@@ -1488,94 +1426,18 @@ fn utf16_u8_len_bytes(units: &[u16]) -> Vec<u8> {
     out
 }
 
-/// Validate `value` against `spec` and lay it out as `spec.encoding` says.
-/// The `u8` length prefix is range-checked here as well as by `max_len`, so a
-/// spec whose limit exceeded 254 units could not silently truncate it.
-fn encode_field_with(spec: &FtpFieldSpec, value: &str) -> Result<Vec<u8>, PtpUsbError> {
-    validate_field(spec, value)?;
-    match spec.encoding {
-        FtpEncoding::AsciiU32Len => {
-            let bytes = value.as_bytes();
-            let mut out = Vec::with_capacity(4 + bytes.len());
-            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            out.extend_from_slice(bytes);
-            Ok(out)
-        }
-        FtpEncoding::Utf16U8Len => {
-            let units: Vec<u16> = value.encode_utf16().collect();
-            if u8::try_from(units.len() + 1).is_err() {
-                return Err(PtpUsbError::FtpFieldTooLong {
-                    field: spec.key,
-                    len: units.len(),
-                    max: usize::from(u8::MAX) - 1,
-                    unit: spec.unit().label(),
-                });
-            }
-            Ok(utf16_u8_len_bytes(&units))
-        }
-    }
-}
-
-fn encode_field(field: FtpField, value: &str) -> Result<Vec<u8>, PtpUsbError> {
-    encode_field_with(field.spec(), value)
-}
-
-fn encode_ipv6_placeholder() -> Vec<u8> {
-    let content = FTP_IPV6_PLACEHOLDER.as_bytes();
-    let mut out = Vec::with_capacity(4 + content.len());
-    out.extend_from_slice(&(content.len() as u32).to_le_bytes());
-    out.extend_from_slice(content);
-    out
-}
-
-/// The 82-byte block between the profile name and the SSID section (see
-/// [`FTP_TEMPLATE_TIMESTAMP_PLACEHOLDER`]).
-fn encode_template_block(network: &FtpCameraNetwork) -> Vec<u8> {
-    let placeholder: Vec<u16> = FTP_TEMPLATE_TIMESTAMP_PLACEHOLDER.encode_utf16().collect();
-    let mut out = Vec::new();
-    out.extend_from_slice(&utf16_u8_len_bytes(&placeholder));
-    out.extend_from_slice(&utf16_u8_len_bytes(&placeholder));
-    out.extend_from_slice(&FTP_TEMPLATE_NETWORK_TAG);
-    let [a, b, c, d] = network.ipv4;
-    out.extend_from_slice(&[d, c, b, a]); // little-endian u32 of the address
-    out.push(network.prefix_len);
-    out.extend_from_slice(&FTP_TEMPLATE_NETWORK_PAD);
-    out
-}
-
 /// Build the `0x90EE` data-phase blob for `profile`, with the captured
 /// [`FtpCameraNetwork`]. Reproduces the real captured wire format
 /// byte-for-byte (verified in tests against two of the three 2026-07-09
-/// captures; the 331-byte variant is not modelled) rather than a best guess.
+/// captures; the 331-byte variant has a folder string the encoder does not
+/// write) rather than a best guess. The layout is [`ftp_layout::FTP_LAYOUT`].
 pub fn encode_ftp_profile(profile: &FtpProfile) -> Result<Vec<u8>, PtpUsbError> {
     encode_ftp_profile_with(profile, &FtpCameraNetwork::CAPTURED)
 }
 
 /// [`encode_ftp_profile`] with an explicit [`FtpCameraNetwork`].
 pub fn encode_ftp_profile_with(profile: &FtpProfile, network: &FtpCameraNetwork) -> Result<Vec<u8>, PtpUsbError> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&FTP_BLOB_HEADER);
-    out.extend_from_slice(&encode_field(FtpField::ProfileName, &profile.profile_name)?);
-    out.extend_from_slice(&encode_template_block(network));
-    out.extend_from_slice(&FTP_TAG_SSID_24GHZ);
-    out.extend_from_slice(&encode_field(FtpField::Ssid24Ghz, &profile.ssid_24ghz)?);
-    out.extend_from_slice(&FTP_TAG_SSID_5GHZ);
-    out.extend_from_slice(&encode_field(FtpField::Ssid5Ghz, &profile.ssid_5ghz)?);
-    out.push(FTP_TAG_HOST);
-    out.extend_from_slice(&encode_field(FtpField::Host, &profile.host)?);
-    out.extend_from_slice(&FTP_TAG_USERNAME);
-    out.extend_from_slice(&encode_field(FtpField::Username, &profile.username)?);
-    // password has no tag bytes of its own — it immediately follows username's content.
-    out.extend_from_slice(&encode_field(FtpField::Password, &profile.password)?);
-    out.extend_from_slice(&FTP_TAG_PORT_SECTION);
-    out.extend_from_slice(&profile.port.to_le_bytes());
-    out.extend_from_slice(&FTP_PORT_SECTION_PAD);
-    out.extend_from_slice(&encode_ipv6_placeholder());
-    out.push(FTP_IPV6_FIELD1_SEPARATOR);
-    out.extend_from_slice(&encode_ipv6_placeholder());
-    out.extend_from_slice(&encode_ipv6_placeholder());
-    out.push(FTP_BLOB_TRAILER);
-    Ok(out)
+    ftp_layout::encode_with(ftp_layout::FTP_LAYOUT, profile, network)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1583,9 +1445,9 @@ pub fn encode_ftp_profile_with(profile: &FtpProfile, network: &FtpCameraNetwork)
 //
 // Worked out offline from the 2026-07-09 Z 9 captures (three distinct blobs:
 // 325 B, 331 B, 317 B). The layout is the one `encode_ftp_profile_with`
-// writes, plus one field the encoder does not model: a PTP string between
-// host and username (see `DecodedFtpProfile::folder`). The decoder is
-// strict: any structural byte it does not recognise is an error carrying
+// writes (both are driven by `ftp_layout::FTP_LAYOUT`), including a PTP
+// string between host and username that the encoder only ever writes empty
+// (see `DecodedFtpProfile::folder`). The decoder is strict: any structural byte it does not recognise is an error carrying
 // the offset, because a silently wrong decode of a profile is worse than
 // none. The raw bytes are always available to the caller.
 // ─────────────────────────────────────────────────────────────────────────
@@ -1884,8 +1746,8 @@ impl DecodedFtpProfile {
     }
 
     /// The [`FtpProfile`] the encoder would need to write this profile back,
-    /// when it can: not possible if [`Self::folder`] is non-empty, or
-    /// [`Self::option_flags`] is not the encoder's `0x0005`, or
+    /// when it can. [`ftp_layout::FTP_LAYOUT`] says what the encoder fixes; it is not possible if
+    /// [`Self::folder`] is non-empty, or [`Self::option_flags`] is not the encoder's `0x0005`, or
     /// [`Self::ftp_port`] is not the 21 it hard-codes, or [`Self::ssid5_kind`]
     /// is not `04`, or [`Self::ssid24_kind`] is not `01`, or [`Self::ssid24_lead`]
     /// is not `03`, or the camera address, the two timestamps or the three IPv6
@@ -1895,40 +1757,10 @@ impl DecodedFtpProfile {
     /// profile. `FtpProfile.port` receives [`Self::second_port`] (where the
     /// encoder writes it).
     pub fn as_encodable(&self) -> Option<FtpProfile> {
-        let placeholder_timestamps = self.timestamps.iter().all(|t| t == FTP_TEMPLATE_TIMESTAMP_PLACEHOLDER);
-        let placeholder_ipv6 = self.ipv6_fields.iter().all(|t| t == FTP_IPV6_PLACEHOLDER);
-        let ascii = [&self.ssid_24ghz, &self.ssid_5ghz, &self.username, &self.password].iter().all(|f| f.is_ascii());
-        (self.folder.is_empty()
-            && self.option_flags == 0x0005
-            && self.ftp_port == 21
-            && self.ssid5_kind == FTP_TAG_SSID_5GHZ[0]
-            && self.ssid24_kind == FTP_TAG_SSID_24GHZ[2]
-            && self.ssid24_lead == FTP_TAG_SSID_24GHZ[0]
-            && self.camera_network == FtpCameraNetwork::CAPTURED
-            && placeholder_timestamps
-            && placeholder_ipv6
-            && ascii)
-            .then(|| FtpProfile {
-            profile_name: self.profile_name.clone(),
-            ssid_24ghz: self.ssid_24ghz.clone(),
-            ssid_5ghz: self.ssid_5ghz.clone(),
-            host: self.host.clone(),
-            port: self.second_port,
-            username: self.username.clone(),
-            password: self.password.clone(),
-        })
+        ftp_layout::encodable_with(ftp_layout::FTP_LAYOUT, self)
     }
 
-    /// This profile with the password and the string the encoder calls the
-    /// 5 GHz SSID (probably a Wi-Fi password) replaced by asterisks of the
-    /// same length, for display.
-    pub fn with_secrets_masked(&self) -> Self {
-        DecodedFtpProfile {
-            password: "*".repeat(self.password.len()),
-            ssid_5ghz: "*".repeat(self.ssid_5ghz.len()),
-            ..self.clone()
-        }
-    }
+    // `with_secrets_masked` and `secret_texts`, which read the layout's secret flags, are in `ftp_layout`.
 }
 
 /// Decode a `0x90ED` reply (or any `0x90EE` data-out blob) into its fields.
@@ -1938,87 +1770,10 @@ pub fn decode_ftp_profile(blob: &[u8]) -> Result<DecodedFtpProfile, PtpUsbError>
     decode_ftp_profile_spans(blob).map(|(decoded, _)| decoded)
 }
 
-/// Where the two secret strings of a profile blob sit: the content bytes (not the 4-byte length
-/// prefix) of the field the encoder calls the 5 GHz SSID and of the password, as offsets into the
-/// blob that was decoded. Taken from the decoder's own cursor, so a value that also appears in an
-/// earlier field cannot be mistaken for them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FtpSecretSpans {
-    pub ssid_5ghz: std::ops::Range<usize>,
-    pub password: std::ops::Range<usize>,
-}
-
-/// [`decode_ftp_profile`], also returning where the secret strings are in `blob`.
+/// [`decode_ftp_profile`], also returning where the secret strings are in `blob`
+/// ([`FtpSecretSpans`]).
 pub fn decode_ftp_profile_spans(blob: &[u8]) -> Result<(DecodedFtpProfile, FtpSecretSpans), PtpUsbError> {
-    let mut r = FtpBlobReader { data: blob, pos: 0 };
-    r.expect("blob header", &FTP_BLOB_HEADER)?;
-    let profile_name = r.ptp_string("profile name")?.text;
-    let timestamps = [r.ptp_string("timestamp 1")?.text, r.ptp_string("timestamp 2")?.text];
-    r.expect("network tag", &FTP_TEMPLATE_NETWORK_TAG)?;
-    let addr: [u8; 4] = r.take("camera address", 4)?.try_into().expect("take(4) returns 4 bytes");
-    let prefix_len = r.u8("camera prefix length")?;
-    r.expect("network padding", &FTP_TEMPLATE_NETWORK_PAD)?;
-    let camera_network = FtpCameraNetwork { ipv4: [addr[3], addr[2], addr[1], addr[0]], prefix_len };
-    let tag_at = r.pos;
-    let tag24 = r.take("2.4 GHz SSID tag", 4)?;
-    if !FTP_TAG_SSID_24GHZ_LEADS.contains(&tag24[0]) || tag24[1] != FTP_TAG_SSID_24GHZ[1] || tag24[3] != FTP_TAG_SSID_24GHZ[3] {
-        r.pos = tag_at;
-        return Err(r.bad("2.4 GHz SSID tag", format!("expected 03|00 00 xx 00, found {}", hex_bytes(tag24))));
-    }
-    let ssid24_lead = tag24[0];
-    let ssid24_kind = tag24[2];
-    let ssid_24ghz = r.utf8_u32_len("2.4 GHz SSID")?;
-    let tag_at = r.pos;
-    let tag5 = r.take("5 GHz SSID tag", 2)?;
-    if tag5[1] != FTP_TAG_SSID_5GHZ[1] {
-        r.pos = tag_at;
-        return Err(r.bad("5 GHz SSID tag", format!("expected xx {:02x}, found {}", FTP_TAG_SSID_5GHZ[1], hex_bytes(tag5))));
-    }
-    let ssid5_kind = tag5[0];
-    let ssid5_at = r.pos;
-    let ssid_5ghz = r.utf8_u32_len("5 GHz SSID")?;
-    let ssid5_span = ssid5_at + 4..r.pos;
-    r.expect("host tag", &[FTP_TAG_HOST])?;
-    let host = r.ptp_string("host")?.text;
-    let folder = r.ptp_string("folder")?.text;
-    // The encoder's FTP_TAG_USERNAME is [00 15 00]: the first byte is the
-    // empty `folder` string (count 0) and `15 00` is the FTP port, 21. It is
-    // a u16 here because a profile read on 2026-11-05 carried `16 00` (22).
-    let ftp_port = r.u16("FTP port")?;
-    let username = r.utf8_u32_len("username")?;
-    let password_at = r.pos;
-    let password = r.utf8_u32_len("password")?;
-    let password_span = password_at + 4..r.pos;
-    let option_flags = r.u16("option flags")?;
-    let second_port = r.u16("second port")?;
-    r.expect("port-section padding", &FTP_PORT_SECTION_PAD)?;
-    let ipv6_a = r.utf8_u32_len("IPv6 field 1")?;
-    r.expect("IPv6 separator", &[FTP_IPV6_FIELD1_SEPARATOR])?;
-    let ipv6_b = r.utf8_u32_len("IPv6 field 2")?;
-    let ipv6_c = r.utf8_u32_len("IPv6 field 3")?;
-    r.expect("blob trailer", &[FTP_BLOB_TRAILER])?;
-    if r.pos != blob.len() {
-        return Err(r.bad("blob end", format!("{} unexpected byte(s) after the trailer", blob.len() - r.pos)));
-    }
-    let decoded = DecodedFtpProfile {
-        profile_name,
-        timestamps,
-        camera_network,
-        ssid_24ghz,
-        ssid24_kind,
-        ssid24_lead,
-        ssid_5ghz,
-        ssid5_kind,
-        host,
-        folder,
-        username,
-        password,
-        ftp_port,
-        option_flags,
-        second_port,
-        ipv6_fields: [ipv6_a, ipv6_b, ipv6_c],
-    };
-    Ok((decoded, FtpSecretSpans { ssid_5ghz: ssid5_span, password: password_span }))
+    ftp_layout::decode_with(ftp_layout::FTP_LAYOUT, blob)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -4540,7 +4295,7 @@ mod tests {
         let profile = valid_profile();
         let blob = encode_ftp_profile(&profile).unwrap();
         // Port section starts right after password's content in this profile.
-        let port_tag_pos = blob.windows(2).rposition(|w| w == FTP_TAG_PORT_SECTION).unwrap();
+        let port_tag_pos = blob.windows(2).rposition(|w| w == [0x05, 0x00]).unwrap();
         let port_bytes = &blob[port_tag_pos + 2..port_tag_pos + 4];
         assert_eq!(u16::from_le_bytes(port_bytes.try_into().unwrap()), profile.port);
     }
@@ -4554,9 +4309,14 @@ mod tests {
         hex::decode_hex(reference_ftp_blob_hex())[17..17 + FTP_TEMPLATE_LEN].to_vec()
     }
 
+    /// Length in bytes of the template block (two timestamps, the network tag, address, prefix, padding).
+    const FTP_TEMPLATE_LEN: usize = 82;
+
     #[test]
     fn template_block_is_82_bytes_and_equals_the_captured_bytes() {
-        let block = encode_template_block(&FtpCameraNetwork::CAPTURED);
+        // The block sits after the header (2) and the profile name ("TEST": 1 + 5 * 2 bytes).
+        let blob = encode_ftp_profile_with(&valid_profile(), &FtpCameraNetwork::CAPTURED).unwrap();
+        let block = blob[13..13 + FTP_TEMPLATE_LEN].to_vec();
         assert_eq!(block.len(), FTP_TEMPLATE_LEN);
         assert_eq!(block, captured_template_block());
     }
@@ -4636,7 +4396,7 @@ mod tests {
         }
         // A UTF-16 field's length prefix is one byte holding content + null.
         for spec in &FTP_PROFILE_FIELDS {
-            if spec.encoding == FtpEncoding::Utf16U8Len {
+            if spec.encoding() == FtpEncoding::Utf16U8Len {
                 assert!(spec.max_len < usize::from(u8::MAX), "{}", spec.key);
             }
         }
@@ -4757,14 +4517,14 @@ mod tests {
             field: FtpField::Host,
             key: "test",
             display_name: "test",
-            encoding: FtpEncoding::Utf16U8Len,
             max_len: 1000,
             trimmed_for_required_check: true,
         };
-        let ok = encode_field_with(&spec, &"a".repeat(254)).unwrap();
+        let encoding = FtpEncoding::Utf16U8Len;
+        let ok = ftp_layout::encode_field_with(&spec, encoding, &"a".repeat(254)).unwrap();
         assert_eq!(ok[0], 255);
         assert_eq!(ok.len(), 1 + 255 * 2);
-        let err = encode_field_with(&spec, &"a".repeat(255)).unwrap_err();
+        let err = ftp_layout::encode_field_with(&spec, encoding, &"a".repeat(255)).unwrap_err();
         assert!(matches!(err, PtpUsbError::FtpFieldTooLong { field: "test", len: 255, max: 254, .. }), "{err:?}");
     }
 
@@ -5001,19 +4761,19 @@ mod tests {
     /// verify.
     fn decode_ftp_profile_fields(blob: &[u8]) -> FtpProfile {
         let mut r = FieldReader::new(blob);
-        r.skip(FTP_BLOB_HEADER.len());
+        r.skip(2); // header f4 01
         let profile_name = r.utf16_field_1byte_len();
         r.skip(FTP_TEMPLATE_LEN);
-        r.skip(FTP_TAG_SSID_24GHZ.len());
+        r.skip(4); // 2.4 GHz SSID tag
         let ssid_24ghz = r.ascii_field();
-        r.skip(FTP_TAG_SSID_5GHZ.len());
+        r.skip(2); // 5 GHz SSID tag
         let ssid_5ghz = r.ascii_field();
-        r.skip(1); // FTP_TAG_HOST
+        r.skip(1); // host tag
         let host = r.utf16_field_1byte_len();
-        r.skip(FTP_TAG_USERNAME.len());
+        r.skip(3); // empty folder string (00) and the FTP port (15 00)
         let username = r.ascii_field();
         let password = r.ascii_field(); // no tag — immediately follows username
-        r.skip(FTP_TAG_PORT_SECTION.len());
+        r.skip(2); // option flags (05 00)
         let port = r.u16_le();
         // Trailing IPv6/pad/trailer bytes deliberately not decoded — none of
         // them are FtpProfile fields, and the golden-capture tests already
@@ -5080,6 +4840,17 @@ mod tests {
 
     // ── decode_ftp_profile_spans ─────────────────────────────────────────
 
+    /// The two secrets' ranges by name: the layout marks exactly the 5 GHz field and the password.
+    struct SecretRanges {
+        ssid_5ghz: std::ops::Range<usize>,
+        password: std::ops::Range<usize>,
+    }
+
+    fn secret_ranges(spans: &FtpSecretSpans) -> SecretRanges {
+        assert_eq!(spans.spans.len(), 2, "the layout marks the 5 GHz field and the password secret");
+        SecretRanges { ssid_5ghz: spans.of("ssid_5ghz").unwrap().clone(), password: spans.of("password").unwrap().clone() }
+    }
+
     #[test]
     fn the_secret_spans_are_the_content_bytes_of_the_password_and_the_5ghz_field() {
         let mut p = valid_profile();
@@ -5088,6 +4859,7 @@ mod tests {
         p.ssid_5ghz = "Wl4-5g".into();
         let blob = encode_ftp_profile(&p).unwrap();
         let (d, spans) = decode_ftp_profile_spans(&blob).unwrap();
+        let spans = secret_ranges(&spans);
         assert_eq!(d, decode_ftp_profile(&blob).unwrap());
         assert_eq!(&blob[spans.password.clone()], b"Zq9!pw");
         assert_eq!(&blob[spans.ssid_5ghz.clone()], b"Wl4-5g");
@@ -5105,12 +4877,14 @@ mod tests {
         let blob = encode_ftp_profile(&p).unwrap();
         let first_by_content = blob.windows(6).position(|w| w == b"samepw").unwrap();
         let (_, spans) = decode_ftp_profile_spans(&blob).unwrap();
+        let spans = secret_ranges(&spans);
         assert!(first_by_content < spans.password.start, "the username copy comes first");
         assert_eq!(&blob[spans.password.clone()], b"samepw");
         // An empty password has an empty span, still at the right place.
         p.password = String::new();
         let blob = encode_ftp_profile(&p).unwrap();
         let (_, spans) = decode_ftp_profile_spans(&blob).unwrap();
+        let spans = secret_ranges(&spans);
         assert!(spans.password.is_empty());
         assert_eq!(blob[spans.password.start - 4..spans.password.start], 0u32.to_le_bytes());
     }
@@ -7590,7 +7364,7 @@ mod tests {
         assert_eq!((d.host.as_str(), d.folder.as_str()), ("192.168.66.1", ""));
         assert_eq!((d.username.as_str(), d.password.as_str()), ("fleet", "12345678"));
         assert_eq!((d.ftp_port, d.option_flags, d.second_port), (21, 0x0005, 8080));
-        assert!(d.ipv6_fields.iter().all(|f| f == FTP_IPV6_PLACEHOLDER));
+        assert!(d.ipv6_fields.iter().all(|f| f == ftp_layout::FTP_IPV6_PLACEHOLDER));
         let profile = d.as_encodable().expect("empty folder and the encoder's flag byte");
         assert_eq!(encode_ftp_profile(&profile).unwrap(), blob);
     }

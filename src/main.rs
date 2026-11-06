@@ -2324,10 +2324,10 @@ fn ftp_readout_body(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: 
 fn mask_ftp_secrets_in_dump(raw: &[u8]) -> Option<Vec<u8>> {
     let (decoded, spans) = nikon_fleet::ptp_usb::decode_ftp_profile_spans(raw).ok()?;
     let mut out = raw.to_vec();
-    for span in [&spans.password, &spans.ssid_5ghz] {
+    for span in spans.ranges() {
         out[span.clone()].fill(0);
     }
-    for secret in [&decoded.password, &decoded.ssid_5ghz] {
+    for secret in &decoded.secret_texts() {
         if secret.is_empty() {
             continue;
         }
@@ -5508,7 +5508,8 @@ mod tests {
             let dump = dump_bytes(&out);
             assert_eq!(dump.len(), raw.len(), "{name}: the length never changes");
             assert_eq!(dump[..2], raw[..2], "{name}: structural bytes outside the secrets are kept");
-            for span in [&spans.password, &spans.ssid_5ghz] {
+            assert_eq!(spans.spans.len(), 2, "the password and the 5 GHz field");
+            for span in spans.ranges() {
                 assert!(dump[span.clone()].iter().all(|b| *b == 0), "{name}: the field itself is zeroed by position");
             }
             for secret in secrets.iter().filter(|s| !s.is_empty()) {
