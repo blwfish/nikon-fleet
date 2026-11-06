@@ -129,8 +129,8 @@ On any failure after a file was captured the staging dir is kept and named in th
 
 **Fallback.** No `webview` feature, or the web view can't start (Windows: WebView2 runtime missing —
 `wry` returns an error from `build`; Linux: no WebKitGTK/display) → the command prints the page URL and
-the `--from-file` steps and exits non-zero. The GUI (tkinter) button "Download from Nikon…" runs the
-CLI as a subprocess (the tao event loop needs the main thread, which eframe/tk own).
+the `--from-file` steps and exits non-zero. The GUI (egui) button "Download from Nikon…" runs the
+CLI as a subprocess (the tao event loop needs the main thread, which eframe owns).
 
 **Verified / not verified** (2026-10-27, macOS 15 arm64):
 - Verified: the real WKWebView window opens, navigation and download callbacks fire, the download is

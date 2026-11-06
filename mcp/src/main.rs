@@ -167,9 +167,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let sup = server.supervisor();
     let mut signals = termination_signals()?;
     let service = server.serve(rmcp::transport::stdio()).await?;
+    // The service task ending abnormally (a join error) is the client side being gone too, with a call possibly still
+    // in flight: it is handled as the client going, below (the in-flight apply is waited for and, if it outlasts the
+    // wait, recorded), and only then returned as the error. It used to be returned at once, and `main`'s `exit(1)` then
+    // left the worker running with no marker.
+    let mut service_failed: Option<tokio::task::JoinError> = None;
     let signal = tokio::select! {
         done = service.waiting() => {
-            done?;
+            if let Err(e) = done {
+                eprintln!("fleet-mcp: the MCP service ended abnormally: {e}");
+                service_failed = Some(e);
+            }
             None
         }
         sig = next_signal(&mut signals) => Some(sig?),
@@ -206,5 +214,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
             eprintln!("fleet-mcp: could not record the call that was in flight: {e}");
         }
     }
-    Ok(())
+    match service_failed {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
 }

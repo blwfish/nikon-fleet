@@ -8,7 +8,11 @@
 //!   and its stderr is this process's stderr, which is the log;
 //! - the answer is the `result` line, never the exit status; once it is read it
 //!   is final, the worker gets [`Supervisor::grace`] to exit and is then killed
-//!   and reaped, so a teardown hang costs nothing;
+//!   and reaped. The default grace ([`DEFAULT_GRACE`]) is longer than the worker's own teardown
+//!   watchdog can take (`nikon_fleet::process_exit::TEARDOWN_WORST_CASE`), so a write op that
+//!   hangs in `DisconnectDevice` ends itself with the status it was going to have, and a
+//!   slow-but-finishing disconnect (4.7 s on a Z 9) is never cut; the kill here is the backstop
+//!   for a worker the watchdog could not end;
 //! - on a deadline, or a cancellation the policy allows, the worker is sent
 //!   SIGKILL and reaped, and the pipe is drained afterwards: a `result` or a
 //!   progress line already written is honoured, because killing does not unwrite it;
@@ -34,6 +38,7 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use nikon_fleet::ops::paths::write_atomic;
+use nikon_fleet::process_exit::TEARDOWN_WORST_CASE;
 use nikon_fleet::ops::worker::{Line, Outcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -178,12 +183,21 @@ impl Drop for InFlightGuard<'_> {
     }
 }
 
+/// The default [`Supervisor::grace`]: [`TEARDOWN_WORST_CASE`] (the teardown watchdog's limit plus its record bound; the
+/// longest a write worker can take to end itself after its result) and a margin of 2 s for the process to be reaped.
+/// It was 3 s, below the 10 s watchdog, so under MCP the watchdog could never fire and a disconnect that was only slow
+/// (4.7 s on a Z 9) was killed mid-disconnect. The cost is that a worker that really hangs after its result delays the
+/// tool's answer by up to this long instead of 3 s; reads leave through `exit_now` and never wait. A test pins that this
+/// stays above the watchdog.
+pub const DEFAULT_GRACE: Duration = Duration::from_secs(TEARDOWN_WORST_CASE.as_secs() + 2);
+
 pub struct Supervisor {
     program: PathBuf,
     /// Global flags placed before `worker` (`--data-dir`, `--sdk-bundle`, ...).
     global_args: Vec<OsString>,
     queue: Mutex<()>,
-    /// How long a worker that has delivered its result may take to exit.
+    /// How long a worker that has delivered its result may take to exit before it is killed. [`DEFAULT_GRACE`]: longer
+    /// than the worker's teardown watchdog, so that watchdog (not this kill) is what ends a hung disconnect.
     pub grace: Duration,
     /// How long to keep reading after a kill (the pipe ends as soon as the child is gone).
     drain: Duration,
@@ -217,7 +231,7 @@ impl Supervisor {
             program,
             global_args,
             queue: Mutex::new(()),
-            grace: Duration::from_secs(3),
+            grace: DEFAULT_GRACE,
             drain: Duration::from_secs(2),
             reap: Duration::from_secs(5),
             in_flight: StdMutex::new(None),
@@ -756,6 +770,37 @@ mod tests {
         let (f, _) = run(&s, &spec(30_000, CancelPolicy::Always), &CancellationToken::new()).await;
         assert!(matches!(f, Finished::Result { .. }));
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn the_default_grace_outlasts_the_workers_teardown_watchdog() {
+        // The relation (finding 9): the worker's watchdog ends a hung disconnect at TEARDOWN_LIMIT plus its record bound;
+        // the supervisor must wait longer than that before it kills, or the watchdog is dead code under MCP and a
+        // slow-but-finishing disconnect (4.7 s on a Z 9, plus the 0.3 s pump) is cut. The library pins its side
+        // (process_exit::tests::the_worst_case_is_the_limit_plus_the_record_bound).
+        let s = Supervisor::new(PathBuf::from("/nonexistent"), vec![]);
+        assert_eq!(s.grace, DEFAULT_GRACE);
+        assert!(s.grace > TEARDOWN_WORST_CASE, "{:?} vs {:?}", s.grace, TEARDOWN_WORST_CASE);
+        assert!(s.grace > nikon_fleet::process_exit::TEARDOWN_LIMIT);
+        // The slow-but-finishing teardown measured on the Z 9 (5.0 s) is well inside it.
+        assert!(s.grace > Duration::from_millis(5_000));
+        // And it is not unbounded: the kill is still the backstop (a worker the watchdog could not end).
+        assert!(s.grace <= Duration::from_secs(60), "{:?}", s.grace);
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_takes_a_slow_but_finishing_teardown_after_its_result_is_not_killed() {
+        // Stands in for DisconnectDevice taking 4.7 s: the worker delivers its result, tears down for 4 s, then
+        // marks that it got to finish. With the old 3 s grace it was killed before the mark.
+        let d = TempDir::new().unwrap();
+        let mark = d.path().join("finished-teardown");
+        let path = d.path().join("w");
+        std::fs::write(&path, format!("#!/bin/sh\necho '{OK_LINE}' >&3\nsleep 4\necho done > {}\n", mark.display())).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let s = Supervisor::new(path, vec![]);
+        let (f, _) = run(&s, &spec(30_000, CancelPolicy::Always), &CancellationToken::new()).await;
+        assert!(matches!(f, Finished::Result { outcome: Outcome::Ok { .. }, .. }), "the worker finished its work: {f:?}");
+        assert!(mark.exists(), "the worker was killed during a teardown that was only slow");
     }
 
     /// Whether `pid` still exists (a killed but unreaped child still does).

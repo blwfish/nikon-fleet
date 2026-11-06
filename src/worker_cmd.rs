@@ -8,8 +8,14 @@
 //! alive, before it is torn down, so a teardown hang cannot lose it.
 //!
 //! Exit status: 0 for an `ok` result, 1 for an error result, 2 when the
-//! result channel could not be established. Callers must not rely on it
-//! (a killed or hung worker has none); the result line is the answer.
+//! result channel could not be established, when the result line could not be
+//! written (the parent sees end-of-input with no result), or when an apply's
+//! `writing` progress line could not be sent (it stops before any write).
+//! Callers must not rely on it (a killed or hung worker has none); the result
+//! line is the answer. A write op's exit is bounded: the teardown watchdog
+//! (`process_exit::arm_teardown_watchdog`) ends the process with the status it
+//! was going to have if the camera session has not closed `TEARDOWN_LIMIT`
+//! after the result.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -381,15 +387,20 @@ fn with_body(
         Err(e) => fail!("sdk_connect_failed", e.to_string()),
     };
     progress(em, "connected");
-    if let Err(e) = ensure_capabilities_present(device.capabilities().len()) {
-        fail!("no_capabilities", e.to_string());
-    }
-    let body = Body {
-        device: &device,
-        camera: Camera { model: target.name.clone(), serial: usb.serial.clone(), firmware: body_firmware(&target, &Some(usb.clone())) },
-        schema: &schema,
+    // From here the camera session is open. Every way out goes through the one `finish` and the one teardown decision
+    // below, the refusal for a body with no capabilities included (it used to `return` straight to `Device::drop`, an
+    // unbounded `DisconnectDevice`, for a write op; finding 8).
+    let outcome = match ensure_capabilities_present(device.capabilities().len()) {
+        Err(e) => Outcome::err("no_capabilities", e.to_string(), None),
+        Ok(()) => {
+            let body = Body {
+                device: &device,
+                camera: Camera { model: target.name.clone(), serial: usb.serial.clone(), firmware: body_firmware(&target, &Some(usb.clone())) },
+                schema: &schema,
+            };
+            f(em, &body)
+        }
     };
-    let outcome = f(em, &body);
     let code = finish(em, outcome);
     if teardown == Teardown::ExitAfterResult {
         // The result line is out and flushed; nothing was written to the camera.

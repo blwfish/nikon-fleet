@@ -22,16 +22,19 @@ use time::format_description::well_known::Rfc3339;
 
 use nikon_fleet::camera_lock::CameraLock;
 use nikon_fleet::diff::{Diff, DiffOptions, diff_with_schema, is_volatile};
+// The exit statuses, `ExitCodeError` and `exit_code_for` live in the library's `exit_status` module, so the GUI and the
+// tests consume the same ones (a renumbering cannot reach one side only).
+use nikon_fleet::exit_status::{EXIT_ALREADY_ARCHIVED, EXIT_WRITE_INDETERMINATE, ExitCodeError, exit_code_for, is_already_archived};
 use nikon_fleet::firmware::{
     ArchiveListing, FirmwareError, FirmwareMeta, FIRMWARE_META_FORMAT_VERSION,
     archive_dir, archive_exists, format_size, ingest_bundle, load_meta,
     model_slug, save_meta, scan_archives, sha256_file, IngestOutcome, Provenance, RetrievalMethod,
 };
 use nikon_fleet::firmware_browse::{
-    BrowseError, BrowserWindow, VersionEvidence, browse_firmware, nikon_is_release_page,
+    BrowserWindow, VersionEvidence, browse_firmware, nikon_is_release_page,
 };
 use nikon_fleet::firmware_source::{
-    CameraRelation, DownloadAccess, FetchError, FirmwareSource, FwVersion, ModelStatus,
+    CameraRelation, DownloadAccess, FirmwareSource, FwVersion, ModelStatus,
     NikonDownloadCenter, Release, UreqHttp, camera_relation, fetch_direct,
 };
 use nikon_fleet::maid_layer::MaidLayerConfig;
@@ -220,6 +223,7 @@ enum Cmd {
     /// `vendor-read` (0x943B), which on a Z 9 answers DevicePropNotSupported for the artist and
     /// image-comment strings. Sends nothing else.
     VendorGetProp(VendorGetPropArgs),
+    #[command(after_help = VENDOR_SET_STRING_HELP)]
     /// EXPERIMENTAL. Write one string property (0xD072 Artist, 0xD073 Copyright, 0xD090 Image
     /// comment) with the standard PTP `SetDevicePropValue` (0x1016), then read it back and say whether
     /// the camera holds what was sent. In one session it reads the property's descriptor (refusing a
@@ -462,11 +466,6 @@ enum FirmwareCmd {
     Browse(FirmwareBrowseArgs),
 }
 
-/// Process exit status for "this model and version is already in the archive and nothing was
-/// changed": `firmware add` without `--force`, or a fetch/browse whose bytes differ from the
-/// archived ones. A script or GUI tests for it instead of reading the message.
-const EXIT_ALREADY_ARCHIVED: i32 = 3;
-
 const ALREADY_ARCHIVED_HELP: &str = "\
 Exit status:
   0  done (identical bytes that are already archived count as done)
@@ -475,12 +474,6 @@ Exit status:
   3  refused: that model and version is already in the archive, nothing was changed
      (`add` without --force; `fetch`/`browse` when the bytes differ from the archived ones;
      with several models, 3 only when every failure was this)";
-
-/// Process exit status for a `vendor-write-ftp` that failed after the profile data had been sent
-/// to the camera: it may or may not have changed (`PtpUsbError::FtpWriteIndeterminate`). Distinct
-/// from the plain failure (1) a script is allowed to retry blindly: this one needs a look at the
-/// camera first.
-const EXIT_WRITE_INDETERMINATE: i32 = 4;
 
 const TRANSPLANT_HELP: &str = "\
 Exit status:
@@ -526,6 +519,15 @@ Exit status:
      took effect put its profile at the front, slot 0
   --port is the u16 written AFTER the password (8080 in every profile read from a camera, probably a
   proxy port), not the FTP port: the encoder fixes the FTP port at 21.";
+
+const VENDOR_SET_STRING_HELP: &str = "\
+Exit status:
+  0  the camera accepted the value and the read-back matched (a dry run: the plan was printed)
+  1  any other error, including a write refused before anything was sent; or the camera accepted
+     the write but the read-back differed or could not be read (look with `vendor-get-prop`)
+  2  command-line usage error
+  4  the value was sent but the camera's reply was lost: the camera MAY have changed. Read it with
+     `vendor-get-prop` before retrying";
 
 const VENDOR_WRITE_BLOB_HELP: &str = "\
 Exit status:
@@ -3554,44 +3556,33 @@ fn restore_run(
 
     say(json, &format!("Connecting to {:?} (id={})…\n", target.name, target.id));
     let device = sdk.connect(target.id)?;
-    ensure_capabilities_present(device.capabilities.len())?;
+    // Everything from here runs with the camera session open. However it ends, an early `?` included, `end_session`
+    // decides the exit and bounds the disconnect before `device` and `sdk` drop (finding 8): the teardown is armed in
+    // this one place, not after whichever step happened to print the result.
+    let result = (|| -> Result<()> {
+        ensure_capabilities_present(device.capabilities.len())?;
 
-    let schema = MaidLayerConfig::parse_file(schema_path)
-        .with_context(|| format!("loading schema from {}", schema_path.display()))?;
-    let name_lookup = schema.name_map_for_model(&target.name);
-    let identity = target_identity(&target, &usb_info);
-    let snapshots = snapshots_dir(data_dir);
-    let setup = RestoreSetup {
-        snap: &snap,
-        source_name: &source_name,
-        source_bytes: &source_bytes,
-        only: only.as_ref(),
-        identity: &identity,
-        snapshots_dir: &snapshots,
-        name_lookup: &name_lookup,
-        captured_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
-    };
-    let mut product = RestoreProduct::default();
-    let result = restore_on_port(&device, args, &setup, &mut product, report_in_hand);
-    product.print(json, &mut json_out)?;
-    if args.dry_run {
-        // A plan wrote nothing and there is nothing left to do once it is out: leave without
-        // closing the session, as `check` does (F24: the SDK's DisconnectDevice hangs on about
-        // 1 run in 14). The failure status is the ordinary one (`main` would print the same).
-        match &result {
-            Ok(()) => nikon_fleet::process_exit::exit_now(0),
-            Err(e) => {
-                eprintln!("Error: {e:?}");
-                nikon_fleet::process_exit::exit_now(exit_code_for(e))
-            }
-        }
-    }
-    // A write ran and its result is printed: bound the disconnect that follows when `device` and `sdk` drop.
-    let (status, line) = match &result {
-        Ok(()) => (0, None),
-        Err(e) => (transplant_exit_status(e, false, !*report_in_hand), Some(format!("Error: {e:?}"))),
-    };
-    bound_apply_teardown(status, line);
+        let schema = MaidLayerConfig::parse_file(schema_path)
+            .with_context(|| format!("loading schema from {}", schema_path.display()))?;
+        let name_lookup = schema.name_map_for_model(&target.name);
+        let identity = target_identity(&target, &usb_info);
+        let snapshots = snapshots_dir(data_dir);
+        let setup = RestoreSetup {
+            snap: &snap,
+            source_name: &source_name,
+            source_bytes: &source_bytes,
+            only: only.as_ref(),
+            identity: &identity,
+            snapshots_dir: &snapshots,
+            name_lookup: &name_lookup,
+            captured_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
+        };
+        let mut product = RestoreProduct::default();
+        let result = restore_on_port(&device, args, &setup, &mut product, report_in_hand);
+        product.print(json, &mut json_out)?;
+        result
+    })();
+    end_session(&result, args.dry_run, *report_in_hand);
     result
 }
 
@@ -3665,12 +3656,54 @@ fn transplant_exit_status(e: &anyhow::Error, dry_run: bool, wrote_nothing: bool)
     }
 }
 
-/// After a write command (a restore or transplant apply) has printed its result: if the camera session does not
-/// close within `TEARDOWN_LIMIT`, end the process with `status`. `DisconnectDevice` hung in 10 of 20 write applies
-/// on a Z 9, every time after a verified result (docs/mcp-hardware-findings.md F26); without this the command waits
-/// for ever. `status` and `error_line` are what `main` would have used, worked out by the caller.
-fn bound_apply_teardown(status: i32, error_line: Option<String>) {
-    nikon_fleet::process_exit::arm_teardown_watchdog(nikon_fleet::process_exit::TEARDOWN_LIMIT, status, error_line);
+/// How a command that held a camera session leaves once its result is out. The decision is a value, apart from the
+/// act, so a test can pin which status and which line each way of ending gets (finding 79: flipping the `report_in_hand`
+/// test below once survived every test).
+#[derive(Debug, PartialEq, Eq)]
+enum SessionEnd {
+    /// A dry run: nothing was written, so end the process now without closing the session (F24: the SDK's
+    /// `DisconnectDevice` hangs on about 1 run in 14 and there is nothing left to close for).
+    Leave { status: i32, error_line: Option<String> },
+    /// An apply: the camera may have been written, so keep the ordinary disconnect, bounded by the teardown watchdog
+    /// (`DisconnectDevice` hung in 10 of 20 write applies on a Z 9, every time after a verified result;
+    /// docs/mcp-hardware-findings.md F26).
+    Bound { status: i32, error_line: Option<String> },
+}
+
+/// The line `main` prints for a failed run, `Error: ` and the error with its causes: what returning the error from
+/// `main` used to print. One function, because the teardown watchdog prints the same line itself when it ends the
+/// process before `main` gets to.
+fn error_line(e: &anyhow::Error) -> String {
+    format!("Error: {e:?}")
+}
+
+/// The exit a command that held a camera session will make, from how it ended. `report_in_hand` is whether the apply
+/// returned a report (so the camera may have been written); `status` is what `main` will end with for `result`
+/// (`transplant_exit_status`), and `error_line` the line `main` would print for it, which the watchdog prints itself
+/// because `main` is never reached when it fires.
+fn session_end(result: &Result<()>, dry_run: bool, report_in_hand: bool) -> SessionEnd {
+    let (status, error_line) = match result {
+        Ok(()) => (0, None),
+        Err(e) => (transplant_exit_status(e, dry_run, !report_in_hand), Some(error_line(e))),
+    };
+    if dry_run { SessionEnd::Leave { status, error_line } } else { SessionEnd::Bound { status, error_line } }
+}
+
+/// Carry out [`session_end`]: the one place a restore or transplant arms the teardown watchdog or leaves with
+/// `exit_now`, called once after the connected part of the command has ended whichever way (not after whichever step
+/// printed the result). `Bound` returns, so `device` and `sdk` drop with the watchdog already armed.
+fn end_session(result: &Result<()>, dry_run: bool, report_in_hand: bool) {
+    match session_end(result, dry_run, report_in_hand) {
+        SessionEnd::Leave { status, error_line } => {
+            if let Some(line) = error_line {
+                eprintln!("{line}");
+            }
+            nikon_fleet::process_exit::exit_now(status)
+        }
+        SessionEnd::Bound { status, error_line } => {
+            nikon_fleet::process_exit::arm_teardown_watchdog(nikon_fleet::process_exit::TEARDOWN_LIMIT, status, error_line)
+        }
+    }
 }
 
 /// Copy a snapshot's settings onto a live camera that may be a different
@@ -3755,131 +3788,71 @@ fn transplant_run(
 
     say(json, &format!("Connecting to {:?} (id={})…\n", target.name, target.id));
     let device = sdk.connect(target.id)?;
-    ensure_capabilities_present(device.capabilities.len())?;
+    // Everything from here runs with the camera session open: however it ends, an early `?` (a refusal such as a stale
+    // plan, a failed print) included, `end_session` decides the exit and bounds the disconnect before `device` and
+    // `sdk` drop (finding 8). A dry run wrote nothing and leaves at once; an apply keeps the ordinary disconnect, bounded.
+    let result = (|| -> Result<()> {
+        ensure_capabilities_present(device.capabilities.len())?;
 
-    let identity = target_identity(&target, &usb_info);
-    let input = PlanInput { source: &snap, source_bytes: &source_bytes, target: &identity, options: &options };
-    let plan = build_plan(&device, &guard, &input);
+        let identity = target_identity(&target, &usb_info);
+        let input = PlanInput { source: &snap, source_bytes: &source_bytes, target: &identity, options: &options };
+        let plan = build_plan(&device, &guard, &input);
 
-    if args.dry_run {
-        let text = cli_report::render_transplant(&plan.outcomes, true);
+        if args.dry_run {
+            let text = cli_report::render_transplant(&plan.outcomes, true);
+            for w in &text.warnings {
+                eprintln!("{w}");
+            }
+            say(json, &text.stdout);
+            say(json, &format!("Plan: {}\nDigest: {}\n", plan.summary, plan.digest));
+            if json {
+                json_out.emit(&serde_json::to_string_pretty(&plan)?)?;
+            }
+            return Ok(());
+        }
+
+        // The same sequence the MCP's transplant_apply runs: recompute the plan, take a restore point,
+        // write, read back. Unless the caller presents a plan it approved (--expect-digest, the way
+        // the GUI does), the plan above is this command's own and its digest and summary are what
+        // apply is given: running the command is the consent, the digest only guards the gap between
+        // the two reads.
+        let snapshots = snapshots_dir(data_dir);
+        let confirmation = transplant_confirmation(args, &plan.digest, &plan.summary);
+        let req = ApplyRequest {
+            plan: input,
+            guard: &guard,
+            snapshots_dir: &snapshots,
+            name_lookup: &name_lookup,
+            expected_digest: confirmation.0,
+            expected_summary: confirmation.1,
+            captured_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
+            gate_policy: if args.allow_partial { GatePolicy::AllowPartial } else { GatePolicy::Strict },
+        };
+        let report = after_apply(apply_transplant(&device, &req, &mut |_| {}), json, report_in_hand)?;
+
+        let text = cli_report::render_transplant(&report.outcomes, false);
         for w in &text.warnings {
             eprintln!("{w}");
         }
         say(json, &text.stdout);
-        say(json, &format!("Plan: {}\nDigest: {}\n", plan.summary, plan.digest));
+        let closing = cli_report::render_transplant_apply(&report);
+        say(json, &closing.stdout);
         if json {
-            json_out.emit(&serde_json::to_string_pretty(&plan)?)?;
+            json_out.emit(&serde_json::to_string_pretty(&report)?)?;
         }
-        // A plan wrote nothing and the result is out: leave without closing the session, as `check`
-        // does (F24: DisconnectDevice hangs on about 1 run in 14).
-        nikon_fleet::process_exit::exit_now(0);
-    }
-
-    // The same sequence the MCP's transplant_apply runs: recompute the plan, take a restore point,
-    // write, read back. Unless the caller presents a plan it approved (--expect-digest, the way
-    // the GUI does), the plan above is this command's own and its digest and summary are what
-    // apply is given: running the command is the consent, the digest only guards the gap between
-    // the two reads.
-    let snapshots = snapshots_dir(data_dir);
-    let confirmation = transplant_confirmation(args, &plan.digest, &plan.summary);
-    let req = ApplyRequest {
-        plan: input,
-        guard: &guard,
-        snapshots_dir: &snapshots,
-        name_lookup: &name_lookup,
-        expected_digest: confirmation.0,
-        expected_summary: confirmation.1,
-        captured_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
-        gate_policy: if args.allow_partial { GatePolicy::AllowPartial } else { GatePolicy::Strict },
-    };
-    let report = after_apply(apply_transplant(&device, &req, &mut |_| {}), json, report_in_hand)?;
-
-    let text = cli_report::render_transplant(&report.outcomes, false);
-    for w in &text.warnings {
-        eprintln!("{w}");
-    }
-    say(json, &text.stdout);
-    let closing = cli_report::render_transplant_apply(&report);
-    say(json, &closing.stdout);
-    if json {
-        json_out.emit(&serde_json::to_string_pretty(&report)?)?;
-    }
-    // The result is printed and the status is decided (a failing report ends 1, as `bail!` below does):
-    // bound the disconnect that follows when `device` and `sdk` drop.
-    let (status, line) = match &closing.failing {
-        Some(msg) => (transplant_exit_status(&anyhow::anyhow!("{msg}"), false, false), Some(format!("Error: {msg}"))),
-        None => (0, None),
-    };
-    bound_apply_teardown(status, line);
-    if let Some(msg) = closing.failing {
-        bail!("{msg}");
-    }
-    Ok(())
+        // A failing report ends 1, as this `bail!` does (a report is in hand).
+        if let Some(msg) = closing.failing {
+            bail!("{msg}");
+        }
+        Ok(())
+    })();
+    end_session(&result, args.dry_run, *report_in_hand);
+    result
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────
-
-/// An error that carries the process exit status it should end the run with.
-#[derive(Debug)]
-struct ExitCodeError {
-    code: i32,
-    message: String,
-}
-
-impl std::fmt::Display for ExitCodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for ExitCodeError {}
-
-/// The archive error inside `e`, however it was wrapped: raised directly, inside a fetch
-/// (`FetchError::Archive`), or inside a browse (`BrowseError::Ingest`).
-fn firmware_error_in(e: &anyhow::Error) -> Option<&FirmwareError> {
-    if let Some(f) = e.downcast_ref::<FirmwareError>() {
-        return Some(f);
-    }
-    match (e.downcast_ref::<FetchError>(), e.downcast_ref::<BrowseError>()) {
-        (Some(FetchError::Archive(f)), _) => Some(f),
-        (_, Some(BrowseError::Ingest { error, .. })) => Some(error),
-        _ => None,
-    }
-}
-
-/// This model and version is already archived and the command refused to change it: the typed
-/// `FirmwareError`s for "already there" (`AlreadyArchived`: `add` without `--force`;
-/// `ContentMismatch`: same version, different bytes).
-fn is_already_archived(e: &anyhow::Error) -> bool {
-    matches!(
-        firmware_error_in(e),
-        Some(FirmwareError::AlreadyArchived { .. } | FirmwareError::ContentMismatch { .. })
-    )
-}
-
-/// The process exit status for a failed run: 3 for "already archived" (`EXIT_ALREADY_ARCHIVED`),
-/// 4 for an indeterminate FTP-profile write (`EXIT_WRITE_INDETERMINATE`), a status an error
-/// carries itself (5 for a stale transplant plan, `EXIT_STALE_PLAN`), else 1.
-fn exit_code_for(e: &anyhow::Error) -> i32 {
-    if let Some(x) = e.downcast_ref::<ExitCodeError>() {
-        x.code
-    } else if is_already_archived(e) {
-        EXIT_ALREADY_ARCHIVED
-    } else if matches!(
-        e.downcast_ref::<nikon_fleet::ptp_usb::PtpUsbError>(),
-        Some(
-            nikon_fleet::ptp_usb::PtpUsbError::FtpWriteIndeterminate { .. }
-                | nikon_fleet::ptp_usb::PtpUsbError::PropWriteIndeterminate { .. }
-        )
-    ) {
-        EXIT_WRITE_INDETERMINATE
-    } else {
-        1
-    }
-}
 
 fn cmd_settings(sub: &SettingsCmd) -> Result<()> {
     use nikon_fleet::settings::{resolve, settings_path, update_in};
@@ -4028,10 +4001,10 @@ fn main() {
             // by `exit_code_for` instead of always 1.
             let code = exit_code_for(&e);
             if let Some(s) = span {
-                s.finish(if code == EXIT_WRITE_INDETERMINATE { Outcome::Indeterminate } else { Outcome::Failed });
+                s.finish(nikon_fleet::exit_status::diag_outcome_for_exit(code));
             }
             diag::shutdown(code);
-            eprintln!("Error: {e:?}");
+            eprintln!("{}", error_line(&e));
             std::process::exit(code);
         }
     }
@@ -4976,6 +4949,8 @@ mod tests {
 
     #[test]
     fn exit_code_is_three_for_already_archived_however_the_error_is_wrapped() {
+        use nikon_fleet::firmware_browse::BrowseError;
+        use nikon_fleet::firmware_source::FetchError;
         let archived: [anyhow::Error; 6] = [
             already("Z 9").into(),
             mismatch().into(),
@@ -4993,6 +4968,8 @@ mod tests {
 
     #[test]
     fn every_other_error_is_exit_one_including_other_archive_errors() {
+        use nikon_fleet::firmware_browse::BrowseError;
+        use nikon_fleet::firmware_source::FetchError;
         let others: [anyhow::Error; 7] = [
             anyhow::anyhow!("no cameras"),
             FirmwareError::NotFound { model: "Z 9".into(), version: "5.31".into() }.into(),
@@ -5225,6 +5202,20 @@ mod tests {
         ];
         for e in &wrapped {
             assert_eq!(exit_code_for(e), EXIT_WRITE_INDETERMINATE, "{e:?}");
+        }
+        // vendor-set-string's own indeterminate error (a property write whose reply was lost), wrapped as that command
+        // wraps it: exit 4, the same as the FTP write (the arm for it could be deleted with every test green).
+        let prop = || nikon_fleet::ptp_usb::PtpUsbError::PropWriteIndeterminate {
+            propcode: 0xD090,
+            cause: Box::new(nikon_fleet::ptp_usb::PtpUsbError::SessionPoisoned { cause: "x".into() }),
+        };
+        let set_string: [anyhow::Error; 3] = [
+            prop().into(),
+            anyhow::Error::new(prop()).context("the camera may have changed: the value was sent before this failed"),
+            Err::<(), _>(prop()).context("a").context("writing the string property over USB PTP").unwrap_err(),
+        ];
+        for e in &set_string {
+            assert_eq!(exit_code_for(e), EXIT_WRITE_INDETERMINATE, "vendor-set-string: {e:?}");
         }
         assert_eq!(EXIT_WRITE_INDETERMINATE, 4, "documented in --help; scripts test for it");
         assert!(![1, 2, EXIT_ALREADY_ARCHIVED].contains(&EXIT_WRITE_INDETERMINATE), "distinct from every other documented status");
@@ -5693,6 +5684,76 @@ mod tests {
         assert_eq!(transplant_exit_status(&plain, true, true), 1, "a dry run keeps the plain failure");
         let stale: anyhow::Error = ExitCodeError { code: 5, message: "stale".into() }.into();
         assert_eq!(transplant_exit_status(&stale, false, true), 5, "a stale plan keeps its own status");
+    }
+
+    // ── how a command that held a camera session leaves (findings 8 and 79) ──────
+
+    fn plain_err() -> Result<()> {
+        Err(anyhow::anyhow!("plain"))
+    }
+
+    fn stale_err() -> Result<()> {
+        Err(ExitCodeError { code: nikon_fleet::exit_status::EXIT_STALE_PLAN, message: "stale".into() }.into())
+    }
+
+    /// (leaves at once, status, the error line `main` would print). A line is checked by its start: with
+    /// RUST_BACKTRACE set, anyhow's Debug adds a trace after the message.
+    fn ended(end: SessionEnd) -> (bool, i32, Option<String>) {
+        match end {
+            SessionEnd::Leave { status, error_line } => (true, status, error_line),
+            SessionEnd::Bound { status, error_line } => (false, status, error_line),
+        }
+    }
+
+    #[test]
+    fn an_apply_that_failed_before_a_report_is_in_hand_ends_6_and_one_with_a_report_ends_1() {
+        // The watchdog's status must be the one `main` will end with. Flip `report_in_hand` (the glue: `!report_in_hand`
+        // is "wrote nothing") and these two lines swap, which no test used to notice.
+        let (leaves, status, line) = ended(session_end(&plain_err(), false, false));
+        assert!(!leaves);
+        assert_eq!(status, nikon_fleet::ops::apply::EXIT_REFUSED_BEFORE_WRITE, "nothing was written: refused before write");
+        assert!(line.is_some_and(|l| l.starts_with("Error: plain")), "the line `main` would print");
+        let (_, status, _) = ended(session_end(&plain_err(), false, true));
+        assert_eq!(status, 1, "a report is in hand: the camera may have been written");
+        // The same status the CLI's own mapping gives the error `cmd_*` returns.
+        for report_in_hand in [false, true] {
+            let mapped = transplant_exit(anyhow::anyhow!("plain"), false, !report_in_hand);
+            let SessionEnd::Bound { status, .. } = session_end(&plain_err(), false, report_in_hand) else { panic!() };
+            assert_eq!(status, exit_code_for(&mapped), "report_in_hand={report_in_hand}");
+        }
+    }
+
+    #[test]
+    fn a_stale_plan_keeps_its_own_status_whether_or_not_a_report_is_in_hand() {
+        // The stale-plan refusal happens before any write and before connecting finishes: the GUI must see 5, not TimedOut.
+        for report_in_hand in [false, true] {
+            let (_, status, _) = ended(session_end(&stale_err(), false, report_in_hand));
+            assert_eq!(status, 5, "report_in_hand={report_in_hand}");
+        }
+    }
+
+    #[test]
+    fn a_result_that_succeeded_ends_0_with_no_error_line() {
+        assert_eq!(ended(session_end(&Ok(()), false, true)), (false, 0, None));
+        assert_eq!(ended(session_end(&Ok(()), false, false)), (false, 0, None), "an apply that returned Ok without a report still ends 0");
+        assert_eq!(ended(session_end(&Ok(()), true, false)), (true, 0, None));
+    }
+
+    #[test]
+    fn a_dry_run_leaves_at_once_with_the_plain_failure_status_and_an_apply_never_does() {
+        // A dry run wrote nothing: its failures keep the ordinary status whatever report_in_hand says.
+        for report_in_hand in [false, true] {
+            let (leaves, status, line) = ended(session_end(&plain_err(), true, report_in_hand));
+            assert!(leaves && status == 1 && line.is_some_and(|l| l.starts_with("Error: plain")), "report_in_hand={report_in_hand}");
+        }
+        let (leaves, status, _) = ended(session_end(&stale_err(), true, false));
+        assert_eq!((leaves, status), (true, 5));
+        // An apply is bounded, never left: `Leave` skips the disconnect, which a write must not.
+        for result in [Ok(()), plain_err(), stale_err()] {
+            for report_in_hand in [false, true] {
+                assert!(matches!(session_end(&result, false, report_in_hand), SessionEnd::Bound { .. }));
+            }
+        }
     }
 
     #[test]

@@ -906,8 +906,9 @@ white-balance fine-tune, one step either side of its default), alternating the t
   capture for the read-back); that is a candidate, untested.
 - **Rate:** 50% here, against about 7% for read-only snapshots with the same pump (F24). One body, one property, 20 runs.
   The Z6III's write path is unmeasured.
-- **Why bounding it is safe:** the MCP supervisor already SIGKILLs a worker 3 s after its result, and every kill after a write
-  so far (F3, F25 and eleven in this experiment) left the camera healthy; the next run's USB reset and open worked each time.
+- **Why bounding it is safe:** the MCP supervisor SIGKILLed a worker 3 s after its result (it now waits 14 s, see below), and every
+  kill after a write so far (F3, F25 and eleven in this experiment) left the camera healthy; the next run's USB reset and open
+  worked each time.
 - **Second batch, after the camera was powered off and on (10 more applies, with the watchdog build, limit 5 s at the time):**
   **0 hangs**, all ten `applied_verified`, exit 0. `DisconnectDevice` took 1.553 to 1.577 s in 8 runs and **4.703 and 4.704 s in
   2**: a third mode, slow but finishing (about 3.15 s longer than healthy, tight enough to look like an internal SDK timeout; possibly
@@ -920,9 +921,18 @@ white-balance fine-tune, one step either side of its default), alternating the t
   `restore-apply`. If the process has not exited 10 s later (twice the slow-but-finishing case) it records a
   `teardown_watchdog` event, prints a warning, and ends with the status it was already going to have. It does not affect a
   process that exits normally. Verified on the Z 9 only for the mechanism: in the second batch it ended both slow runs at 5 s with the
-  right status and a complete result; a true hang under the final 10 s limit has not been seen since. Not covered: a failure between
-  connecting and the first write that leaves the session open (the old behaviour: it waits), and read-only commands, which still skip
+  right status and a complete result; a true hang under the final 10 s limit has not been seen since. Read-only commands still skip
   the disconnect (F24).
+- **Arming (2026-11-05, review findings 8, 9, 79).** It was armed by hand after the result was printed, so a failure between connecting
+  and that point (a stale plan refused at exit 5, a failed print, a body with no capabilities in the worker) left the disconnect
+  unbounded. Now the part of `restore` and `transplant` that holds the session ends in one place (`end_session`, which decides the
+  status from the result and arms the watchdog whichever way the connected part ended), and the worker's `with_body` has one path from
+  connect to its teardown decision. Under MCP the supervisor's grace is now 14 s (`DEFAULT_GRACE`: the watchdog's 10 s, its 2 s record
+  bound, 2 s of margin), so the watchdog, not the supervisor's kill, is what ends a hung disconnect, and the 4.7 s slow-but-finishing
+  disconnect is no longer cut. The cost: a worker that really hangs after its result delays the tool's answer by up to 14 s instead
+  of 3 s (reads leave through `exit_now` and never wait). The status the watchdog ends with is the same one `main` would have used
+  (`session_end`, pinned by tests that flip `report_in_hand`). Hardware status unchanged: mechanism verified on the Z 9, the new
+  ordering is not.
 - **Not tried:** a longer or repeated pump after a write, to find the cause. The watchdog bounds the cost; it does not remove the hang.
 
 ## F13. Still unverified

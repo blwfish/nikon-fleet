@@ -14,7 +14,8 @@ use nikon_fleet::firmware::{
 use nikon_fleet::ops::cameras::{AmbiguousPairing, CameraList, duplicate_models, list_cameras};
 use nikon_fleet::ops::list::{EntryState, list_dir};
 use nikon_fleet::ops::paths::{checked_reference_filename, is_safe_path_component, write_atomic};
-use nikon_fleet::ops::apply::{ApplyStatus, EXIT_REFUSED_BEFORE_WRITE, EXIT_STALE_PLAN};
+use nikon_fleet::exit_status::{EXIT_REFUSED_BEFORE_WRITE, EXIT_STALE_PLAN, EXIT_WRITE_INDETERMINATE, ExitKind};
+use nikon_fleet::ops::apply::ApplyStatus;
 use nikon_fleet::ops::labels::Labels;
 use nikon_fleet::ops::plan::planned_would_change;
 use nikon_fleet::ops::render::{self, Row, RowFilter};
@@ -966,11 +967,22 @@ fn level_color(level: Level) -> Option<egui::Color32> {
     }
 }
 
+/// Record a normal quit of the window. Plain `shutdown(0)`, on the UI thread, is right because the recorder judges open
+/// spans by the thread that calls it: the `gui` span (begun in `main`, on the thread `run_native` and so `on_exit` run
+/// on) ends `ok`, while a `gui_cmd` or a `cli_child` begun on the worker thread, a camera child that is still running
+/// when the window closes, ends `abandoned` and the exit entry carries `cut_off`. The quit does not claim that work
+/// finished (finding 24). It must therefore be called on the thread that began the `gui` span.
+fn record_quit(d: Option<&nikon_fleet::diag::Diag>) {
+    if let Some(d) = d {
+        d.shutdown(0);
+    }
+}
+
 impl eframe::App for FleetApp {
     /// Called once on a normal quit. The window system may end the process without returning from
     /// `run_native`, so the exit is recorded here too (a second record is ignored).
     fn on_exit(&mut self) {
-        nikon_fleet::diag::shutdown(0);
+        record_quit(nikon_fleet::diag::global());
     }
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1776,7 +1788,7 @@ fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Evt>, ctx: egui::Context, in
                 Err(e) => Evt::Checked { request, result: Err(e.clone()) },
             },
         };
-        span.finish(if evt_failed(&evt) { Outcome::Failed } else { Outcome::Ok });
+        span.finish(evt_outcome(&evt));
         // The receiver is gone only when the window closed; there is no one to tell.
         let _ = tx.send(evt);
         ctx.request_repaint();
@@ -1801,10 +1813,34 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
     }
 }
 
-/// Whether the result the worker is about to send is a failure. Only the variants that carry a plain
-/// failure are looked at; a plan or an apply carries its own status for the window to show.
-fn evt_failed(evt: &Evt) -> bool {
-    matches!(evt, Evt::Err(_) | Evt::Vendor { result: Err(_), .. } | Evt::Checked { result: Err(_), .. })
+/// How the `gui_cmd` span of the result the worker is about to send ends. A plain failure is `failed`; a plan that could
+/// not be made is `failed`; an apply is judged by what it reported, as the CLI's and the MCP's `apply` spans are
+/// (`ApplyStatus::diag_outcome`): an apply that was not fully verified, or whose outcome is unknown, is `indeterminate`,
+/// a refusal `failed`, and only a verified apply is `ok`. (It used to end `ok` for any `Applied` event.)
+fn evt_outcome(evt: &Evt) -> nikon_fleet::diag::Outcome {
+    use nikon_fleet::diag::Outcome;
+    fn judged<R: AppliedReport>(o: &ApplyOutcome<R>) -> Outcome {
+        match o {
+            ApplyOutcome::Report { report, .. } => report.status().diag_outcome(),
+            ApplyOutcome::NotApplied { .. } => Outcome::Failed,
+            ApplyOutcome::Indeterminate { .. } => Outcome::Indeterminate,
+        }
+    }
+    match evt {
+        Evt::Err(_)
+        | Evt::Vendor { result: Err(_), .. }
+        | Evt::Checked { result: Err(_), .. }
+        | Evt::Planned(PlannedEvt::Transplant { result: Err(_), .. })
+        | Evt::Planned(PlannedEvt::Restore { result: Err(_), .. }) => Outcome::Failed,
+        Evt::Applied(AppliedEvt::Transplant { outcome, .. }) => judged(outcome),
+        Evt::Applied(AppliedEvt::Restore { outcome, .. }) => judged(outcome),
+        Evt::Cameras(_)
+        | Evt::Listing(_)
+        | Evt::Done(_)
+        | Evt::Vendor { result: Ok(_), .. }
+        | Evt::Checked { result: Ok(_), .. }
+        | Evt::Planned(_) => Outcome::Ok,
+    }
 }
 
 fn with_data_dir(data_dir: &Result<PathBuf, String>, f: impl FnOnce(&Path) -> Evt) -> Evt {
@@ -1821,8 +1857,12 @@ const CLI_ENV: &str = "NIKON_FLEET_CLI";
 const CLI_NAME: &str = "nikon-fleet";
 
 /// How long a command that talks to a camera may run before it is killed. A camera
-/// session takes 4-20 s; the SDK's close hangs on about 1 run in 14 (F24), and a
-/// worker with no limit would wait for that forever.
+/// session takes 4-20 s. This is the outer backstop: the CLI bounds its own teardown (a
+/// read-only command skips the SDK's close, F24, and a write command's close is cut by the
+/// teardown watchdog `process_exit::TEARDOWN_LIMIT` after its result, F26), so a run this long
+/// is stuck somewhere else. A test pins that it is longer than the watchdog's worst case:
+/// killing the child first would turn "the result is out, ended by the watchdog with its status"
+/// into `TimedOut`.
 const CAMERA_CLI_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Where to find the CLI binary: `$NIKON_FLEET_CLI` if set, else
@@ -1899,11 +1939,6 @@ struct CliError {
     code: Option<i32>,
 }
 
-/// `nikon-fleet vendor-write-ftp` exits with this when the profile data was sent and the write
-/// then failed (`PtpUsbError::FtpWriteIndeterminate`): the camera may have changed. Documented
-/// under "Exit status:" in its `--help`; callers test the code, never the stderr text.
-const EXIT_FTP_WRITE_INDETERMINATE: i32 = 4;
-
 impl CliError {
     /// A camera write that ended this way may or may not have reached the camera.
     fn outcome_unknown(&self) -> bool {
@@ -1917,7 +1952,8 @@ impl CliError {
     fn write_outcome_unknown(&self) -> bool {
         self.outcome_unknown()
             || self.kind == CliFailure::StdinWrite
-            || (self.kind == CliFailure::Exit && !matches!(self.code, Some(1) | Some(2)))
+            || (self.kind == CliFailure::Exit
+                && !matches!(self.code.and_then(ExitKind::from_code), Some(ExitKind::Failure | ExitKind::Usage)))
     }
 }
 
@@ -2463,9 +2499,10 @@ fn vendor_write_via(cli: &Path, profile: &FtpProfile, serial: Option<&str>, time
 /// A failed FTP write. When the run was cut off after the data may have gone out, or the
 /// child took a truncated password, the camera may have changed: not a plain failure.
 fn ftp_write_failure(e: &CliError) -> String {
-    if e.kind == CliFailure::Exit && e.code == Some(EXIT_FTP_WRITE_INDETERMINATE) {
+    if e.kind == CliFailure::Exit && e.code == Some(EXIT_WRITE_INDETERMINATE) {
         format!(
-            "The camera may have changed: check the FTP profile in the camera's menu (this tool cannot read it back). {}",
+            "The camera may have changed: check the FTP profile in the camera's menu, or read it back with the command \
+             line (`nikon-fleet vendor-read-ftp --slot 0`, from a new session: a written profile moves to the front). {}",
             e.message
         )
     } else if e.write_outcome_unknown() {
@@ -5814,9 +5851,11 @@ mod tests {
     fn exit_status_4_from_the_write_command_means_the_camera_may_have_changed() {
         let dir = TempDir::new().unwrap();
         // The message text is deliberately unhelpful: only the exit status may decide.
-        let indeterminate = script(dir.path(), "ind", "cat > /dev/null\necho 'Error: write failed' >&2\nexit 4");
+        let indeterminate =
+            script(dir.path(), "ind", &format!("cat > /dev/null\necho 'Error: write failed' >&2\nexit {EXIT_WRITE_INDETERMINATE}"));
         let e = vendor_write_via(&indeterminate, &sample_profile(), None, T).unwrap_err();
-        assert!(e.contains("camera may have changed") && e.contains("camera's menu") && e.contains("cannot read it back"), "{e}");
+        assert!(e.contains("camera may have changed") && e.contains("camera's menu") && e.contains("vendor-read-ftp --slot 0"), "{e}");
+        assert!(!e.contains("cannot read it back"), "vendor-read-ftp works on the Z 9 and Z6III: {e}");
         assert!(e.contains("Error: write failed"), "the CLI's own text is kept: {e}");
         // The CLI's definitive refusals (1, 2) are plain failures.
         for code in [1, 2] {
@@ -5824,11 +5863,11 @@ mod tests {
             assert_eq!(vendor_write_via(&plain, &sample_profile(), None, T).unwrap_err(), "Error: write failed", "exit {code}");
         }
         // A read is not a write: 4 means nothing special there.
-        let read = script(dir.path(), "read", "echo 'Error: x' >&2\nexit 4");
+        let read = script(dir.path(), "read", &format!("echo 'Error: x' >&2\nexit {EXIT_WRITE_INDETERMINATE}"));
         assert_eq!(vendor_read_via(&read, 0xD053, None, T).unwrap_err(), "Error: x");
         // The code is carried typed on the error.
-        let (p, a) = sh("exit 4");
-        assert_eq!(run_cli(&p, &a, None, T).unwrap_err().code, Some(4));
+        let (p, a) = sh(&format!("exit {EXIT_WRITE_INDETERMINATE}"));
+        assert_eq!(run_cli(&p, &a, None, T).unwrap_err().code, Some(EXIT_WRITE_INDETERMINATE));
     }
 
     #[cfg(unix)]
@@ -5851,7 +5890,7 @@ mod tests {
             let c = script(dir.path(), "refused", &format!("cat > /dev/null\necho 'refused' >&2\nexit {code}"));
             assert_eq!(vendor_write_via(&c, &sample_profile(), None, T).unwrap_err(), "refused", "exit {code}");
         }
-        let four = script(dir.path(), "four", "cat > /dev/null\necho 'x' >&2\nexit 4");
+        let four = script(dir.path(), "four", &format!("cat > /dev/null\necho 'x' >&2\nexit {EXIT_WRITE_INDETERMINATE}"));
         let e = vendor_write_via(&four, &sample_profile(), None, T).unwrap_err();
         assert!(e.contains("camera may have changed") && !may(&e), "{e}");
         // A read that dies is just a failed read.
@@ -5866,6 +5905,54 @@ mod tests {
         for kind in [CliFailure::TimedOut, CliFailure::Wait, CliFailure::StdinWrite] {
             let e = CliError { kind, ..e.clone() };
             assert!(ftp_write_failure(&e).contains("MAY have taken"), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_guis_kill_timeouts_leave_the_clis_teardown_watchdog_room_to_end_the_run_first() {
+        // Three unrelated constants (finding 9): the watchdog in the library, the supervisor's grace in the MCP crate, and
+        // these. A run that is only waiting for its disconnect to be cut must not be killed by the GUI first. (The plan
+        // and apply timeouts also have to cover a whole camera session, 4-20 s a read, before any teardown.)
+        let worst = nikon_fleet::process_exit::TEARDOWN_WORST_CASE;
+        for (name, t) in [("CAMERA_CLI_TIMEOUT", CAMERA_CLI_TIMEOUT), ("TRANSPLANT_APPLY_TIMEOUT", TRANSPLANT_APPLY_TIMEOUT)] {
+            assert!(t > worst * 3, "{name} = {t:?} must leave the {worst:?} watchdog plenty of room");
+        }
+        assert!(TRANSPLANT_APPLY_TIMEOUT > CAMERA_CLI_TIMEOUT, "an apply adds a restore point and a read-back to the session");
+    }
+
+    #[test]
+    fn the_guis_reading_of_a_write_status_agrees_with_the_cli_for_every_kind_of_camera_error() {
+        // Finding 4: the GUI had its own `EXIT_FTP_WRITE_INDETERMINATE = 4` beside the CLI's constant, with nothing tying
+        // them together. Both now come from `nikon_fleet::exit_status`; this walks the camera errors a write can end
+        // with, takes the status the CLI would exit with for each (`write_kind_of_ptp_usb_error`, which the CLI's
+        // `exit_code_for` is built on) and checks what the GUI makes of a child that exited with it.
+        use nikon_fleet::exit_status::write_kind_of_ptp_usb_error;
+        use nikon_fleet::ptp_usb::PtpUsbError as E;
+        let cause = || Box::new(E::SessionPoisoned { cause: "x".into() });
+        let errors = [
+            (E::FtpWriteIndeterminate { cause: cause() }, true),
+            (E::PropWriteIndeterminate { propcode: 0xD090, cause: cause() }, true),
+            (E::NoDevice, false),
+            (E::ShortWrite { written: 1, expected: 2 }, false),
+            (E::SessionPoisoned { cause: "x".into() }, false),
+            (E::UnconfirmedModel("Z 5".into()), false),
+            (E::PropNotWritable { propcode: 0xD090, get_set: 0 }, false),
+            (E::FtpWriteRefused { slot: 9, param2: 1, why: ptp_usb::FtpWriteRefusal::SlotHangsCamera }, false),
+        ];
+        for (err, indeterminate) in errors {
+            let code = write_kind_of_ptp_usb_error(&err).code();
+            let e = CliError { kind: CliFailure::Exit, message: "m".into(), stdout: String::new(), stderr: String::new(), code: Some(code) };
+            let text = ftp_write_failure(&e);
+            assert_eq!(text.contains("camera may have changed"), indeterminate, "{err:?} -> exit {code} -> {text}");
+            // Whatever the wording, an indeterminate status is never read as a refusal that is safe to retry.
+            assert_eq!(e.write_outcome_unknown(), indeterminate || code != 1, "{err:?} -> exit {code}");
+            assert_eq!(code == EXIT_WRITE_INDETERMINATE, indeterminate, "{err:?}");
+        }
+        // The GUI's own constants are the library's: 4 is the indeterminate write, 1 and 2 stay definitive.
+        assert_eq!(ExitKind::WriteIndeterminate.code(), 4);
+        for definitive in [ExitKind::Failure, ExitKind::Usage] {
+            let e = CliError { kind: CliFailure::Exit, message: "m".into(), stdout: String::new(), stderr: String::new(), code: Some(definitive.code()) };
+            assert!(!e.write_outcome_unknown(), "{definitive:?}");
         }
     }
 
@@ -8577,9 +8664,71 @@ mod tests {
         assert_eq!(cmd_name(&Cmd::Export { dest: PathBuf::from("/x") }), "export");
         assert_eq!(cmd_name(&Cmd::SetReference { file: "f".into() }), "set_reference");
         assert_eq!(cmd_name(&Cmd::VendorRead { propcode: 1, serial: None }), "vendor_read");
-        assert!(evt_failed(&Evt::Err("x".into())));
-        assert!(evt_failed(&Evt::Vendor { op: VendorOp::Read, result: Err("x".into()) }));
-        assert!(!evt_failed(&Evt::Vendor { op: VendorOp::Read, result: Ok(VendorOut { text: String::new(), stderr: String::new() }) }));
+        assert_eq!(evt_outcome(&Evt::Err("x".into())), nikon_fleet::diag::Outcome::Failed);
+        assert_eq!(evt_outcome(&Evt::Vendor { op: VendorOp::Read, result: Err("x".into()) }), nikon_fleet::diag::Outcome::Failed);
+        assert_eq!(
+            evt_outcome(&Evt::Vendor { op: VendorOp::Read, result: Ok(VendorOut { text: String::new(), stderr: String::new() }) }),
+            nikon_fleet::diag::Outcome::Ok
+        );
+    }
+
+    #[test]
+    fn an_apply_command_span_ends_as_the_apply_was_judged_not_always_ok() {
+        // Finding 25 (the GUI half): `gui_cmd` ended Ok for every Applied event, an unverified or indeterminate apply
+        // included, while the CLI's and the MCP's apply spans are judged by the report's status.
+        use nikon_fleet::diag::Outcome;
+        let digest = "d";
+        let report_of = |scenario: &str| {
+            let (json, status) = library_apply_json(scenario);
+            let plan_digest = serde_json::from_str::<ApplyJson>(&json).unwrap().plan_digest;
+            (classify_apply(Ok(CliOutput { stdout: json, stderr: String::new() }), &plan_digest), status)
+        };
+        let request = || tp_request(&[]);
+        for (scenario, want) in [("verified", Outcome::Ok), ("unverified", Outcome::Indeterminate), ("failed", Outcome::Failed)] {
+            let (outcome, status) = report_of(scenario);
+            assert_eq!(status.diag_outcome(), want, "{scenario}: the status itself");
+            assert_eq!(evt_outcome(&Evt::Applied(AppliedEvt::Transplant { request: request(), outcome })), want, "{scenario}");
+        }
+        // Without a report: a CLI refusal is a failure; a run that may have written is indeterminate.
+        let refused = classify_apply(Err(cli_error(CliFailure::Exit, Some(EXIT_REFUSED_BEFORE_WRITE), "")), digest);
+        assert_eq!(evt_outcome(&Evt::Applied(AppliedEvt::Transplant { request: request(), outcome: refused })), Outcome::Failed);
+        let unknown = classify_apply(Err(cli_error(CliFailure::TimedOut, None, "")), digest);
+        assert_eq!(evt_outcome(&Evt::Applied(AppliedEvt::Transplant { request: request(), outcome: unknown })), Outcome::Indeterminate);
+    }
+
+    #[test]
+    fn a_quit_ends_the_window_span_ok_and_a_camera_child_still_running_abandoned_with_cut_off() {
+        // Finding 24: on_exit calls `shutdown(0)`, which used to close every open span ok. Now spans begun on other
+        // threads (the worker's `gui_cmd` and its `cli_child`) end abandoned and the exit entry says it cut work off.
+        use nikon_fleet::diag::{Class, Config, Diag, FIELD_CUT_OFF, OP_EXIT, Outcome, Subsystem, Val};
+        let dir = TempDir::new().unwrap();
+        let d = std::sync::Arc::new(Diag::new(Config::new(dir.path().to_path_buf(), Subsystem::Gui)).unwrap());
+        // `gui` is begun on this thread, as `main` does, and `record_quit` runs on it, as `on_exit` does.
+        let gui = d.span(Subsystem::Gui, "gui", Class::Top, &[]);
+        let (began_tx, began_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let d2 = d.clone();
+        let worker = std::thread::spawn(move || {
+            let cmd = d2.span(Subsystem::Gui, "gui_cmd", Class::Top, &[]);
+            let child = d2.span(Subsystem::Gui, "cli_child", Class::Top, &[]);
+            began_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            child.finish(Outcome::Ok);
+            cmd.finish(Outcome::Ok);
+        });
+        began_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        record_quit(Some(&d));
+        let outcome_of = |op: &str| d.snapshot().into_iter().find(|e| e.op == op).and_then(|e| e.outcome);
+        assert_eq!(outcome_of("cli_child"), Some(Outcome::Abandoned), "a camera child still running is not ok");
+        assert_eq!(outcome_of("gui_cmd"), Some(Outcome::Abandoned));
+        assert_eq!(outcome_of("gui"), Some(Outcome::Ok), "the window's own span closed with the quit");
+        let exit = d.snapshot().into_iter().find(|e| e.op == OP_EXIT).expect("an exit entry");
+        assert_eq!(diag_field(&exit, FIELD_CUT_OFF), Some(&Val::U64(2)), "{exit:?}");
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        drop(gui);
+        // No recorder: the quit is simply not recorded.
+        record_quit(None);
     }
 
     #[test]

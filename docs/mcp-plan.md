@@ -131,9 +131,11 @@ that exists but cannot be read (`reference_read_failures`) instead of treating i
   - Lines are `progress` (a named phase: connected, restore point written, writing n/N,
     read-back) and exactly one `result`. The `result` line is **written and flushed before the
     `Device`/`Sdk` is dropped**, so a teardown hang (F3 (4): a hang after a completed write) cannot
-    lose it. Once the parent has read the `result` it is final: the worker gets a short grace to
-    exit, then is sent SIGKILL and reaped, and a hang or non-zero exit after the result is not an
-    error. (F3's hangs were ended with SIGTERM or an alarm and the camera was healthy afterwards;
+    lose it. Once the parent has read the `result` it is final: the worker gets a grace to
+    exit (14 s: the worker's own teardown watchdog, 10 s plus its 2 s record bound, and a 2 s margin; see
+    `supervisor::DEFAULT_GRACE`), then is sent SIGKILL and reaped, and a hang or non-zero exit after the
+    result is not an error. (The grace was 3 s, which cut a slow-but-finishing disconnect and kept the
+    watchdog from ever firing under MCP.) (F3's hangs were ended with SIGTERM or an alarm and the camera was healthy afterwards;
     SIGKILL of the worker has not been tried separately, §8.2.) F24 found the cause of most hangs
     (an unserviced main run loop before `DisconnectDevice`) and `Device::drop` now pumps it first;
     this grace-then-kill stays as the backstop, since the hang is rare after the pump, not impossible. The read-only
@@ -783,7 +785,7 @@ To write for the MCP:
   Nothing is auto-deleted and there is no delete tool; past a cap the call refuses with `data_dir_full` and the user
   tidies by hand. A human prune command is not built; add it if the caps start to bite.
 - **Per-tool deadlines unchanged: capture 90 s, check 120 s, plan 150 s, apply 300 s** (`--deadline-secs` overrides).
-  Healthy calls take about 3 to 20 s and a hang after the result is handled by the 3 s grace, so the deadlines bind
+  Healthy calls take about 3 to 20 s and a hang after the result is handled by the worker's teardown watchdog (10 s) and, behind it, the 14 s grace, so the deadlines bind
   rarely. A too-long read deadline only makes a stuck call slow; a too-short apply deadline would make a good write
   look `indeterminate`, so the apply one stays generous. Clients' own request timeouts are still unverified (§8.2).
   The offline tools (list, get, diff, `list_cameras`) have their own deadline (30 s; `firmware_status`, which uses the
@@ -817,7 +819,8 @@ automating the firmware licence; FTP profile writes; firmware flashing.
   `failed`: `isError: true` with the whole report as structured content and no `error` key.
 - **Worker supervision.** Result on a private pipe as fd 3 in the child only (both ends close-on-exec in the
   server); calls queue FIFO; a deadline or a cancellation kills (SIGKILL) and reaps the worker; once the
-  `result` line is read the worker gets a 3 s grace and is then killed whatever it is doing. Lines already in
+  `result` line is read the worker gets a 14 s grace (`supervisor::DEFAULT_GRACE`: longer than the worker's 10 s teardown
+  watchdog plus its 2 s record bound, a relation a test pins in both crates) and is then killed whatever it is doing. Lines already in
   the pipe are read before a deadline or cancellation is acted on, and the pipe is drained after a kill, so a
   `writing` or `result` line that was flushed is never missed. Deadlines: capture 90 s, check 120 s, plans
   150 s, applies 300 s (`--deadline-secs` overrides all).

@@ -90,7 +90,14 @@ pub enum SourceError {
     #[error("source {source_id} has no entry for model {model:?}")]
     UnsupportedModel { source_id: &'static str, model: String },
     #[error("HTTP request for {url} failed: {detail}")]
-    Http { url: String, detail: String },
+    Http {
+        url: String,
+        detail: String,
+        /// The HTTP status when the server answered with an error status; `None` for a failure before there was an
+        /// answer (DNS, connect, TLS, a timeout). A typed field so the diagnostics can tell a 404 from a 503 from a
+        /// timeout without reading `detail`.
+        status: Option<u16>,
+    },
     #[error("could not read {url}: {reason}")]
     Parse { url: String, reason: String },
     #[error("I/O error: {0}")]
@@ -104,6 +111,11 @@ pub trait HttpGet {
     fn get_to_file(&self, url: &str, dest: &Path) -> Result<u64, SourceError>;
 }
 
+/// How long a connection may take to be made, and how long a whole request may take. Both are set on the agent and both are
+/// recorded on every HTTP span, so a request that hung shows which limit it was under.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
+
 pub struct UreqHttp {
     agent: ureq::Agent,
 }
@@ -112,19 +124,16 @@ impl UreqHttp {
     pub fn new() -> Self {
         let agent = ureq::AgentBuilder::new()
             .user_agent("nikon-fleet/0.1 (firmware check; +local)")
-            .timeout_connect(Duration::from_secs(15))
-            .timeout(Duration::from_secs(600))
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout(TOTAL_TIMEOUT)
             .build();
         UreqHttp { agent }
     }
 
     fn call(&self, url: &str) -> Result<ureq::Response, SourceError> {
-        self.agent.get(url).call().map_err(|e| SourceError::Http {
-            url: url.to_owned(),
-            detail: match e {
-                ureq::Error::Status(code, _) => format!("HTTP {code}"),
-                ureq::Error::Transport(t) => t.to_string(),
-            },
+        self.agent.get(url).call().map_err(|e| match e {
+            ureq::Error::Status(code, _) => SourceError::Http { url: url.to_owned(), detail: format!("HTTP {code}"), status: Some(code) },
+            ureq::Error::Transport(t) => SourceError::Http { url: url.to_owned(), detail: t.to_string(), status: None },
         })
     }
 }
@@ -136,12 +145,24 @@ impl Default for UreqHttp {
 }
 
 /// The diagnostics span for one request. It records the host, never the URL (a query can carry a token) and never
-/// an error's text (a [`SourceError::Http`] embeds the URL): the host, the timeouts that apply, then how many bytes
-/// came back and a closed kind for a failure. A request can sit for the whole 600 s timeout, and the in-flight
-/// file shows which host it is waiting on.
+/// an error's text (a [`SourceError::Http`] embeds the URL): the host (`url_ok` says whether the URL parsed to one, so
+/// "not a URL" and "no host" are not both just an empty host), the timeouts that apply, then how many bytes came back
+/// and a closed kind for a failure (`http_status` with the status, or `http_transport`). A request can sit for the
+/// whole 600 s timeout, and the in-flight file shows which host it is waiting on.
 fn http_span(op: &str, url: &str) -> crate::diag::Span<'static> {
     use crate::diag::{self, Class, Subsystem, Val};
-    diag::span(Subsystem::Firmware, op, Class::Top, &[("host", Val::text(&host_of(url)))])
+    let host = host_of(url);
+    diag::span(
+        Subsystem::Firmware,
+        op,
+        Class::Top,
+        &[
+            ("url_ok", Val::Bool(!host.is_empty())),
+            ("host", Val::text(&host)),
+            ("connect_timeout_ms", Val::U64(CONNECT_TIMEOUT.as_millis() as u64)),
+            ("total_timeout_ms", Val::U64(TOTAL_TIMEOUT.as_millis() as u64)),
+        ],
+    )
 }
 
 /// Just the host of `url`: no scheme, credentials, port, path or query. Empty when it does not parse.
@@ -154,15 +175,27 @@ fn finish_http<T>(span: crate::diag::Span<'static>, result: &Result<T, SourceErr
     use crate::diag::{Outcome, Val};
     match result {
         Ok(v) => span.finish_with(Outcome::Ok, &[("bytes", Val::U64(bytes(v)))]),
-        Err(e) => span.finish_with(Outcome::Failed, &[("error_kind", Val::text(source_error_kind(e)))]),
+        Err(e) => span.finish_with(Outcome::Failed, &source_error_fields(e)),
     }
+}
+
+/// The fields a failed [`SourceError`] adds to a span: its closed `error_kind`, and for an HTTP error status the status
+/// itself (`http_status`), so a 404, a 503 and a timeout are three different records.
+fn source_error_fields(e: &SourceError) -> Vec<(&'static str, crate::diag::Val)> {
+    use crate::diag::Val;
+    let mut fields = vec![("error_kind", Val::text(source_error_kind(e)))];
+    if let SourceError::Http { status: Some(code), .. } = e {
+        fields.push(("http_status", Val::U64(u64::from(*code))));
+    }
+    fields
 }
 
 /// A closed name for a [`SourceError`] variant, for diagnostics (never the message, which can embed a URL).
 fn source_error_kind(e: &SourceError) -> &'static str {
     match e {
         SourceError::UnsupportedModel { .. } => "unsupported_model",
-        SourceError::Http { .. } => "http",
+        SourceError::Http { status: Some(_), .. } => "http_status",
+        SourceError::Http { status: None, .. } => "http_transport",
         SourceError::Parse { .. } => "parse",
         SourceError::Io(_) => "io",
     }
@@ -177,7 +210,7 @@ fn fetch_span_result(r: &Result<IngestOutcome, FetchError>) -> crate::firmware::
     match r {
         Ok(o) => (Outcome::Ok, ingest_ok_fields(o)),
         Err(FetchError::Archive(e)) => (Outcome::Failed, firmware_error_fields(e)),
-        Err(FetchError::Source(e)) => (Outcome::Failed, vec![("error_kind", Val::text(source_error_kind(e)))]),
+        Err(FetchError::Source(e)) => (Outcome::Failed, source_error_fields(e)),
         Err(FetchError::Gated(_)) => (Outcome::Failed, vec![("error_kind", Val::text("gated"))]),
         Err(FetchError::SizeMismatch { expected, got }) => (Outcome::Failed, vec![
             ("error_kind", Val::text("size_mismatch")), ("expected_size", Val::Len(*expected)), ("got_size", Val::Len(*got)),
@@ -779,8 +812,8 @@ mod tests {
             self.asked.lock().unwrap().push(url.to_owned());
             match self.pages.get(url) {
                 Some(Ok(b)) => Ok(b.clone()),
-                Some(Err(d)) => Err(SourceError::Http { url: url.to_owned(), detail: d.clone() }),
-                None => Err(SourceError::Http { url: url.to_owned(), detail: "HTTP 404".into() }),
+                Some(Err(d)) => Err(SourceError::Http { url: url.to_owned(), detail: d.clone(), status: None }),
+                None => Err(SourceError::Http { url: url.to_owned(), detail: "HTTP 404".into(), status: Some(404) }),
             }
         }
         fn get_to_file(&self, url: &str, dest: &Path) -> Result<u64, SourceError> {
@@ -873,7 +906,7 @@ mod tests {
         assert_eq!(assess(&l, &[v("5.31"), v("5.33")]), ModelStatus::AlreadyArchived { latest: v("5.33") });
         // Archive holds only OLDER versions → still new. Archive holds a NEWER one → latest still not archived.
         assert!(matches!(assess(&l, &[v("5.34")]), ModelStatus::NewAvailable { .. }));
-        let bad: Result<Release, SourceError> = Err(SourceError::Http { url: "u".into(), detail: "HTTP 503".into() });
+        let bad: Result<Release, SourceError> = Err(SourceError::Http { url: "u".into(), detail: "HTTP 503".into(), status: Some(503) });
         assert!(matches!(assess(&bad, &[v("5.33")]), ModelStatus::CouldNotDetermine { .. }),
             "a source failure must never read as 'already archived' or 'nothing new'");
     }
@@ -927,6 +960,33 @@ mod tests {
             data.path(), scratch.path(), "t").unwrap_err();
         assert!(matches!(e, FetchError::HashMismatch { .. }), "{e:?}");
         assert!(!crate::firmware::archive_exists(data.path(), "Z 9", "5.33"));
+    }
+
+    #[test]
+    fn an_http_error_status_and_a_transport_failure_are_different_records() {
+        use crate::diag::Val;
+        let get = |f: &Vec<(&'static str, Val)>, k: &str| f.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+        let http = |status| SourceError::Http { url: "https://x.test/secret?token=T".into(), detail: "d".into(), status };
+        let f404 = source_error_fields(&http(Some(404)));
+        let f503 = source_error_fields(&http(Some(503)));
+        let timeout = source_error_fields(&http(None));
+        assert_eq!((get(&f404, "error_kind"), get(&f404, "http_status")), (Some(Val::text("http_status")), Some(Val::U64(404))));
+        assert_eq!((get(&f503, "error_kind"), get(&f503, "http_status")), (Some(Val::text("http_status")), Some(Val::U64(503))));
+        assert_eq!((get(&timeout, "error_kind"), get(&timeout, "http_status")), (Some(Val::text("http_transport")), None));
+        // The URL (a token in its query) and the detail text are in none of them.
+        for f in [&f404, &f503, &timeout] {
+            assert!(f.iter().all(|(_, v)| !format!("{v:?}").contains("token")), "{f:?}");
+        }
+        // Other source errors keep their kind and gain no status.
+        let io = source_error_fields(&SourceError::Io(std::io::Error::other("x")));
+        assert_eq!((get(&io, "error_kind"), get(&io, "http_status")), (Some(Val::text("io")), None));
+    }
+
+    #[test]
+    fn the_request_timeouts_are_the_ones_on_the_agent() {
+        // Recorded on every HTTP span from the same constants the agent is built with.
+        assert_eq!((CONNECT_TIMEOUT.as_secs(), TOTAL_TIMEOUT.as_secs()), (15, 600));
+        assert!(CONNECT_TIMEOUT < TOTAL_TIMEOUT);
     }
 
     #[test]

@@ -6,8 +6,14 @@
 //! disconnect nor any exit handler (the SDK dylib's included) runs; the OS closes the USB
 //! handles. 60 consecutive opens after sessions left that way needed no replug (F24).
 //!
-//! Use it only after the result has been written and flushed, and only for commands that
-//! wrote nothing to the camera: a write path keeps the ordinary disconnect.
+//! Use [`exit_now`] only after the result has been written and flushed, and only for commands that
+//! wrote nothing to the camera: a write path keeps the ordinary disconnect, but bounded by
+//! [`arm_teardown_watchdog`] (F26), which ends the process with the status it was already going to
+//! have if the disconnect has not finished within [`TEARDOWN_LIMIT`].
+//!
+//! Both are for the macOS build, the only one the camera SDK exists for. The non-Unix branches
+//! (`std::process::exit`, which does run `atexit` handlers) only keep the crate compiling elsewhere;
+//! they do not give the guarantee above.
 
 use std::io::Write;
 use std::sync::mpsc;
@@ -17,6 +23,13 @@ use std::time::Duration;
 /// process anyway. They run on a thread of their own: a diagnostics write, or a stderr whose reader has stopped
 /// reading, must not be able to keep the process alive, which is the thing the watchdog is for.
 const CUT_RECORD_BOUND: Duration = Duration::from_secs(2);
+
+/// The longest a write command can take to end once its result is out and the camera session is hanging: the watchdog
+/// fires at [`TEARDOWN_LIMIT`], then takes at most [`CUT_RECORD_BOUND`] for its record and flushes before `_exit`. A
+/// supervisor that wants the watchdog to be the thing that ends a hung worker (and not to cut a slow-but-finishing
+/// disconnect itself) must wait longer than this: the MCP supervisor's `grace` is this plus a margin, and a test in
+/// each crate pins the relation.
+pub const TEARDOWN_WORST_CASE: Duration = Duration::from_secs(TEARDOWN_LIMIT.as_secs() + CUT_RECORD_BOUND.as_secs());
 
 /// Flush stdout and stderr, then end the process with `code` without running destructors,
 /// `atexit` handlers or `Drop` impls.
@@ -73,8 +86,9 @@ fn run_bounded(bound: Duration, work: impl FnOnce() + Send + 'static) -> bool {
 /// (healthy), **4.70 s** (slow, but it finishes: twice in 10 runs, 4.703 and 4.704 s, which is 5.0 s after the 0.3 s
 /// pump) or **never** (10 of 20 write applies in one batch were still in it when killed after 90 s, and one after
 /// 279 s). The limit sits above the slow-but-finishing case, so a teardown that is only slow is never reported as a
-/// hang, and far below the real hang: 10 s is twice the slow case. (The MCP supervisor kills a worker 3 s after its
-/// result for the same reason; there it only costs a retry of the exit.)
+/// hang, and far below the real hang: 10 s is twice the slow case. The MCP supervisor waits [`TEARDOWN_WORST_CASE`] plus a margin before it
+/// kills a worker that has delivered its result, so under MCP this limit is the one that applies (it used to kill
+/// after 3 s, which cut the slow-but-finishing case mid-disconnect and made this watchdog dead code there).
 pub const TEARDOWN_LIMIT: Duration = Duration::from_secs(10);
 
 /// After the result of a write has been written and flushed, give the camera session `limit` to close. If the process
@@ -187,6 +201,14 @@ mod tests {
     fn the_record_bound_is_well_under_the_teardown_limit() {
         assert!(CUT_RECORD_BOUND >= Duration::from_millis(500) && CUT_RECORD_BOUND <= Duration::from_secs(5), "{CUT_RECORD_BOUND:?}");
         assert!(CUT_RECORD_BOUND < TEARDOWN_LIMIT);
+    }
+
+    #[test]
+    fn the_worst_case_is_the_limit_plus_the_record_bound() {
+        // The relation a supervisor's grace is built on (mcp/src/supervisor.rs pins its side of it): the watchdog fires
+        // at the limit and then takes at most the record bound, so no write command outlives this once its result is out.
+        assert_eq!(TEARDOWN_WORST_CASE, TEARDOWN_LIMIT + CUT_RECORD_BOUND);
+        assert!(TEARDOWN_WORST_CASE > TEARDOWN_LIMIT);
     }
 
     #[test]

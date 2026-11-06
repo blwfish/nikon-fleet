@@ -335,7 +335,7 @@ pub(crate) type SpanResult = (crate::diag::Outcome, Vec<(&'static str, crate::di
 /// What an ingest span records when it ends: `result` (archived / already_present) on success; on failure a
 /// closed `error_kind` and the digests that disagreed.
 pub(crate) fn ingest_span_result(r: &Result<IngestOutcome, FirmwareError>) -> SpanResult {
-    use crate::diag::{Outcome, Val};
+    use crate::diag::Outcome;
     match r {
         Ok(o) => (Outcome::Ok, ingest_ok_fields(o)),
         Err(e) => (Outcome::Failed, firmware_error_fields(e)),

@@ -445,8 +445,8 @@ pub(crate) enum FailedHow {
 }
 
 /// The exit status `firmware add` / `fetch` / `browse` end with when that model and version is
-/// already archived and nothing was changed (`EXIT_ALREADY_ARCHIVED` in `src/main.rs`).
-pub(crate) const EXIT_ALREADY_ARCHIVED: i32 = 3;
+/// already archived and nothing was changed: the library's, the same constant the CLI exits with.
+pub(crate) use nikon_fleet::exit_status::EXIT_ALREADY_ARCHIVED;
 
 pub(crate) fn classify_write(op: &FwOp, result: Result<CliOutput, CliError>) -> WriteEnd {
     match result {
@@ -457,7 +457,12 @@ pub(crate) fn classify_write(op: &FwOp, result: Result<CliOutput, CliError>) -> 
                 return WriteEnd::NothingChanged { message: e.message };
             }
             let how = match (e.kind, e.code) {
-                (CliFailure::Spawn, _) | (CliFailure::Exit, Some(1) | Some(2)) => FailedHow::Refused,
+                (CliFailure::Spawn, _) => FailedHow::Refused,
+                (CliFailure::Exit, Some(code))
+                    if matches!(ExitKind::from_code(code), Some(ExitKind::Failure | ExitKind::Usage)) =>
+                {
+                    FailedHow::Refused
+                }
                 _ => FailedHow::Stopped,
             };
             WriteEnd::Failed { message: e.message, stdout: e.stdout, stderr: e.stderr, how }
