@@ -23,7 +23,8 @@ use crate::snapshot_edit::{Applied, EditRefusal, ensure_editable, finish, ftp_st
 /// The option bit that makes a profile SFTP (confirmed on one profile whose menu says SFTP).
 pub const SFTP_BIT: u16 = 0x0008;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Protocol {
     Ftp,
     Sftp,

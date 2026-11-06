@@ -56,6 +56,14 @@ url = "2"
 wry = { version = "0.57.1", optional = true }
 tao = { version = "0.37.2", optional = true }
 
+# FTP and SFTP clients for `ftp-test` (src/ftp_test.rs): connect, log in, change into the folder, put a small file, get
+# it back, compare, delete it. suppaftp without any TLS feature (plain FTP); russh and russh-sftp are pure Rust (no
+# libssh2 or OpenSSL to build) and async, so the test runs a small current-thread tokio runtime of its own.
+suppaftp = { version = "12", default-features = false }
+russh = { version = "0.65", default-features = false, features = ["ring"] }
+russh-sftp = "3"
+tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }
+
 # macOS dev builds default to `split-debuginfo = "unpacked"`, which keeps every build's object files (a few hundred
 # `.rcgu.o` per rebuild of a crate) in target/debug/deps for ever; cargo never removes them. A pile of 733,000 of them made
 # the first launch of every newly linked executable stall for ~30 s while `syspolicyd` scanned the directory. "packed" runs
@@ -75,3 +83,5 @@ required-features = ["webview"]
 [dev-dependencies]
 # Nicer assertion output for tests
 pretty_assertions = "1"
+# A throwaway host key for the in-process SFTP server the `ftp_test` tests talk to (russh uses rand 0.10).
+rand = "0.10"

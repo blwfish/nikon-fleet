@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -244,6 +245,12 @@ enum Cmd {
     /// dump in `<data-dir>/sweeps/`. To find which property a camera menu setting is: sweep, change that one setting on
     /// the camera, sweep again, and compare with `vendor-sweep-diff`. Sends nothing but `GetDevicePropDesc`.
     VendorSweep(VendorSweepArgs),
+    /// Try an FTP or SFTP server from this computer: look the host up, connect, log in, go to the folder and (unless
+    /// `--no-file-check`) put a small uniquely-named file there, fetch it back, compare it and delete it, reporting each
+    /// step and, on a failure, what was tried and what the server said. Give either the settings (`--host` ...) or a
+    /// profile stored in a snapshot (`--snapshot FILE --profile N`, which reads it and changes nothing). Tests the SERVER
+    /// side only: whether the camera can join the Wi-Fi network is not tested. Exits 0 only if every step passed.
+    FtpTest(FtpTestArgs),
     /// Compare two `vendor-sweep` dumps: which properties appeared, vanished or changed (current value, allowed values,
     /// access). With `--noise`, a third dump of the same body taken with nothing changed, the properties that move on their
     /// own (a clock, a counter) are set aside. Reads files only; no camera.
@@ -923,6 +930,43 @@ struct VendorGetPropArgs {
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
     serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct FtpTestArgs {
+    /// A snapshot (a file name in `snapshots/`, or a path) whose stored profile to test; needs `--profile`.
+    #[arg(long, requires = "profile", conflicts_with_all = ["host", "port", "protocol", "user", "password", "password_stdin", "folder"])]
+    snapshot: Option<PathBuf>,
+    /// Which profile of the snapshot's list (0 is the front).
+    #[arg(long, requires = "snapshot")]
+    profile: Option<usize>,
+    #[arg(long, allow_hyphen_values = true, required_unless_present = "snapshot")]
+    host: Option<String>,
+    /// Default: 21 for FTP, 22 for SFTP.
+    #[arg(long)]
+    port: Option<u16>,
+    /// `ftp` or `sftp`. Default: ftp.
+    #[arg(long, value_parser = ["ftp", "sftp"])]
+    protocol: Option<String>,
+    #[arg(long, allow_hyphen_values = true, required_unless_present = "snapshot")]
+    user: Option<String>,
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "password_stdin")]
+    password: Option<String>,
+    /// Read the password from standard input (one trailing newline removed).
+    #[arg(long)]
+    password_stdin: bool,
+    /// The folder to go to; default: the login directory.
+    #[arg(long, allow_hyphen_values = true)]
+    folder: Option<String>,
+    /// Do not put, fetch and delete a test file; only connect, log in and go to the folder.
+    #[arg(long)]
+    no_file_check: bool,
+    /// Seconds each step may take.
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=300))]
+    timeout: u64,
+    /// Print the report as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2566,6 +2610,55 @@ fn cmd_vendor_get_prop(args: &VendorGetPropArgs) -> Result<()> {
     }
     println!("{}", vendor_get_prop_text(args.prop, args.desc, &read.data));
     Ok(())
+}
+
+/// `ftp-test`: see `FtpTestArgs`.
+fn cmd_ftp_test(data_dir: &Path, args: &FtpTestArgs) -> Result<()> {
+    use nikon_fleet::ftp_edit::Protocol;
+    use nikon_fleet::ftp_test::{TestRequest, run_test};
+    let mut req = if let (Some(file), Some(index)) = (&args.snapshot, args.profile) {
+        let path = resolve_snapshot_path(data_dir, file);
+        let mut snap = Snapshot::load_from_file(&path).with_context(|| format!("loading {}", path.display()))?;
+        let v = nikon_fleet::ftp_edit::profile_view(&mut snap, index).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
+        TestRequest {
+            host: v.host,
+            port: v.port,
+            protocol: v.protocol,
+            username: v.username,
+            password: v.password,
+            folder: v.folder,
+            file_check: true,
+            step_timeout: Duration::from_secs(args.timeout),
+        }
+    } else {
+        let protocol = if args.protocol.as_deref() == Some("sftp") { Protocol::Sftp } else { Protocol::Ftp };
+        let password = if args.password_stdin {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf).context("reading the password from stdin")?;
+            strip_single_trailing_newline(buf)
+        } else {
+            args.password.clone().unwrap_or_default()
+        };
+        TestRequest {
+            host: args.host.clone().unwrap_or_default(),
+            port: args.port.unwrap_or(if protocol == Protocol::Sftp { 22 } else { 21 }),
+            protocol,
+            username: args.user.clone().unwrap_or_default(),
+            password,
+            folder: args.folder.clone().unwrap_or_default(),
+            file_check: true,
+            step_timeout: Duration::from_secs(args.timeout),
+        }
+    };
+    req.file_check = !args.no_file_check;
+    req.step_timeout = Duration::from_secs(args.timeout);
+    let report = run_test(&req);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", report.to_text());
+    }
+    if report.ok { Ok(()) } else { bail!("the test did not pass") }
 }
 
 /// `vendor-sweep`: read every descriptor in the blocks and keep the dump. A sweep that had to stop early is still
@@ -4654,6 +4747,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::VendorOpSupport(args) => cmd_vendor_op_support(args),
         Cmd::RestoreExtended(args) => cmd_restore_extended(&cli.data_dir, args),
         Cmd::VendorGetProp(args) => cmd_vendor_get_prop(args),
+        Cmd::FtpTest(args) => cmd_ftp_test(&cli.data_dir, args),
         Cmd::VendorSweep(args) => cmd_vendor_sweep(&cli.data_dir, args),
         Cmd::VendorSweepDiff(args) => cmd_vendor_sweep_diff(&cli.data_dir, args),
         Cmd::VendorReadIptc(args) => cmd_vendor_read_iptc(args),
