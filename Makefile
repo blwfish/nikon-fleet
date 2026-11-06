@@ -13,7 +13,10 @@ test-rust:
 # Release-gate cadence only, not part of `make test` — coverage is a
 # floor-check (does anything exercise this file at all), not a quality
 # gate. Requires `cargo install cargo-llvm-cov` + `rustup component add
-# llvm-tools-preview` once per machine. /full-review's Phase 3.5 detects
-# this target and runs it.
+# llvm-tools-preview` once per machine. /full-review's Phase 3.5 does NOT
+# yet detect this target (it only checks Python-style config and README
+# commands, so it reports SKIPPED): tracked in
+# https://github.com/blwfish/claude-config/issues/1. The command is also
+# documented in AGENT-README.md ("Building and testing").
 test-cov:
 	cargo llvm-cov --workspace --summary-only

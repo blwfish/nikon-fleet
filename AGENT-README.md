@@ -184,7 +184,12 @@ cargo build --workspace         # debug build: target/debug/nikon-fleet and flee
 cargo test --workspace         # Rust unit tests: 108+23 in the nikon-fleet lib/bin, 35+ in gui/ (all offline)
 python3 -m unittest scripts/test_extract_maid_labels.py   # the SDK-document extractor (invented inputs; offline)
 python3 -I scripts/test_ptpip_read_ftp.py                 # the PTP/IP FTP-profile probe (scripted camera; also run by `cargo test`)
+make test-cov                  # COVERAGE: cargo llvm-cov --workspace --summary-only (per-file table; needs cargo-llvm-cov + llvm-tools-preview, installed)
 ```
+
+**Coverage tool (configured):** `cargo-llvm-cov`, driven by the `test-cov` target in the `Makefile` (no config file — the
+Makefile is the configuration). It is a floor-check ("does anything run this file at all"), not a quality gate, and is not
+part of `make test`. Always `--workspace`, or `gui/` is silently skipped.
 
 To name what `nikon-fleet show` prints (display names, enumeration value names), run
 `python3 scripts/extract-maid-labels.py /path/to/S-SDKZ-200BF-ALLIN` by hand; it writes
