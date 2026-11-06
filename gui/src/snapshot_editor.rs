@@ -9,6 +9,8 @@
 // the library and the CLI's `edit` commands use the same ones.
 
 use super::*;
+use nikon_fleet::ftp_edit::{ProfileFields, ProfileView, Protocol};
+use nikon_fleet::ftp_test::{StepOutcome, TestReport};
 use nikon_fleet::ops::edit_snapshot::{create_edit_copy, edit_in_place};
 use nikon_fleet::ops::labels::Lookup;
 use nikon_fleet::snapshot::DerivedFrom;
@@ -21,7 +23,17 @@ pub(crate) struct EditModel {
     pub controls: BTreeMap<String, ControlView>,
     /// `None`: the snapshot has no extended section.
     pub owner: Option<OwnerView>,
+    /// The FTP profiles with their fields (secrets included: the window masks them), or why the list cannot be edited.
+    pub ftp: Result<Vec<FtpRow>, String>,
     pub derived: DerivedFrom,
+}
+
+/// One FTP profile of the list as the editor needs it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FtpRow {
+    Fields(ProfileView),
+    /// The stored profile does not decode, so its fields cannot be shown or edited; it can still be moved or deleted.
+    Unreadable { name: String, why: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,7 +59,21 @@ impl EditModel {
                 (name.clone(), ControlView { control, options })
             })
             .collect();
-        Some(EditModel { controls, owner: edit::owner_view(s), derived })
+        let owner = edit::owner_view(s);
+        let ftp = match owner.as_ref().map(|o| &o.ftp) {
+            None => Err("the snapshot has no extended section".to_string()),
+            Some(Err(why)) => Err(why.clone()),
+            Some(Ok(names)) => {
+                let mut copy = s.clone();
+                Ok((0..names.len())
+                    .map(|i| match nikon_fleet::ftp_edit::profile_view(&mut copy, i) {
+                        Ok(v) => FtpRow::Fields(v),
+                        Err(e) => FtpRow::Unreadable { name: names[i].clone(), why: e.to_string() },
+                    })
+                    .collect())
+            }
+        };
+        Some(EditModel { controls, owner, ftp, derived })
     }
 
     /// The property was changed in this copy (it is in the edit log).
@@ -75,6 +101,16 @@ pub(crate) enum ViewEdit {
     Iptc { slot: u32, field: String, text: String },
     FtpDelete(usize),
     FtpMove { from: usize, to: usize },
+    /// Change fields of one FTP profile.
+    FtpFields { index: usize, fields: ProfileFields },
+    FtpAdd { fields: ProfileFields },
+    FtpDuplicate(usize),
+    /// Something typed that is not a value at all (a port that is not a number): shown as a refusal, nothing is written.
+    Invalid { key: String, why: String },
+    /// Try the stored profile on its server (handled by the app, not by the file).
+    TestFtp { index: usize, file_check: bool },
+    /// Remove a test result from the window.
+    DismissFtpTest(usize),
 }
 
 pub(crate) fn now_rfc3339() -> String {
@@ -93,6 +129,11 @@ pub(crate) fn apply_view_edit(data_dir: &Path, file: &str, req: &ViewEdit, now: 
         ViewEdit::Iptc { slot, field, text } => edit_in_place(&snaps, file, |s| edit::set_iptc_field(s, *slot, field, text, now)),
         ViewEdit::FtpDelete(index) => edit_in_place(&snaps, file, |s| edit::ftp_delete(s, *index, now)),
         ViewEdit::FtpMove { from, to } => edit_in_place(&snaps, file, |s| edit::ftp_move(s, *from, *to, now)),
+        ViewEdit::FtpFields { index, fields } => edit_in_place(&snaps, file, |s| nikon_fleet::ftp_edit::ftp_set_fields(s, *index, fields, now)),
+        ViewEdit::FtpAdd { fields } => edit_in_place(&snaps, file, |s| nikon_fleet::ftp_edit::ftp_add(s, fields, None, now)),
+        ViewEdit::FtpDuplicate(index) => edit_in_place(&snaps, file, |s| nikon_fleet::ftp_edit::ftp_duplicate(s, *index, None, &ProfileFields::default(), now)),
+        ViewEdit::Invalid { why, .. } => return Err(why.clone()),
+        ViewEdit::TestFtp { .. } | ViewEdit::DismissFtpTest(_) => return Err("this is not a change to the file".to_string()),
     };
     done.map_err(|e| e.to_string())
 }
@@ -113,11 +154,44 @@ pub(crate) struct EditUi {
     sliders: BTreeMap<String, u64>,
     /// The FTP profile whose delete button was pressed once; a second press deletes it.
     confirm_delete: Option<usize>,
+    /// FTP tests started or finished in this window, by the profile's position. Cleared on a reload: the list may
+    /// have changed, and a result is of the profile as it was.
+    pub(crate) ftp_tests: BTreeMap<usize, FtpTestState>,
+    /// Leave the test file out of an FTP test (connect, log in and go to the folder only). A choice, so it survives a reload.
+    skip_file_check: bool,
+}
+
+/// An FTP test of one profile of this window.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FtpTestState {
+    Running,
+    Done(Box<TestReport>),
+    /// The test could not be started or run at all (not a failed step: nothing was tried).
+    Failed(String),
 }
 
 impl EditUi {
     pub(crate) fn clear(&mut self) {
-        *self = EditUi::default();
+        let skip_file_check = self.skip_file_check;
+        *self = EditUi { skip_file_check, ..EditUi::default() };
+    }
+
+    pub(crate) fn skip_file_check(&self) -> bool {
+        self.skip_file_check
+    }
+
+    /// Whether a test also puts, fetches and deletes a small file.
+    pub(crate) fn file_check_wanted(&self) -> bool {
+        !self.skip_file_check
+    }
+
+    pub(crate) fn want_file_check(&mut self, wanted: bool) {
+        self.skip_file_check = !wanted;
+    }
+
+    /// The request the Test button of profile `index` makes.
+    pub(crate) fn test_request(&self, index: usize) -> ViewEdit {
+        ViewEdit::TestFtp { index, file_check: self.file_check_wanted() }
     }
 
     /// Forget the text typed for one field, so it shows the stored value again.
@@ -138,8 +212,27 @@ pub(crate) fn field_key(req: &ViewEdit) -> Option<String> {
         ViewEdit::Property { name, .. } => format!("property:{name}"),
         ViewEdit::OwnerString { code, .. } => format!("string:{code:#06x}"),
         ViewEdit::Iptc { slot, field, .. } => format!("iptc:{slot}:{field}"),
-        ViewEdit::Switch { .. } | ViewEdit::FtpDelete(_) | ViewEdit::FtpMove { .. } => return None,
+        ViewEdit::FtpFields { index, fields } => format!("ftp:{index}:{}", ftp_field_name(fields)?),
+        ViewEdit::Invalid { key, .. } => key.clone(),
+        ViewEdit::Switch { .. } | ViewEdit::FtpDelete(_) | ViewEdit::FtpMove { .. } | ViewEdit::FtpAdd { .. } | ViewEdit::FtpDuplicate(_) | ViewEdit::TestFtp { .. } | ViewEdit::DismissFtpTest(_) => return None,
     })
+}
+
+/// The one field a `ProfileFields` from a single edit sets, by the name its text box keeps its text under.
+fn ftp_field_name(f: &ProfileFields) -> Option<&'static str> {
+    [
+        ("name", f.name.is_some()),
+        ("wifi_name", f.wifi_name.is_some()),
+        ("wifi_key", f.wifi_key.is_some()),
+        ("host", f.host.is_some()),
+        ("folder", f.folder.is_some()),
+        ("username", f.username.is_some()),
+        ("password", f.password.is_some()),
+        ("port", f.port.is_some()),
+        ("proxy_port", f.proxy_port.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(n, set)| set.then_some(n))
 }
 
 // ── drawing ──────────────────────────────────────────────────────────────
@@ -148,8 +241,13 @@ pub(crate) fn field_key(req: &ViewEdit) -> Option<String> {
 /// typed so far is kept in `ui_state` under `key`; `stored` is what the file holds. Returns the new text when it
 /// differs from `stored`.
 fn text_field(ui: &mut egui::Ui, state: &mut EditUi, key: &str, stored: &str, enabled: bool, width: f32) -> Option<String> {
+    text_field_masked(ui, state, key, stored, enabled, width, false)
+}
+
+/// [`text_field`], showing dots instead of the text when `masked`.
+fn text_field_masked(ui: &mut egui::Ui, state: &mut EditUi, key: &str, stored: &str, enabled: bool, width: f32, masked: bool) -> Option<String> {
     let buf = state.texts.entry(key.to_string()).or_insert_with(|| stored.to_string());
-    let resp = ui.add_enabled(enabled, egui::TextEdit::singleline(buf).desired_width(width));
+    let resp = ui.add_enabled(enabled, egui::TextEdit::singleline(buf).desired_width(width).password(masked));
     if resp.lost_focus() {
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             state.texts.remove(key);
@@ -261,11 +359,25 @@ pub(crate) fn ftp_row_press(state: &mut EditUi, i: usize, len: usize, press: Row
 }
 
 /// The section for the owner data of an edited copy: strings, switches, IPTC presets and the FTP profile list.
-pub(crate) fn draw_owner_editor(ui: &mut egui::Ui, file: &str, owner: &OwnerView, state: &mut EditUi, enabled: bool) -> Option<ViewEdit> {
+pub(crate) fn draw_owner_editor(
+    ui: &mut egui::Ui,
+    file: &str,
+    owner: &OwnerView,
+    ftp: &Result<Vec<FtpRow>, String>,
+    state: &mut EditUi,
+    enabled: bool,
+    reveal: &mut bool,
+) -> Option<ViewEdit> {
     let mut out = None;
     let warn = egui::Color32::from_rgb(200, 120, 0);
     ui.separator();
-    ui.label(egui::RichText::new("Owner data (edit)").strong());
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Owner data (edit)").strong());
+        let label = if *reveal { "👁 Hide passwords" } else { "👁 Show passwords" };
+        if ui.selectable_label(*reveal, label).clicked() {
+            *reveal = !*reveal;
+        }
+    });
     egui::Grid::new((file, "owner_edit")).num_columns(3).striped(true).show(ui, |ui| {
         for s in &owner.strings {
             ui.label(egui::RichText::new(s.name).monospace());
@@ -345,40 +457,229 @@ pub(crate) fn draw_owner_editor(ui: &mut egui::Ui, file: &str, owner: &OwnerView
             ui.label(egui::RichText::new(format!("IPTC presets: {why}")).weak());
         }
     }
-    match &owner.ftp {
-        Ok(names) if names.is_empty() => {
-            ui.label(egui::RichText::new("FTP profiles: the list is empty").weak());
+    if let Some(req) = draw_ftp_editor(ui, file, ftp, state, enabled, *reveal) {
+        out = Some(req);
+    }
+    out
+}
+
+/// A number box for a port. Typing something that is not a whole number from 0 to 65535 is reported as such.
+fn port_field(ui: &mut egui::Ui, state: &mut EditUi, key: &str, stored: u16, enabled: bool) -> Option<Result<u16, ViewEdit>> {
+    let typed = text_field(ui, state, key, &stored.to_string(), enabled, 70.0)?;
+    Some(typed.trim().parse::<u16>().map_err(|_| ViewEdit::Invalid { key: key.to_string(), why: format!("{typed:?} is not a port: a whole number from 0 to 65535") }))
+}
+
+/// The list of FTP profiles: for each, its name, the buttons that move, copy, delete and test it, its fields, and the
+/// result of the last test; and a form to add one.
+fn draw_ftp_editor(ui: &mut egui::Ui, file: &str, ftp: &Result<Vec<FtpRow>, String>, state: &mut EditUi, enabled: bool, reveal: bool) -> Option<ViewEdit> {
+    let mut out: Option<ViewEdit> = None;
+    ui.add_space(6.0);
+    let rows = match ftp {
+        Err(why) => {
+            ui.label(egui::RichText::new(format!("FTP profiles: {why}")).weak());
+            return None;
         }
-        Ok(names) => {
-            ui.label(format!("FTP profiles ({}): the front of the list is used first. Restoring a changed list rebuilds it on the camera.", names.len()));
-            for (i, name) in names.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{i}")).weak());
-                    ui.label(egui::RichText::new(name).monospace());
-                    ui.add_enabled_ui(enabled && i > 0, |ui| {
-                        if ui.small_button("↑").on_hover_text("Move up").clicked() {
-                            out = ftp_row_press(state, i, names.len(), RowPress::Up).or(out.take());
-                        }
-                    });
-                    ui.add_enabled_ui(enabled && i + 1 < names.len(), |ui| {
-                        if ui.small_button("↓").on_hover_text("Move down").clicked() {
-                            out = ftp_row_press(state, i, names.len(), RowPress::Down).or(out.take());
-                        }
-                    });
-                    ui.add_enabled_ui(enabled, |ui| {
-                        let label = if state.confirm_delete == Some(i) { "Really delete?" } else { "Delete" };
-                        if ui.small_button(label).on_hover_text("Remove this profile from this copy (the camera is not touched)").clicked() {
-                            out = ftp_row_press(state, i, names.len(), RowPress::Delete).or(out.take());
-                        }
-                    });
+        Ok(rows) => rows,
+    };
+    ui.label(format!(
+        "FTP profiles ({}): the front of the list is used first. Nothing here touches a camera; restoring the changed list rebuilds it on the camera. \
+         A profile you change is saved at once; Test connection tries it from this computer.",
+        rows.len()
+    ));
+    ui.horizontal(|ui| {
+        let mut also_file = state.file_check_wanted();
+        if ui.checkbox(&mut also_file, "Test also puts, fetches and deletes a small file").changed() {
+            state.want_file_check(also_file);
+        }
+    });
+    for (i, row) in rows.iter().enumerate() {
+        let title = match row {
+            FtpRow::Fields(v) => format!("{i}  {:?}", v.name),
+            FtpRow::Unreadable { name, .. } => format!("{i}  {name}"),
+        };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).monospace());
+            ui.add_enabled_ui(enabled && i > 0, |ui| {
+                if ui.small_button("↑").on_hover_text("Move up").clicked() {
+                    out = ftp_row_press(state, i, rows.len(), RowPress::Up).or(out.take());
+                }
+            });
+            ui.add_enabled_ui(enabled && i + 1 < rows.len(), |ui| {
+                if ui.small_button("↓").on_hover_text("Move down").clicked() {
+                    out = ftp_row_press(state, i, rows.len(), RowPress::Down).or(out.take());
+                }
+            });
+            ui.add_enabled_ui(enabled && matches!(row, FtpRow::Fields(_)), |ui| {
+                if ui.small_button("Duplicate").on_hover_text("Copy this profile (Wi-Fi name and key and login included) right after it").clicked() {
+                    out = Some(ViewEdit::FtpDuplicate(i));
+                }
+            });
+            ui.add_enabled_ui(enabled, |ui| {
+                let label = if state.confirm_delete == Some(i) { "Really delete?" } else { "Delete" };
+                if ui.small_button(label).on_hover_text("Remove this profile from this copy (the camera is not touched)").clicked() {
+                    out = ftp_row_press(state, i, rows.len(), RowPress::Delete).or(out.take());
+                }
+            });
+            let running = matches!(state.ftp_tests.get(&i), Some(FtpTestState::Running));
+            ui.add_enabled_ui(enabled && !running && matches!(row, FtpRow::Fields(_)), |ui| {
+                if ui.small_button("Test connection").on_hover_text("Try this profile's server from this computer").clicked() {
+                    out = Some(state.test_request(i));
+                }
+            });
+        });
+        match row {
+            FtpRow::Unreadable { why, .. } => {
+                ui.label(egui::RichText::new(format!("    cannot be edited: it does not decode ({why})")).small().color(egui::Color32::from_rgb(200, 120, 0)));
+            }
+            FtpRow::Fields(v) => {
+                egui::CollapsingHeader::new("fields").id_salt((file, "ftp_fields_edit", i)).default_open(false).show(ui, |ui| {
+                    if let Some(req) = draw_ftp_fields(ui, file, i, v, state, enabled, reveal) {
+                        out = Some(req);
+                    }
                 });
             }
         }
-        Err(why) => {
-            ui.label(egui::RichText::new(format!("FTP profiles: {why}")).weak());
+        if let Some(t) = state.ftp_tests.get(&i).cloned() {
+            ui.indent(("ftp_test_result", file, i), |ui| {
+                if draw_ftp_test(ui, &t) {
+                    out = Some(ViewEdit::DismissFtpTest(i));
+                }
+            });
         }
     }
+    egui::CollapsingHeader::new("Add a profile").id_salt((file, "ftp_add")).default_open(false).show(ui, |ui| {
+        let mut set = |ui: &mut egui::Ui, label: &str, key: &str, secret: bool| -> Option<String> {
+            ui.label(label);
+            let buf = state.texts.entry(format!("ftp:new:{key}")).or_default();
+            ui.add_enabled(enabled, egui::TextEdit::singleline(buf).desired_width(260.0).password(secret && !reveal));
+            ui.end_row();
+            let t = state.texts.get(&format!("ftp:new:{key}")).cloned().unwrap_or_default();
+            (!t.is_empty()).then_some(t)
+        };
+        let mut f = ProfileFields::default();
+        egui::Grid::new((file, "ftp_add_grid")).num_columns(2).show(ui, |ui| {
+            f.name = set(ui, "Profile name", "name", false);
+            f.host = set(ui, "Server (host)", "host", false);
+            f.folder = set(ui, "Folder", "folder", false);
+            f.username = set(ui, "Login", "username", false);
+            f.password = set(ui, "Password", "password", true);
+            f.wifi_name = set(ui, "Wi-Fi name", "wifi_name", false);
+            f.wifi_key = set(ui, "Wi-Fi key", "wifi_key", true);
+        });
+        ui.label(egui::RichText::new("The port is 21 and the protocol FTP until you change them in the new profile's fields. To reuse a Wi-Fi network, Duplicate a profile instead.").small().weak());
+        ui.add_enabled_ui(enabled, |ui| {
+            if ui.button("Add this profile").clicked() {
+                out = Some(ViewEdit::FtpAdd { fields: f.clone() });
+            }
+        });
+    });
     out
+}
+
+/// The fields of one profile as text boxes. Returns the change committed this frame.
+fn draw_ftp_fields(ui: &mut egui::Ui, file: &str, i: usize, v: &ProfileView, state: &mut EditUi, enabled: bool, reveal: bool) -> Option<ViewEdit> {
+    let mut out = None;
+    let one = |f: ProfileFields| Some(ViewEdit::FtpFields { index: i, fields: f });
+    egui::Grid::new((file, "ftp_fields_grid", i)).num_columns(2).striped(true).show(ui, |ui| {
+        let mut text = |ui: &mut egui::Ui, label: &str, key: &str, stored: &str, secret: bool| -> Option<String> {
+            ui.label(label);
+            let r = text_field_masked(ui, state, &format!("ftp:{i}:{key}"), stored, enabled, 280.0, secret && !reveal);
+            ui.end_row();
+            r
+        };
+        if let Some(t) = text(ui, "Profile name", "name", &v.name, false) {
+            out = one(ProfileFields { name: Some(t), ..Default::default() });
+        }
+        if let Some(t) = text(ui, "Server (host)", "host", &v.host, false) {
+            out = one(ProfileFields { host: Some(t), ..Default::default() });
+        }
+        if let Some(t) = text(ui, "Folder", "folder", &v.folder, false) {
+            out = one(ProfileFields { folder: Some(t), ..Default::default() });
+        }
+        if let Some(t) = text(ui, "Login", "username", &v.username, false) {
+            out = one(ProfileFields { username: Some(t), ..Default::default() });
+        }
+        if let Some(t) = text(ui, "Password", "password", &v.password, true) {
+            out = one(ProfileFields { password: Some(t), ..Default::default() });
+        }
+        if let Some(t) = text(ui, "Wi-Fi name", "wifi_name", &v.wifi_name, false) {
+            out = one(ProfileFields { wifi_name: Some(t), ..Default::default() });
+        }
+        if let Some(t) = text(ui, "Wi-Fi key", "wifi_key", &v.wifi_key, true) {
+            out = one(ProfileFields { wifi_key: Some(t), ..Default::default() });
+        }
+        ui.label("Server port");
+        match port_field(ui, state, &format!("ftp:{i}:port"), v.port, enabled) {
+            Some(Ok(p)) => out = one(ProfileFields { port: Some(p), ..Default::default() }),
+            Some(Err(invalid)) => out = Some(invalid),
+            None => {}
+        }
+        ui.end_row();
+        ui.label("Protocol");
+        ui.add_enabled_ui(enabled, |ui| {
+            let shown = if v.protocol == Protocol::Sftp { "SFTP" } else { "FTP" };
+            egui::ComboBox::from_id_salt((file, "ftp_protocol", i)).selected_text(shown).width(80.0).show_ui(ui, |ui| {
+                for (p, name) in [(Protocol::Ftp, "FTP"), (Protocol::Sftp, "SFTP")] {
+                    if ui.selectable_label(v.protocol == p, name).clicked() && v.protocol != p {
+                        out = one(ProfileFields { protocol: Some(p), ..Default::default() });
+                    }
+                }
+            });
+        });
+        ui.end_row();
+        ui.label("Second port");
+        match port_field(ui, state, &format!("ftp:{i}:proxy_port"), v.proxy_port, enabled) {
+            Some(Ok(p)) => out = one(ProfileFields { proxy_port: Some(p), ..Default::default() }),
+            Some(Err(invalid)) => out = Some(invalid),
+            None => {}
+        }
+        ui.end_row();
+    });
+    ui.label(egui::RichText::new("The Wi-Fi key is stored in the field called the 5 GHz SSID; it is probably the passphrase (unconfirmed). The second port is probably a proxy port.").small().weak());
+    out
+}
+
+/// A test's state as lines. True when the person asked to remove it.
+fn draw_ftp_test(ui: &mut egui::Ui, t: &FtpTestState) -> bool {
+    let (ok, bad) = (egui::Color32::from_rgb(60, 160, 80), egui::Color32::from_rgb(200, 60, 60));
+    let mut dismiss = false;
+    match t {
+        FtpTestState::Running => {
+            ui.label(egui::RichText::new("Testing…").italics());
+        }
+        FtpTestState::Failed(why) => {
+            ui.colored_label(bad, format!("The test could not be run: {why}"));
+            dismiss = ui.small_button("Close").clicked();
+        }
+        FtpTestState::Done(r) => {
+            for s in &r.steps {
+                match &s.outcome {
+                    StepOutcome::Ok { detail } => {
+                        ui.colored_label(ok, format!("✔ {}: {detail}", s.step.words()));
+                    }
+                    StepOutcome::Failed { message, hint, .. } => {
+                        ui.colored_label(bad, format!("✘ {}: {message}", s.step.words()));
+                        ui.label(egui::RichText::new(hint).small());
+                    }
+                    StepOutcome::Skipped { because } => {
+                        ui.label(egui::RichText::new(format!("– {}: {because}", s.step.words())).weak());
+                    }
+                }
+            }
+            if let Some(k) = &r.host_key {
+                ui.label(egui::RichText::new(format!("server host key {k} (reported, not checked)")).small().weak());
+            }
+            if let Some(f) = &r.file_left_behind {
+                ui.colored_label(bad, format!("The test file {f:?} could not be deleted and is still on the server; delete it by hand."));
+            }
+            ui.horizontal(|ui| {
+                ui.colored_label(if r.ok { ok } else { bad }, if r.ok { "The server accepted this profile." } else { "The test did not pass." });
+                dismiss = ui.small_button("Close").clicked();
+            });
+            ui.label(egui::RichText::new("This tests the server only, not whether the camera can join the Wi-Fi network.").small().weak());
+        }
+    }
+    dismiss
 }
 
 /// The strip at the top of an edited copy's window: where it came from, and the history.
@@ -576,8 +877,11 @@ mod tests {
                 assert_eq!(property_cell(ui, &mut state, name, view, false), None, "{name} disabled");
             }
             let owner = m.owner.as_ref().unwrap();
-            assert_eq!(draw_owner_editor(ui, "f.json", owner, &mut state, true), None);
-            assert_eq!(draw_owner_editor(ui, "f.json", owner, &mut state, false), None);
+            let mut reveal = false;
+            assert_eq!(draw_owner_editor(ui, "f.json", owner, &m.ftp, &mut state, true, &mut reveal), None);
+            assert_eq!(draw_owner_editor(ui, "f.json", owner, &m.ftp, &mut state, false, &mut reveal), None);
+            reveal = true;
+            assert_eq!(draw_owner_editor(ui, "f.json", owner, &m.ftp, &mut state, true, &mut reveal), None);
             draw_edit_header(ui, "f.json", &m, Some(&(Level::Error, "a refusal".into())), true);
         });
     }
@@ -934,6 +1238,345 @@ mod tests {
         assert!(asked.iter().all(Option::is_none), "drawing asks for nothing by itself: {asked:?}");
         let copy_has_controls = app.viewers.open.iter().filter(|v| v.edit.is_some()).count();
         assert_eq!(copy_has_controls, 1);
+    }
+
+    // ── FTP profile fields ──
+
+    fn copy_of_captured() -> Snapshot {
+        nikon_fleet::snapshot_edit::copy_for_edit(&captured(), "captured.json", None, NOW)
+    }
+
+    #[test]
+    fn the_model_carries_each_profiles_fields_and_says_why_a_list_or_a_profile_cannot_be_edited() {
+        let m = EditModel::build(&copy_of_captured(), &no_labels()).unwrap();
+        let rows = m.ftp.as_ref().unwrap();
+        let FtpRow::Fields(first) = &rows[0] else { panic!("{rows:?}") };
+        assert_eq!((first.name.as_str(), first.host.as_str(), first.username.as_str(), first.port, first.protocol), ("alpha", "h", "u", 21, Protocol::Ftp));
+        assert_eq!(rows.len(), 3);
+        assert!(!format!("{rows:?}").contains("\"pw\""), "secrets are not in Debug output");
+        // a profile that does not decode can be moved and deleted but not edited
+        let mut broken = copy_of_captured();
+        if let Some(Extended { ftp: FtpState::Read(st), .. }) = &mut broken.extended {
+            st.profiles[1].hex = "deadbeef".into();
+        }
+        let m = EditModel::build(&broken, &no_labels()).unwrap();
+        let rows = m.ftp.as_ref().unwrap();
+        assert!(matches!(&rows[0], FtpRow::Fields(_)) && matches!(&rows[1], FtpRow::Unreadable { why, .. } if why.contains("decode")) && matches!(&rows[2], FtpRow::Fields(_)));
+        // lists that are not there
+        let mut none = copy_of_captured();
+        none.extended.as_mut().unwrap().ftp = FtpState::NotOnModel;
+        assert!(EditModel::build(&none, &no_labels()).unwrap().ftp.unwrap_err().contains("no FTP"));
+        let mut bare = copy_of_captured();
+        bare.extended = None;
+        assert!(EditModel::build(&bare, &no_labels()).unwrap().ftp.is_err());
+    }
+
+    #[test]
+    fn profile_changes_are_applied_through_the_library_and_the_request_that_names_a_field_names_its_text_box() {
+        let (d, file) = data_dir_with(&captured());
+        let copy = make_edit_copy(d.path(), &file, NOW).unwrap();
+        let one = |f: ProfileFields| ViewEdit::FtpFields { index: 0, fields: f };
+        for (req, expect) in [
+            (one(ProfileFields { host: Some("files.example.org".into()), ..Default::default() }), "host changed"),
+            (one(ProfileFields { port: Some(22), protocol: Some(Protocol::Sftp), ..Default::default() }), "port, protocol changed"),
+            (ViewEdit::FtpAdd { fields: ProfileFields { name: Some("fresh".into()), host: Some("h.example".into()), ..Default::default() } }, "\"fresh\" added"),
+            (ViewEdit::FtpDuplicate(0), "\"alpha copy\" duplicated"),
+            (ViewEdit::FtpDuplicate(3), "\"gamma copy\" duplicated"),
+        ] {
+            let a = apply_view_edit(d.path(), &copy, &req, NOW).unwrap_or_else(|e| panic!("{req:?}: {e}"));
+            assert!(a.change.contains(expect), "{req:?}: {}", a.change);
+        }
+        let s = Snapshot::load_from_file(d.path().join("snapshots").join(&copy)).unwrap();
+        let FtpState::Read(st) = &s.extended.unwrap().ftp else { panic!() };
+        assert_eq!(st.profiles.len(), 6);
+        // refusals and invalid typing are errors with the reason, writing nothing
+        let bytes = std::fs::read(d.path().join("snapshots").join(&copy)).unwrap();
+        let e = apply_view_edit(d.path(), &copy, &one(ProfileFields { wifi_name: Some("café".into()), ..Default::default() }), NOW).unwrap_err();
+        assert!(e.contains("ASCII"), "{e}");
+        let e = apply_view_edit(d.path(), &copy, &ViewEdit::Invalid { key: "ftp:0:port".into(), why: "\"x\" is not a port".into() }, NOW).unwrap_err();
+        assert!(e.contains("not a port"));
+        assert!(apply_view_edit(d.path(), &copy, &ViewEdit::TestFtp { index: 0, file_check: true }, NOW).is_err(), "a test is not a change to the file");
+        assert_eq!(std::fs::read(d.path().join("snapshots").join(&copy)).unwrap(), bytes);
+        // the text box a field was typed in
+        assert_eq!(field_key(&one(ProfileFields { password: Some("x".into()), ..Default::default() })).as_deref(), Some("ftp:0:password"));
+        assert_eq!(field_key(&ViewEdit::FtpFields { index: 3, fields: ProfileFields { proxy_port: Some(1), ..Default::default() } }).as_deref(), Some("ftp:3:proxy_port"));
+        assert_eq!(field_key(&ViewEdit::Invalid { key: "ftp:2:port".into(), why: String::new() }).as_deref(), Some("ftp:2:port"));
+        assert_eq!(field_key(&ViewEdit::FtpAdd { fields: ProfileFields::default() }), None, "a refused add keeps what was typed");
+        assert_eq!(field_key(&ViewEdit::TestFtp { index: 0, file_check: true }), None);
+        assert_eq!(ftp_field_name(&ProfileFields::default()), None);
+    }
+
+    #[test]
+    fn a_secret_being_set_is_not_in_the_requests_debug_output() {
+        let dump = format!("{:?}", ViewEdit::FtpFields { index: 0, fields: ProfileFields { password: Some("hunter2-secret".into()), host: Some("h.example".into()), ..Default::default() } });
+        assert!(!dump.contains("hunter2-secret") && dump.contains("h.example"), "{dump}");
+    }
+
+    fn ftp_row(host: &str) -> ProfileView {
+        ProfileView { name: "alpha".into(), wifi_name: "w".into(), wifi_key: "k".into(), host: host.into(), folder: String::new(), username: "u".into(), password: "pw".into(), port: 21, protocol: Protocol::Ftp, proxy_port: 8080 }
+    }
+
+    /// Focus the first text box with Tab, type `typed`, press Enter, and return what was asked for on each frame.
+    fn edit_first_box(stored: &ProfileView, typed: &str) -> Vec<Option<ViewEdit>> {
+        let mut frames: Vec<Vec<egui::Event>> = vec![vec![], key(egui::Key::Tab)];
+        frames.push(vec![egui::Event::Text(typed.to_string())]);
+        frames.push(key(egui::Key::Enter));
+        frames.push(vec![]);
+        let mut state = EditUi::default();
+        // the fields are inside a collapsing header in the full editor; draw them directly here
+        drive(frames, |ui, _| draw_ftp_fields(ui, "f.json", 0, stored, &mut state, true, false))
+    }
+
+    #[test]
+    fn typing_in_a_profile_field_and_pressing_enter_asks_for_that_field_only() {
+        let asked = edit_first_box(&ftp_row("h"), "Z");
+        let requests: Vec<&ViewEdit> = asked.iter().flatten().collect();
+        assert_eq!(requests.len(), 1, "one request, on Enter: {asked:?}");
+        let ViewEdit::FtpFields { index: 0, fields } = requests[0] else { panic!("{requests:?}") };
+        assert_eq!(ftp_field_name(fields), Some("name"), "the first box is the profile name");
+        assert!(fields.name.as_deref().is_some_and(|n| n.contains('Z') && n != "alpha"), "{fields:?}");
+        assert!(fields.host.is_none() && fields.password.is_none(), "nothing but the field that was typed in");
+        // pressing Enter without typing asks for nothing
+        let asked = edit_first_box(&ftp_row("h"), "");
+        assert!(asked.iter().all(Option::is_none), "{asked:?}");
+    }
+
+    #[test]
+    fn a_port_that_is_not_a_number_is_reported_a_good_one_is_asked_for_and_an_unchanged_one_is_not() {
+        let commit = |typed: &str, stored: u16| -> Vec<Result<u16, ViewEdit>> {
+            let mut state = EditUi::default();
+            state.texts.insert("ftp:0:port".into(), typed.to_string());
+            let frames = vec![vec![], key(egui::Key::Tab), key(egui::Key::Enter), vec![]];
+            drive(frames, |ui, _| port_field(ui, &mut state, "ftp:0:port", stored, true)).into_iter().flatten().collect()
+        };
+        let bad = commit("twenty", 21);
+        assert!(matches!(bad.as_slice(), [Err(ViewEdit::Invalid { key, why })] if key == "ftp:0:port" && why.contains("not a port")), "{bad:?}");
+        for text in ["65536", "-1", "", "2e1", "21.5"] {
+            assert!(matches!(commit(text, 21).as_slice(), [Err(ViewEdit::Invalid { .. })]), "{text:?}");
+        }
+        for (text, port) in [("2222", 2222u16), (" 22 ", 22), ("0", 0), ("65535", 65535)] {
+            assert!(matches!(commit(text, 21).as_slice(), [Ok(p)] if *p == port), "{text:?}");
+        }
+        assert!(commit("21", 21).is_empty(), "what is already stored is not a request");
+    }
+
+    /// Tab to the `n`th box (1 is the first), type `typed`, press Enter: what was asked for.
+    fn edit_nth_box(stored: &ProfileView, n: usize, typed: &str) -> Vec<ViewEdit> {
+        let mut frames: Vec<Vec<egui::Event>> = vec![vec![]];
+        frames.extend((0..n).map(|_| key(egui::Key::Tab)));
+        frames.push(vec![egui::Event::Text(typed.to_string())]);
+        frames.push(key(egui::Key::Enter));
+        frames.push(vec![]);
+        let mut state = EditUi::default();
+        drive(frames, |ui, _| draw_ftp_fields(ui, "f.json", 0, stored, &mut state, true, false)).into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn each_box_of_a_profile_asks_for_its_own_field() {
+        let v = ftp_row("h");
+        let want = ["name", "host", "folder", "username", "password", "wifi_name", "wifi_key", "port"];
+        for (i, field) in want.iter().enumerate() {
+            let typed = if *field == "port" { "9" } else { "Q" };
+            let got = edit_nth_box(&v, i + 1, typed);
+            let [ViewEdit::FtpFields { index: 0, fields }] = got.as_slice() else { panic!("box {} ({field}): {got:?}", i + 1) };
+            assert_eq!(ftp_field_name(fields), Some(*field), "box {}: {fields:?}", i + 1);
+        }
+    }
+
+    // ── testing a profile through the app ──
+
+    fn copy_with_profile_at(dir: &Path, port: u16, protocol: Protocol) -> String {
+        use nikon_fleet::ftp_edit::ftp_add;
+        let mut s = nikon_fleet::snapshot_edit::copy_for_edit(&captured(), "captured.json", None, NOW);
+        if let Some(Extended { ftp: FtpState::Read(st), .. }) = &mut s.extended {
+            st.profiles.clear();
+            st.count = 0;
+            st.active_slot = None;
+        }
+        let f = ProfileFields {
+            name: Some("local".into()),
+            host: Some("127.0.0.1".into()),
+            username: Some("fleet".into()),
+            password: Some("s3cret!".into()),
+            folder: Some("incoming".into()),
+            port: Some(port),
+            protocol: Some(protocol),
+            ..Default::default()
+        };
+        ftp_add(&mut s, &f, None, NOW).unwrap();
+        std::fs::create_dir_all(dir.join("snapshots")).unwrap();
+        let name = "copy.json".to_string();
+        s.save_to_file(dir.join("snapshots").join(&name)).unwrap();
+        name
+    }
+
+    /// An FTP server that knows login, PWD and CWD.
+    fn mini_ftp(pass: &'static str) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in l.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut w = conn.try_clone().unwrap();
+                    let mut r = BufReader::new(conn);
+                    let say = |w: &mut std::net::TcpStream, t: &str| {
+                        let _ = w.write_all(format!("{t}\r\n").as_bytes());
+                    };
+                    say(&mut w, "220 mini");
+                    let mut line = String::new();
+                    let mut good = false;
+                    loop {
+                        line.clear();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let c = line.trim_end();
+                        let (v, a) = c.split_once(' ').unwrap_or((c, ""));
+                        match v.to_uppercase().as_str() {
+                            "USER" => {
+                                good = a == "fleet";
+                                say(&mut w, "331 password");
+                            }
+                            "PASS" => say(&mut w, if good && a == pass { "230 ok" } else { "530 Login incorrect." }),
+                            "TYPE" => say(&mut w, "200 ok"),
+                            "PWD" => say(&mut w, "257 \"/\" current"),
+                            "CWD" => say(&mut w, if a == "incoming" { "250 ok" } else { "550 No such file or directory." }),
+                            "QUIT" => {
+                                say(&mut w, "221 bye");
+                                return;
+                            }
+                            _ => say(&mut w, "502 no"),
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn wait_for_test(app: &mut FleetApp, file: &str, index: usize) -> FtpTestState {
+        for _ in 0..400 {
+            app.poll_views();
+            let st = app.viewers.find_mut(file).and_then(|v| v.edit_ui.ftp_tests.get(&index).cloned());
+            match st {
+                Some(FtpTestState::Running) | None => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Some(done) => return done,
+            }
+        }
+        panic!("the test of profile {index} never finished");
+    }
+
+    #[test]
+    fn the_test_button_runs_the_stored_profile_against_its_server_and_shows_the_result() {
+        let port = mini_ftp("s3cret!");
+        let (mut app, _cmd_rx, _evt_tx, dir) = crate::tests::test_app();
+        let name = copy_with_profile_at(dir.path(), port, Protocol::Ftp);
+        let ctx = egui::Context::default();
+        app.open_snapshot(&ctx, &name, false, false);
+        wait_for_reload(&mut app, &name);
+        app.apply_viewer_edit(&ctx, &name, ViewEdit::TestFtp { index: 0, file_check: false });
+        assert!(matches!(app.viewers.find_mut(&name).unwrap().edit_ui.ftp_tests.get(&0), Some(FtpTestState::Running)), "it shows as running at once");
+        let FtpTestState::Done(report) = wait_for_test(&mut app, &name, 0) else { panic!("a finished test") };
+        assert!(report.ok, "{}", report.to_text());
+        assert_eq!((report.host.as_str(), report.port), ("127.0.0.1", port));
+        assert!(!format!("{report:?}").contains("s3cret!"));
+        // dismissing it removes it
+        app.apply_viewer_edit(&ctx, &name, ViewEdit::DismissFtpTest(0));
+        assert!(app.viewers.find_mut(&name).unwrap().edit_ui.ftp_tests.is_empty());
+    }
+
+    #[test]
+    fn a_test_of_a_server_that_is_not_there_shows_the_failed_step_and_the_wrong_password_shows_the_servers_words() {
+        let (mut app, _cmd_rx, _evt_tx, dir) = crate::tests::test_app();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let name = copy_with_profile_at(dir.path(), closed, Protocol::Sftp);
+        let ctx = egui::Context::default();
+        app.open_snapshot(&ctx, &name, false, false);
+        wait_for_reload(&mut app, &name);
+        app.apply_viewer_edit(&ctx, &name, ViewEdit::TestFtp { index: 0, file_check: true });
+        let FtpTestState::Done(r) = wait_for_test(&mut app, &name, 0) else { panic!() };
+        assert!(!r.ok && matches!(r.failure().map(|f| f.step), Some(nikon_fleet::ftp_test::Step::Connect)), "{}", r.to_text());
+        // a profile that does not exist
+        app.apply_viewer_edit(&ctx, &name, ViewEdit::TestFtp { index: 7, file_check: true });
+        let FtpTestState::Failed(why) = wait_for_test(&mut app, &name, 7) else { panic!("could not be run") };
+        assert!(why.contains("does not exist"), "{why}");
+    }
+
+    #[test]
+    fn the_file_check_choice_is_what_the_button_asks_for() {
+        let mut st = EditUi::default();
+        assert!(st.file_check_wanted(), "on unless turned off");
+        assert_eq!(st.test_request(3), ViewEdit::TestFtp { index: 3, file_check: true });
+        st.want_file_check(false);
+        assert!(!st.file_check_wanted() && st.skip_file_check());
+        assert_eq!(st.test_request(0), ViewEdit::TestFtp { index: 0, file_check: false });
+        st.want_file_check(true);
+        assert_eq!(st.test_request(1), ViewEdit::TestFtp { index: 1, file_check: true });
+    }
+
+    #[test]
+    fn a_result_for_a_test_the_window_is_not_waiting_for_is_dropped() {
+        let (mut app, _cmd_rx, _evt_tx, dir) = crate::tests::test_app();
+        let name = copy_with_profile_at(dir.path(), 1, Protocol::Ftp);
+        let ctx = egui::Context::default();
+        app.open_snapshot(&ctx, &name, false, false);
+        wait_for_reload(&mut app, &name);
+        let report = nikon_fleet::ftp_test::run_test(&nikon_fleet::ftp_test::TestRequest::from_profile(&ftp_row("no-such-host.invalid"), false, std::time::Duration::from_millis(300)));
+        // nothing was started: a result that turns up anyway (from before a reload, say) must not appear
+        app.ftp_test_tx.send(crate::FtpTestDone { file: name.clone(), index: 0, result: Ok(report.clone()) }).unwrap();
+        app.poll_views();
+        assert!(app.viewers.find_mut(&name).unwrap().edit_ui.ftp_tests.is_empty());
+        // one that is waited for is shown
+        app.viewers.find_mut(&name).unwrap().edit_ui.ftp_tests.insert(0, FtpTestState::Running);
+        app.ftp_test_tx.send(crate::FtpTestDone { file: name.clone(), index: 0, result: Ok(report) }).unwrap();
+        app.poll_views();
+        assert!(matches!(app.viewers.find_mut(&name).unwrap().edit_ui.ftp_tests.get(&0), Some(FtpTestState::Done(_))));
+        // a result for a window that was closed is ignored
+        app.ftp_test_tx.send(crate::FtpTestDone { file: "closed.json".into(), index: 0, result: Err("x".into()) }).unwrap();
+        app.poll_views();
+    }
+
+    #[test]
+    fn a_reload_forgets_tests_and_a_result_that_arrives_for_a_forgotten_one_is_dropped() {
+        let port = mini_ftp("s3cret!");
+        let (mut app, _cmd_rx, _evt_tx, dir) = crate::tests::test_app();
+        let name = copy_with_profile_at(dir.path(), port, Protocol::Ftp);
+        let ctx = egui::Context::default();
+        app.open_snapshot(&ctx, &name, false, false);
+        wait_for_reload(&mut app, &name);
+        app.apply_viewer_edit(&ctx, &name, ViewEdit::TestFtp { index: 0, file_check: false });
+        // the file is changed (and reloaded) while the test runs: the list may be different now
+        app.apply_viewer_edit(&ctx, &name, ViewEdit::FtpFields { index: 0, fields: ProfileFields { folder: Some("incoming".into()), host: Some("localhost".into()), ..Default::default() } });
+        wait_for_reload(&mut app, &name);
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        app.poll_views();
+        assert!(app.viewers.find_mut(&name).unwrap().edit_ui.ftp_tests.is_empty(), "the reload cleared it and the late result did not bring it back");
+        // the choice about the test file survives a reload
+        let v = app.viewers.find_mut(&name).unwrap();
+        v.edit_ui.skip_file_check = true;
+        v.edit_ui.clear();
+        assert!(v.edit_ui.skip_file_check());
+    }
+
+    #[test]
+    fn every_state_of_a_test_draws() {
+        let mut report = nikon_fleet::ftp_test::run_test(&nikon_fleet::ftp_test::TestRequest::from_profile(&ftp_row("no-such-host.invalid"), true, std::time::Duration::from_millis(500)));
+        report.file_left_behind = Some("nikon-fleet-test-1.txt".into());
+        report.host_key = Some("SHA256:abc".into());
+        let states = [FtpTestState::Running, FtpTestState::Failed("nothing".into()), FtpTestState::Done(Box::new(report))];
+        run_ui(|ui| {
+            for st in &states {
+                let _ = draw_ftp_test(ui, st);
+            }
+            let m = EditModel::build(&copy_of_captured(), &no_labels()).unwrap();
+            let mut state = EditUi::default();
+            for (i, st) in states.iter().enumerate() {
+                state.ftp_tests.insert(i, st.clone());
+            }
+            let mut reveal = true;
+            assert_eq!(draw_owner_editor(ui, "f.json", m.owner.as_ref().unwrap(), &m.ftp, &mut state, true, &mut reveal), None);
+        });
     }
 
     #[test]

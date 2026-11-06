@@ -31,7 +31,7 @@ pub enum Protocol {
 }
 
 /// The fields of a profile a person edits. `None` leaves a field as it is; for a new profile, as the template has it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ProfileFields {
     pub name: Option<String>,
     /// The Wi-Fi name (the 2.4 GHz SSID field).
@@ -50,6 +50,24 @@ pub struct ProfileFields {
     pub protocol: Option<Protocol>,
     /// The second port (probably a proxy port; 8080 in nearly every profile seen).
     pub proxy_port: Option<u16>,
+}
+
+impl std::fmt::Debug for ProfileFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hidden = |s: &Option<String>| s.as_ref().map(|t| format!("<{} byte(s) hidden>", t.len()));
+        f.debug_struct("ProfileFields")
+            .field("name", &self.name)
+            .field("wifi_name", &self.wifi_name)
+            .field("wifi_key", &hidden(&self.wifi_key))
+            .field("host", &self.host)
+            .field("folder", &self.folder)
+            .field("username", &self.username)
+            .field("password", &hidden(&self.password))
+            .field("port", &self.port)
+            .field("protocol", &self.protocol)
+            .field("proxy_port", &self.proxy_port)
+            .finish()
+    }
 }
 
 /// Every field of a profile as the editor shows it, secrets included (the caller masks them).
@@ -534,6 +552,13 @@ mod tests {
         let v = view(&mut s, 3);
         assert_eq!((v.host.as_str(), v.folder.as_str(), v.wifi_key.as_str()), ("studio.test", "/in", "wifi-key-12345"));
         assert_eq!(ftp_duplicate(&mut s, 9, None, &ProfileFields::default(), NOW).unwrap_err().tag(), "ftp_index");
+    }
+
+    #[test]
+    fn fields_being_set_hide_their_secrets_from_debug_output_too() {
+        let f = ProfileFields { password: Some("hunter2-secret".into()), wifi_key: Some("key-12345".into()), host: Some("h.example".into()), ..Default::default() };
+        let dump = format!("{f:?}");
+        assert!(!dump.contains("hunter2-secret") && !dump.contains("key-12345") && dump.contains("h.example") && dump.contains("14 byte(s) hidden"), "{dump}");
     }
 
     #[test]

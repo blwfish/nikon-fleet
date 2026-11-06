@@ -2620,16 +2620,7 @@ fn cmd_ftp_test(data_dir: &Path, args: &FtpTestArgs) -> Result<()> {
         let path = resolve_snapshot_path(data_dir, file);
         let mut snap = Snapshot::load_from_file(&path).with_context(|| format!("loading {}", path.display()))?;
         let v = nikon_fleet::ftp_edit::profile_view(&mut snap, index).map_err(|e| anyhow::anyhow!("{e} [{}]", e.tag()))?;
-        TestRequest {
-            host: v.host,
-            port: v.port,
-            protocol: v.protocol,
-            username: v.username,
-            password: v.password,
-            folder: v.folder,
-            file_check: true,
-            step_timeout: Duration::from_secs(args.timeout),
-        }
+        TestRequest::from_profile(&v, true, Duration::from_secs(args.timeout))
     } else {
         let protocol = if args.protocol.as_deref() == Some("sftp") { Protocol::Sftp } else { Protocol::Ftp };
         let password = if args.password_stdin {

@@ -35,9 +35,8 @@ edit function refuses a snapshot without it, so a caller that forgot to check st
 | the FTP profile list | `edit ftp-delete FILE INDEX`, `edit ftp-move FILE FROM TO` | index exists; the list was read whole; slots and count renumbered; the active slot always names a profile |
 | (history) | `edit log FILE` | |
 
-Not editable: strings, dates, arrays and other shapes; properties the restore never copies (`code_policy`). Not yet:
-changing the **fields** of an FTP profile, adding one, duplicating one (they need a writer that builds a profile from
-fields; the existing encoder fixes the server port, folder and protocol). Reordering is by rebuilding the list on the
+Not editable: strings, dates, arrays and other shapes; properties the restore never copies (`code_policy`). The fields of an FTP
+profile, adding one and duplicating one are in `docs/ftp-profiles.md`. Reordering is by rebuilding the list on the
 camera, which restoring a reordered list already does.
 
 What only the camera can answer is answered when a restore is planned, not here: whether a property is writable now,

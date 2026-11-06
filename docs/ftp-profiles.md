@@ -5,7 +5,7 @@ the typing and the checking on the computer: edit a copy of a snapshot (`docs/sn
 then restore the result to the body with `restore-extended` (a guarded plan, a restore point, a read-back).
 
 Code: `src/ftp_edit.rs` (fields), `ptp_usb::encode_decoded_ftp_profile` (the writer), `src/ftp_test.rs` (the test).
-**Neither the fields nor the test have touched a camera yet** (see "Not verified").
+**Neither the fields nor the test have touched a camera yet, and the window has not been seen on a screen** (see "Not verified").
 
 ## The fields
 
@@ -27,6 +27,23 @@ the network), `ftp-show FILE INDEX [--reveal]`, and the earlier `ftp-delete` / `
 Checks: the encoder's own limits and character rules (the Wi-Fi name 32 bytes, the host 199 units, ASCII only where
 the wire form is bytes, no control characters), a profile needs a name and a server, a port is 1 to 65535, the list
 holds at most the camera's limit (20). The edit log names the fields changed and never a value.
+
+## In the GUI
+
+In an edited copy's window (open a snapshot with **Edit a copy…**), the **Owner data (edit)** section lists the FTP
+profiles. For each: its position and name; **↑ ↓** to move it, **Duplicate** (a copy right after it, with its Wi-Fi
+name and key and login), **Delete** (a second press on the same row confirms), and **Test connection**. A
+**fields** fold-out holds the name, server, folder, login, password, Wi-Fi name, Wi-Fi key, server port, protocol
+(FTP or SFTP) and second port. A field is saved when you leave its box (Enter, Tab or a click elsewhere; Escape gives up),
+through the same checks as the command line, and a refusal says why and puts the stored value back. Passwords and the
+Wi-Fi key are masked; **👁 Show passwords** at the top of the section reveals them. **Add a profile** takes a name and a
+server (and, if you like, folder, login, password and Wi-Fi) and starts from the encoder's template.
+
+**Test connection** runs `ftp-test`'s engine on a thread of its own with the profile as stored in the file (so what is
+tested is what was saved), and shows each step under the profile: ✔ / ✘ / – with the server's words and a hint on a
+failure, the SFTP host key, and a warning naming any test file that could not be deleted. The checkbox above the list
+leaves the test file out. A result is of the profile as it was: any change to the file clears the results.
+It says in the window that it tests the server only.
 
 ## The writer
 

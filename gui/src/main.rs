@@ -685,6 +685,30 @@ fn load_for_view_full(data_dir: &Path, sdk_runtime: &Path, file: &str) -> Result
     Ok((render::render_snapshot_with(&snapshot, None, &labels), edit))
 }
 
+/// A finished FTP test, from the thread that ran it.
+struct FtpTestDone {
+    file: String,
+    index: usize,
+    result: Result<nikon_fleet::ftp_test::TestReport, String>,
+}
+
+/// Run an FTP/SFTP test of profile `index` of the edited copy `file`, with the settings stored in the file now. A
+/// thread of its own: it waits on a network, never on a camera, so it needs neither the worker nor a subprocess.
+fn spawn_ftp_test(data_dir: PathBuf, file: String, index: usize, file_check: bool, tx: mpsc::Sender<FtpTestDone>, ctx: egui::Context) -> std::io::Result<()> {
+    std::thread::Builder::new().name("ftp-test".into()).spawn(move || {
+        let result = (|| {
+            let path = nikon_fleet::ops::paths::resolve_existing(&data_dir.join("snapshots"), &file).map_err(|e| e.to_string())?;
+            let mut snap = Snapshot::load_from_file(&path).map_err(|e| e.to_string())?;
+            let view = nikon_fleet::ftp_edit::profile_view(&mut snap, index).map_err(|e| e.to_string())?;
+            let req = nikon_fleet::ftp_test::TestRequest::from_profile(&view, file_check, Duration::from_secs(15));
+            Ok(nikon_fleet::ftp_test::run_test(&req))
+        })();
+        let _ = tx.send(FtpTestDone { file, index, result });
+        ctx.request_repaint();
+    })?;
+    Ok(())
+}
+
 /// Where the SDK's names are: `$NIKON_FLEET_SDK_RUNTIME` if set, else the project's `sdk-runtime/`
 /// (where `scripts/setup-sdk-runtime.sh` puts it, and where the CLI's `--schema` default points).
 fn resolve_sdk_runtime(env_override: Option<OsString>) -> PathBuf {
@@ -722,6 +746,9 @@ struct FleetApp {
     viewers: SnapshotViewers,
     view_tx: mpsc::Sender<ViewLoad>,
     view_rx: mpsc::Receiver<ViewLoad>,
+    /// FTP tests started from edited copies' windows.
+    ftp_test_tx: mpsc::Sender<FtpTestDone>,
+    ftp_test_rx: mpsc::Receiver<FtpTestDone>,
     label: String,
     status: Status,
     notices: Vec<String>,
@@ -756,6 +783,7 @@ impl FleetApp {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = mpsc::channel();
         let (view_tx, view_rx) = mpsc::channel();
+        let (ftp_test_tx, ftp_test_rx) = mpsc::channel();
         let ctx = cc.egui_ctx.clone();
         let initial = settings.data_dir_or_err();
         std::thread::spawn(move || worker(cmd_rx, evt_tx, ctx, initial));
@@ -775,6 +803,8 @@ impl FleetApp {
             viewers: SnapshotViewers::default(),
             view_tx,
             view_rx,
+            ftp_test_tx,
+            ftp_test_rx,
             label: String::new(),
             status,
             notices: Vec::new(),
@@ -873,6 +903,18 @@ impl FleetApp {
         while let Ok(load) = self.view_rx.try_recv() {
             if self.viewers.finish(&load.file, load.result) {
                 self.viewers.set_edit(&load.file, load.edit);
+            }
+        }
+        while let Ok(done) = self.ftp_test_rx.try_recv() {
+            // Only a test this window is still waiting for: a reload clears them, because the list may have changed.
+            if let Some(v) = self.viewers.find_mut(&done.file) {
+                if matches!(v.edit_ui.ftp_tests.get(&done.index), Some(snapshot_editor::FtpTestState::Running)) {
+                    let state = match done.result {
+                        Ok(report) => snapshot_editor::FtpTestState::Done(Box::new(report)),
+                        Err(why) => snapshot_editor::FtpTestState::Failed(why),
+                    };
+                    v.edit_ui.ftp_tests.insert(done.index, state);
+                }
             }
         }
     }
@@ -1528,6 +1570,24 @@ impl FleetApp {
             self.status = Status::new(Level::Error, "The data directory is unknown, so nothing can be saved.");
             return;
         };
+        // Two requests are not changes to the file.
+        match &req {
+            ViewEdit::TestFtp { index, file_check } => {
+                let Some(viewer) = self.viewers.find_mut(file) else { return };
+                viewer.edit_ui.ftp_tests.insert(*index, snapshot_editor::FtpTestState::Running);
+                if let Err(e) = spawn_ftp_test(data_dir, file.to_string(), *index, *file_check, self.ftp_test_tx.clone(), ctx.clone()) {
+                    viewer.edit_ui.ftp_tests.insert(*index, snapshot_editor::FtpTestState::Failed(format!("could not start the test: {e}")));
+                }
+                return;
+            }
+            ViewEdit::DismissFtpTest(index) => {
+                if let Some(viewer) = self.viewers.find_mut(file) {
+                    viewer.edit_ui.ftp_tests.remove(index);
+                }
+                return;
+            }
+            _ => {}
+        }
         let result = snapshot_editor::apply_view_edit(&data_dir, file, &req, &snapshot_editor::now_rfc3339());
         let Some(viewer) = self.viewers.find_mut(file) else { return };
         match result {
@@ -1646,8 +1706,8 @@ fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) -> Optio
     let warn = egui::Color32::from_rgb(200, 120, 0);
     let show_codes = viewer.show_codes;
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        if let Some(owner) = viewer.edit.as_ref().and_then(|m| m.owner.as_ref()) {
-            if let Some(req) = snapshot_editor::draw_owner_editor(ui, &viewer.file, owner, &mut edit_ui, controls_enabled) {
+        if let Some((owner, ftp)) = viewer.edit.as_ref().and_then(|m| m.owner.as_ref().map(|o| (o, &m.ftp))) {
+            if let Some(req) = snapshot_editor::draw_owner_editor(ui, &viewer.file, owner, ftp, &mut edit_ui, controls_enabled, &mut viewer.reveal_secrets) {
                 asked = Some(req);
             }
             ui.add_space(6.0);
@@ -7752,6 +7812,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = mpsc::channel();
         let (view_tx, view_rx) = mpsc::channel();
+        let (ftp_test_tx, ftp_test_rx) = mpsc::channel();
         let settings = SettingsState {
             path: dir.path().join("settings.json"),
             data_dir: Some(dir.path().to_path_buf()),
@@ -7768,6 +7829,8 @@ mod tests {
             viewers: SnapshotViewers::default(),
             view_tx,
             view_rx,
+            ftp_test_tx,
+            ftp_test_rx,
             label: String::new(),
             status: Status::new(Level::Info, ""),
             notices: Vec::new(),

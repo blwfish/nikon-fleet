@@ -26,6 +26,23 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::ftp_edit::Protocol;
 
+impl TestRequest {
+    /// Test a stored profile with its own settings (`ftp_edit::profile_view`). The one place that maps a profile's
+    /// fields to a request, so the command line and the GUI cannot disagree about which field is the server's port.
+    pub fn from_profile(v: &crate::ftp_edit::ProfileView, file_check: bool, step_timeout: Duration) -> TestRequest {
+        TestRequest {
+            host: v.host.clone(),
+            port: v.port,
+            protocol: v.protocol,
+            username: v.username.clone(),
+            password: v.password.clone(),
+            folder: v.folder.clone(),
+            file_check,
+            step_timeout,
+        }
+    }
+}
+
 /// What to try. The password is used and never kept in a report.
 #[derive(Clone)]
 pub struct TestRequest {
@@ -1019,6 +1036,27 @@ mod tests {
             }
         }
         assert!(FailKind::Unreachable.hint().contains("may simply not be on it") && FailKind::TimedOut.hint().contains("cannot tell them apart"), "the hints say what this test cannot know");
+    }
+
+    #[test]
+    fn a_request_from_a_stored_profile_takes_the_servers_port_not_the_second_port() {
+        use crate::ftp_edit::ProfileView;
+        let v = ProfileView {
+            name: "n".into(),
+            wifi_name: "w".into(),
+            wifi_key: "k".into(),
+            host: "h.example".into(),
+            folder: "/in".into(),
+            username: "u".into(),
+            password: "p".into(),
+            port: 2222,
+            protocol: Protocol::Sftp,
+            proxy_port: 8080,
+        };
+        let r = TestRequest::from_profile(&v, true, Duration::from_secs(9));
+        assert_eq!((r.host.as_str(), r.port, r.protocol, r.folder.as_str(), r.username.as_str(), r.password.as_str(), r.file_check), ("h.example", 2222, Protocol::Sftp, "/in", "u", "p", true));
+        assert_eq!(r.step_timeout, Duration::from_secs(9));
+        assert!(!TestRequest::from_profile(&v, false, Duration::from_secs(1)).file_check);
     }
 
     #[test]
