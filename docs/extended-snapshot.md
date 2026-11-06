@@ -98,7 +98,9 @@ session's own gate functions (`ptp_usb::check_string_property_write`, `check_byt
 (`ptp_usb::MODEL_CAPS`, `src/ptp_usb/model_caps.rs`), not by a copy, and `ptp_usb`'s tests run the planner and a scripted session over the same
 model-by-value grid. Apply writes the restore point
 first, as a snapshot with no MAID properties and the extended section as it was (label `restore-ext`), refusing first
-(like the MAID apply) if the data directory already holds the per-camera cap of restore points; restoring from
+(like the MAID apply) if the data directory already holds the per-camera cap of restore points (`data_dir_full`; the
+`mcp-restore-...` ones and the `restore-ext` ones count together, by `ops::retention::kind_of_label`, and nothing is deleted
+for you: the files hold the FTP passwords they replaced, so remove old ones by hand); restoring from
 it undoes the restore. The report names it as `restore_point: {file, label}` (the shape the MAID restore uses) and gives
 `undo_set`, the categories with a write that was tried (an FTP rebuild that failed part-way counts: it may have emptied
 the list); restoring the restore point with `--only` = `undo_set` puts back just those. Status: verified only if every write's read-back matched and the body, read again, matches the
@@ -146,6 +148,12 @@ index first, then reversed adds, and that the list ends in the snapshot's order;
 was run on a Z 9 and a Z6III, but the session method `delete_ftp_profile` and this sequence are UNVERIFIED on hardware), and `EnableCopyright` on a Z 9 or Z6III (the gate allows only
 the Z 5 until then). The `0xD060` preset switch is allowed on a Z6III only (a Z 9 refused it while its presets were
 empty).
+**Not verified: a new FTP profile's camera address.** A profile added in the snapshot editor used to carry the capture rig's
+camera address (192.168.66.87/24) and now has none stored (0.0.0.0/0, 2.4 GHz tag kind `0x30`, the form of the camera-made
+fixture `hotspot_no_address`); a duplicate keeps its source's. That a body takes such a profile in a restore, lists it and
+connects with it has not been tried. On a body: add a profile in the editor, restore it, read it back, check the camera lists it
+and connects. **Also unverified on a camera:** that `restore-ext` restore points are counted against the cap (that is host-side
+file counting, covered by tests only).
 
 **Surfaces.** The same plan / digest / apply operation is offered three ways, none of them a second implementation:
 

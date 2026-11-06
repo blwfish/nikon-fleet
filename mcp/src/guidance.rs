@@ -340,7 +340,7 @@ pub fn notes() -> Vec<Note> {
              at all (`file`, `error`): treat that the same way.\n\
              What it does not tell you is how far the apply got, or whether the worker finished after the server left. Do not run the apply again from the same plan. Capture the \
              body (capture_snapshot) or check it against its reference (check_against_reference), compare with the restore point the apply stored first \
-             (list_snapshots with label_prefix `mcp-restore-`, or `restore-ext` after a restore-extended-apply), and tell the user what you find.",
+             (list_snapshots with `kind: restore_point`, which lists the `mcp-restore-` ones and the `restore-ext` one of a restore-extended-apply), and tell the user what you find.",
         )
         .tags(&["camera"])
         .addresses(&[
@@ -391,7 +391,7 @@ pub fn notes() -> Vec<Note> {
         )
         .detail(
             "There is no delete tool. Past a cap the call fails with `data_dir_full` before touching the camera; the user clears old files themselves. \
-             Labels you supply are stored as `mcp-<label>`; restore points are `mcp-restore-...` (`restore-ext` after an extended restore).",
+             Labels you supply are stored as `mcp-<label>`; restore points are `mcp-restore-...` (`restore-ext` after an extended restore); both labels count toward the 50-restore-point cap, and `list_snapshots` with `kind: restore_point` lists both.",
         )
         .tags(&["snapshots"])
         .addresses(&["data_dir_full", "disk full", "too many snapshots", "delete snapshot"]),

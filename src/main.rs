@@ -448,7 +448,7 @@ enum EditCmd {
         #[command(flatten)]
         fields: FtpFieldArgs,
     },
-    /// Add an FTP profile (it needs `--name` and `--host`), starting from the encoder's template; at `--at` (default: the end).
+    /// Add an FTP profile (it needs `--name` and `--host`), starting from a profile with no stored camera address (unverified on a camera); at `--at` (default: the end).
     FtpAdd {
         file: String,
         #[arg(long)]

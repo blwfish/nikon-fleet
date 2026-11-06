@@ -67,10 +67,9 @@ use crate::snapshot::{Camera, Snapshot, SnapshotError, Transport};
 /// was made (the live FTP list, the live IPTC slot, the live value), not only what would be written.
 pub const DIGEST_FORMAT: u32 = 2;
 
-/// The label of the restore point an apply writes, and the one place it is spelled. A fixed label: the file name is
-/// built from it, and a name that embedded the source's would grow with every restore from a restore point until it
-/// exceeded the file system's limit.
-pub const RESTORE_POINT_LABEL: &str = "restore-ext";
+/// The label of the restore point an apply writes. Spelled once, in `ops::retention` (whose classifier counts it as a
+/// restore point); re-exported here for the callers that name it by this path.
+pub use crate::ops::retention::RESTORE_POINT_LABEL;
 
 /// A group of items, for `--only`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1038,23 +1037,6 @@ fn status_of(results: &[ItemResult], still_differing: &[String], after_failed: b
     }
 }
 
-/// The restore points the data directory holds for `camera`: the MCP's (`mcp-restore-...`, counted by
-/// [`retention::count_for_camera`]) plus the ones this operation writes, which carry [`RESTORE_POINT_LABEL`] and which
-/// `retention::kind_of_label` does not know. So the one per-camera cap binds the files that hold plaintext FTP
-/// passwords as well, and they cannot pile up unseen.
-fn restore_points_held(snapshots_dir: &Path, camera: &Camera) -> Result<retention::Counts, crate::ops::list::ListError> {
-    use crate::ops::list::{EntryState, list_dir};
-    let mut counts = retention::count_for_camera(snapshots_dir, &camera.model, &camera.serial)?;
-    let listing = list_dir(snapshots_dir, None, None)?;
-    counts.restore_points += listing
-        .entries
-        .iter()
-        .filter(|e| matches!(&e.state, EntryState::Ok { model, serial, label, .. }
-            if *model == camera.model && *serial == camera.serial && label.as_deref() == Some(RESTORE_POINT_LABEL)))
-        .count();
-    Ok(counts)
-}
-
 /// The status of an apply that wrote nothing. A plan with nothing but matching items (and routine absences: a body
 /// without the feature, a snapshot without the value) is a verified no-op. A plan that skipped something for a reason
 /// ([`SkipKind::is_routine`] is false) did NOT leave the body matching the snapshot, and "applied, verified, nothing to
@@ -1128,7 +1110,8 @@ pub fn apply_extended_restore<S: ExtendedSink + ?Sized>(
     rp.extended = Some(live.clone());
     let rp_file = rp.suggested_filename();
     std::fs::create_dir_all(req.snapshots_dir).map_err(|e| Refusal::RestorePoint(SnapshotError::Io(e)))?;
-    let counts = restore_points_held(req.snapshots_dir, input.target).map_err(ApplyError::List)?;
+    // One count, the classifier's: `mcp-restore-...` and `restore-ext` files alike (`retention::kind_of_label`).
+    let counts = retention::count_for_camera(req.snapshots_dir, &input.target.model, &input.target.serial).map_err(ApplyError::List)?;
     retention::check_restore_point_cap(&counts).map_err(ApplyError::RestorePointCap)?;
     rp.save_new(req.snapshots_dir.join(&rp_file)).map_err(Refusal::RestorePoint)?;
     progress(PHASE_RESTORE_POINT_WRITTEN);
@@ -2133,6 +2116,56 @@ mod tests {
         }
     }
 
+    /// `n` files labelled with `label`, for `camera`, each at its own second so the file names differ.
+    fn fill_with_label(dir: &Path, camera: &Camera, label: &str, n: usize, minute: u32) {
+        for i in 0..n {
+            let mut rp = Snapshot::new(camera.clone(), Transport::Usb, format!("2026-11-05T{:02}:{minute:02}:{:02}Z", i / 60, i % 60));
+            rp.label = Some(label.to_string());
+            rp.save_new(dir.join(rp.suggested_filename())).unwrap();
+        }
+    }
+
+    #[test]
+    fn restore_points_of_both_labels_share_one_cap_at_below_and_above_it() {
+        let cap = crate::ops::retention::MAX_RESTORE_POINTS_PER_CAMERA;
+        let half = cap / 2;
+        // (mcp-restore-*, restore-ext) held before the apply: cap - 1 passes, cap and cap + 1 are refused before any write.
+        for (mcp, ext, allowed) in [(half, cap - half - 1, true), (half, cap - half, false), (half, cap - half + 1, false), (0, cap, false), (cap, 0, false)] {
+            let (mut b, f) = drifted();
+            fill_with_mcp_restore_points(f.dir.path(), &target(&b), mcp);
+            fill_with_label(f.dir.path(), &target(&b), RESTORE_POINT_LABEL, ext, 30);
+            let r = apply(&mut b, &f, None);
+            if allowed {
+                assert_eq!(r.unwrap().status, ApplyStatus::AppliedVerified, "{mcp} + {ext} = {} held", mcp + ext);
+            } else {
+                assert_eq!(r.unwrap_err().tag(), "data_dir_full", "{mcp} + {ext} = {} held", mcp + ext);
+                assert!(b.log.is_empty(), "no write: {:?}", b.log);
+                assert_eq!(std::fs::read_dir(f.dir.path()).unwrap().count(), mcp + ext, "no restore point was added");
+            }
+        }
+    }
+
+    #[test]
+    fn labels_that_only_start_like_a_restore_point_do_not_count_toward_the_cap() {
+        let cap = crate::ops::retention::MAX_RESTORE_POINTS_PER_CAMERA;
+        let (mut b, f) = drifted();
+        // `restore-extra`, `restore-ext2`, `restore-` and `mcp-restore` (no trailing dash) are not restore points.
+        for (i, label) in ["restore-extra", "restore-ext2", "restore-", "mcp-restore", "Restore-ext"].iter().enumerate() {
+            fill_with_label(f.dir.path(), &target(&b), label, cap, 10 + i as u32);
+        }
+        assert_eq!(apply(&mut b, &f, None).unwrap().status, ApplyStatus::AppliedVerified);
+    }
+
+    #[test]
+    fn the_cap_refusal_names_restore_points_and_how_to_clear_them() {
+        let cap = crate::ops::retention::MAX_RESTORE_POINTS_PER_CAMERA;
+        let (mut b, f) = drifted();
+        fill_with_label(f.dir.path(), &target(&b), RESTORE_POINT_LABEL, cap, 30);
+        let msg = apply(&mut b, &f, None).unwrap_err().to_string();
+        assert!(msg.contains("restore points") && !msg.contains("MCP restore points"), "{msg}");
+        assert!(msg.contains("`mcp-restore-...`") && msg.contains("`restore-ext`") && msg.contains("by hand"), "{msg}");
+    }
+
     #[test]
     fn the_restore_point_obeys_the_data_directorys_restore_point_cap_before_any_write() {
         let cap = crate::ops::retention::MAX_RESTORE_POINTS_PER_CAMERA;
@@ -2166,6 +2199,30 @@ mod tests {
         assert!(b.log.is_empty(), "refused before any write");
         // The restore point keeps its one label.
         assert_eq!(RESTORE_POINT_LABEL, "restore-ext");
+    }
+
+    #[test]
+    fn a_profile_added_in_the_editor_with_no_camera_address_plans_and_writes_byte_for_byte() {
+        // Finding 30: a new profile now has no stored camera address (0.0.0.0/0, tag kind 0x30). The restore path asks only
+        // that the strict decoder reads the blob, so it is planned as a write and sent as the editor stored it.
+        let mut d = crate::ftp_edit::template();
+        crate::ftp_edit::apply_fields(
+            &mut d,
+            &crate::ftp_edit::ProfileFields { name: Some("fresh".into()), host: Some("ftp.fresh.test".into()), password: Some("pw-new".into()), ..Default::default() },
+        )
+        .unwrap();
+        let blob = crate::ptp_usb::encode_decoded_ftp_profile(&d).unwrap();
+        assert!(decode_ftp_profile(&blob).is_ok());
+        let mut source = body("Z 9");
+        source.ftp = vec![blob.clone()];
+        let f = fixture(&mut source);
+        let mut b = body("Z 9");
+        b.ftp = vec![profile("one", "password-1")];
+        let plan = plan_of(&mut b, &f, None);
+        assert!(matches!(action(&plan, "ftp"), ItemAction::Write { .. }), "{:?}", action(&plan, "ftp"));
+        let report = apply(&mut b, &f, None).unwrap();
+        assert_eq!(report.status, ApplyStatus::AppliedVerified);
+        assert_eq!(b.ftp, vec![blob], "what the body holds is what the editor stored");
     }
 
     // ── the undo command ──────────────────────────────────────────────────

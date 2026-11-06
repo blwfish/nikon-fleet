@@ -40,7 +40,9 @@ name and key and login), **Delete** (a second press on the same row confirms), a
 (FTP or SFTP) and second port. A field is saved when you leave its box (Enter, Tab or a click elsewhere; Escape gives up),
 through the same checks as the command line, and a refusal says why and puts the stored value back. Passwords and the
 Wi-Fi key are masked; **👁 Show passwords** at the top of the section reveals them. **Add a profile** takes a name and a
-server (and, if you like, folder, login, password and Wi-Fi) and starts from the encoder's template.
+server (and, if you like, folder, login, password and Wi-Fi) and starts from the editor's template: FTP port 21, second port
+8080, option bits `0x0005`, and **no stored camera address** (it used to carry the capture rig's, 192.168.66.87/24; see
+`docs/snapshot-editing.md`). Duplicate copies the profile whole, its camera address included.
 
 **Test connection** runs `ftp-test`'s engine on a thread of its own with the profile as stored in the file (so what is
 tested is what was saved), and shows each step under the profile: ✔ / ✘ / – with the server's words and a hint on a
@@ -101,6 +103,10 @@ current-thread tokio runtime the test creates for itself. About 60 crates are ne
 
 - What a Z 9 or Z6III does with a profile whose port, folder or protocol was changed, or a brand-new one built from the
   template. The check is to restore such a copy to a body and read the profile back (`vendor-read-ftp`).
+- The template's **no stored camera address** (0.0.0.0/0, 2.4 GHz tag kind `0x30`; before, the capture rig's 192.168.66.87/24).
+  Evidence is only that one camera-made fixture (`hotspot_no_address`) has that form; the combination with option bits
+  `0x0005`, 5 GHz kind 4 and second port 8080 is not itself a camera-made one. The check on a body: add a profile in the
+  editor, restore it, and see whether the camera lists it and can connect with it.
 - Which option bit is passive mode, and whether any is FTPS: change one menu setting at a time and compare
   `vendor-read-ftp` (see `docs/property-sweep.md`).
 - The test against a real server. Nothing here has been run against a real FTP or SFTP server; both protocols are tested

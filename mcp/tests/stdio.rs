@@ -383,6 +383,25 @@ fn snapshots_are_listed_read_and_diffed_by_name() {
     let e = structured(&r)["entries"].as_array().unwrap().clone();
     assert_eq!((e.len(), e[0]["file"].as_str()), (1, Some("b.json")));
 
+    // `kind` is the retention classifier's: it lists the `restore-ext` restore point of an extended restore too, which a
+    // `mcp-restore-` prefix misses; a label that only starts like it (`restore-extra`) is neither kind.
+    seed_snapshot(&d, "c.json", "Z 9", "S1", "restore-ext", &[("kNkMAIDCapability_ISO", 2, json!(100))]);
+    seed_snapshot(&d, "d.json", "Z 9", "S1", "restore-extra", &[("kNkMAIDCapability_ISO", 2, json!(100))]);
+    seed_snapshot(&d, "e.json", "Z 9", "S1", "mcp-wedding", &[("kNkMAIDCapability_ISO", 2, json!(100))]);
+    let files = |s: &mut Server, args: Value| {
+        let r = s.call("list_snapshots", args);
+        assert!(!is_error(&r), "{r}");
+        structured(&r)["entries"].as_array().unwrap().iter().map(|e| e["file"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+    };
+    assert_eq!(files(&mut s, json!({"kind": "restore_point"})), ["b.json", "c.json"]);
+    assert_eq!(files(&mut s, json!({"kind": "capture"})), ["e.json"]);
+    assert_eq!(files(&mut s, json!({"label_prefix": "mcp-restore-"})), ["b.json"], "a prefix alone still misses restore-ext");
+    assert_eq!(files(&mut s, json!({})).len(), 5);
+    assert!(is_error(&s.call("list_snapshots", json!({"kind": "restore"}))), "an unknown kind is refused, not ignored");
+    for f in ["c.json", "d.json", "e.json"] {
+        std::fs::remove_file(d.join("snapshots").join(f)).unwrap();
+    }
+
     let r = s.call("get_snapshot", json!({"name": "a.json"}));
     let v = structured(&r);
     assert_eq!((v["property_count"].clone(), v["page"]["returned"].clone(), v["page"]["truncated"].clone()), (json!(2), json!(0), json!(true)));

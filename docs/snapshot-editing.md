@@ -25,7 +25,7 @@ rule guards against mistakes, not against editing your own data directory).
   (it ties with it on that time).
 - Edited copies stay editable in place; captured snapshots and references do not.
 - An edited copy **cannot become a reference** (`ref set` refuses it): a reference is what `check` compares a body to.
-- A copy's label may not start `mcp-` (the MCP server counts its own captures and restore points by that prefix).
+- A copy's label may not start `mcp-` or be `restore-ext` (the MCP server and `restore-extended` count their captures and restore points by those labels: `ops::retention::kind_of_label`).
 - A reference can be copied; it is only read.
 - Nothing about an edited copy is special to restore or transplant: it is a snapshot, so a restore plan made from one
   writes the edited values (pinned by a test that plans from a fake body), and the plan, the confirmation, the restore
@@ -63,9 +63,20 @@ profile" than the capture, and that difference is not something a restore will c
 (`ptp_usb::ftp_profile_missing_fields`). The editor does not, and a restore does not check it either: cameras make
 profiles without a login (two real blobs in the test fixtures), so a rule that refused them would refuse profiles a
 camera made. When an edit leaves a profile lacking something `vendor-write-ftp` would require, the result says so.
-A new profile starts from the encoder's template, which carries the capture rig's camera address (192.168.66.87/24) and
-option bits `0x0005`; the result says the profile took the template's address. What a camera does with that address on
-another network, or with a profile that has no login or no Wi-Fi name, written by a restore, is **not verified**.
+A new profile starts from the editor's template (`ftp_edit::template`). **It used to** carry the capture rig's camera
+address (192.168.66.87/24, the owner's Z 9 on the rig), so every profile added here, and every restore that wrote one,
+carried another person's camera address. **It now has no stored camera address** (0.0.0.0/0) and the 2.4 GHz tag kind
+byte `0x30`, which is the form of the one camera-made profile in `tests/fixtures/ftp_profile_vectors.json` that has none
+(`hotspot_no_address`; the other five fixtures have an address, 192.168.66.87/24, 192.168.68.83/22 or 10.0.0.251/24, and
+kind `0x01`). Option bits (`0x0005`), ports (21 and 8080) and the 5 GHz tag kind (4) keep their documented defaults, so the
+combination is the nearest the fixtures support rather than a copy of one: the strict decoder takes it (it accepts any
+value in those tag bytes). A **duplicate** is unchanged: it copies its source whole, that profile's own camera address
+included. The result of an add says the profile has no stored camera address and that this is unverified. `vendor-write-ftp`
+is unchanged too: it builds a profile with the encoder and still writes the captured form. **Not verified on a camera**:
+whether a body lists, keeps and connects with a profile that has no stored address, or with one that has no login or no
+Wi-Fi name. To check on a body: add a profile in the editor, restore it with `restore-extended`, then read the body back
+(`vendor-read-ftp`) and see whether the camera lists the profile and can connect with it; if it does not, the next step is to
+start from a copy of one of that body's own profiles.
 
 ## Concurrency
 

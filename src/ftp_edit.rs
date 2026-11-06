@@ -23,10 +23,14 @@
 //! require, the edit's result says which ([`write_gate_note`]). Whether a camera accepts such a profile written back
 //! is **not verified**.
 //!
-//! **A new profile's camera address.** [`template`] is the encoder's blank profile, which carries the capture rig's
-//! camera address (192.168.66.87/24) and option bits `0x0005`. A body's own profiles can differ (one real blob has
-//! 10.0.0.251/24, another has no stored address). What a camera does with the template's address on a different network
-//! is **not verified**; a profile added here says it took the template's.
+//! **A new profile's camera address.** [`template`] used to be the encoder's blank profile, which carries the capture
+//! rig's camera address (192.168.66.87/24), so every profile added here (and every restore that wrote one) carried
+//! another person's camera address. It now has NO stored camera address (0.0.0.0/0) and the 2.4 GHz tag kind byte
+//! `0x30`, the form of the one camera-made profile in `tests/fixtures/ftp_profile_vectors.json` that has none
+//! (`hotspot_no_address`); a body's own profiles have their own addresses (192.168.66.87/24, 192.168.68.83/22,
+//! 10.0.0.251/24 in the fixtures). Option bits stay `0x0005`, the ports 21 and 8080. A duplicate copies its source whole,
+//! its camera address included. That a camera accepts, lists and connects with a profile that has no address is
+//! **not verified**; a profile added here says so.
 
 use crate::extended::{hex_decode, hex_encode};
 use crate::ptp_usb::{DecodedFtpProfile, FtpField, FtpProfile, PtpUsbError, decode_ftp_profile, encode_decoded_ftp_profile, encode_ftp_profile, ftp_profile_missing_fields};
@@ -239,8 +243,29 @@ pub fn apply_fields(d: &mut DecodedFtpProfile, f: &ProfileFields) -> Result<Vec<
     Ok(changed)
 }
 
-/// The profile a new one starts from: what the encoder writes for an empty profile (the captured camera address,
-/// option bits `0x0005`, FTP port 21, second port 8080).
+/// The 2.4 GHz SSID tag's kind byte that goes with "no stored camera address" in the one camera-made profile that has
+/// none (`hotspot_no_address` in `tests/fixtures/ftp_profile_vectors.json`: tag `03 00 30 00`, where the other five
+/// fixtures have `03 00 01 00`). Whether the byte is connected to the missing address or to something else about that
+/// profile (it is a hotspot profile) is **unknown**; it travels with the address here because that is how the one
+/// example is.
+pub const NO_ADDRESS_SSID24_KIND: u8 = 0x30;
+
+/// The camera network a new profile starts with: none stored (0.0.0.0/0), the form a camera itself writes for a
+/// profile with no address (`hotspot_no_address`).
+pub const NO_CAMERA_NETWORK: crate::ptp_usb::FtpCameraNetwork = crate::ptp_usb::FtpCameraNetwork { ipv4: [0, 0, 0, 0], prefix_len: 0 };
+
+/// The profile a new one starts from: the encoder's blank profile (FTP port 21, second port 8080, option bits `0x0005`,
+/// empty folder), with NO stored camera address (0.0.0.0/0) and the 2.4 GHz tag kind byte the camera-made no-address
+/// profile carries ([`NO_ADDRESS_SSID24_KIND`]), where it used to carry the capture rig's address (192.168.66.87/24).
+///
+/// `encode_ftp_profile` writes only the captured form, so this is the encoder's blank profile, decoded, with those two
+/// values set, and written back through the byte-exact path (`encode_decoded_ftp_profile`) to prove the strict
+/// decoder takes the result. The combination "no address + 5 GHz tag kind 4 + 2.4 GHz kind 0x30" is not itself in a
+/// camera-made fixture (`hotspot_no_address` has 5 GHz kind 6, option bits 7 and second port 0), but the decoder
+/// accepts any value in those tag bytes, so it is the nearest form the fixtures support while the rest keeps its
+/// documented defaults. **Not verified on a camera**: whether a body lists and connects with a profile added this way.
+///
+/// This is only the starting point of a NEW profile. A duplicate copies its source whole, camera address included.
 pub fn template() -> DecodedFtpProfile {
     let blank = FtpProfile {
         profile_name: String::new(),
@@ -252,7 +277,12 @@ pub fn template() -> DecodedFtpProfile {
         password: String::new(),
     };
     let blob = encode_ftp_profile(&blank).expect("an empty profile always encodes");
-    decode_ftp_profile(&blob).expect("what the encoder writes always decodes")
+    let mut d = decode_ftp_profile(&blob).expect("what the encoder writes always decodes");
+    d.camera_network = NO_CAMERA_NETWORK;
+    d.ssid24_kind = NO_ADDRESS_SSID24_KIND;
+    // The write-back path is the one a snapshot edit and a restore use; the strict decoder must take what it writes.
+    let written = encode_decoded_ftp_profile(&d).expect("a blank profile with the no-address form always encodes");
+    decode_ftp_profile(&written).expect("what the byte-exact encoder writes always decodes")
 }
 
 fn decoded_at(snap: &Snapshot, index: usize) -> Result<(DecodedFtpProfile, usize), EditRefusal> {
@@ -315,8 +345,11 @@ pub fn ftp_add(snap: &mut Snapshot, f: &ProfileFields, position: Option<usize>, 
     let len = ftp_store_mut(snap)?.profiles.len();
     let mut d = template();
     apply_fields(&mut d, f)?;
-    // Nothing of the template is the person's: say that its camera address was not chosen (unverified on a camera).
-    let note = format!("{}; its camera address and option bits are the template's (unverified on a camera)", write_gate_note(&[], &d));
+    // Nothing of the template is the person's: say that it has no camera address (unverified on a camera).
+    let note = format!(
+        "{}; it has no stored camera address and the default option bits, which the camera is expected to fill in (unverified on a camera)",
+        write_gate_note(&[], &d)
+    );
     insert_profile(snap, &d, position.unwrap_or(len), "added", &note, now)
 }
 
@@ -718,22 +751,144 @@ mod tests {
         }
     }
 
+    /// A camera-made blob from the shared golden fixtures, by name.
+    fn fixture_blob(name: &str) -> Vec<u8> {
+        let v: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/ftp_profile_vectors.json")).unwrap();
+        let p = v["profiles"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap_or_else(|| panic!("no fixture {name}"));
+        hex_decode(p["hex"].as_str().unwrap()).unwrap()
+    }
+
+    fn set_profile(s: &mut Snapshot, i: usize, d: &DecodedFtpProfile) {
+        if let Some(Extended { ftp: FtpState::Read(st), .. }) = &mut s.extended {
+            st.profiles[i].hex = hex_encode(&encode_decoded_ftp_profile(d).unwrap());
+        }
+    }
+
+    const NO_NETWORK: crate::ptp_usb::FtpCameraNetwork = crate::ptp_usb::FtpCameraNetwork { ipv4: [0, 0, 0, 0], prefix_len: 0 };
+
     #[test]
-    fn the_template_is_the_encoders_blank_profile_with_the_capture_rigs_camera_address() {
-        // Pinned so that the value a new profile starts from is visible in a diff when it changes (finding: a new
-        // profile can be restored to any body with the capture rig's address; unverified on a camera).
+    fn a_new_profile_starts_with_no_stored_camera_address_where_it_used_to_carry_the_capture_rigs() {
+        // Finding 30: the template carried 192.168.66.87/24 (the capture rig's Z 9) into every added profile and every
+        // restore that wrote one. The no-address form is the one the camera itself writes for `hotspot_no_address`.
         let t = template();
-        assert_eq!((t.camera_network, t.option_flags, t.ftp_port, t.second_port), (crate::ptp_usb::FtpCameraNetwork::CAPTURED, 0x0005, 21, 8080));
+        assert_eq!(t.camera_network, NO_NETWORK);
+        assert_ne!(t.camera_network, crate::ptp_usb::FtpCameraNetwork::CAPTURED, "not the capture rig's address");
+        assert_eq!(t.ssid24_kind, 0x30, "the kind byte the camera-made no-address profile carries");
+        assert_eq!(t.ssid24_lead, 0x03);
+        // Everything else keeps the documented defaults.
+        assert_eq!((t.option_flags, t.ftp_port, t.second_port, t.ssid5_kind, t.folder.as_str()), (0x0005, 21, 8080, 4, ""));
         let mut s = snapshot_with(&["alpha"], 20);
         ftp_add(&mut s, &new_profile(), None, NOW).unwrap();
-        assert_eq!(decoded_of(&s, 1).camera_network, crate::ptp_usb::FtpCameraNetwork::CAPTURED);
-        // a duplicate keeps the original's, whatever it is
+        assert_eq!(decoded_of(&s, 1).camera_network, NO_NETWORK);
+        assert_eq!(decoded_of(&s, 1).ssid24_kind, 0x30);
+        assert_eq!(decoded_of(&s, 0).camera_network, crate::ptp_usb::FtpCameraNetwork::CAPTURED, "the existing profile is untouched");
+    }
+
+    #[test]
+    fn the_no_address_form_matches_the_camera_made_profile_that_has_none() {
+        // The independent judge: the real blob. Same network, same 2.4 GHz tag kind, and the layout's strict decoder reads
+        // both; the template differs from it only where the template keeps documented defaults (5 GHz kind, option bits, ports).
+        let real = decode_ftp_profile(&fixture_blob("hotspot_no_address")).unwrap();
+        let t = template();
+        assert_eq!((t.camera_network, t.ssid24_kind, t.ssid24_lead), (real.camera_network, real.ssid24_kind, real.ssid24_lead));
+        assert_eq!((real.camera_network, real.ssid24_kind), (NO_NETWORK, 0x30), "the fixture is what this test says it is");
+        // And the other camera-made profiles all have an address and kind 1: the no-address form is the odd one out, by design.
+        for other in ["reference", "z9_317", "z9_331_folder", "sftp_port22", "hotspot_anonymous"] {
+            let d = decode_ftp_profile(&fixture_blob(other)).unwrap();
+            assert_ne!(d.camera_network, NO_NETWORK, "{other}");
+            assert_eq!(d.ssid24_kind, 1, "{other}");
+        }
+    }
+
+    #[test]
+    fn the_template_encodes_decodes_and_round_trips_byte_for_byte() {
+        let t = template();
+        let blob = encode_decoded_ftp_profile(&t).unwrap();
+        let back = decode_ftp_profile(&blob).expect("the strict decoder takes the no-address form");
+        assert_eq!(back, t);
+        assert_eq!(encode_decoded_ftp_profile(&back).unwrap(), blob, "decode then encode is byte-identical");
+        // With the person's fields applied too (the profile a restore would write).
+        let mut filled = template();
+        apply_fields(&mut filled, &new_profile()).unwrap();
+        let blob = encode_decoded_ftp_profile(&filled).unwrap();
+        let back = decode_ftp_profile(&blob).unwrap();
+        assert_eq!((back.camera_network, back.ssid24_kind), (NO_NETWORK, 0x30));
+        assert_eq!(encode_decoded_ftp_profile(&back).unwrap(), blob);
+    }
+
+    #[test]
+    fn the_vendor_write_ftp_gate_is_unchanged_and_still_wants_the_captured_form_while_a_restore_takes_the_template() {
+        // `vendor-write-ftp` builds a profile from scratch with the encoder, which writes the captured network; its gate
+        // (`as_encodable`) therefore refuses a profile with any other network and any other tag kind. The restore path
+        // writes decoded blobs and asks only that the strict decoder reads them. Both behaviours are pinned here.
+        let mut filled = template();
+        apply_fields(&mut filled, &new_profile()).unwrap();
+        assert!(filled.as_encodable().is_none(), "the vendor-write-ftp gate wants 192.168.66.87/24 and tag kind 1");
+        let mut as_captured = filled.clone();
+        as_captured.camera_network = crate::ptp_usb::FtpCameraNetwork::CAPTURED;
+        as_captured.ssid24_kind = 0x01;
+        assert!(as_captured.as_encodable().is_some(), "the gate is unchanged: captured network and kind 1 pass");
+        // Each of the three differences alone refuses it.
+        let mut only_address = as_captured.clone();
+        only_address.camera_network.ipv4 = [0, 0, 0, 0];
+        let mut only_prefix = as_captured.clone();
+        only_prefix.camera_network.prefix_len = 0;
+        let mut only_kind = as_captured.clone();
+        only_kind.ssid24_kind = 0x30;
+        for (what, d) in [("address", only_address), ("prefix", only_prefix), ("2.4 GHz kind", only_kind)] {
+            assert!(d.as_encodable().is_none(), "{what} alone must refuse it");
+        }
+        let blob = encode_decoded_ftp_profile(&filled).unwrap();
+        assert!(decode_ftp_profile(&blob).is_ok(), "the restore path's check (the strict decoder) takes the template");
+    }
+
+    #[test]
+    fn adding_to_an_empty_list_and_to_a_non_empty_one_both_start_from_no_address() {
+        let mut empty = snapshot_with(&[], 20);
+        ftp_add(&mut empty, &new_profile(), None, NOW).unwrap();
+        assert_eq!(decoded_of(&empty, 0).camera_network, NO_NETWORK);
+        let mut s = snapshot_with(&["a", "b"], 20);
+        ftp_add(&mut s, &new_profile(), Some(1), NOW).unwrap();
+        assert_eq!(names(&s), ["a", "fresh", "b"]);
+        assert_eq!(decoded_of(&s, 1).camera_network, NO_NETWORK);
+        for i in [0, 2] {
+            assert_eq!(decoded_of(&s, i).camera_network, crate::ptp_usb::FtpCameraNetwork::CAPTURED, "profile {i} keeps its own");
+        }
+    }
+
+    #[test]
+    fn the_add_result_says_there_is_no_camera_address_and_that_it_is_unverified() {
+        let mut s = snapshot_with(&["a"], 20);
+        let a = ftp_add(&mut s, &new_profile(), None, NOW).unwrap();
+        assert!(a.change.contains("no stored camera address") && a.change.contains("unverified on a camera"), "{}", a.change);
+        assert!(!a.change.contains("template's"), "the old wording is gone: {}", a.change);
+    }
+
+    #[test]
+    fn a_duplicate_keeps_its_sources_own_camera_address_and_tag_kind_whatever_it_is() {
+        // 10.0.0.251/24: one of the camera-made addresses in the fixtures.
+        let mut s = snapshot_with(&["alpha"], 20);
         let mut other = decoded_of(&s, 0);
         other.camera_network = crate::ptp_usb::FtpCameraNetwork { ipv4: [10, 0, 0, 251], prefix_len: 24 };
-        if let Some(Extended { ftp: FtpState::Read(st), .. }) = &mut s.extended {
-            st.profiles[0].hex = hex_encode(&encode_decoded_ftp_profile(&other).unwrap());
-        }
+        set_profile(&mut s, 0, &other);
         ftp_duplicate(&mut s, 0, None, &ProfileFields::default(), NOW).unwrap();
-        assert_eq!(decoded_of(&s, 1).camera_network.ipv4, [10, 0, 0, 251]);
+        assert_eq!(decoded_of(&s, 1).camera_network, other.camera_network);
+        assert_eq!((decoded_of(&s, 1).ssid24_kind, decoded_of(&s, 1).option_flags), (1, decoded_of(&s, 0).option_flags));
+        // A duplicate of a no-address profile has none; one of the rig's profile has the rig's: the source decides.
+        let mut none = decoded_of(&s, 0);
+        none.camera_network = NO_NETWORK;
+        none.ssid24_kind = 0x30;
+        set_profile(&mut s, 0, &none);
+        ftp_duplicate(&mut s, 0, Some("again"), &ProfileFields::default(), NOW).unwrap();
+        assert_eq!((decoded_of(&s, 1).camera_network, decoded_of(&s, 1).ssid24_kind), (NO_NETWORK, 0x30));
+        // The real fixture with the camera-made address, through the same path.
+        let mut real = snapshot_with(&["x"], 20);
+        if let Some(Extended { ftp: FtpState::Read(st), .. }) = &mut real.extended {
+            st.profiles[0].hex = hex_encode(&fixture_blob("hotspot_anonymous"));
+        }
+        let want = decode_ftp_profile(&fixture_blob("hotspot_anonymous")).unwrap().camera_network;
+        ftp_duplicate(&mut real, 0, None, &ProfileFields::default(), NOW).unwrap();
+        assert_eq!(decoded_of(&real, 1).camera_network, want);
+        assert_ne!(want, NO_NETWORK);
     }
 }

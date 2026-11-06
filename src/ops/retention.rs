@@ -6,6 +6,9 @@
 //!
 //! - captures: `mcp-<label>`
 //! - restore points: `mcp-restore-<op>-<timestamp>`
+//! - restore points of an extended restore (owner strings, IPTC, FTP profiles, which hold plaintext FTP
+//!   passwords): exactly [`RESTORE_POINT_LABEL`] (`restore-ext`), no `mcp-` prefix, because the CLI and the GUI
+//!   write them too
 //!
 //! Each kind has its own per-camera cap. Past the capture cap `capture_snapshot`
 //! refuses; past the restore-point cap an apply refuses before any write.
@@ -22,10 +25,17 @@ pub const CAPTURE_PREFIX: &str = "mcp-";
 /// Marks a restore point made through the MCP. Checked before [`CAPTURE_PREFIX`].
 pub const RESTORE_PREFIX: &str = "mcp-restore-";
 
+/// The label of the restore point `restore-extended` writes, and the one place it is spelled
+/// (`ops::restore_extended` re-exports it). A fixed label: the file name is built from it, and a name that embedded the
+/// source's would grow with every restore from a restore point until it exceeded the file system's limit. An EXACT
+/// label, not a prefix: [`kind_of_label`] compares for equality, so `restore-extra` is not a restore point.
+pub const RESTORE_POINT_LABEL: &str = "restore-ext";
+
 /// Cap on MCP captures per camera (docs/mcp-plan.md §9, decided 2026-10-28:
 /// a snapshot is about 83 KB, so 200 is about 16 MB).
 pub const MAX_CAPTURES_PER_CAMERA: usize = 200;
-/// Cap on MCP restore points per camera (about 4 MB at 50; decided 2026-10-28).
+/// Cap on restore points per camera, both the `mcp-restore-` ones and the `restore-ext` ones, counted together
+/// (about 4 MB at 50; decided 2026-10-28).
 pub const MAX_RESTORE_POINTS_PER_CAMERA: usize = 50;
 
 /// Longest label an agent may supply (before the prefix).
@@ -38,16 +48,26 @@ pub enum Kind {
     RestorePoint,
 }
 
-/// Which kind of MCP file a label marks, if any. `mcp-restore-` is tested
-/// first, because every restore-point label also starts with `mcp-`.
+/// Which kind of file a label marks, if any. The single classifier: the caps, the listing filter and the reserved-label
+/// check all ask it. A restore point is a label that starts with `mcp-restore-` (tested before the capture prefix,
+/// because every such label also starts with `mcp-`) or that IS [`RESTORE_POINT_LABEL`] (equality, not a prefix test).
 pub fn kind_of_label(label: &str) -> Option<Kind> {
-    if label.starts_with(RESTORE_PREFIX) {
+    if label.starts_with(RESTORE_PREFIX) || label == RESTORE_POINT_LABEL {
         Some(Kind::RestorePoint)
     } else if label.starts_with(CAPTURE_PREFIX) {
         Some(Kind::Capture)
     } else {
         None
     }
+}
+
+/// Keep only the entries whose label [`kind_of_label`] puts in `kind`. Unreadable entries are dropped: they have no label
+/// to classify (the listing's own count of them is the caller's to report).
+pub fn retain_kind(listing: &mut crate::ops::list::Listing, kind: Kind) {
+    listing.entries.retain(|e| match &e.state {
+        EntryState::Ok { label, .. } => label.as_deref().and_then(kind_of_label) == Some(kind),
+        EntryState::Unreadable { .. } => false,
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +162,7 @@ pub fn restore_point_label(op: RestoreOp, timestamp: &str) -> Result<String, Lab
     Ok(format!("{RESTORE_PREFIX}{}-{timestamp}", op.slug()))
 }
 
-/// How many MCP files exist for one camera.
+/// How many captures and restore points exist for one camera.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct Counts {
     pub captures: usize,
@@ -152,7 +172,7 @@ pub struct Counts {
     pub unreadable: usize,
 }
 
-/// Count the MCP files for (`model`, `serial`) in `snapshots_dir`, by the
+/// Count the captures and restore points for (`model`, `serial`) in `snapshots_dir`, by the
 /// content of each file (model, serial, label), not by file name.
 pub fn count_for_camera(snapshots_dir: &Path, model: &str, serial: &str) -> Result<Counts, ListError> {
     let listing = list_dir(snapshots_dir, None, None)?;
@@ -189,16 +209,22 @@ impl DataDirFull {
 
 impl std::fmt::Display for DataDirFull {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let what = match self.kind {
-            Kind::Capture => "captures",
-            Kind::RestorePoint => "restore points",
-        };
-        write!(
-            f,
-            "{} MCP {what} are stored for this camera (cap {}); nothing is deleted automatically, \
-             remove some by hand",
-            self.count, self.cap
-        )
+        match self.kind {
+            Kind::Capture => write!(
+                f,
+                "{} MCP captures are stored for this camera (cap {}); nothing is deleted automatically, \
+                 remove some by hand",
+                self.count, self.cap
+            ),
+            Kind::RestorePoint => write!(
+                f,
+                "{} restore points are stored for this camera (cap {}); nothing is deleted automatically, \
+                 remove some by hand: the snapshot files in the snapshots directory whose label is \
+                 `{RESTORE_PREFIX}...` or `{RESTORE_POINT_LABEL}` (a restore-extended restore point, which holds the FTP \
+                 passwords it replaced)",
+                self.count, self.cap
+            ),
+        }
     }
 }
 
@@ -293,6 +319,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_extended_restore_point_label_is_a_restore_point_by_equality_not_prefix() {
+        assert_eq!(RESTORE_POINT_LABEL, "restore-ext");
+        assert_eq!(kind_of_label(RESTORE_POINT_LABEL), Some(Kind::RestorePoint));
+        // Near misses: longer, shorter, other case, padded, and the lookalikes the seam rule warns about.
+        for near in [
+            "restore-extra", "restore-ext2", "restore-ext-", "restore-ex", "restore-e", "restore-", "restore", "Restore-ext",
+            "RESTORE-EXT", " restore-ext", "restore-ext ", "mcp-restore", "mcp-restore-ext-no", "xrestore-ext",
+        ] {
+            // `mcp-restore-ext-no` starts with the MCP restore prefix, so it IS a restore point; every other one is nothing.
+            let want = if near.starts_with(RESTORE_PREFIX) { Some(Kind::RestorePoint) } else if near == "mcp-restore" { Some(Kind::Capture) } else { None };
+            assert_eq!(kind_of_label(near), want, "{near:?}");
+        }
+        // A capture label cannot be made to equal it: captures are `mcp-<label>` and `restore-` is reserved.
+        assert_eq!(capture_label(Some("restore-ext")), Err(LabelError::Reserved));
+        assert_eq!(kind_of_label(&capture_label(Some("ext")).unwrap()), Some(Kind::Capture));
+    }
+
     // ── counting ─────────────────────────────────────────────────────────
 
     fn put(dir: &Path, file: &str, model: &str, serial: &str, label: Option<&str>) {
@@ -318,6 +362,36 @@ mod tests {
         put(d.path(), "7.json", "Z6_3", "A", Some("mcp-other-model"));
         let c = count_for_camera(d.path(), "Z 9", "A").unwrap();
         assert_eq!(c, Counts { captures: 2, restore_points: 1, unreadable: 0 });
+    }
+
+    #[test]
+    fn restore_ext_files_count_as_restore_points_for_their_camera_only() {
+        let d = TempDir::new().unwrap();
+        put(d.path(), "1.json", "Z 9", "A", Some(RESTORE_POINT_LABEL));
+        put(d.path(), "2.json", "Z 9", "A", Some("mcp-restore-pre-restore-t"));
+        put(d.path(), "3.json", "Z 9", "A", Some("restore-extra"));
+        put(d.path(), "4.json", "Z 9", "B", Some(RESTORE_POINT_LABEL));
+        put(d.path(), "5.json", "Z6_3", "A", Some(RESTORE_POINT_LABEL));
+        assert_eq!(count_for_camera(d.path(), "Z 9", "A").unwrap(), Counts { captures: 0, restore_points: 2, unreadable: 0 });
+    }
+
+    #[test]
+    fn the_restore_point_listing_filter_comes_from_the_classifier() {
+        let d = TempDir::new().unwrap();
+        put(d.path(), "cap.json", "Z 9", "A", Some("mcp-one"));
+        put(d.path(), "mcp.json", "Z 9", "A", Some("mcp-restore-pre-restore-t"));
+        put(d.path(), "ext.json", "Z 9", "A", Some(RESTORE_POINT_LABEL));
+        put(d.path(), "extra.json", "Z 9", "A", Some("restore-extra"));
+        put(d.path(), "plain.json", "Z 9", "A", Some("hand-made"));
+        put(d.path(), "none.json", "Z 9", "A", None);
+        std::fs::write(d.path().join("torn.json"), "{ nope").unwrap();
+        let files = |kind| {
+            let mut l = list_dir(d.path(), None, None).unwrap();
+            retain_kind(&mut l, kind);
+            l.entries.into_iter().map(|e| e.file).collect::<Vec<_>>()
+        };
+        assert_eq!(files(Kind::RestorePoint), ["ext.json", "mcp.json"]);
+        assert_eq!(files(Kind::Capture), ["cap.json"]);
     }
 
     #[test]
@@ -402,7 +476,10 @@ mod tests {
         assert_eq!(e.tag(), "data_dir_full");
         let s = e.to_string();
         assert!(s.contains("200") && s.contains("captures") && s.contains("nothing is deleted"), "{s}");
-        assert!(DataDirFull { kind: Kind::RestorePoint, count: 1, cap: 1 }.to_string().contains("restore points"));
+        let rp = DataDirFull { kind: Kind::RestorePoint, count: 1, cap: 1 }.to_string();
+        assert!(rp.contains("restore points") && !rp.contains("MCP restore points"), "{rp}");
+        // It says which files to remove: both labels, and that nothing is removed for the person.
+        assert!(rp.contains("`mcp-restore-...`") && rp.contains("`restore-ext`") && rp.contains("by hand"), "{rp}");
     }
 
     #[test]

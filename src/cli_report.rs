@@ -335,7 +335,7 @@ pub fn refusal_hint(tag: &str) -> Option<&'static str> {
             "Pass --allow-partial to go ahead anyway: the restore point is still taken and the read-back is still compared, \
              but the camera's state could not be judged complete.",
         ),
-        "data_dir_full" => Some("Clear old mcp-restore-* snapshots from the snapshots directory, then retry."),
+        "data_dir_full" => Some("Clear old restore points (snapshots labelled mcp-restore-... or restore-ext) from the snapshots directory, then retry."),
         _ => None,
     }
 }
