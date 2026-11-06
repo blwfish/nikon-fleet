@@ -517,14 +517,23 @@ fn elem_count_mismatch(enum_value: &Value, values: &[Value]) -> Option<String> {
 
 /// `elem_type` if present and one of `KNOWN_ELEM_TYPES`; `None` if the field
 /// is simply absent (defaults to the conservative raw-code strategy, same as
-/// before); `Err(MalformedSource)` if it's present but not a recognized
-/// value (a real anomaly, not an absent-field case).
-fn parse_known_elem_type(value: &Value) -> Result<Option<u64>, SkipReason> {
+/// before); an error if it's present but not a recognized value (a real
+/// anomaly, not an absent-field case). The error is `MalformedSource` for a
+/// source (a snapshot file) and `EnumUndecodedBySdk` for a target (a live read,
+/// whose fault is not the snapshot's), the same split `packed_string_options` makes.
+fn parse_known_elem_type(value: &Value, side: Side) -> Result<Option<u64>, SkipReason> {
+    let bad = || match side {
+        Side::Source => SkipReason::MalformedSource,
+        Side::Target => SkipReason::EnumUndecodedBySdk {
+            side: side.as_str(),
+            reason: "elem_type is not one the SDK decoder recognizes".to_string(),
+        },
+    };
     match value.get("elem_type") {
         None => Ok(None),
         Some(v) => {
-            let n = v.as_u64().ok_or(SkipReason::MalformedSource)?;
-            if KNOWN_ELEM_TYPES.contains(&n) { Ok(Some(n)) } else { Err(SkipReason::MalformedSource) }
+            let n = v.as_u64().ok_or_else(bad)?;
+            if KNOWN_ELEM_TYPES.contains(&n) { Ok(Some(n)) } else { Err(bad()) }
         }
     }
 }
@@ -536,14 +545,14 @@ fn translate_enum(source: &Value, target_live: &Value) -> Result<(Value, Strateg
     let src_idx = source.get("value_index").and_then(Value::as_u64).ok_or(SkipReason::MalformedSource)? as usize;
     let src_values_raw = source.get("values").ok_or(SkipReason::MalformedSource)?;
     if let Some(reason) = enum_values_sdk_decode_failure(src_values_raw) {
-        return Err(SkipReason::EnumUndecodedBySdk { side: "source", reason });
+        return Err(SkipReason::EnumUndecodedBySdk { side: Side::Source.as_str(), reason });
     }
     let src_values = src_values_raw.as_array().ok_or(SkipReason::MalformedSource)?;
     let src_label = src_values.get(src_idx).ok_or(SkipReason::MalformedSource)?;
 
     let tgt_values_raw = target_live.get("values").ok_or(SkipReason::NoMatchingOption)?;
     if let Some(reason) = enum_values_sdk_decode_failure(tgt_values_raw) {
-        return Err(SkipReason::EnumUndecodedBySdk { side: "target", reason });
+        return Err(SkipReason::EnumUndecodedBySdk { side: Side::Target.as_str(), reason });
     }
     let tgt_values = tgt_values_raw.as_array().ok_or(SkipReason::NoMatchingOption)?;
     // `elem_count` is how many options the SDK says there are. A decoded array of a different
@@ -552,14 +561,14 @@ fn translate_enum(source: &Value, target_live: &Value) -> Result<(Value, Strateg
     // empty array and a nonzero count is an old snapshot written before values were decoded:
     // that stays `malformed_source`, which is what tells the caller to capture again.
     if let Some(reason) = elem_count_mismatch(source, src_values).filter(|_| !src_values.is_empty()) {
-        return Err(SkipReason::EnumUndecodedBySdk { side: "source", reason });
+        return Err(SkipReason::EnumUndecodedBySdk { side: Side::Source.as_str(), reason });
     }
     if let Some(reason) = elem_count_mismatch(target_live, tgt_values) {
-        return Err(SkipReason::EnumUndecodedBySdk { side: "target", reason });
+        return Err(SkipReason::EnumUndecodedBySdk { side: Side::Target.as_str(), reason });
     }
 
-    let src_elem_type = parse_known_elem_type(source)?;
-    let tgt_elem_type = parse_known_elem_type(target_live)?;
+    let src_elem_type = parse_known_elem_type(source, Side::Source)?;
+    let tgt_elem_type = parse_known_elem_type(target_live, Side::Target)?;
     // An absent `elem_type` has always meant "raw codes" (a legacy or hand-built value). But a
     // one-byte-per-element array is the packed-string layout, whose elements are single characters:
     // matching those as raw codes (and `--allow-raw-code` would let it write) picks an option by one
@@ -599,8 +608,21 @@ fn translate_enum(source: &Value, target_live: &Value) -> Result<(Value, Strateg
         let label = src_options.get(src_idx).ok_or(SkipReason::MalformedSource)?;
         if label == UNRESOLVED_LABEL {
             return Err(SkipReason::EnumUndecodedBySdk {
-                side: "source",
+                side: Side::Source.as_str(),
                 reason: format!("the SDK could not resolve the selected option's label ({UNRESOLVED_LABEL:?})"),
+            });
+        }
+        // The SDK decode is lossy (`String::from_utf8_lossy`): bytes that are not valid UTF-8, and
+        // in the one-byte-per-element layout every byte of a multi-byte character, become U+FFFD.
+        // Different labels can then read identically, so a label holding one identifies nothing,
+        // as with the placeholder above.
+        if label.contains(char::REPLACEMENT_CHARACTER) {
+            return Err(SkipReason::EnumUndecodedBySdk {
+                side: Side::Source.as_str(),
+                reason: format!(
+                    "the selected option's label {label:?} holds bytes the SDK decode could not read as text, \
+                     so it cannot be told from other labels"
+                ),
             });
         }
         let source_count = src_options.iter().filter(|o| *o == label).count();
@@ -630,7 +652,10 @@ fn translate_enum(source: &Value, target_live: &Value) -> Result<(Value, Strateg
 
     // Carry the target's own elem_type/elem_count/elem_bytes/default forward
     // unchanged — only the index (the thing that actually varies per body)
-    // is overwritten.
+    // is overwritten. Source fields: `value_index` and `values` are extracted (the chosen
+    // option); `elem_type`, `elem_count` and `elem_bytes` are read (strategy, a consistency check,
+    // the packed-string layout), not copied; `default_index` is dropped-with-reason: a default
+    // belongs to the body being written, so the target's own is kept.
     let mut out = target_live.clone();
     out["value_index"] = json!(tgt_idx as u64);
     Ok((out, strategy))
@@ -672,6 +697,9 @@ fn translate_range(source: &Value, target_live: &Value) -> Result<(Value, Strate
 
     // What the target holds at that index (stepped), or the clamped number (continuous).
     let value = if stepped { value_at(lower, upper, steps, value_index) } else { clamped };
+    // Source fields: the position (`value`/`value_index`) and the scale (`lower`, `upper`, `steps`)
+    // are read; `default` and `default_index` are dropped-with-reason: a default belongs to the
+    // body being written, so the target's own (carried from `target_live`) is kept.
     let mut out = target_live.clone();
     out["value"] = json!(value);
     out["value_index"] = json!(value_index);
@@ -2710,6 +2738,66 @@ mod tests {
         });
         let target_live = raw_code_enum(0, &[1]);
         assert_eq!(translate_value(&source, Some(&target_live)), Err(SkipReason::MalformedSource));
+    }
+
+    #[test]
+    fn unrecognized_elem_type_on_the_target_is_a_decode_fault_not_a_bad_snapshot() {
+        // #65: the target is a live read; calling its fault "malformed value in source snapshot"
+        // sends the person to re-capture a file that is fine.
+        let source = raw_code_enum(0, &[1]);
+        for bad in [json!(99), json!("2"), json!(null), json!(-1)] {
+            let mut target_live = raw_code_enum(0, &[1]);
+            target_live["elem_type"] = bad.clone();
+            assert!(
+                matches!(
+                    translate_value(&source, Some(&target_live)),
+                    Err(SkipReason::EnumUndecodedBySdk { side: "target", .. })
+                ),
+                "target elem_type {bad}"
+            );
+            // and the same value on the source stays the snapshot's fault
+            let mut bad_source = raw_code_enum(0, &[1]);
+            bad_source["elem_type"] = bad.clone();
+            assert_eq!(
+                translate_value(&bad_source, Some(&raw_code_enum(0, &[1]))),
+                Err(SkipReason::MalformedSource),
+                "source elem_type {bad}"
+            );
+        }
+        // every recognized type is still accepted on the target (no over-rejection)
+        for t in KNOWN_ELEM_TYPES {
+            let mut target_live = raw_code_enum(0, &[1]);
+            target_live["elem_type"] = json!(t);
+            assert_eq!(parse_known_elem_type(&target_live, Side::Target), Ok(Some(*t)));
+        }
+    }
+
+    #[test]
+    fn a_label_the_sdk_decode_replaced_with_u_fffd_never_matches() {
+        // #61: from_utf8_lossy turns every byte of a non-UTF-8 sequence into U+FFFD, so two
+        // different labels can read identically. Matching them would pick an option by luck.
+        let bad = "\u{FFFD}\u{FFFD}";
+        let source = byte_layout(1, &["Off", bad]);
+        let target = byte_layout(0, &[bad, "Off"]);
+        assert!(
+            matches!(
+                translate_value(&source, Some(&target)),
+                Err(SkipReason::EnumUndecodedBySdk { side: "source", .. })
+            ),
+            "{:?}",
+            translate_value(&source, Some(&target))
+        );
+        // the other options of the same list are unaffected: only the selected label is judged
+        let (v, s) = translate_value(&byte_layout(0, &["Off", bad]), Some(&target)).unwrap();
+        assert_eq!((v["value_index"].clone(), s), (json!(1), Strategy::EnumByLabel));
+        // a single U+FFFD is enough (boundary: one replacement char, not only a run)
+        assert!(matches!(
+            translate_value(&byte_layout(0, &["a\u{FFFD}"]), Some(&byte_layout(0, &["a\u{FFFD}"]))),
+            Err(SkipReason::EnumUndecodedBySdk { side: "source", .. })
+        ));
+        // genuinely non-ASCII text that decoded fine is a label like any other
+        let (v, _) = translate_value(&byte_layout(0, &["Café"]), Some(&byte_layout(1, &["Off", "Café"]))).unwrap();
+        assert_eq!(v["value_index"], json!(1));
     }
 
     #[test]
