@@ -414,6 +414,15 @@ pub enum PtpUsbError {
     DeviceInfoMalformed { field: &'static str, offset: usize, fault: DeviceInfoFault },
     #[error("FTP profile data is not in a layout this decoder knows: {what} at byte offset {offset}: {detail}")]
     FtpBlobMalformed { what: &'static str, offset: usize, detail: String },
+    #[error("{}", ftp_info_malformed_text(.raw, .cause))]
+    FtpInfoMalformed {
+        /// The whole `0x90EB` reply data, kept because a reply the decoder cannot read is the finding. The
+        /// decoder reads no password from it (count, limit, slot, GUID, device name, trailer), so it is
+        /// printed to the user; diagnostics record its length only.
+        raw: Vec<u8>,
+        /// The decoder's complaint: always a [`PtpUsbError::FtpBlobMalformed`].
+        cause: Box<PtpUsbError>,
+    },
     #[error(
         "FTP profile slot {slot} is outside the {count} stored profile(s) (slots 0..{count}); a read past the end \
          stalls the USB pipe, so it was not sent"
@@ -536,6 +545,7 @@ impl PtpUsbError {
             PtpUsbError::NoDataPhase { .. } => "no_data_phase",
             PtpUsbError::DeviceInfoMalformed { .. } => "device_info_malformed",
             PtpUsbError::FtpBlobMalformed { .. } => "ftp_blob_malformed",
+            PtpUsbError::FtpInfoMalformed { .. } => "ftp_info_malformed",
             PtpUsbError::FtpSlotOutOfRange { .. } => "ftp_slot_out_of_range",
             PtpUsbError::FtpProbeOpNotAllowed { .. } => "ftp_probe_op_not_allowed",
             PtpUsbError::FtpProbeDataTooLong { .. } => "ftp_probe_data_too_long",
@@ -597,6 +607,11 @@ impl PtpUsbError {
             PtpUsbError::FtpWriteIndeterminate { cause } | PtpUsbError::PropWriteIndeterminate { cause, .. } => {
                 f.push(("cause_kind", Val::text(cause.tag())));
             }
+            // Length only: a reply that did not decode as the info layout has no known shape, so no hash or bytes.
+            PtpUsbError::FtpInfoMalformed { raw, cause } => {
+                f.push(("len", Val::U64(raw.len() as u64)));
+                f.push(("cause_kind", Val::text(cause.tag())));
+            }
             // Tag only: the remaining variants carry paths, serials, camera strings or no data that adds to the tag.
             _ => {}
         }
@@ -616,6 +631,20 @@ impl PtpUsbError {
                 | PtpUsbError::TooManyCommandParams { .. }
         )
     }
+}
+
+/// The most bytes of a malformed `0x90EB` reply that [`PtpUsbError::FtpInfoMalformed`] prints. A real reply is
+/// 57 to 59 bytes (a Z 9, a Z6III); the whole reply stays in the error's `raw` whatever this is.
+pub const FTP_INFO_SHOWN_MAX: usize = 128;
+
+fn ftp_info_malformed_text(raw: &[u8], cause: &PtpUsbError) -> String {
+    let shown = &raw[..raw.len().min(FTP_INFO_SHOWN_MAX)];
+    let cut = if shown.len() < raw.len() {
+        format!(", first {} shown", shown.len())
+    } else {
+        String::new()
+    };
+    format!("the 0x90EB info reply ({} byte(s){cut}: {}) is not in a layout this decoder knows: {cause}", raw.len(), hex_bytes(shown))
 }
 
 /// A PTP response code, with `Display` naming the standard ones (PIMA 15740
@@ -2116,6 +2145,36 @@ impl std::fmt::Debug for FtpProfileBlob {
     }
 }
 
+/// What one reply of an FTP-profile read carried besides its data: kept as data, because a reply that
+/// departs from what the command called for is a finding. None of it is a profile field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtpReplyNotes {
+    /// The operation the reply answered (`0x90E8`, `0x90EB` or `0x90ED`).
+    pub op: u16,
+    /// The parameters of the response container (none seen in any capture).
+    pub response_params: Vec<u32>,
+    /// Exactly how the reply departed from its command: the transaction id or operation code it carried instead.
+    pub deviations: Vec<ReplyDeviation>,
+    /// Containers of a kind this module does not know that arrived and were skipped.
+    pub unrecognized_containers: u32,
+}
+
+impl FtpReplyNotes {
+    fn of(op: u16, reply: &Reply) -> Self {
+        FtpReplyNotes {
+            op,
+            response_params: reply.params.clone(),
+            deviations: reply.deviations.clone(),
+            unrecognized_containers: reply.unrecognized_containers,
+        }
+    }
+
+    /// Nothing worth telling: no response parameters, no deviation, no skipped container.
+    pub fn is_empty(&self) -> bool {
+        self.response_params.is_empty() && self.deviations.is_empty() && self.unrecognized_containers == 0
+    }
+}
+
 /// What [`PtpUsbSession::read_ftp_profile`] found.
 #[derive(Debug)]
 pub struct FtpProfileReadout {
@@ -2127,7 +2186,11 @@ pub struct FtpProfileReadout {
     pub warnings: Vec<String>,
     /// False when a reply carried a different transaction id or operation
     /// code than its command (tolerated; these ops have no USB capture).
+    /// True exactly when no entry of [`Self::replies`] has a deviation.
     pub reply_matched_command: bool,
+    /// What each reply carried besides its data, in the order sent: `0x90E8`, `0x90EB` and, when it was
+    /// sent, `0x90ED`.
+    pub replies: Vec<FtpReplyNotes>,
 }
 
 /// `propcode` is one of the [`STRING_PROPS`] this module writes; otherwise [`PtpUsbError::PropWriteUnsupported`].
@@ -3266,13 +3329,15 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         self.send_ftp_blob(FTP_PROFILE_WRITE_PARAMS, &blob)
     }
 
-    /// `0x90E8` setup then `0x90EB`: the stored count and the selected slot, read-only. The reply
-    /// flag is false when either reply did not match its command (tolerated, see [`TxidCheck`]).
-    fn read_ftp_info_step(&mut self) -> Result<(FtpProfileInfo, bool), PtpUsbError> {
+    /// `0x90E8` setup then `0x90EB`: the stored count and the selected slot, read-only. The notes are
+    /// those of the two replies (tolerated departures, see [`TxidCheck`]). A `0x90EB` reply the decoder
+    /// cannot read is [`PtpUsbError::FtpInfoMalformed`], which keeps its bytes.
+    fn read_ftp_info_step(&mut self) -> Result<(FtpProfileInfo, Vec<FtpReplyNotes>), PtpUsbError> {
         let setup = self.ftp_setup_step()?;
         let info_reply = self.transact_ok_with_data(OP_FTP_PROFILE_INFO, &[], None, TxidCheck::Unchecked)?;
-        let info = parse_ftp_profile_info(&info_reply.data)?;
-        Ok((info, setup.deviations.is_empty() && info_reply.deviations.is_empty()))
+        let info = parse_ftp_profile_info(&info_reply.data)
+            .map_err(|cause| PtpUsbError::FtpInfoMalformed { raw: info_reply.data.clone(), cause: Box::new(cause) })?;
+        Ok((info, vec![FtpReplyNotes::of(OP_FTP_SETUP, &setup), FtpReplyNotes::of(OP_FTP_PROFILE_INFO, &info_reply)]))
     }
 
     /// The part of a guarded FTP write that sends nothing: the model gate, the blob must decode,
@@ -3292,7 +3357,8 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         let decoded = decode_ftp_profile(blob)?;
         let refuse = |why| PtpUsbError::FtpWriteRefused { slot, param2, why };
         classify_ftp_write(slot, param2, None).map_err(refuse)?;
-        let (info, info_replies_matched) = self.read_ftp_info_step()?;
+        let (info, info_notes) = self.read_ftp_info_step()?;
+        let info_replies_matched = info_notes.iter().all(|n| n.deviations.is_empty());
         let kind = classify_ftp_write(slot, param2, Some(info.count)).map_err(refuse)?;
         Ok(FtpWritePlan { model: self.model.clone(), kind, count: info.count, decoded, info_replies_matched })
     }
@@ -3438,7 +3504,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// slot `0x90EB` reports stayed `0` across two different active profiles).
     pub fn read_ftp_profile_slot(&mut self, slot: Option<u32>) -> Result<FtpProfileReadout, PtpUsbError> {
         let mut warnings: Vec<String> = unsurveyed_model_warning(self.model(), "the FTP-profile read").into_iter().collect();
-        let (info, mut matched) = self.read_ftp_info_step()?;
+        let (info, mut replies) = self.read_ftp_info_step()?;
 
         let wanted = match slot {
             Some(n) if n >= info.count => return Err(PtpUsbError::FtpSlotOutOfRange { slot: n, count: info.count }),
@@ -3456,13 +3522,14 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         };
         let profile = if let Some(wanted) = wanted {
             let reply = self.read_ftp_profile_reply(wanted)?;
-            matched &= reply.deviations.is_empty();
+            replies.push(FtpReplyNotes::of(OP_FTP_PROFILE_READ, &reply));
             let decoded = decode_ftp_profile(&reply.data);
             Some(FtpProfileBlob { raw: reply.data, decoded })
         } else {
             None
         };
-        Ok(FtpProfileReadout { info, profile, warnings, reply_matched_command: matched })
+        let reply_matched_command = replies.iter().all(|n| n.deviations.is_empty());
+        Ok(FtpProfileReadout { info, profile, warnings, reply_matched_command, replies })
     }
 }
 
@@ -8185,6 +8252,10 @@ mod tests {
             PtpUsbError::NoDataPhase { op: 0x1001 },
             PtpUsbError::DeviceInfoMalformed { field: "model", offset: 4, fault: DeviceInfoFault::Truncated { needed: 2, available: 1 } },
             PtpUsbError::FtpBlobMalformed { what: "host", offset: 3, detail: "a camera-supplied detail".into() },
+            PtpUsbError::FtpInfoMalformed {
+                raw: vec![0xc8, 0x00, 0x01],
+                cause: Box::new(PtpUsbError::FtpBlobMalformed { what: "info count", offset: 2, detail: "needs 4 byte(s) but only 1 remain".into() }),
+            },
             PtpUsbError::FtpSlotOutOfRange { slot: 3, count: 3 },
             PtpUsbError::FtpProbeOpNotAllowed { op: 1 },
             PtpUsbError::FtpProbeDataTooLong { len: 40 },
@@ -8209,7 +8280,7 @@ mod tests {
         let errs = every_ptp_usb_error();
         let tags: std::collections::BTreeSet<_> = errs.iter().map(PtpUsbError::tag).collect();
         assert_eq!(tags.len(), errs.len(), "tags are unique");
-        assert_eq!(errs.len(), 41, "a new PtpUsbError variant needs an entry here (tag() is exhaustive, this list is not)");
+        assert_eq!(errs.len(), 42, "a new PtpUsbError variant needs an entry here (tag() is exhaustive, this list is not)");
         for e in &errs {
             assert!(e.tag().chars().all(|c| c.is_ascii_lowercase() || c == '_'), "{}", e.tag());
             assert_eq!(e.diag_fields()[0], ("error_kind", crate::diag::Val::text(e.tag())), "{e}");
@@ -8560,6 +8631,129 @@ mod tests {
         let p = s.read_ftp_profile().unwrap().profile.unwrap();
         assert_eq!(p.raw, odd);
         assert!(matches!(p.decoded, Err(PtpUsbError::FtpBlobMalformed { what: "blob header", .. })));
+    }
+
+    // ── the readout keeps what each reply carried (b7d3#43) ──────────────
+
+    fn ftp_note(op: u16) -> FtpReplyNotes {
+        FtpReplyNotes { op, response_params: vec![], deviations: vec![], unrecognized_containers: 0 }
+    }
+
+    #[test]
+    fn read_ftp_profile_keeps_each_replys_params_deviations_and_skipped_containers() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let (mut s, _t) = session(
+            vec![
+                // 0x90E8: OK with two response parameters.
+                Step::Stamped(vec![(CONTAINER_RESPONSE, RESP_OK, [le(5), le(6)].concat())]),
+                // 0x90EB: the data is the right op, the response carries another transaction id.
+                data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(7, 0, "Z_9_0000000")),
+                resp_id(RESP_OK, 99),
+                // 0x90ED: a container of an unknown kind, then data labelled with another op, then OK.
+                Step::Stamped(vec![(0x0077, 0, vec![])]),
+                data_c(0x1234, &blob),
+                resp(RESP_OK),
+            ],
+            "Z 9",
+        );
+        let r = s.read_ftp_profile().unwrap();
+        assert_eq!(
+            r.replies,
+            vec![
+                FtpReplyNotes { response_params: vec![5, 6], ..ftp_note(OP_FTP_SETUP) },
+                FtpReplyNotes { deviations: vec![ReplyDeviation::TransactionId { got: 99 }], ..ftp_note(OP_FTP_PROFILE_INFO) },
+                FtpReplyNotes {
+                    deviations: vec![ReplyDeviation::DataOp { got: 0x1234 }],
+                    unrecognized_containers: 1,
+                    ..ftp_note(OP_FTP_PROFILE_READ)
+                },
+            ]
+        );
+        assert!(!r.reply_matched_command, "the flag is the summary of the deviations");
+        assert!(r.profile.unwrap().decoded.is_ok(), "the tolerated departures do not stop the decode");
+    }
+
+    #[test]
+    fn read_ftp_profile_clean_replies_are_empty_notes_in_order_sent() {
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let (mut s, _t) = session(
+            vec![
+                resp(RESP_OK),
+                data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(7, 0, "Z_9_0000000")),
+                resp(RESP_OK),
+                data_c(OP_FTP_PROFILE_READ, &blob),
+                resp(RESP_OK),
+            ],
+            "Z 9",
+        );
+        let r = s.read_ftp_profile().unwrap();
+        assert_eq!(r.replies, vec![ftp_note(OP_FTP_SETUP), ftp_note(OP_FTP_PROFILE_INFO), ftp_note(OP_FTP_PROFILE_READ)]);
+        assert!(r.replies.iter().all(FtpReplyNotes::is_empty) && r.reply_matched_command);
+        // No active profile: 0x90ED is not sent, so it has no entry.
+        let (mut none, _t) = session(
+            vec![resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &ftp_info_bytes(3, 0xff, "Z6_3_0000000")), resp(RESP_OK)],
+            "Z 9",
+        );
+        let ops: Vec<u16> = none.read_ftp_profile().unwrap().replies.iter().map(|n| n.op).collect();
+        assert_eq!(ops, vec![OP_FTP_SETUP, OP_FTP_PROFILE_INFO]);
+    }
+
+    #[test]
+    fn a_note_is_empty_only_when_all_three_of_its_parts_are() {
+        assert!(ftp_note(1).is_empty());
+        assert!(!FtpReplyNotes { response_params: vec![0], ..ftp_note(1) }.is_empty());
+        assert!(!FtpReplyNotes { deviations: vec![ReplyDeviation::DataOp { got: 1 }], ..ftp_note(1) }.is_empty());
+        assert!(!FtpReplyNotes { unrecognized_containers: 1, ..ftp_note(1) }.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_info_reply_keeps_its_bytes_and_stops_before_0x90ed() {
+        let ok = ftp_info_bytes(7, 0, "Z_9_0000000");
+        let mut longer = ok.clone();
+        longer.push(0);
+        for (what, bytes) in [("truncated", ok[..10].to_vec()), ("empty", vec![]), ("trailing byte", longer)] {
+            let (mut s, t) = session(vec![resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &bytes), resp(RESP_OK)], "Z 9");
+            match s.read_ftp_profile().unwrap_err() {
+                PtpUsbError::FtpInfoMalformed { raw, cause } => {
+                    assert_eq!(raw, bytes, "{what}");
+                    assert!(matches!(*cause, PtpUsbError::FtpBlobMalformed { .. }), "{what}: {cause:?}");
+                }
+                other => panic!("{what}: {other:?}"),
+            }
+            assert!(t.sent().iter().all(|(_, op, _, _)| *op != OP_FTP_PROFILE_READ), "{what}");
+        }
+        // The same error from the write planner, which reads the same info reply.
+        let blob = hex::decode_hex(reference_ftp_blob_hex());
+        let (mut s, _t) = session(vec![resp(RESP_OK), data_c(OP_FTP_PROFILE_INFO, &ok[..10]), resp(RESP_OK)], "Z 9");
+        assert!(matches!(s.plan_ftp_write(0, 0, &blob, false), Err(PtpUsbError::FtpInfoMalformed { .. })));
+    }
+
+    #[test]
+    fn a_malformed_info_reply_prints_its_bytes_up_to_the_bound_and_records_only_its_length() {
+        use crate::diag::Val;
+        let cause = || Box::new(PtpUsbError::FtpBlobMalformed { what: "info end", offset: 0, detail: "x".into() });
+        for (len, cut) in [(0, false), (FTP_INFO_SHOWN_MAX - 1, false), (FTP_INFO_SHOWN_MAX, false), (FTP_INFO_SHOWN_MAX + 1, true)] {
+            let raw: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let shown_len = len.min(FTP_INFO_SHOWN_MAX);
+            let e = PtpUsbError::FtpInfoMalformed { raw: raw.clone(), cause: cause() };
+            let text = e.to_string();
+            assert!(text.contains(&format!("({len} byte(s)")), "{len}: {text}");
+            assert_eq!(text.contains(&format!("first {FTP_INFO_SHOWN_MAX} shown")), cut, "{len}: {text}");
+            assert!(text.contains(&hex_bytes(&raw[..shown_len])), "{len}: {text}");
+            if cut {
+                assert!(!text.contains(&hex_bytes(&raw[..shown_len + 1])), "one byte past the bound is not printed: {text}");
+            }
+            // Diagnostics: the kind, the length and the cause's kind; no bytes, no hash, no text from the camera.
+            let f = e.diag_fields();
+            assert_eq!(
+                f,
+                vec![
+                    ("error_kind", Val::text("ftp_info_malformed")),
+                    ("len", Val::U64(len as u64)),
+                    ("cause_kind", Val::text("ftp_blob_malformed")),
+                ]
+            );
+        }
     }
 
     #[test]
@@ -9352,6 +9546,7 @@ mod tests {
             profile: Some(FtpProfileBlob { raw: blob.clone(), decoded: Ok(decoded.clone()) }),
             warnings: vec![],
             reply_matched_command: true,
+            replies: vec![],
         };
         let encodable = decoded.as_encodable().unwrap();
         for (what, shown) in [

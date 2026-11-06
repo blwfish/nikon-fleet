@@ -1918,7 +1918,7 @@ fn probe_indeterminate_error(probe: &nikon_fleet::ptp_usb::FtpOpProbe) -> Option
 /// What `vendor-probe-op` prints: the response verbatim, the profile list before and after, and every
 /// difference between them by name (never by value: the profiles hold a password).
 fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
-    use nikon_fleet::ptp_usb::{hex_bytes, FtpListChange, FtpListState, FtpProbeOutcome, PtpResponseCode, ReplyDeviation};
+    use nikon_fleet::ptp_usb::{hex_bytes, FtpListChange, FtpListState, FtpProbeOutcome, PtpResponseCode};
     fn list(s: &FtpListState) -> String {
         let items: Vec<String> = s
             .entries
@@ -1974,14 +1974,7 @@ fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
                 out.push_str(&format!(", {} byte(s) in {} data container(s): {}", r.data.len(), r.data_containers, hex_bytes(&r.data)));
             }
             for d in &r.deviations {
-                match d {
-                    ReplyDeviation::TransactionId { got } => {
-                        out.push_str(&format!("\nnote: a reply container carried transaction id {got}, not the command's"));
-                    }
-                    ReplyDeviation::DataOp { got } => {
-                        out.push_str(&format!("\nnote: a data container carried operation code 0x{got:04x}, not the command's"));
-                    }
-                }
+                out.push_str(&format!("\n{}", reply_deviation_note(d)));
             }
             if r.unrecognized_containers > 0 {
                 out.push_str(&format!("\nnote: {} container(s) of an unknown kind were skipped", r.unrecognized_containers));
@@ -2159,14 +2152,7 @@ fn vendor_op_query_text(q: &nikon_fleet::ptp_usb::VendorOpQuery) -> String {
         line.push_str(&format!("\nresponse parameters: {:?}", q.response_params));
     }
     for d in &q.deviations {
-        match d {
-            nikon_fleet::ptp_usb::ReplyDeviation::TransactionId { got } => {
-                line.push_str(&format!("\nnote: a reply container carried transaction id {got}, not the command's"));
-            }
-            nikon_fleet::ptp_usb::ReplyDeviation::DataOp { got } => {
-                line.push_str(&format!("\nnote: a data container carried operation code 0x{got:04x}, not the command's"));
-            }
-        }
+        line.push_str(&format!("\n{}", reply_deviation_note(d)));
     }
     if q.unrecognized_containers > 0 {
         line.push_str(&format!("\nnote: {} container(s) of an unknown kind were skipped", q.unrecognized_containers));
@@ -2209,10 +2195,37 @@ fn cmd_vendor_read_ftp(args: &VendorReadFtpArgs) -> Result<()> {
     Ok(())
 }
 
+/// The one-line note for a way a tolerated reply departed from its command.
+fn reply_deviation_note(d: &nikon_fleet::ptp_usb::ReplyDeviation) -> String {
+    use nikon_fleet::ptp_usb::ReplyDeviation;
+    match d {
+        ReplyDeviation::TransactionId { got } => format!("note: a reply container carried transaction id {got}, not the command's"),
+        ReplyDeviation::DataOp { got } => format!("note: a data container carried operation code 0x{got:04x}, not the command's"),
+    }
+}
+
 /// What `vendor-read-ftp` prints. The password and the 5 GHz field (probably a
 /// Wi-Fi password) are masked, in the decoded fields and in the hex dump,
-/// unless `show_password`.
+/// unless `show_password`. After the profile come the notes of each reply that carried
+/// response parameters, a transaction-id or operation-code departure, or a skipped container.
 fn ftp_readout_text(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: bool, raw: bool) -> String {
+    let mut out = ftp_readout_body(r, show_password, raw);
+    for n in r.replies.iter().filter(|n| !n.is_empty()) {
+        out.push_str(&format!("\n0x{:04x} reply:", n.op));
+        if !n.response_params.is_empty() {
+            out.push_str(&format!(" response parameters {:?};", n.response_params));
+        }
+        for d in &n.deviations {
+            out.push_str(&format!("\n  {}", reply_deviation_note(d)));
+        }
+        if n.unrecognized_containers > 0 {
+            out.push_str(&format!("\n  note: {} container(s) of an unknown kind were skipped", n.unrecognized_containers));
+        }
+    }
+    out
+}
+
+fn ftp_readout_body(r: &nikon_fleet::ptp_usb::FtpProfileReadout, show_password: bool, raw: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let i = &r.info;
@@ -5310,6 +5323,7 @@ mod tests {
             profile: Some(FtpProfileBlob { decoded: decode_ftp_profile(&blob), raw: blob }),
             warnings: vec![],
             reply_matched_command: true,
+            replies: vec![],
         }
     }
 
@@ -5342,6 +5356,37 @@ mod tests {
         assert!(!withheld.contains(&nikon_fleet::ptp_usb::hex_bytes(b"s3cretpw")), "{withheld}");
         let shown = ftp_readout_text(&r, true, true);
         assert!(shown.contains(&nikon_fleet::ptp_usb::hex_bytes(b"s3cretpw")), "--show-password prints the bytes: {shown}");
+    }
+
+    #[test]
+    fn vendor_read_ftp_prints_the_notes_of_each_reply_that_has_any_and_nothing_for_clean_ones() {
+        use nikon_fleet::ptp_usb::{FtpReplyNotes, ReplyDeviation};
+        let note = |op| FtpReplyNotes { op, response_params: vec![], deviations: vec![], unrecognized_containers: 0 };
+        let mut r = ftp_readout_with_profile();
+        r.replies = vec![note(0x90E8), note(0x90EB), note(0x90ED)];
+        let clean = ftp_readout_text(&r, false, false);
+        assert!(!clean.contains("reply:") && !clean.contains("note:"), "{clean}");
+        r.replies = vec![
+            FtpReplyNotes { response_params: vec![5, 6], ..note(0x90E8) },
+            note(0x90EB),
+            FtpReplyNotes {
+                deviations: vec![ReplyDeviation::TransactionId { got: 99 }, ReplyDeviation::DataOp { got: 0x1234 }],
+                unrecognized_containers: 2,
+                ..note(0x90ED)
+            },
+        ];
+        let text = ftp_readout_text(&r, true, true);
+        assert!(text.contains("0x90e8 reply: response parameters [5, 6];"), "{text}");
+        assert!(!text.contains("0x90eb reply"), "a clean reply prints nothing: {text}");
+        assert!(text.contains("0x90ed reply:") && text.contains("transaction id 99") && text.contains("operation code 0x1234"), "{text}");
+        assert!(text.contains("2 container(s) of an unknown kind were skipped"), "{text}");
+        // The notes follow the whole profile, the raw dump included, and the dump still parses.
+        assert!(text.find("raw (").unwrap() < text.find("0x90e8 reply").unwrap(), "{text}");
+        assert_eq!(dump_bytes(&text), r.profile.as_ref().unwrap().raw);
+        // And when the camera reports no profile the notes are still there.
+        r.profile = None;
+        r.info.slot = 0xff;
+        assert!(ftp_readout_text(&r, false, false).contains("0x90e8 reply: response parameters [5, 6];"));
     }
 
     #[test]

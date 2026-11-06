@@ -137,6 +137,7 @@ pub fn write_kind_of_ptp_usb_error(e: &PtpUsbError) -> ExitKind {
         | PtpUsbError::NoDataPhase { .. }
         | PtpUsbError::DeviceInfoMalformed { .. }
         | PtpUsbError::FtpBlobMalformed { .. }
+        | PtpUsbError::FtpInfoMalformed { .. }
         | PtpUsbError::FtpSlotOutOfRange { .. }
         | PtpUsbError::FtpProbeOpNotAllowed { .. }
         | PtpUsbError::FtpProbeDataTooLong { .. }
@@ -245,6 +246,7 @@ mod tests {
             PtpUsbError::NoDataPhase { op: 1 },
             PtpUsbError::DeviceInfoMalformed { field: "f", offset: 0, fault: DeviceInfoFault::Truncated { needed: 4, available: 1 } },
             PtpUsbError::FtpBlobMalformed { what: "w", offset: 0, detail: "d".into() },
+            PtpUsbError::FtpInfoMalformed { raw: vec![1, 2], cause: Box::new(PtpUsbError::FtpBlobMalformed { what: "w", offset: 0, detail: "d".into() }) },
             PtpUsbError::FtpSlotOutOfRange { slot: 5, count: 2 },
             PtpUsbError::FtpProbeOpNotAllowed { op: 1 },
             PtpUsbError::FtpProbeDataTooLong { len: 99 },
