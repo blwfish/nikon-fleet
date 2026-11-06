@@ -64,14 +64,17 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-fn pump_cf_runloop(duration: std::time::Duration) {
+fn pump_cf_runloop(duration: std::time::Duration) -> i32 {
     // returnAfterSourceHandled=0: process all pending events, not just the first.
-    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, duration.as_secs_f64(), 0); }
+    // The result is the CFRunLoopRunResult (1 finished, 2 stopped, 3 timed out, 4 handled a source): a loop with no
+    // sources in this mode returns 1 at once, which makes the wait a no-op. Callers that care record it.
+    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, duration.as_secs_f64(), 0) }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn pump_cf_runloop(_duration: std::time::Duration) {
+fn pump_cf_runloop(_duration: std::time::Duration) -> i32 {
     // No-op: Windows does not need a run-loop pump between EnumDevices retries.
+    0
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1110,14 +1113,28 @@ fn teardown(pump: impl FnOnce(), disconnect: impl FnOnce()) {
 impl<'sdk> Drop for Device<'sdk> {
     fn drop(&mut self) {
         use crate::diag::{self, Class, Outcome, Subsystem, Val};
+        // What the pump did: the run loop's result and how long it really ran, so a pump that returned at once
+        // (nothing to service, the 300 ms wait a no-op) is visible in the disconnect span instead of assumed away.
+        let pumped = std::cell::Cell::new((0i32, 0u64));
         teardown(
-            || pump_cf_runloop(PRE_DISCONNECT_PUMP),
+            || {
+                let began = std::time::Instant::now();
+                let rc = pump_cf_runloop(PRE_DISCONNECT_PUMP);
+                pumped.set((rc, began.elapsed().as_millis() as u64));
+            },
             || {
                 // The known hang (F24): DisconnectDevice sometimes never returns. If it does not, this span stays
-                // open in the in-flight file with the process still alive.
-                let span = diag::span(Subsystem::MaidSdk, "disconnect_device", Class::Top, &[]);
+                // open in the in-flight file with the process still alive, and if the teardown watchdog ends the
+                // process it is recorded `abandoned` (process_exit::arm_teardown_watchdog), never `ok`.
+                let (pump_rc, pump_ms) = pumped.get();
+                let span = diag::span(
+                    Subsystem::MaidSdk,
+                    "disconnect_device",
+                    Class::Top,
+                    &[("pump_rc", Val::I64(i64::from(pump_rc))), ("pump_ms", Val::U64(pump_ms))],
+                );
                 let code = unsafe { (self.sdk.disconnect_device)() };
-                span.finish_with(if code < 0 { Outcome::Failed } else { Outcome::Ok }, &[("code", Val::I64(i64::from(code)))]);
+                span.finish_with(if check("DisconnectDevice", code).is_ok() { Outcome::Ok } else { Outcome::Failed }, &[("code", Val::I64(i64::from(code)))]);
             },
         );
     }
@@ -1433,6 +1450,16 @@ mod tests {
         let log = std::cell::RefCell::new(Vec::new());
         teardown(|| log.borrow_mut().push("pump"), || log.borrow_mut().push("disconnect"));
         assert_eq!(*log.borrow(), ["pump", "disconnect"]);
+    }
+
+    #[test]
+    fn the_pump_reports_the_run_loops_result_instead_of_discarding_it() {
+        // kCFRunLoopRunFinished/Stopped/TimedOut/HandledSource are 1..=4; off macOS the pump is a no-op (0).
+        let rc = pump_cf_runloop(std::time::Duration::from_millis(10));
+        #[cfg(target_os = "macos")]
+        assert!((1..=4).contains(&rc), "{rc}");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(rc, 0);
     }
 
     #[test]

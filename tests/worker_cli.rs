@@ -189,13 +189,23 @@ fn capture_reports_a_missing_sdk_bundle_as_a_typed_error() {
     assert_eq!((code, stdout.as_str()), (Some(1), ""));
 }
 
+/// The real MaidLayer.config when the SDK runtime is present, else a minimal valid one written into `dir`. These
+/// tests only need a schema that parses (the lock is refused before anything reads a model section), so a missing
+/// runtime must not turn them into tests that return early and pass having checked nothing.
+fn schema_or_stand_in(dir: &std::path::Path) -> std::path::PathBuf {
+    let real = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk-runtime/MaidLayer.config");
+    if real.exists() {
+        return real;
+    }
+    let stand_in = dir.join("MaidLayer.config");
+    std::fs::write(&stand_in, "<ProfileVersion>9.0.3000</ProfileVersion>\n").unwrap();
+    stand_in
+}
+
 #[test]
 fn capture_reports_camera_busy_when_another_session_holds_the_lock_without_loading_the_sdk() {
-    let schema = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk-runtime/MaidLayer.config");
-    if !schema.exists() {
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
+    let schema = schema_or_stand_in(dir.path());
     let lock_path = dir.path().join("camera.lock");
     let _held = CameraLock::acquire_at(&lock_path).unwrap();
     // The bundle only has to exist: the lock is taken before it is loaded.
@@ -342,12 +352,9 @@ fn transplant_apply_refuses_an_unsafe_source_even_with_a_valid_confirmation() {
 
 #[test]
 fn plan_and_apply_report_camera_busy_without_loading_the_sdk() {
-    let schema = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk-runtime/MaidLayer.config");
-    if !schema.exists() {
-        return;
-    }
     let (d, src) = data_dir_with_source();
     let lock_dir = tempfile::tempdir().unwrap();
+    let schema = schema_or_stand_in(lock_dir.path());
     let lock_path = lock_dir.path().join("camera.lock");
     let _held = CameraLock::acquire_at(&lock_path).unwrap();
     let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
@@ -561,11 +568,8 @@ fn a_worker_that_hangs_after_its_result_is_a_running_process_with_its_command_op
 #[test]
 fn a_refused_camera_lock_is_recorded_as_an_event_in_the_refused_process() {
     use nikon_fleet::diag::Val;
-    let schema = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk-runtime/MaidLayer.config");
-    if !schema.exists() {
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
+    let schema = schema_or_stand_in(dir.path());
     let lock_path = dir.path().join("camera.lock");
     let diag = dir.path().join("diag");
     let _held = CameraLock::acquire_at(&lock_path).unwrap();
@@ -628,10 +632,32 @@ fn a_worker_that_hangs_after_its_result_is_ended_by_the_watchdog_with_the_status
     assert!(err.contains("did not close within") && err.contains("exit status 0"), "{err}");
 
     let t = worker_trace(&diag, pid);
-    assert_eq!(t.verdict(), Verdict::ExitedCleanly { code: 0 }, "an ended hang is a planned exit in the record");
+    // The hung main thread still had the command span open (the selftest stands in for a hang inside
+    // DisconnectDevice, whose own span is open in the same way). The watchdog ends the process from its own thread:
+    // that span must read `abandoned`, and the exit must not read as a clean one (finding #02).
+    assert_eq!(t.verdict(), Verdict::ExitedWithWorkCutOff { code: 0, cut_off: 1 }, "an ended hang is an exit that cut work short");
+    let command = t.entries.iter().find(|e| e.op == "command").expect("the command span");
+    assert_eq!(command.outcome, Some(nikon_fleet::diag::Outcome::Abandoned), "a span still open when the watchdog ended the process is not ok");
+    assert!(t.inflight.is_none(), "nothing is left in flight");
     let fired = t.entries.iter().find(|e| e.op == "teardown_watchdog").expect("a teardown_watchdog event");
     assert_eq!(field(fired, "limit_ms"), Some(&Val::U64(500)));
     assert_eq!(field(fired, "code"), Some(&Val::I64(0)));
+}
+
+#[test]
+fn the_watchdog_still_ends_the_process_when_stderr_has_no_reader_left() {
+    // eprintln! panics on a closed pipe (SIGPIPE is ignored in Rust): the watchdog thread died before `_exit` and the
+    // process hung exactly as it did without a watchdog (finding #10).
+    let dir = tempfile::tempdir().unwrap();
+    let diag = dir.path().join("diag");
+    let mut w = spawn(&[], &["selftest", "--hang-after-result", "--teardown-limit-ms", "500"], &[("NIKON_FLEET_DIAG_DIR", diag.to_str().unwrap())]);
+    let _ = w.read();
+    drop(w.child.stderr.take()); // the reader goes away before the watchdog speaks
+    let pid = w.child.id();
+    let (took, code) = wait_for_exit(&mut w, Duration::from_secs(20));
+    assert_eq!(code, Some(0));
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    assert_eq!(worker_trace(&diag, pid).verdict(), nikon_fleet::diag::Verdict::ExitedWithWorkCutOff { code: 0, cut_off: 1 });
 }
 
 #[test]

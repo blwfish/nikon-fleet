@@ -12,6 +12,15 @@ fn ring_lines(dir: &Path, pid: u32) -> Vec<String> {
     fs::read_to_string(ring_path(dir, pid)).unwrap().lines().map(str::to_string).collect()
 }
 
+/// [`load`] with no OS start-time lookup: the tests use made-up pids, and a real process may hold the same number.
+fn load_t(dir: &Path, alive: &dyn Fn(u32) -> Option<bool>) -> std::io::Result<Vec<ProcessTrace>> {
+    load_with(dir, alive, &|_| None)
+}
+
+fn trace_of(dir: &Path, pid: u32, alive: Option<bool>) -> ProcessTrace {
+    load_t(dir, &|_| alive).unwrap().into_iter().find(|t| t.pid == pid).unwrap_or_else(|| panic!("no files for pid {pid}"))
+}
+
 fn leaf_ok(d: &Diag, op: &str) {
     d.span(Subsystem::MaidSdk, op, Class::Leaf, &[]).finish(Outcome::Ok);
 }
@@ -380,7 +389,9 @@ fn old_processes_files_are_pruned_beyond_the_keep_count_but_never_this_ones() {
         let f = fs::File::create(ring_path(dir.path(), pid)).unwrap();
         f.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + i as u64)).unwrap();
     }
-    let _d = mk(dir.path(), 9999, 64);
+    // Not through `Diag::new` (which asks the OS whether these made-up pids are running): nothing here is.
+    fs::File::create(ring_path(dir.path(), 9999)).unwrap();
+    prune_with(dir.path(), 9999, KEEP_PROCESSES, &|_| false);
     let mut pids: Vec<u32> = fs::read_dir(dir.path())
         .unwrap()
         .flatten()
@@ -418,7 +429,7 @@ fn the_verdicts_follow_from_what_is_open_whether_the_process_is_alive_and_whethe
     let open = d.span(Subsystem::MaidSdk, "read_capability", Class::Leaf, &[("cap", Val::Hex(0x8001))]);
     std::mem::forget(open); // the process "dies" with it open
     let verdict = |alive: Option<bool>| {
-        let t = load(dir.path(), &|_| alive).unwrap();
+        let t = load_t(dir.path(), &|_| alive).unwrap();
         t.into_iter().find(|t| t.pid == 4020).unwrap().verdict()
     };
     assert_eq!(verdict(Some(false)), Verdict::GoneWithSpansOpen);
@@ -429,7 +440,7 @@ fn the_verdicts_follow_from_what_is_open_whether_the_process_is_alive_and_whethe
     let e = mk(dir.path(), 4021, 64);
     leaf_ok(&e, "x");
     e.shutdown(3);
-    let v = |alive| load(dir.path(), &|_| alive).unwrap().into_iter().find(|t| t.pid == 4021).unwrap().verdict();
+    let v = |alive| load_t(dir.path(), &|_| alive).unwrap().into_iter().find(|t| t.pid == 4021).unwrap().verdict();
     for alive in [Some(false), Some(true), None] {
         assert_eq!(v(alive), Verdict::ExitedCleanly { code: 3 }, "{alive:?}");
     }
@@ -437,7 +448,7 @@ fn the_verdicts_follow_from_what_is_open_whether_the_process_is_alive_and_whethe
     // A third that recorded entries but no exit, and is gone: killed between operations.
     let f = mk(dir.path(), 4022, 64);
     leaf_ok(&f, "x");
-    let v = |alive| load(dir.path(), &|_| alive).unwrap().into_iter().find(|t| t.pid == 4022).unwrap().verdict();
+    let v = |alive| load_t(dir.path(), &|_| alive).unwrap().into_iter().find(|t| t.pid == 4022).unwrap().verdict();
     assert_eq!(v(Some(false)), Verdict::GoneWithoutExit);
     assert_eq!(v(Some(true)), Verdict::RunningIdle);
     assert_eq!(v(None), Verdict::RunningIdle);
@@ -457,7 +468,7 @@ fn shutdown_closes_what_is_still_open_by_code_and_class_and_then_reads_as_a_clea
         let outcome_of = |op: &str| ring.iter().find(|e| e.op == op).unwrap().outcome;
         assert_eq!(outcome_of("command"), Some(top_outcome), "code {code}");
         assert_eq!(outcome_of("ptp_txn"), Some(Outcome::Abandoned), "a leaf still open is abandoned whatever the code");
-        let t = load(dir.path(), &|_| Some(false)).unwrap().pop().unwrap();
+        let t = load_t(dir.path(), &|_| Some(false)).unwrap().pop().unwrap();
         assert_eq!(t.verdict(), Verdict::ExitedCleanly { code: i64::from(code) });
     }
 }
@@ -468,7 +479,7 @@ fn a_hang_before_shutdown_is_still_a_hang_and_shutdown_twice_records_one_exit() 
     let d = mk(dir.path(), 4031, 64);
     std::mem::forget(d.span(Subsystem::MaidSdk, "disconnect", Class::Leaf, &[]));
     // Never reached shutdown: the report says so.
-    let t = load(dir.path(), &|_| Some(true)).unwrap().pop().unwrap();
+    let t = load_t(dir.path(), &|_| Some(true)).unwrap().pop().unwrap();
     assert_eq!(t.verdict(), Verdict::RunningWithSpansOpen);
     d.shutdown(0);
     d.shutdown(7);
@@ -486,7 +497,7 @@ fn the_report_names_the_operation_in_flight_and_says_it_was_killed_or_crashed() 
     let inner = d.span(Subsystem::Usb, "ptp_txn", Class::Leaf, &[("op", Val::Hex(0x90EE)), ("data_len", Val::Len(323))]);
     std::mem::forget(inner);
     std::mem::forget(outer);
-    let traces = load(dir.path(), &|_| Some(false)).unwrap();
+    let traces = load_t(dir.path(), &|_| Some(false)).unwrap();
     let text = render(&traces, unix_ms() + 2500, 10);
     assert!(text.contains("pid 4023"), "{text}");
     assert!(text.contains("killed or crashed"), "{text}");
@@ -505,7 +516,7 @@ fn a_line_cut_off_by_a_kill_is_counted_and_the_rest_still_load() {
     leaf_ok(&d, "b");
     let mut f = fs::OpenOptions::new().append(true).open(ring_path(dir.path(), 4024)).unwrap();
     write!(f, "{{\"seq\":9,\"ts_ms\":1,\"kind\":\"sp").unwrap();
-    let t = load(dir.path(), &|_| Some(false)).unwrap().into_iter().find(|t| t.pid == 4024).unwrap();
+    let t = load_t(dir.path(), &|_| Some(false)).unwrap().into_iter().find(|t| t.pid == 4024).unwrap();
     assert_eq!((t.entries.len(), t.malformed_lines), (2, 1));
     assert!(render(&[t], unix_ms(), 10).contains("1 unreadable line(s)"));
 }
@@ -516,10 +527,13 @@ fn an_unparseable_inflight_file_is_reported_as_a_problem_not_as_nothing_in_fligh
     let d = mk(dir.path(), 4025, 64);
     leaf_ok(&d, "a");
     fs::write(inflight_path(dir.path(), 4025), b"{not json").unwrap();
-    let t = load(dir.path(), &|_| Some(false)).unwrap().into_iter().find(|t| t.pid == 4025).unwrap();
+    let t = load_t(dir.path(), &|_| Some(false)).unwrap().into_iter().find(|t| t.pid == 4025).unwrap();
     assert!(t.inflight.is_none());
-    assert!(t.read_problem.as_deref().is_some_and(|p| p.contains("did not parse")), "{:?}", t.read_problem);
-    assert!(render(&[t], unix_ms(), 10).contains("problem:"));
+    assert!(t.read_problems.iter().any(|p| p.contains("did not parse")), "{:?}", t.read_problems);
+    // Not "killed between operations" / "exited cleanly": the verdict says it does not know.
+    assert_eq!(t.verdict(), Verdict::InflightUnreadable);
+    let text = render(&[t], unix_ms(), 10);
+    assert!(text.contains("problem:") && text.contains("in-flight file could not be read"), "{text}");
 }
 
 #[test]
@@ -530,7 +544,7 @@ fn a_collapsed_run_in_the_report_says_its_fields_are_the_first_ones() {
         d.span(Subsystem::MaidSdk, "read", Class::Leaf, &[("cap", Val::U64(i))]).finish(Outcome::Ok);
     }
     d.span(Subsystem::MaidSdk, "write", Class::Leaf, &[("cap", Val::U64(9))]).finish(Outcome::Ok);
-    let text = render(&load(dir.path(), &|_| Some(false)).unwrap(), unix_ms(), 10);
+    let text = render(&load_t(dir.path(), &|_| Some(false)).unwrap(), unix_ms(), 10);
     assert!(text.contains("read ok x3"), "{text}");
     assert!(text.contains("first: cap=0"), "{text}");
     assert!(!text.contains("cap=2"), "only the first entry's fields are shown for a run: {text}");
@@ -540,7 +554,7 @@ fn a_collapsed_run_in_the_report_says_its_fields_are_the_first_ones() {
 #[test]
 fn a_missing_directory_is_an_empty_report_and_an_empty_one_says_so() {
     let dir = tempdir().unwrap();
-    let t = load(&dir.path().join("nope"), &|_| None).unwrap();
+    let t = load_t(&dir.path().join("nope"), &|_| None).unwrap();
     assert!(t.is_empty());
     assert_eq!(render(&t, 0, 10), "no diagnostics files found\n");
 }
@@ -638,7 +652,7 @@ fn in_flight_spans_are_listed_by_start_order_whatever_their_per_thread_depth() {
     std::mem::forget(first);
     let open = d.open_spans();
     assert_eq!(open.iter().map(|o| o.depth).collect::<Vec<_>>(), vec![0, 0], "both are depth 0: they are on different threads");
-    let text = render(&load(dir.path(), &|_| Some(false)).unwrap(), unix_ms(), 10);
+    let text = render(&load_t(dir.path(), &|_| Some(false)).unwrap(), unix_ms(), 10);
     let outer = text.find("mcp outer").unwrap();
     let inner = text.find("mcp inner").unwrap();
     assert!(outer < inner, "started first, listed first: {text}");
@@ -718,6 +732,607 @@ fn the_report_names_a_finished_process_by_the_role_in_its_start_event_not_by_dia
     let d = Diag::new(c).unwrap();
     d.event(Subsystem::Diag, OP_START, &[("role", Val::text("gui"))]);
     d.shutdown(0);
-    let text = render(&load(dir.path(), &|_| Some(false)).unwrap(), unix_ms(), 10);
+    let text = render(&load_t(dir.path(), &|_| Some(false)).unwrap(), unix_ms(), 10);
     assert!(text.starts_with("pid 4090 (gui):"), "{text}");
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Remediation pass (nikon-fleet-20261105-b7d3): shutdown semantics, liveness, tolerance, thresholds
+// ═════════════════════════════════════════════════════════════════════════
+
+fn exit_entry(d: &Diag) -> Entry {
+    d.snapshot().into_iter().rev().find(|e| e.op == OP_EXIT).expect("an exit entry")
+}
+
+fn field_val<'a>(e: &'a Entry, key: &str) -> Option<&'a Val> {
+    e.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+// ── #02: a span another thread had open when the process is ended is abandoned, not ok ─────────────
+
+#[test]
+fn shutdown_from_another_thread_abandons_the_spans_the_exit_interrupts_whatever_their_class_and_code() {
+    // The watchdog case: the main thread is stuck inside `disconnect_device` (a Top span) under the command
+    // span (Top); the watchdog thread calls shutdown(0). Neither may read `ok`.
+    for code in [0, 1] {
+        let dir = tempdir().unwrap();
+        let d = mk(dir.path(), 4100, 64);
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                std::mem::forget(d.span(Subsystem::Cli, "command", Class::Top, &[]));
+                std::mem::forget(d.span(Subsystem::MaidSdk, "disconnect_device", Class::Top, &[]));
+            });
+        });
+        d.shutdown(code); // this thread plays the watchdog
+        let ring = d.snapshot();
+        for op in ["command", "disconnect_device"] {
+            assert_eq!(ring.iter().find(|e| e.op == op).unwrap().outcome, Some(Outcome::Abandoned), "{op}, code {code}");
+        }
+        assert_eq!(field_val(&exit_entry(&d), FIELD_CUT_OFF), Some(&Val::U64(2)));
+        let t = trace_of(dir.path(), 4100, Some(false));
+        assert_eq!(t.verdict(), Verdict::ExitedWithWorkCutOff { code: i64::from(code), cut_off: 2 }, "not a clean exit");
+        let text = render(&[t], unix_ms(), 10);
+        assert!(text.contains("cut work short") && text.contains("2 span(s)"), "{text}");
+        assert!(!text.contains("exited cleanly"), "{text}");
+    }
+}
+
+#[test]
+fn shutdown_still_finishes_the_calling_threads_own_spans_by_code_and_counts_only_other_threads_as_cut_off() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4101, 64);
+    std::mem::forget(d.span(Subsystem::Gui, "gui", Class::Top, &[])); // the UI thread's own span
+    std::thread::scope(|sc| {
+        sc.spawn(|| std::mem::forget(d.span(Subsystem::Gui, "cli_child", Class::Top, &[])));
+    });
+    d.shutdown(0); // the UI thread quits while a child runs on a worker thread
+    let ring = d.snapshot();
+    assert_eq!(ring.iter().find(|e| e.op == "gui").unwrap().outcome, Some(Outcome::Ok));
+    assert_eq!(ring.iter().find(|e| e.op == "cli_child").unwrap().outcome, Some(Outcome::Abandoned));
+    assert_eq!(field_val(&exit_entry(&d), FIELD_CUT_OFF), Some(&Val::U64(1)));
+    // And with nothing on another thread there is no cut_off field at all and the exit is clean.
+    let dir2 = tempdir().unwrap();
+    let e = mk(dir2.path(), 4102, 64);
+    std::mem::forget(e.span(Subsystem::Cli, "command", Class::Top, &[]));
+    e.shutdown(0);
+    assert_eq!(field_val(&exit_entry(&e), FIELD_CUT_OFF), None);
+    assert_eq!(trace_of(dir2.path(), 4102, Some(false)).verdict(), Verdict::ExitedCleanly { code: 0 });
+}
+
+// ── #26: shutdown races, spans after the exit, unmatched ends ───────────────────────────────────────
+
+#[test]
+fn a_second_shutdown_waits_for_the_first_to_finish_writing_instead_of_returning_at_once() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4110, 64);
+    let finished = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|sc| {
+        // Stand in for the winner caught mid-write: it has claimed the exit and still holds the lock.
+        let mut guard = d.lock();
+        guard.exited = true;
+        let second = sc.spawn(|| {
+            d.shutdown(0);
+            finished.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(!finished.load(Ordering::SeqCst), "the second caller must not get ahead of the first's records");
+        drop(guard);
+        second.join().unwrap();
+    });
+    assert!(finished.load(Ordering::SeqCst));
+}
+
+#[test]
+fn two_threads_shutting_down_at_once_record_one_exit_and_neither_returns_before_it_exists() {
+    for round in 0..50u32 {
+        let dir = tempdir().unwrap();
+        let d = mk(dir.path(), 4111, 64);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|sc| {
+            for code in [0, 9] {
+                let (d, barrier) = (&d, &barrier);
+                sc.spawn(move || {
+                    barrier.wait();
+                    d.shutdown(code);
+                    assert!(d.snapshot().iter().any(|e| e.op == OP_EXIT), "round {round}: returned before the exit was recorded");
+                });
+            }
+        });
+        assert_eq!(d.snapshot().iter().filter(|e| e.op == OP_EXIT).count(), 1);
+    }
+}
+
+#[test]
+fn a_span_begun_after_the_exit_does_not_bring_the_inflight_file_back_and_the_exit_still_reads_as_the_end() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4112, 64);
+    d.shutdown(0);
+    let late = d.span(Subsystem::Gui, "late_worker", Class::Top, &[]);
+    assert!(!inflight_path(dir.path(), 4112).exists(), "no in-flight file after the exit");
+    late.set("phase", Val::text("x"));
+    assert!(!inflight_path(dir.path(), 4112).exists());
+    assert_eq!(trace_of(dir.path(), 4112, Some(false)).verdict(), Verdict::ExitedCleanly { code: 0 });
+    late.finish(Outcome::Ok);
+    assert!(!inflight_path(dir.path(), 4112).exists());
+}
+
+#[test]
+fn ending_or_setting_a_span_that_shutdown_already_closed_is_counted_and_adds_no_entry() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4113, 64);
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|sc| {
+        sc.spawn(|| {
+            let s = d.span(Subsystem::Gui, "worker", Class::Top, &[]);
+            barrier.wait(); // begun
+            barrier.wait(); // main has shut down
+            s.set("phase", Val::text("late"));
+            s.finish(Outcome::Ok);
+        });
+        barrier.wait();
+        d.shutdown(0);
+        assert_eq!(d.unmatched_ops(), 0);
+        barrier.wait();
+    });
+    assert_eq!(d.unmatched_ops(), 2, "the late set and the late finish");
+    let workers: Vec<_> = d.snapshot().into_iter().filter(|e| e.op == "worker").collect();
+    assert_eq!(workers.len(), 1, "recorded once, by the shutdown");
+    assert_eq!(workers[0].outcome, Some(Outcome::Abandoned));
+}
+
+// ── #27: panic hook ─────────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn the_panic_hook_does_not_wait_for_a_lock_held_by_the_panicking_thread() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4120, 64);
+    let guard = d.lock(); // a panic raised while this thread was recording
+    assert!(!d.try_event(Subsystem::Cli, OP_PANIC, &[]), "reports that it could not record");
+    assert_eq!(d.write_failures(), 1, "and counts it");
+    drop(guard);
+    assert!(d.try_event(Subsystem::Cli, OP_PANIC, &[]));
+    assert_eq!(d.snapshot().len(), 1);
+}
+
+#[test]
+fn a_panic_entry_carries_the_location_and_only_the_length_and_hash_of_the_message() {
+    let secret = "called `Result::unwrap()` on an `Err` value: Os { path: \"/Users/me/hunter2\" }";
+    let fields = panic_fields("src/x.rs:9", secret);
+    let text = format!("{fields:?}");
+    assert!(!text.contains("hunter2") && !text.contains("unwrap"), "{text}");
+    assert_eq!(fields.iter().map(|(k, _)| *k).collect::<Vec<_>>(), vec!["location", "message_len", "message_hash"]);
+    assert_eq!(fields[1].1, Val::Len(secret.len() as u64));
+    assert_eq!(fields[2].1, Val::hash(secret.as_bytes()));
+}
+
+// ── #28: write failures are surfaced ────────────────────────────────────────────────────────────────
+
+#[test]
+fn the_failure_count_reaches_the_inflight_file_and_the_report() {
+    let dir = tempdir().unwrap();
+    let diag_dir = dir.path().join("d");
+    let d = mk(&diag_dir, 4130, 64);
+    fs::remove_dir_all(&diag_dir).unwrap();
+    let first = d.span(Subsystem::Usb, "ptp_txn", Class::Leaf, &[]); // its in-flight write fails
+    assert!(d.write_failures() >= 1);
+    fs::create_dir_all(&diag_dir).unwrap(); // the disk comes back
+    let second = d.span(Subsystem::Usb, "ptp_txn", Class::Leaf, &[]);
+    let t = trace_of(&diag_dir, 4130, Some(true));
+    assert!(t.write_failures() >= 1, "{}", t.write_failures());
+    let text = render(&[t], unix_ms(), 10);
+    assert!(text.contains("diagnostics write(s) failed") && text.contains("may be incomplete"), "{text}");
+    drop((first, second));
+}
+
+#[test]
+fn the_failure_count_and_the_eviction_count_are_in_the_exit_entry_only_when_nonzero() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4131, MIN_RING_CAP);
+    d.shutdown(0);
+    let e = exit_entry(&d);
+    assert_eq!((field_val(&e, FIELD_WRITE_FAILURES), field_val(&e, FIELD_EVICTED)), (None, None));
+
+    let dir2 = tempdir().unwrap();
+    let f = mk(dir2.path(), 4132, MIN_RING_CAP);
+    for _ in 0..MIN_RING_CAP + 3 {
+        leaf_ok(&f, "x");
+    }
+    f.shutdown(0);
+    assert_eq!(field_val(&exit_entry(&f), FIELD_EVICTED), Some(&Val::U64(3)), "exactly the entries beyond the capacity");
+    let text = render(&[trace_of(dir2.path(), 4132, Some(false))], unix_ms(), 100);
+    assert!(text.contains("3 older entries were evicted"), "{text}");
+}
+
+#[test]
+fn a_ring_file_that_cannot_be_reopened_after_compaction_is_reopened_by_the_next_entry_and_nothing_is_lost() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4133, MIN_RING_CAP);
+    leaf_ok(&d, "before");
+    d.lock().ring_file = None; // what a failed reopen after a compaction leaves
+    leaf_ok(&d, "after");
+    assert!(d.lock().ring_file.is_some(), "reopened");
+    let ops: Vec<String> = ring_lines(dir.path(), 4133).iter().map(|l| serde_json::from_str::<Entry>(l).unwrap().op).collect();
+    assert_eq!(ops, vec!["before", "after"], "the entry written while the handle was missing is on disk");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_compaction_whose_replacement_cannot_be_written_is_counted_and_appending_to_the_old_file_continues() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root ignores directory modes, so the failure cannot be induced.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let cap = MIN_RING_CAP;
+    let d = mk(dir.path(), 4134, cap);
+    for _ in 0..2 * cap - 1 {
+        d.event(Subsystem::Cli, "x", &[]);
+    }
+    // No new files can be created in the directory, but the open ring file can still be appended to. Events, not
+    // spans: a span would also try (and fail) to write its in-flight file.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    d.event(Subsystem::Cli, "at_threshold", &[]); // reaches 2*cap lines: compaction runs and its temp file cannot be created
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(d.write_failures(), 1, "the failed compaction is counted, once");
+    assert_eq!(ring_lines(dir.path(), 4134).len(), 2 * cap, "the file was not replaced");
+    d.event(Subsystem::Cli, "after", &[]);
+    let last: Entry = serde_json::from_str(ring_lines(dir.path(), 4134).last().unwrap()).unwrap();
+    assert_eq!(last.op, "after", "still appending to the file a reader will open");
+}
+
+#[test]
+fn a_failure_in_both_the_ring_file_and_the_trace_file_counts_twice() {
+    let dir = tempdir().unwrap();
+    let trace = dir.path().join("t.jsonl");
+    let mut c = Config::new(dir.path().to_path_buf(), Subsystem::Cli);
+    c.pid = 4135;
+    c.trace_file = Some(trace);
+    let d = Diag::new(c).unwrap();
+    // Replace both handles with read-only ones: every write to either fails.
+    let ro = |p: &Path| fs::File::open(p).unwrap();
+    {
+        let mut st = d.lock();
+        st.ring_file = Some(ro(&ring_path(dir.path(), 4135)));
+        st.trace_file = Some(ro(&dir.path().join("t.jsonl")));
+    }
+    leaf_ok(&d, "x");
+    assert_eq!(d.write_failures(), 2, "the trace file's failure is not hidden by the ring file's");
+}
+
+// ── #20: prune keeps live processes, and its boundary is pinned ─────────────────────────────────────
+
+fn make_ring_files(dir: &Path, pids: &[u32]) {
+    for (i, pid) in pids.iter().enumerate() {
+        let f = fs::File::create(ring_path(dir, *pid)).unwrap();
+        f.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + i as u64)).unwrap();
+    }
+}
+
+fn remaining_pids(dir: &Path) -> Vec<u32> {
+    let mut v: Vec<u32> = fs::read_dir(dir).unwrap().flatten().filter_map(|e| pid_of_file_name(&e.file_name().to_string_lossy())).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+#[test]
+fn prune_removes_nothing_at_or_below_the_keep_count_and_exactly_the_oldest_one_above_it() {
+    let keep = 5;
+    for (total, removed) in [(keep - 1, 0usize), (keep, 0), (keep + 1, 1), (keep + 2, 2)] {
+        let dir = tempdir().unwrap();
+        // pids 100.. oldest first; the last is this process.
+        let pids: Vec<u32> = (0..total as u32).map(|i| 100 + i).collect();
+        make_ring_files(dir.path(), &pids);
+        let own = *pids.last().unwrap();
+        prune_with(dir.path(), own, keep, &|_| false);
+        let left = remaining_pids(dir.path());
+        assert_eq!(left.len(), total - removed, "total {total}");
+        assert_eq!(left, pids[removed..].to_vec(), "the oldest {removed} went, total {total}");
+    }
+}
+
+#[test]
+fn prune_never_removes_a_running_process_however_old_so_an_idle_server_keeps_its_files() {
+    let dir = tempdir().unwrap();
+    let pids: Vec<u32> = (0..10).map(|i| 200 + i).collect();
+    make_ring_files(dir.path(), &pids);
+    fs::write(inflight_path(dir.path(), 200), b"{}").unwrap();
+    // 200 (the oldest) and 201 are running; this process is the newest.
+    prune_with(dir.path(), 209, 5, &|p| p == 200 || p == 201);
+    let left = remaining_pids(dir.path());
+    assert!(left.contains(&200) && left.contains(&201), "{left:?}");
+    assert!(inflight_path(dir.path(), 200).exists());
+    assert_eq!(left, vec![200, 201, 207, 208, 209], "the live ones count toward the keep count: the oldest finished ones went instead");
+}
+
+#[test]
+fn prune_through_diag_new_spares_this_real_running_process_even_when_it_is_the_oldest() {
+    let dir = tempdir().unwrap();
+    let live = std::process::id();
+    let mut pids = vec![live];
+    pids.extend((0..KEEP_PROCESSES as u32 + 3).map(|i| 3_000_000_000 + i)); // pids no machine has
+    make_ring_files(dir.path(), &pids);
+    let _d = mk(dir.path(), 3_100_000_000, 64);
+    assert!(remaining_pids(dir.path()).contains(&live), "the running process's file survived 23 newer ones");
+}
+
+#[test]
+fn a_temp_file_left_by_a_dead_writer_is_pruned_and_one_whose_writer_is_running_or_unrelated_is_not() {
+    let dir = tempdir().unwrap();
+    for name in [".ring-7.jsonl.8.0.tmp", ".inflight-7.json.9.3.tmp", ".ring-7.jsonl.10.0.tmp", ".ring-x.jsonl.8.0.tmp", ".other.8.0.tmp", ".ring-7.jsonl.12.0.tmp"] {
+        fs::write(dir.path().join(name), b"x").unwrap();
+    }
+    // 9 is running, 12 is this process; 8 and 10 are dead.
+    prune_with(dir.path(), 12, 20, &|p| p == 9);
+    let mut left: Vec<String> = fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    left.sort();
+    assert_eq!(left, vec![".inflight-7.json.9.3.tmp", ".other.8.0.tmp", ".ring-7.jsonl.12.0.tmp", ".ring-x.jsonl.8.0.tmp"]);
+}
+
+#[test]
+fn the_owner_pid_of_a_temp_file_name_parses_only_our_own_shape() {
+    assert_eq!(temp_owner_pid(".ring-1.jsonl.9.0.tmp"), Some(9));
+    assert_eq!(temp_owner_pid(".inflight-1.json.4294967295.77.tmp"), Some(u32::MAX));
+    for bad in ["ring-1.jsonl.9.0.tmp", ".ring-1.jsonl.9.0", ".ring-1.jsonl.9.tmp", ".ring-1.jsonl.x.0.tmp", ".ring-1.jsonl.9.y.tmp", ".foo.9.0.tmp", ".ring-1.json.9.0.tmp"] {
+        assert_eq!(temp_owner_pid(bad), None, "{bad}");
+    }
+}
+
+// ── #21: pid reuse ──────────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_new_process_does_not_inherit_an_inflight_file_a_dead_process_with_the_same_pid_left_behind() {
+    let dir = tempdir().unwrap();
+    let old = mk(dir.path(), 4140, 64);
+    std::mem::forget(old.span(Subsystem::MaidSdk, "disconnect_device", Class::Top, &[])); // the earlier process hung and was killed
+    assert!(inflight_path(dir.path(), 4140).exists());
+    let _new = mk(dir.path(), 4140, 64); // the pid is reused
+    assert!(!inflight_path(dir.path(), 4140).exists(), "its spans are not the new process's");
+    assert_eq!(trace_of(dir.path(), 4140, Some(true)).verdict(), Verdict::RunningIdle);
+}
+
+#[test]
+fn the_pid_reuse_threshold_is_strictly_more_than_the_slack_after_the_recorded_start() {
+    let rec = 1_000_000;
+    assert!(!pid_recycled(rec - 1, rec), "started before the record: the same process");
+    assert!(!pid_recycled(rec, rec));
+    assert!(!pid_recycled(rec + PID_REUSE_SLACK_MS, rec), "exactly the slack: still the same");
+    assert!(pid_recycled(rec + PID_REUSE_SLACK_MS + 1, rec), "one millisecond past it: another process");
+    assert!(!pid_recycled(5, u64::MAX), "no overflow");
+}
+
+#[test]
+fn a_running_pid_that_started_after_the_files_were_written_is_reported_as_another_process() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4141, 64);
+    std::mem::forget(d.span(Subsystem::MaidSdk, "read", Class::Leaf, &[]));
+    let recorded = trace_of(dir.path(), 4141, Some(true)).inflight.unwrap().process_started_ms;
+    let t = |os: u64| load_with(dir.path(), &|_| Some(true), &|_| Some(os)).unwrap().pop().unwrap();
+    let at = t(recorded + PID_REUSE_SLACK_MS);
+    assert_eq!((at.pid_recycled, at.verdict()), (false, Verdict::RunningWithSpansOpen));
+    let above = t(recorded + PID_REUSE_SLACK_MS + 1);
+    assert_eq!((above.pid_recycled, above.verdict()), (true, Verdict::GoneWithSpansOpen));
+    assert!(render(&[above], unix_ms(), 10).contains("it is a different process"));
+    // The OS cannot say: the answer from `alive` stands.
+    let unknown = load_with(dir.path(), &|_| Some(true), &|_| None).unwrap().pop().unwrap();
+    assert_eq!(unknown.verdict(), Verdict::RunningWithSpansOpen);
+    // A process that is not running is not second-guessed.
+    let gone = load_with(dir.path(), &|_| Some(false), &|_| Some(recorded + 10 * PID_REUSE_SLACK_MS)).unwrap().pop().unwrap();
+    assert!(!gone.pid_recycled);
+}
+
+#[test]
+fn an_exit_entry_without_a_usable_code_is_not_read_as_a_clean_exit_with_code_zero() {
+    let write_exit = |pid: u32, fields: &str| {
+        let dir = tempdir().unwrap();
+        fs::write(
+            ring_path(dir.path(), pid),
+            format!("{{\"seq\":0,\"ts_ms\":1,\"kind\":\"event\",\"class\":\"top\",\"subsystem\":\"cli\",\"op\":\"exit\",\"fields\":{fields},\"depth\":0,\"thread\":1,\"outcome\":null,\"dur_us\":0}}\n"),
+        )
+        .unwrap();
+        trace_of(dir.path(), pid, Some(false)).verdict()
+    };
+    assert_eq!(write_exit(4150, "[]"), Verdict::ExitCodeUnknown, "no code at all");
+    assert_eq!(write_exit(4151, "[[\"code\",{\"t\":\"u64\",\"v\":0}]]"), Verdict::ExitCodeUnknown, "a code of the wrong type");
+    assert_eq!(write_exit(4152, "[[\"code\",{\"t\":\"i64\",\"v\":0}]]"), Verdict::ExitedCleanly { code: 0 }, "an honest zero is still zero");
+}
+
+#[test]
+fn an_event_named_exit_by_a_subsystem_that_is_not_a_process_role_is_not_an_exit() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4153, 64);
+    d.event(Subsystem::Usb, OP_EXIT, &[(FIELD_CODE, Val::I64(0))]);
+    assert_eq!(trace_of(dir.path(), 4153, Some(false)).verdict(), Verdict::GoneWithoutExit);
+    d.event(Subsystem::Cli, OP_EXIT, &[(FIELD_CODE, Val::I64(0))]);
+    assert_eq!(trace_of(dir.path(), 4153, Some(false)).verdict(), Verdict::ExitedCleanly { code: 0 });
+    for s in Subsystem::ALL {
+        assert_eq!(s.is_role(), matches!(s, Subsystem::Cli | Subsystem::Gui | Subsystem::Mcp), "{s:?}");
+    }
+}
+
+// ── #22 / #23: read problems and format tolerance ───────────────────────────────────────────────────
+
+#[test]
+fn every_read_problem_is_kept_not_only_the_last() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4160, 64);
+    leaf_ok(&d, "a");
+    fs::write(inflight_path(dir.path(), 4160), b"{not json").unwrap();
+    fs::remove_file(ring_path(dir.path(), 4160)).unwrap();
+    fs::create_dir(ring_path(dir.path(), 4160)).unwrap(); // a ring "file" that cannot be read
+    let t = trace_of(dir.path(), 4160, Some(false));
+    assert_eq!(t.read_problems.len(), 2, "{:?}", t.read_problems);
+    assert!(t.read_problems[0].contains("did not parse") && t.read_problems[1].contains("could not be read"), "{:?}", t.read_problems);
+}
+
+#[test]
+fn an_inflight_file_with_one_value_this_build_does_not_know_keeps_the_spans_it_can_read_and_counts_the_rest_as_open() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4161, 64);
+    std::mem::forget(d.span(Subsystem::Usb, "ptp_txn", Class::Leaf, &[]));
+    let path = inflight_path(dir.path(), 4161);
+    let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut known = v["spans"][0].clone();
+    known["op"] = "known".into();
+    let mut unknown = v["spans"][0].clone();
+    unknown["subsystem"] = "frobnicate".into(); // a subsystem a newer build added
+    v["spans"] = serde_json::json!([known, unknown]);
+    fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+    let t = trace_of(dir.path(), 4161, Some(true));
+    assert_eq!(t.inflight.as_ref().unwrap().spans.len(), 1);
+    assert_eq!(t.unreadable_open_spans, 1);
+    assert_eq!(t.verdict(), Verdict::RunningWithSpansOpen, "the process still reads as having work open");
+    assert!(t.read_problems.iter().any(|p| p.contains("not fully understood") && p.contains("1 open span(s) could not be read")), "{:?}", t.read_problems);
+    let text = render(&[t], unix_ms(), 10);
+    assert!(text.contains("1 open span(s) in the in-flight file could not be read"), "{text}");
+    // Nothing readable and the unknown one is all there was: still open.
+    v["spans"] = serde_json::json!([unknown]);
+    fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+    assert_eq!(trace_of(dir.path(), 4161, Some(false)).verdict(), Verdict::GoneWithSpansOpen);
+    // Valid JSON with no list of spans at all is unreadable, not "nothing open".
+    fs::write(&path, b"{\"pid\":1}").unwrap();
+    assert_eq!(trace_of(dir.path(), 4161, Some(false)).verdict(), Verdict::InflightUnreadable);
+}
+
+#[test]
+fn the_inflight_schema_defaults_to_one_and_a_newer_one_is_named_in_a_problem() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4162, 64);
+    std::mem::forget(d.span(Subsystem::Usb, "ptp_txn", Class::Leaf, &[]));
+    let path = inflight_path(dir.path(), 4162);
+    let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(v["schema"], SCHEMA);
+    v.as_object_mut().unwrap().remove("schema"); // a file from before the field existed
+    fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+    let t = trace_of(dir.path(), 4162, Some(true));
+    assert_eq!((t.inflight.unwrap().schema, t.read_problems.len()), (1, 0));
+    v["schema"] = (SCHEMA + 1).into();
+    fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+    let t = trace_of(dir.path(), 4162, Some(true));
+    assert_eq!(t.inflight.as_ref().unwrap().spans.len(), 1, "still read");
+    assert!(t.read_problems.iter().any(|p| p.contains("newer build")), "{:?}", t.read_problems);
+}
+
+#[test]
+fn a_ring_line_with_a_value_this_build_does_not_know_is_not_called_a_cut_line() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4163, 64);
+    leaf_ok(&d, "a");
+    let mut f = fs::OpenOptions::new().append(true).open(ring_path(dir.path(), 4163)).unwrap();
+    // Valid JSON, an outcome from a newer build.
+    writeln!(f, "{{\"seq\":5,\"ts_ms\":1,\"kind\":\"span\",\"class\":\"leaf\",\"subsystem\":\"usb\",\"op\":\"x\",\"fields\":[],\"depth\":0,\"thread\":1,\"outcome\":\"vanished\",\"dur_us\":0}}").unwrap();
+    // And a genuinely cut line.
+    write!(f, "{{\"seq\":6,\"ts_ms\":1,\"ki").unwrap();
+    let t = trace_of(dir.path(), 4163, Some(false));
+    assert_eq!((t.entries.len(), t.unrecognised_lines, t.malformed_lines), (1, 1, 1));
+    let text = render(&[t], unix_ms(), 10);
+    assert!(text.contains("1 unreadable line(s)") && text.contains("1 line(s) this build does not understand"), "{text}");
+}
+
+#[test]
+fn a_line_cut_in_the_middle_of_a_character_costs_that_line_not_the_whole_file() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4164, 64);
+    d.span(Subsystem::Cli, "caf\u{e9}", Class::Leaf, &[]).finish(Outcome::Ok);
+    leaf_ok(&d, "b");
+    let mut f = fs::OpenOptions::new().append(true).open(ring_path(dir.path(), 4164)).unwrap();
+    f.write_all(b"{\"seq\":9,\"op\":\"caf\xc3").unwrap(); // the first byte of a two-byte character, then the kill
+    let t = trace_of(dir.path(), 4164, Some(false));
+    assert_eq!((t.entries.len(), t.malformed_lines), (2, 1), "the two good lines load; the cut one is counted");
+    assert!(t.read_problems.is_empty(), "{:?}", t.read_problems);
+    assert_eq!(t.entries[0].op, "caf\u{e9}");
+}
+
+// ── #49: directory hygiene ──────────────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn an_existing_directory_keeps_its_mode_and_a_new_one_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let dir = tempdir().unwrap();
+    let shared = dir.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+    private_dir(&shared).unwrap();
+    assert_eq!(mode(&shared), 0o755, "a directory the user supplied is not re-moded");
+    let fresh = dir.path().join("fresh");
+    private_dir(&fresh).unwrap();
+    assert_eq!(mode(&fresh), 0o700);
+}
+
+// ── #53 / #88: ordering and the report's formatting thresholds ──────────────────────────────────────
+
+#[test]
+fn processes_are_listed_oldest_first_by_start_time_not_by_pid() {
+    let dir = tempdir().unwrap();
+    let first = mk(dir.path(), 4172, 64); // the higher pid starts first
+    first.event(Subsystem::Cli, "x", &[]);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let second = mk(dir.path(), 4171, 64);
+    second.event(Subsystem::Cli, "x", &[]);
+    let pids: Vec<u32> = load_t(dir.path(), &|_| None).unwrap().iter().map(|t| t.pid).collect();
+    assert_eq!(pids, vec![4172, 4171]);
+}
+
+#[test]
+fn age_text_switches_to_seconds_at_exactly_one_thousand_milliseconds() {
+    assert_eq!(age_text(0), "0 ms");
+    assert_eq!(age_text(999), "999 ms");
+    assert_eq!(age_text(1000), "1.0 s");
+    assert_eq!(age_text(1001), "1.0 s");
+    assert_eq!(age_text(1050), "1.1 s");
+}
+
+#[test]
+fn the_report_header_pluralises_the_entry_count_and_mentions_unreadable_lines_only_when_there_are_some() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4180, 64);
+    let head = |dir: &Path, pid| render(&[trace_of(dir, pid, Some(false))], unix_ms(), 10).lines().next().unwrap().to_string();
+    assert!(head(dir.path(), 4180).contains(": 0 entries"), "{}", head(dir.path(), 4180));
+    leaf_ok(&d, "a");
+    let h = head(dir.path(), 4180);
+    assert!(h.contains(": 1 entry") && !h.contains("1 entries") && !h.contains("unreadable"), "{h}");
+    leaf_ok(&d, "b");
+    assert!(head(dir.path(), 4180).contains(": 2 entries"));
+    let mut f = fs::OpenOptions::new().append(true).open(ring_path(dir.path(), 4180)).unwrap();
+    write!(f, "{{\"seq").unwrap();
+    assert!(head(dir.path(), 4180).contains(", 1 unreadable line(s)"));
+}
+
+#[test]
+fn the_report_says_last_n_of_m_only_when_entries_were_actually_left_out() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4181, 64);
+    for i in 0..3 {
+        d.span(Subsystem::Cli, &format!("op{i}"), Class::Top, &[]).finish(Outcome::Ok);
+    }
+    let t = trace_of(dir.path(), 4181, Some(false));
+    for (last_n, expect_last) in [(2, true), (3, false), (4, false)] {
+        let text = render(&[t.clone()], unix_ms(), last_n);
+        assert_eq!(text.contains("last "), expect_last, "last_n {last_n}: {text}");
+    }
+    let text = render(&[t], unix_ms(), 2);
+    assert!(text.contains("last 2 of 3 entries") && !text.contains("op0") && text.contains("op1") && text.contains("op2"), "{text}");
+}
+
+// ── #90 ─────────────────────────────────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn a_process_we_may_not_signal_still_counts_as_running() {
+    // pid 1 exists on every unix; unless this test runs as root, kill(1, 0) fails with EPERM, which must read "alive".
+    assert_eq!(pid_alive(1), Some(true));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_os_start_time_of_this_process_is_before_now_and_a_missing_pid_has_none() {
+    let started = process_start_ms(std::process::id()).expect("this process has a start time");
+    let now = unix_ms();
+    assert!(started <= now + 1000, "{started} vs {now}");
+    assert!(started + 7 * 24 * 3600 * 1000 > now, "started within the last week: {started} vs {now}");
+    assert_eq!(process_start_ms(0x7fff_fffe), None);
+    assert!(!pid_recycled(started, started));
 }

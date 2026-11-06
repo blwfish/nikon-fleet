@@ -26,7 +26,9 @@
 //! carries a password and nothing here tries to scrub text, it just never stores the bytes.
 //!
 //! Failing to write diagnostics never fails the operation being diagnosed. Each failure bumps
-//! [`Diag::write_failures`], is reported once on stderr per streak, and appears in the report.
+//! [`Diag::write_failures`], is reported once on stderr per streak (outside the recorder's lock, and
+//! never as a panic if stderr is gone), and the count is written into the in-flight file and the exit
+//! entry so the report shows it.
 //!
 //! A process that never calls [`init`] pays one atomic load per call and records nothing, so the
 //! library is usable (and its tests run) without any of this being switched on.
@@ -53,8 +55,23 @@ pub const DIR_NAME: &str = "diag";
 /// [`MIN_RING_CAP`] up works, and the disk cost per entry does not depend on it.
 pub const DEFAULT_RING_CAP: usize = 1024;
 pub const MIN_RING_CAP: usize = 8;
-/// How many processes' files are kept when a new process starts (the newest by pid-file mtime).
+/// How many processes' files are kept when a new process starts: the newest by pid-file mtime, but
+/// never the files of a process that is still running (an idle GUI or MCP server must not lose its
+/// files to the short-lived processes that come after it), so a running process can push the total
+/// above this.
 pub const KEEP_PROCESSES: usize = 20;
+/// The version of the in-flight file format. The ring lines are one self-contained JSON object each
+/// and carry no version: a line this build cannot understand is counted separately from a cut line.
+pub const SCHEMA: u32 = 1;
+/// A process whose OS start time is later than the recorded start by more than this is not the
+/// process that wrote the files: its pid was reused.
+pub const PID_REUSE_SLACK_MS: u64 = 5_000;
+/// Field keys of the exit entry, so the writer and the report read one spelling.
+pub const FIELD_CODE: &str = "code";
+/// Exit entry: how many spans begun on other threads were still open and were recorded abandoned.
+pub const FIELD_CUT_OFF: &str = "cut_off";
+pub const FIELD_WRITE_FAILURES: &str = "write_failures";
+pub const FIELD_EVICTED: &str = "evicted";
 /// Longest [`Val::Text`], in characters, before it is cut and marked.
 pub const TEXT_MAX_CHARS: usize = 256;
 pub const TRUNCATED_MARK: &str = " …[truncated]";
@@ -101,6 +118,12 @@ impl Subsystem {
         Subsystem::Lock,
         Subsystem::Diag,
     ];
+
+    /// Whether this subsystem names what a whole process is (the `role` of a recorder). The exit entry
+    /// is recorded under the role, so an entry named `exit` by any other subsystem is not an exit.
+    pub const fn is_role(self) -> bool {
+        matches!(self, Subsystem::Cli | Subsystem::Gui | Subsystem::Mcp)
+    }
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -272,10 +295,23 @@ pub struct OpenSpan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InflightFile {
+    /// The format version ([`SCHEMA`]); a file without one is version 1.
+    #[serde(default = "default_schema")]
+    pub schema: u32,
     pub pid: u32,
     pub role: Subsystem,
     pub process_started_ms: u64,
     pub spans: Vec<OpenSpan>,
+    /// Diagnostics writes that had failed when this was written ([`Diag::write_failures`]).
+    #[serde(default)]
+    pub write_failures: u64,
+    /// Completed entries pushed out of the ring when this was written.
+    #[serde(default)]
+    pub evicted: u64,
+}
+
+fn default_schema() -> u32 {
+    1
 }
 
 /// Where a process's in-flight file is. The one definition: the writer and the reader both use it.
@@ -312,13 +348,18 @@ pub fn unix_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// Create `dir` owner-only. A directory that already exists keeps its mode: it may be one the user
+/// supplied in [`DIR_ENV`] and shares for other purposes, or one this user does not own.
 fn private_dir(dir: &Path) -> std::io::Result<()> {
+    let existed = dir.is_dir();
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
-    {
+    if !existed {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(not(unix))]
+    let _ = existed;
     Ok(())
 }
 
@@ -386,8 +427,17 @@ struct State {
     ring: VecDeque<Entry>,
     open: Vec<OpenSpan>,
     ring_lines: usize,
+    /// `None` only after a compaction replaced the file and the new one could not be reopened: the
+    /// next entry tries again, and until then entries are counted as failed writes, not appended to
+    /// a handle that names a file nobody will read.
     ring_file: Option<fs::File>,
     trace_file: Option<fs::File>,
+    /// Set by the first [`Diag::shutdown`], under this lock, so a second caller (the teardown watchdog
+    /// against `main`) waits for the first to finish writing instead of returning at once, and so a
+    /// span begun after the exit does not bring the in-flight file back.
+    exited: bool,
+    /// Completed entries pushed out of the ring.
+    evicted: u64,
 }
 
 pub struct Diag {
@@ -395,11 +445,13 @@ pub struct Diag {
     started_ms: u64,
     seq: AtomicU64,
     failures: AtomicU64,
+    /// `end`/`set` calls whose span was no longer open: one that ended after [`Diag::shutdown`] closed it.
+    unmatched: AtomicU64,
     /// True while the last write failed, so one streak warns once.
     in_failure_streak: AtomicBool,
-    /// Set by the first [`Diag::shutdown`]; a later one does nothing, so a process that reaches its exit by
-    /// two routes (the GUI's `on_exit`, then `main`) records one exit, with the first code.
-    exited: AtomicBool,
+    /// The warning for a new failure streak, printed by the entry point that caused it once it has
+    /// released the state lock (a stderr that blocks must not hold the recorder).
+    pending_warning: Mutex<Option<String>>,
     state: Mutex<State>,
 }
 
@@ -427,10 +479,17 @@ fn eviction_rank(e: &Entry) -> u8 {
 
 impl Diag {
     /// Start recording to `cfg.dir`. Creates the directory (owner-only), opens this process's ring
-    /// file, and removes the oldest processes' files beyond [`KEEP_PROCESSES`]. An `Err` means
-    /// diagnostics could not be set up; nothing was left half-open.
+    /// file, and removes the oldest finished processes' files beyond [`KEEP_PROCESSES`]. An `Err`
+    /// means diagnostics could not be set up; nothing was left half-open.
     pub fn new(cfg: Config) -> std::io::Result<Diag> {
         private_dir(&cfg.dir)?;
+        // A pid is reused. Whatever this pid's earlier process left behind is not this process's, and
+        // the ring below is truncated for the same reason: an in-flight file kept from before would be
+        // read as this process's hung state.
+        match fs::remove_file(inflight_path(&cfg.dir, cfg.pid)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         let ring_file = private_open(&ring_path(&cfg.dir, cfg.pid), false)?;
         let trace_file = match &cfg.trace_file {
             Some(p) => Some(private_open(p, true)?),
@@ -441,9 +500,18 @@ impl Diag {
             started_ms: unix_ms(),
             seq: AtomicU64::new(0),
             failures: AtomicU64::new(0),
+            unmatched: AtomicU64::new(0),
             in_failure_streak: AtomicBool::new(false),
-            exited: AtomicBool::new(false),
-            state: Mutex::new(State { ring: VecDeque::new(), open: Vec::new(), ring_lines: 0, ring_file: Some(ring_file), trace_file }),
+            pending_warning: Mutex::new(None),
+            state: Mutex::new(State {
+                ring: VecDeque::new(),
+                open: Vec::new(),
+                ring_lines: 0,
+                ring_file: Some(ring_file),
+                trace_file,
+                exited: false,
+                evicted: 0,
+            }),
             cfg,
         })
     }
@@ -452,9 +520,15 @@ impl Diag {
         &self.cfg
     }
 
-    /// How many diagnostics writes have failed. Reported in the report; never an operation error.
+    /// How many diagnostics writes have failed. Written into the in-flight file and the exit entry, so
+    /// the report shows it; never an operation error.
     pub fn write_failures(&self) -> u64 {
         self.failures.load(Ordering::Relaxed)
+    }
+
+    /// How many `end`/`set` calls found their span already closed (by [`Diag::shutdown`]).
+    pub fn unmatched_ops(&self) -> u64 {
+        self.unmatched.load(Ordering::Relaxed)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -473,9 +547,19 @@ impl Diag {
             Err(e) => {
                 self.failures.fetch_add(1, Ordering::Relaxed);
                 if !self.in_failure_streak.swap(true, Ordering::Relaxed) {
-                    eprintln!("warning: diagnostics could not be written to {} ({e}); the operation is not affected", self.cfg.dir.display());
+                    let w = format!("warning: diagnostics could not be written to {} ({e}); the operation is not affected", self.cfg.dir.display());
+                    *self.pending_warning.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
                 }
             }
+        }
+    }
+
+    /// Print the warning [`Diag::note_write`] queued. Called with the state lock released. A stderr that
+    /// is closed is not an error here, and must not panic (`eprintln!` would).
+    fn flush_warning(&self) {
+        let w = self.pending_warning.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(w) = w {
+            let _ = writeln!(std::io::stderr(), "{w}");
         }
     }
 
@@ -483,27 +567,53 @@ impl Diag {
     pub fn span(&self, subsystem: Subsystem, op: &str, class: Class, fields: &[(&'static str, Val)]) -> Span<'_> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let thread = thread_num();
-        let mut st = self.lock();
-        let depth = st.open.iter().filter(|o| o.thread == thread).count() as u32;
-        st.open.push(OpenSpan {
-            seq,
-            ts_ms: unix_ms(),
-            class,
-            subsystem,
-            op: op.to_string(),
-            fields: fields.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect(),
-            depth,
-            thread,
-        });
-        self.write_inflight(&st);
+        {
+            let mut st = self.lock();
+            let depth = st.open.iter().filter(|o| o.thread == thread).count() as u32;
+            st.open.push(OpenSpan {
+                seq,
+                ts_ms: unix_ms(),
+                class,
+                subsystem,
+                op: op.to_string(),
+                fields: own_fields(fields),
+                depth,
+                thread,
+            });
+            self.write_inflight(&st);
+        }
+        self.flush_warning();
         Span { diag: Some(self), seq, started: Instant::now(), finished: false }
     }
 
     /// Record something that happened, with no duration.
     pub fn event(&self, subsystem: Subsystem, op: &str, fields: &[(&'static str, Val)]) {
+        {
+            let mut st = self.lock();
+            self.record_event(&mut st, subsystem, op, fields);
+        }
+        self.flush_warning();
+    }
+
+    /// [`Diag::event`] for the panic hook: never waits for the lock. A panic on a thread that already
+    /// holds it (a write that panicked mid-record) would otherwise wait for itself. `false` (counted as
+    /// a failed write) when the event could not be recorded.
+    fn try_event(&self, subsystem: Subsystem, op: &str, fields: &[(&'static str, Val)]) -> bool {
+        let mut st = match self.state.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        };
+        self.record_event(&mut st, subsystem, op, fields);
+        true
+    }
+
+    fn record_event(&self, st: &mut State, subsystem: Subsystem, op: &str, fields: &[(&'static str, Val)]) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let thread = thread_num();
-        let mut st = self.lock();
         let depth = st.open.iter().filter(|o| o.thread == thread).count() as u32;
         let entry = Entry {
             seq,
@@ -512,52 +622,88 @@ impl Diag {
             class: Class::Top,
             subsystem,
             op: op.to_string(),
-            fields: fields.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect(),
+            fields: own_fields(fields),
             depth,
             thread,
             outcome: None,
             dur_us: 0,
         };
-        self.push(&mut st, entry);
+        self.push(st, entry);
     }
 
     /// Record that the process is exiting with `code`, the entry that tells the report this was a
     /// planned exit and not a kill. Spans still open are closed first: this is called on the paths
     /// that leave without unwinding (`process::exit`, `_exit`), where a command's own span never
-    /// gets to finish. A [`Class::Top`] span ends [`Outcome::Ok`] for code 0 and [`Outcome::Failed`]
-    /// otherwise; anything else still open ends [`Outcome::Abandoned`]. A process that hangs
-    /// *before* this is reached keeps its spans open, which is the whole point.
+    /// gets to finish.
+    ///
+    /// What a span ends as depends on **which thread calls this**, because the caller is the thread
+    /// that is leaving:
+    /// - a span begun on the calling thread is part of what is finishing: a [`Class::Top`] one ends
+    ///   [`Outcome::Ok`] for code 0 and [`Outcome::Failed`] otherwise, a [`Class::Leaf`] one
+    ///   [`Outcome::Abandoned`];
+    /// - a span begun on **any other thread** is work the exit interrupts, whatever its class and
+    ///   whatever the code: it ends [`Outcome::Abandoned`], and the exit entry carries
+    ///   [`FIELD_CUT_OFF`] with how many there were, so the report does not call the exit clean.
+    ///
+    /// So the teardown watchdog (its own thread) records the hung main thread's `disconnect_device`
+    /// and command spans as abandoned, and a GUI's `on_exit` on the UI thread records its running
+    /// `cli_child` spans (begun on worker threads) as abandoned and its own `gui` span as finished.
+    ///
+    /// Only the first call records; a later one returns once the first has finished writing (it takes
+    /// the same lock), so a second route to the exit never gets ahead of the first's records. A
+    /// process that hangs *before* this is reached keeps its spans open, which is the whole point.
     pub fn shutdown(&self, code: i32) {
-        if self.exited.swap(true, Ordering::SeqCst) {
-            return;
-        }
         let thread = thread_num();
-        let mut st = self.lock();
-        let open = std::mem::take(&mut st.open);
-        for o in open {
-            let outcome = match (o.class, code) {
-                (Class::Top, 0) => Outcome::Ok,
-                (Class::Top, _) => Outcome::Failed,
-                (Class::Leaf, _) => Outcome::Abandoned,
+        {
+            let mut st = self.lock();
+            if st.exited {
+                return;
+            }
+            st.exited = true;
+            let open = std::mem::take(&mut st.open);
+            let mut cut_off = 0u64;
+            for o in open {
+                let outcome = if o.thread != thread {
+                    cut_off += 1;
+                    Outcome::Abandoned
+                } else {
+                    match (o.class, code) {
+                        (Class::Top, 0) => Outcome::Ok,
+                        (Class::Top, _) => Outcome::Failed,
+                        (Class::Leaf, _) => Outcome::Abandoned,
+                    }
+                };
+                let dur_us = unix_ms().saturating_sub(o.ts_ms) * 1000;
+                self.finish_open(&mut st, o, outcome, &[], dur_us);
+            }
+            self.write_inflight(&st);
+            let mut fields = vec![(FIELD_CODE.to_string(), Val::I64(i64::from(code)))];
+            if cut_off > 0 {
+                fields.push((FIELD_CUT_OFF.to_string(), Val::U64(cut_off)));
+            }
+            let failures = self.failures.load(Ordering::Relaxed);
+            if failures > 0 {
+                fields.push((FIELD_WRITE_FAILURES.to_string(), Val::U64(failures)));
+            }
+            if st.evicted > 0 {
+                fields.push((FIELD_EVICTED.to_string(), Val::U64(st.evicted)));
+            }
+            let entry = Entry {
+                seq: self.seq.fetch_add(1, Ordering::Relaxed),
+                ts_ms: unix_ms(),
+                kind: Kind::Event,
+                class: Class::Top,
+                subsystem: self.cfg.role,
+                op: OP_EXIT.to_string(),
+                fields,
+                depth: 0,
+                thread,
+                outcome: None,
+                dur_us: 0,
             };
-            let dur_us = unix_ms().saturating_sub(o.ts_ms) * 1000;
-            self.finish_open(&mut st, o, outcome, &[], dur_us);
+            self.push(&mut st, entry);
         }
-        self.write_inflight(&st);
-        let entry = Entry {
-            seq: self.seq.fetch_add(1, Ordering::Relaxed),
-            ts_ms: unix_ms(),
-            kind: Kind::Event,
-            class: Class::Top,
-            subsystem: self.cfg.role,
-            op: OP_EXIT.to_string(),
-            fields: vec![("code".to_string(), Val::I64(i64::from(code)))],
-            depth: 0,
-            thread,
-            outcome: None,
-            dur_us: 0,
-        };
-        self.push(&mut st, entry);
+        self.flush_warning();
     }
 
     fn write_inflight(&self, st: &State) {
@@ -571,12 +717,43 @@ impl Diag {
             self.note_write(r);
             return;
         }
-        let file = InflightFile { pid: self.cfg.pid, role: self.cfg.role, process_started_ms: self.started_ms, spans: st.open.clone() };
+        if st.exited {
+            // A span begun after the exit (a thread that outlived it): the exit entry is the record, and
+            // a file listing this span would make a finished process read as hung.
+            return;
+        }
+        let file = InflightFile {
+            schema: SCHEMA,
+            pid: self.cfg.pid,
+            role: self.cfg.role,
+            process_started_ms: self.started_ms,
+            spans: st.open.clone(),
+            write_failures: self.failures.load(Ordering::Relaxed),
+            evicted: st.evicted,
+        };
         let r = match serde_json::to_vec(&file) {
             Ok(bytes) => write_private_atomic(&path, &bytes),
             Err(e) => Err(std::io::Error::other(e)),
         };
+        if r.is_err() {
+            // The file still on disk lists the state before this change, which may include spans that have
+            // since ended: it would read as a hang that is not one. Removing it says "nothing recorded"
+            // instead of something false (best effort; the failure is counted and warned about either way).
+            let _ = fs::remove_file(&path);
+        }
         self.note_write(r);
+    }
+
+    /// Append `line` to the ring file, reopening it first if a failed compaction left no handle.
+    fn ring_append(&self, st: &mut State, line: &str) -> std::io::Result<()> {
+        if st.ring_file.is_none() {
+            st.ring_file = Some(private_open(&ring_path(&self.cfg.dir, self.cfg.pid), true)?);
+        }
+        st.ring_lines += 1;
+        match st.ring_file.as_mut() {
+            Some(f) => f.write_all(line.as_bytes()),
+            None => Err(std::io::Error::other("the ring file is not open")),
+        }
     }
 
     /// Add a completed entry: ring (with priority eviction), ring file, trace file.
@@ -592,28 +769,31 @@ impl Diag {
                 .map(|(i, _)| i)
                 .expect("the ring is non-empty while its length is at least the capacity");
             st.ring.remove(victim);
+            st.evicted += 1;
         }
         st.ring.push_back(entry.clone());
 
-        let line = match serde_json::to_string(&entry) {
+        // One `write` per line (the newline is part of it): a trace file several processes append to
+        // would otherwise see their halves interleaved.
+        let mut line = match serde_json::to_string(&entry) {
             Ok(l) => l,
             Err(e) => {
                 self.note_write(Err(std::io::Error::other(e)));
                 return;
             }
         };
-        let mut result = Ok(());
-        if let Some(f) = st.ring_file.as_mut() {
-            result = writeln!(f, "{line}");
-            st.ring_lines += 1;
-        }
-        if let Some(f) = st.trace_file.as_mut() {
-            let r = writeln!(f, "{line}");
-            if result.is_ok() {
-                result = r;
+        line.push('\n');
+        let ring_result = self.ring_append(st, &line);
+        let trace_result = st.trace_file.as_mut().map(|f| f.write_all(line.as_bytes())).unwrap_or(Ok(()));
+        match (ring_result, trace_result) {
+            (Ok(()), Ok(())) => self.note_write(Ok(())),
+            (a, b) => {
+                // Both failures count; neither hides the other.
+                for e in [a, b].into_iter().filter_map(Result::err) {
+                    self.note_write(Err(e));
+                }
             }
         }
-        self.note_write(result);
         if st.ring_lines >= cap * 2 {
             self.compact(st);
         }
@@ -635,30 +815,39 @@ impl Diag {
             }
         }
         let path = ring_path(&self.cfg.dir, self.cfg.pid);
-        let r = write_private_atomic(&path, out.as_bytes()).and_then(|()| private_open(&path, true));
-        match r {
+        st.ring_lines = st.ring.len(); // restarts either way; a failure retries at the next threshold
+        if let Err(e) = write_private_atomic(&path, out.as_bytes()) {
+            // Nothing was replaced (the temp file or the rename failed): the old handle still names the file
+            // a reader will open, so appending to it stays right.
+            self.note_write(Err(e));
+            return;
+        }
+        match private_open(&path, true) {
             Ok(f) => {
                 st.ring_file = Some(f);
-                st.ring_lines = st.ring.len();
                 self.note_write(Ok(()));
             }
             Err(e) => {
-                // Keep appending to the old handle (it still names the replaced file or the
-                // original); the count restarts so this retries at the next threshold.
-                st.ring_lines = st.ring.len();
+                // The file was replaced and the old handle now names an unlinked inode: appends to it would
+                // "succeed" and be lost. Drop it; the next entry reopens, and until then writes fail visibly.
+                st.ring_file = None;
                 self.note_write(Err(e));
             }
         }
     }
 
     fn end(&self, seq: u64, outcome: Outcome, extra: &[(&'static str, Val)], dur_us: u64) {
-        let mut st = self.lock();
-        let Some(pos) = st.open.iter().position(|o| o.seq == seq) else {
-            return;
-        };
-        let open = st.open.remove(pos);
-        self.finish_open(&mut st, open, outcome, extra, dur_us);
-        self.write_inflight(&st);
+        {
+            let mut st = self.lock();
+            let Some(pos) = st.open.iter().position(|o| o.seq == seq) else {
+                self.unmatched.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let open = st.open.remove(pos);
+            self.finish_open(&mut st, open, outcome, extra, dur_us);
+            self.write_inflight(&st);
+        }
+        self.flush_warning();
     }
 
     /// Turn an open span (already removed from `st.open`) into a completed ring entry.
@@ -684,14 +873,19 @@ impl Diag {
     /// Replace (or add) one field of a span that is still open, and rewrite the in-flight file so a
     /// reader sees it: how a long operation reports the stage it has reached.
     fn set_field(&self, seq: u64, key: &'static str, v: Val) {
-        let mut st = self.lock();
-        if let Some(o) = st.open.iter_mut().find(|o| o.seq == seq) {
-            match o.fields.iter_mut().find(|(k, _)| k == key) {
-                Some(slot) => slot.1 = v,
-                None => o.fields.push((key.to_string(), v)),
+        {
+            let mut st = self.lock();
+            if let Some(o) = st.open.iter_mut().find(|o| o.seq == seq) {
+                match o.fields.iter_mut().find(|(k, _)| k == key) {
+                    Some(slot) => slot.1 = v,
+                    None => o.fields.push((key.to_string(), v)),
+                }
+                self.write_inflight(&st);
+            } else {
+                self.unmatched.fetch_add(1, Ordering::Relaxed);
             }
-            self.write_inflight(&st);
         }
+        self.flush_warning();
     }
 
     /// A copy of the ring, oldest first.
@@ -705,11 +899,38 @@ impl Diag {
     }
 }
 
-/// Remove the oldest processes' files beyond [`KEEP_PROCESSES`], never this process's. Best effort:
-/// a file that cannot be removed is left, and nothing about that is an error for the caller.
+fn own_fields(fields: &[(&'static str, Val)]) -> Vec<(String, Val)> {
+    fields.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
+}
+
+/// Whether the process that wrote `pid`'s files is still running: its pid exists and is not a later
+/// process that reused the number (judged by the start time in its in-flight file).
+fn live_process(dir: &Path, pid: u32) -> bool {
+    if pid_alive(pid) != Some(true) {
+        return false;
+    }
+    let recorded = fs::read(inflight_path(dir, pid))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("process_started_ms").and_then(serde_json::Value::as_u64));
+    match (recorded, process_start_ms(pid)) {
+        (Some(recorded), Some(os)) => !pid_recycled(os, recorded),
+        _ => true,
+    }
+}
+
+/// Remove the oldest finished processes' files beyond [`KEEP_PROCESSES`], never this process's and never
+/// those of a process that is still running. Best effort: a file that cannot be removed is left, and
+/// nothing about that is an error for the caller.
 fn prune(dir: &Path, own_pid: u32) {
+    prune_with(dir, own_pid, KEEP_PROCESSES, &|pid| live_process(dir, pid));
+}
+
+/// [`prune`] with the count and the liveness test given, so the boundary and the live-process case can be tested.
+fn prune_with(dir: &Path, own_pid: u32, keep: usize, is_live: &dyn Fn(u32) -> bool) {
     let Ok(read) = fs::read_dir(dir) else { return };
     let mut pids: std::collections::BTreeMap<u32, std::time::SystemTime> = std::collections::BTreeMap::new();
+    let mut temps: Vec<(PathBuf, u32)> = Vec::new();
     for entry in read.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if let Some(pid) = pid_of_file_name(&name) {
@@ -718,15 +939,23 @@ fn prune(dir: &Path, own_pid: u32) {
             if m > *slot {
                 *slot = m;
             }
+        } else if let Some(owner) = temp_owner_pid(&name) {
+            temps.push((entry.path(), owner));
         }
     }
-    if pids.len() <= KEEP_PROCESSES {
+    // A temp file whose writer died between creating and renaming it is never read; its writer, if alive, is mid-write.
+    for (path, owner) in temps {
+        if owner != own_pid && !is_live(owner) {
+            let _ = fs::remove_file(path);
+        }
+    }
+    if pids.len() <= keep {
         return;
     }
-    let mut by_age: Vec<(u32, std::time::SystemTime)> = pids.into_iter().filter(|(p, _)| *p != own_pid).collect();
-    by_age.sort_by_key(|(_, m)| *m);
-    let excess = by_age.len().saturating_sub(KEEP_PROCESSES.saturating_sub(1));
-    for (pid, _) in by_age.into_iter().take(excess) {
+    let excess = pids.len() - keep;
+    let mut removable: Vec<(u32, std::time::SystemTime)> = pids.into_iter().filter(|(p, _)| *p != own_pid && !is_live(*p)).collect();
+    removable.sort_by_key(|(_, m)| *m);
+    for (pid, _) in removable.into_iter().take(excess) {
         let _ = fs::remove_file(inflight_path(dir, pid));
         let _ = fs::remove_file(ring_path(dir, pid));
     }
@@ -740,6 +969,17 @@ fn pid_of_file_name(name: &str) -> Option<u32> {
         .and_then(|r| r.strip_suffix(".json"))
         .or_else(|| name.strip_prefix("ring-").and_then(|r| r.strip_suffix(".jsonl")))?;
     stem.parse().ok()
+}
+
+/// The writer's pid in a temp file name `.<target file name>.<writer pid>.<n>.tmp` (what
+/// [`write_private_atomic`] makes), when `<target file name>` is one of ours.
+fn temp_owner_pid(name: &str) -> Option<u32> {
+    let body = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let mut parts = body.rsplitn(3, '.');
+    let _n: u64 = parts.next()?.parse().ok()?;
+    let owner: u32 = parts.next()?.parse().ok()?;
+    pid_of_file_name(parts.next()?)?;
+    Some(owner)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -890,8 +1130,9 @@ pub fn start(role: Subsystem, trace_file: Option<&Path>) -> Option<&'static Diag
         // SAFETY: getppid has no preconditions and cannot fail.
         fields.push(("ppid", Val::U64(unsafe { libc::getppid() } as u64)));
     }
-    if let Some(id) = std::env::var(REQUEST_ID_ENV).ok().filter(|v| !v.is_empty()) {
-        fields.push(("request_id", Val::text(&id)));
+    if let Some(id) = std::env::var_os(REQUEST_ID_ENV).filter(|v| !v.is_empty()) {
+        // Lossy, not dropped: a non-UTF-8 id still joins the two sides' records if both write it the same way.
+        fields.push(("request_id", Val::text(&id.to_string_lossy())));
     }
     d.event(Subsystem::Diag, OP_START, &fields);
     Some(d)
@@ -946,12 +1187,20 @@ impl Diag {
     }
 }
 
-/// Install a panic hook that records the panic (location and a bounded message) before the
-/// previous hook runs. With `panic = "abort"` the open spans are never dropped, so the in-flight file
-/// keeps them and this entry says why. Safe to call once per process.
+/// Install a panic hook that records the panic (its location, and the message only as a length and a
+/// hash: an `unwrap` on an `Err` carries the error's `Debug` text, which can embed a path, URL or payload)
+/// before the previous hook runs, which still prints the message for the user. The hook never waits for
+/// the recorder's lock ([`Diag::try_event`]): a panic on a thread that holds it would wait for itself.
+/// With `panic = "abort"` the open spans are never dropped, so the in-flight file keeps them and this
+/// entry says why. Safe to call once per process.
 pub fn install_panic_hook() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(install_panic_hook_once);
+}
+
+/// The fields of a panic entry: where it happened, and the message only as a length and a hash.
+fn panic_fields(location: &str, message: &str) -> Vec<(&'static str, Val)> {
+    vec![("location", Val::text(location)), ("message_len", Val::len(message.len())), ("message_hash", Val::hash(message.as_bytes()))]
 }
 
 fn install_panic_hook_once() {
@@ -966,7 +1215,7 @@ fn install_panic_hook_once() {
             } else {
                 "(non-string panic payload)".to_string()
             };
-            d.event(d.cfg.role, OP_PANIC, &[("location", Val::text(&location)), ("message", Val::text(&message))]);
+            d.try_event(d.cfg.role, OP_PANIC, &panic_fields(&location, &message));
         }
         previous(info);
     }));
@@ -979,8 +1228,14 @@ fn install_panic_hook_once() {
 /// What the files of one process say happened to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// It recorded an exit and has nothing in flight.
+    /// It recorded an exit with a code and has nothing in flight.
     ExitedCleanly { code: i64 },
+    /// It recorded an exit, but `cut_off` spans begun on other threads were still open and the exit
+    /// interrupted them (recorded `abandoned`): the teardown watchdog ending a hung camera session, or a
+    /// GUI quitting with a child still running. Not a clean exit.
+    ExitedWithWorkCutOff { code: i64, cut_off: u64 },
+    /// An exit entry is there but carries no usable code.
+    ExitCodeUnknown,
     /// Spans were still open and the process is gone: it was killed or crashed.
     GoneWithSpansOpen,
     /// Spans are open and the process is still running: hung, or simply busy.
@@ -991,6 +1246,9 @@ pub enum Verdict {
     RunningIdle,
     /// Spans are open and this platform cannot say whether the process is alive.
     SpansOpenLivenessUnknown,
+    /// An in-flight file exists and could not be read at all, so what was open is unknown. Says nothing
+    /// about the process's state; `read_problems` says why.
+    InflightUnreadable,
 }
 
 #[derive(Debug, Clone)]
@@ -998,29 +1256,90 @@ pub struct ProcessTrace {
     pub pid: u32,
     pub inflight: Option<InflightFile>,
     pub entries: Vec<Entry>,
-    /// Lines of the ring file that did not parse. A last line cut off by a kill is expected: it is
+    /// Lines of the ring file that are not JSON. A last line cut off by a kill is expected: it is
     /// counted, not hidden.
     pub malformed_lines: usize,
-    /// `None` when the platform cannot say.
+    /// Lines that are JSON but not an entry this build understands (a value or field another build
+    /// added): counted apart from a cut line, because the cause is different.
+    pub unrecognised_lines: usize,
+    /// `None` when the platform cannot say. Already `Some(false)` when the pid now belongs to a later process.
     pub alive: Option<bool>,
-    /// Set when a file of this process could not be read or parsed, with why.
-    pub read_problem: Option<String>,
+    /// The pid is running, but it started after this process's files were written: a different process.
+    pub pid_recycled: bool,
+    /// Everything that could not be read or understood, each with why. All are kept.
+    pub read_problems: Vec<String>,
+    /// Open spans in the in-flight file that this build could not read (they count as open).
+    pub unreadable_open_spans: usize,
+    /// The in-flight file exists and nothing of it could be read.
+    pub inflight_unusable: bool,
+}
+
+/// An exit entry: recorded under the process's role, named [`OP_EXIT`]. Another subsystem's event that
+/// happens to be called `exit` is not one.
+fn is_exit(e: &Entry) -> bool {
+    e.kind == Kind::Event && e.op == OP_EXIT && e.subsystem.is_role()
+}
+
+fn field_of<'a>(fields: &'a [(String, Val)], key: &str) -> Option<&'a Val> {
+    fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
 impl ProcessTrace {
     pub fn verdict(&self) -> Verdict {
-        let exit = self.entries.iter().rev().find(|e| e.kind == Kind::Event && e.op == OP_EXIT);
-        let open = self.inflight.as_ref().is_some_and(|f| !f.spans.is_empty());
+        if self.inflight_unusable {
+            return Verdict::InflightUnreadable;
+        }
+        let exit = self.entries.iter().rev().find(|e| is_exit(e));
+        let open = self.inflight.as_ref().is_some_and(|f| !f.spans.is_empty()) || self.unreadable_open_spans > 0;
         match (open, self.alive, exit) {
             (true, Some(false), _) => Verdict::GoneWithSpansOpen,
             (true, Some(true), _) => Verdict::RunningWithSpansOpen,
             (true, None, _) => Verdict::SpansOpenLivenessUnknown,
-            (false, _, Some(e)) => Verdict::ExitedCleanly {
-                code: e.fields.iter().find_map(|(k, v)| if k == "code" { if let Val::I64(c) = v { Some(*c) } else { None } } else { None }).unwrap_or(0),
+            (false, _, Some(e)) => match field_of(&e.fields, FIELD_CODE) {
+                Some(Val::I64(code)) => match field_of(&e.fields, FIELD_CUT_OFF) {
+                    Some(Val::U64(n)) if *n > 0 => Verdict::ExitedWithWorkCutOff { code: *code, cut_off: *n },
+                    _ => Verdict::ExitedCleanly { code: *code },
+                },
+                _ => Verdict::ExitCodeUnknown,
             },
             (false, Some(false), None) => Verdict::GoneWithoutExit,
             (false, _, None) => Verdict::RunningIdle,
         }
+    }
+
+    /// When the process began, as well as the files say: its in-flight file's start, else its first entry; the
+    /// earlier of the two when both exist.
+    pub fn started_ms(&self) -> Option<u64> {
+        let from_file = self.inflight.as_ref().map(|f| f.process_started_ms).filter(|ms| *ms > 0);
+        let from_entries = self.entries.first().map(|e| e.ts_ms);
+        match (from_file, from_entries) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Diagnostics writes that failed, from the in-flight file or the exit entry (whichever saw more).
+    pub fn write_failures(&self) -> u64 {
+        self.counter(FIELD_WRITE_FAILURES, self.inflight.as_ref().map_or(0, |f| f.write_failures))
+    }
+
+    /// Completed entries pushed out of the ring, from the in-flight file or the exit entry.
+    pub fn evicted(&self) -> u64 {
+        self.counter(FIELD_EVICTED, self.inflight.as_ref().map_or(0, |f| f.evicted))
+    }
+
+    fn counter(&self, key: &str, from_file: u64) -> u64 {
+        let from_exit = self
+            .entries
+            .iter()
+            .rev()
+            .find(|e| is_exit(e))
+            .and_then(|e| match field_of(&e.fields, key) {
+                Some(Val::U64(n)) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(0);
+        from_file.max(from_exit)
     }
 }
 
@@ -1046,10 +1365,112 @@ pub fn pid_alive(pid: u32) -> Option<bool> {
     }
 }
 
-/// Read every process's files from `dir`, oldest pid-file first. `alive` says whether a pid is
-/// running (pass [`pid_alive`]); it is a parameter so the verdicts are testable. A missing
-/// directory is an empty report, not an error.
+/// When process `pid` started, in unix milliseconds, where the OS can say (macOS today; `None`
+/// elsewhere, and for a pid that does not exist). Used with [`pid_recycled`] to tell a running process
+/// from a later one that reused its pid.
+pub fn process_start_ms(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: proc_pidinfo fills at most `size` bytes of the zeroed struct we pass.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast::<libc::c_void>(), size) };
+        if n != size {
+            return None;
+        }
+        Some(info.pbi_start_tvsec * 1000 + info.pbi_start_tvusec / 1000)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether a running process that the OS says started at `os_start_ms` is not the one that recorded
+/// `recorded_ms` as its start: it started later than that by more than [`PID_REUSE_SLACK_MS`]. (A process
+/// always exists before it starts recording, so an OS start *earlier* than the record is never a mismatch.)
+pub fn pid_recycled(os_start_ms: u64, recorded_ms: u64) -> bool {
+    os_start_ms > recorded_ms.saturating_add(PID_REUSE_SLACK_MS)
+}
+
+/// What reading `inflight-<pid>.json` found.
+struct InflightRead {
+    file: Option<InflightFile>,
+    unreadable_spans: usize,
+    unusable: bool,
+    problems: Vec<String>,
+}
+
+fn read_inflight(dir: &Path, pid: u32) -> InflightRead {
+    let path = inflight_path(dir, pid);
+    let mut r = InflightRead { file: None, unreadable_spans: 0, unusable: false, problems: Vec::new() };
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return r,
+        Err(e) => {
+            r.unusable = true;
+            r.problems.push(format!("{} could not be read: {e}", path.display()));
+            return r;
+        }
+    };
+    if let Ok(f) = serde_json::from_slice::<InflightFile>(&bytes) {
+        if f.schema > SCHEMA {
+            r.problems.push(format!("{} has schema {} and this build reads schema {SCHEMA}: it was written by a newer build", path.display(), f.schema));
+        }
+        r.file = Some(f);
+        return r;
+    }
+    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            r.unusable = true;
+            r.problems.push(format!("{} did not parse: {e}", path.display()));
+            return r;
+        }
+    };
+    // Valid JSON that is not the format this build writes: another build's file. Keep every open span that can be
+    // read, and count the rest as open, rather than losing the process's whole hung state to one new value.
+    let Some(spans) = value.get("spans").and_then(serde_json::Value::as_array) else {
+        r.unusable = true;
+        r.problems.push(format!("{} is JSON but has no list of spans (a different format?)", path.display()));
+        return r;
+    };
+    let mut ok = Vec::new();
+    for s in spans {
+        match serde_json::from_value::<OpenSpan>(s.clone()) {
+            Ok(s) => ok.push(s),
+            Err(_) => r.unreadable_spans += 1,
+        }
+    }
+    let num = |k: &str| value.get(k).and_then(serde_json::Value::as_u64);
+    r.problems.push(format!(
+        "{} was not fully understood (written by a different build?): {} open span(s) could not be read",
+        path.display(),
+        r.unreadable_spans
+    ));
+    r.file = Some(InflightFile {
+        schema: num("schema").map_or(1, |n| n as u32),
+        pid: num("pid").map_or(pid, |n| n as u32),
+        role: value.get("role").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or(Subsystem::Diag),
+        process_started_ms: num("process_started_ms").unwrap_or(0),
+        spans: ok,
+        write_failures: num("write_failures").unwrap_or(0),
+        evicted: num("evicted").unwrap_or(0),
+    });
+    r
+}
+
+/// Read every process's files from `dir`, oldest process first (by when it started, then pid). `alive`
+/// says whether a pid is running (pass [`pid_alive`]); it is a parameter so the verdicts are testable. A
+/// running pid that the OS says started after the files were written is reported as gone: its pid was reused
+/// ([`process_start_ms`], [`pid_recycled`]). A missing directory is an empty report, not an error.
 pub fn load(dir: &Path, alive: &dyn Fn(u32) -> Option<bool>) -> std::io::Result<Vec<ProcessTrace>> {
+    load_with(dir, alive, &process_start_ms)
+}
+
+/// [`load`] with the OS start-time lookup given, so reuse detection is testable with made-up pids.
+pub fn load_with(dir: &Path, alive: &dyn Fn(u32) -> Option<bool>, start_of: &dyn Fn(u32) -> Option<u64>) -> std::io::Result<Vec<ProcessTrace>> {
     let read = match fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1063,38 +1484,52 @@ pub fn load(dir: &Path, alive: &dyn Fn(u32) -> Option<bool>) -> std::io::Result<
     }
     let mut out = Vec::new();
     for pid in pids {
-        let mut problem = None;
-        let inflight = match fs::read(inflight_path(dir, pid)) {
-            Ok(bytes) => match serde_json::from_slice::<InflightFile>(&bytes) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    problem = Some(format!("{} did not parse: {e}", inflight_path(dir, pid).display()));
-                    None
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                problem = Some(format!("{} could not be read: {e}", inflight_path(dir, pid).display()));
-                None
-            }
-        };
+        let inflight = read_inflight(dir, pid);
+        let mut problems = inflight.problems;
         let mut entries = Vec::new();
-        let mut malformed = 0;
-        match fs::read_to_string(ring_path(dir, pid)) {
-            Ok(text) => {
-                for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                    match serde_json::from_str::<Entry>(line) {
+        let (mut malformed, mut unrecognised) = (0, 0);
+        match fs::read(ring_path(dir, pid)) {
+            // Bytes, not a string: one line cut in the middle of a character must not make the whole file unreadable.
+            Ok(bytes) => {
+                for raw in bytes.split(|b| *b == b'\n') {
+                    let line = String::from_utf8_lossy(raw);
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<Entry>(&line) {
                         Ok(e) => entries.push(e),
+                        Err(_) if serde_json::from_str::<serde_json::Value>(&line).is_ok() => unrecognised += 1,
                         Err(_) => malformed += 1,
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => problem = Some(format!("{} could not be read: {e}", ring_path(dir, pid).display())),
+            Err(e) => problems.push(format!("{} could not be read: {e}", ring_path(dir, pid).display())),
         }
         entries.sort_by_key(|e| e.seq);
-        out.push(ProcessTrace { pid, inflight, entries, malformed_lines: malformed, alive: alive(pid), read_problem: problem });
+        let mut trace = ProcessTrace {
+            pid,
+            inflight: inflight.file,
+            entries,
+            malformed_lines: malformed,
+            unrecognised_lines: unrecognised,
+            alive: alive(pid),
+            pid_recycled: false,
+            read_problems: problems,
+            unreadable_open_spans: inflight.unreadable_spans,
+            inflight_unusable: inflight.unusable,
+        };
+        if trace.alive == Some(true) {
+            if let (Some(recorded), Some(os)) = (trace.started_ms(), start_of(pid)) {
+                if pid_recycled(os, recorded) {
+                    trace.alive = Some(false);
+                    trace.pid_recycled = true;
+                }
+            }
+        }
+        out.push(trace);
     }
+    out.sort_by_key(|t| (t.started_ms().unwrap_or(0), t.pid));
     Ok(out)
 }
 
@@ -1136,25 +1571,37 @@ pub fn render(traces: &[ProcessTrace], now_ms: u64, last_n: usize) -> String {
     }
     let mut out = String::new();
     for t in traces {
-        // The process's role: from its in-flight file if it has one, else from its `start` event (the entry's own
-        // subsystem is `diag`, which says nothing), else the first entry's subsystem.
+        // The process's role: from its `start` event (the entry's own subsystem is `diag`, which says nothing), else
+        // its in-flight file, else the first entry's subsystem.
         let start_role = t.entries.iter().find(|e| e.kind == Kind::Event && e.op == OP_START).and_then(|e| {
             e.fields.iter().find_map(|(k, v)| match (k.as_str(), v) {
                 ("role", Val::Text(r)) => Some(r.as_str()),
                 _ => None,
             })
         });
-        let role = t.inflight.as_ref().map(|f| f.role.as_str()).or(start_role).or_else(|| t.entries.first().map(|e| e.subsystem.as_str())).unwrap_or("?");
+        let role = start_role.or(t.inflight.as_ref().map(|f| f.role.as_str())).or_else(|| t.entries.first().map(|e| e.subsystem.as_str())).unwrap_or("?");
         out.push_str(&format!("pid {} ({role}): {} entr{}", t.pid, t.entries.len(), if t.entries.len() == 1 { "y" } else { "ies" }));
         if t.malformed_lines > 0 {
             out.push_str(&format!(", {} unreadable line(s) (a line cut off by a kill is normal)", t.malformed_lines));
         }
+        if t.unrecognised_lines > 0 {
+            out.push_str(&format!(", {} line(s) this build does not understand (written by a different build?)", t.unrecognised_lines));
+        }
         out.push('\n');
-        if let Some(p) = &t.read_problem {
+        for p in &t.read_problems {
             out.push_str(&format!("  problem: {p}\n"));
+        }
+        let failures = t.write_failures();
+        if failures > 0 {
+            out.push_str(&format!("  warning: {failures} diagnostics write(s) failed in this process; this record may be incomplete\n"));
         }
         let verdict = match t.verdict() {
             Verdict::ExitedCleanly { code } => format!("exited cleanly (code {code})"),
+            Verdict::ExitedWithWorkCutOff { code, cut_off } => format!(
+                "exited (code {code}) but cut work short: {cut_off} span(s) on other threads were still open and are recorded abandoned (the teardown watchdog ending a hung session, or a quit with work running)"
+            ),
+            Verdict::ExitCodeUnknown => "an exit was recorded without a readable code".to_string(),
+            Verdict::InflightUnreadable => "the in-flight file could not be read, so what was in flight is unknown (see the problem line)".to_string(),
             Verdict::GoneWithSpansOpen => "the process is gone and spans were still open: it was killed or crashed".to_string(),
             Verdict::RunningWithSpansOpen => "the process is still running with spans open: hung, or just busy".to_string(),
             Verdict::GoneWithoutExit => "the process is gone, nothing was open and no exit was recorded: killed between operations".to_string(),
@@ -1162,6 +1609,12 @@ pub fn render(traces: &[ProcessTrace], now_ms: u64, last_n: usize) -> String {
             Verdict::SpansOpenLivenessUnknown => "spans are open; this platform cannot say whether the process is still running".to_string(),
         };
         out.push_str(&format!("  state: {verdict}\n"));
+        if t.pid_recycled {
+            out.push_str(&format!("  note: pid {} is running now, but it started after these files were written: it is a different process\n", t.pid));
+        }
+        if t.unreadable_open_spans > 0 {
+            out.push_str(&format!("  note: {} open span(s) in the in-flight file could not be read and are not listed\n", t.unreadable_open_spans));
+        }
         if let Some(f) = &t.inflight {
             if !f.spans.is_empty() {
                 // By start order, which is always right. `depth` (the indent) counts the spans open on the
@@ -1182,6 +1635,9 @@ pub fn render(traces: &[ProcessTrace], now_ms: u64, last_n: usize) -> String {
                     ));
                 }
             }
+        }
+        if t.evicted() > 0 {
+            out.push_str(&format!("  note: {} older entries were evicted from the ring and are not shown\n", t.evicted()));
         }
         let agg = aggregated(&t.entries);
         let skipped = agg.len().saturating_sub(last_n);
