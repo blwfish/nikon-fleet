@@ -23,14 +23,13 @@ pub(crate) enum MenuAction {
     Restore,
     RestoreExtended,
     Check,
-    VendorOps,
     Firmware,
     About,
 }
 
 impl MenuAction {
     #[cfg(test)]
-    pub(crate) const ALL: [MenuAction; 12] = [
+    pub(crate) const ALL: [MenuAction; 11] = [
         MenuAction::Export,
         MenuAction::Import,
         MenuAction::Quit,
@@ -40,7 +39,6 @@ impl MenuAction {
         MenuAction::Restore,
         MenuAction::RestoreExtended,
         MenuAction::Check,
-        MenuAction::VendorOps,
         MenuAction::Firmware,
         MenuAction::About,
     ];
@@ -57,7 +55,6 @@ impl MenuAction {
             MenuAction::Restore => "Restore…",
             MenuAction::RestoreExtended => "Restore Owner Data…",
             MenuAction::Check => "Check Against Reference…",
-            MenuAction::VendorOps => "Vendor Ops…",
             MenuAction::Firmware => "Firmware Archive…",
             MenuAction::About => "About Fleet",
         }
@@ -134,8 +131,6 @@ fn in_window_layout() -> Vec<Menu> {
                 Item(MenuAction::Restore),
                 Item(MenuAction::RestoreExtended),
                 Item(MenuAction::Check),
-                Separator,
-                Item(MenuAction::VendorOps),
             ],
         },
         Menu { title: "Firmware", entries: vec![Item(MenuAction::Firmware)] },
@@ -202,7 +197,6 @@ pub(crate) mod native {
             | MenuAction::Restore
             | MenuAction::RestoreExtended
             | MenuAction::Check
-            | MenuAction::VendorOps
             | MenuAction::Firmware
             | MenuAction::About => None,
         }
@@ -320,14 +314,13 @@ mod tests {
             MenuAction::Transplant => 5,
             MenuAction::Restore => 6,
             MenuAction::Check => 7,
-            MenuAction::VendorOps => 8,
-            MenuAction::Firmware => 9,
-            MenuAction::About => 10,
-            MenuAction::RestoreExtended => 11,
+            MenuAction::Firmware => 8,
+            MenuAction::About => 9,
+            MenuAction::RestoreExtended => 10,
         };
         let mut seen: Vec<usize> = MenuAction::ALL.iter().map(|a| n(*a)).collect();
         seen.sort();
-        assert_eq!(seen, (0..12).collect::<Vec<_>>());
+        assert_eq!(seen, (0..11).collect::<Vec<_>>());
     }
 
     #[test]
@@ -424,7 +417,6 @@ mod tests {
             (MenuAction::Restore, "Restore…", "Restore…"),
             (MenuAction::RestoreExtended, "Restore Owner Data…", "Restore Owner Data…"),
             (MenuAction::Check, "Check Against Reference…", "Check Against Reference…"),
-            (MenuAction::VendorOps, "Vendor Ops…", "Vendor Ops…"),
             (MenuAction::Firmware, "Firmware Archive…", "Firmware Archive…"),
             (MenuAction::About, "About Fleet", "About Fleet"),
         ];

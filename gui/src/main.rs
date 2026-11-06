@@ -14,7 +14,7 @@ use nikon_fleet::firmware::{
 use nikon_fleet::ops::cameras::{AmbiguousPairing, CameraList, duplicate_models, list_cameras};
 use nikon_fleet::ops::list::{EntryState, list_dir};
 use nikon_fleet::ops::paths::{checked_reference_filename, is_safe_path_component, write_atomic};
-use nikon_fleet::exit_status::{EXIT_REFUSED_BEFORE_WRITE, EXIT_STALE_PLAN, EXIT_WRITE_INDETERMINATE, ExitKind};
+use nikon_fleet::exit_status::{EXIT_REFUSED_BEFORE_WRITE, EXIT_STALE_PLAN, ExitKind};
 use nikon_fleet::ops::apply::ApplyStatus;
 use nikon_fleet::ops::labels::Labels;
 use nikon_fleet::ops::plan::planned_would_change;
@@ -30,7 +30,6 @@ use crate::menu::{Bar, Entry, MenuAction, menus};
 const MACOS: bool = cfg!(target_os = "macos");
 use nikon_fleet::snapshot::Snapshot;
 use nikon_fleet::transplant::{PROPERTY_PREFIX, Severity};
-use nikon_fleet::vendor_argv::{vendor_read_argv, vendor_write_ftp_argv};
 use serde::Deserialize;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
@@ -55,7 +54,7 @@ use restore::{RestoreApplyJson, RestorePlanJson, RestoreRequest, RestoreUi, Sour
 use restore_ext::{ExtApplyJson, ExtPlanJson, ExtRestoreRequest, ExtRestoreUi};
 
 // This GUI is a thin front end over the `nikon-fleet` CLI and the `nikon_fleet`
-// library. Everything that touches a camera (discover, snapshot, the vendor ops)
+// library. Everything that touches a camera (discover, snapshot, the guarded writes)
 // runs as a CLI subprocess with a timeout, so a hung SDK call can never wedge this
 // process or leave its camera lock held; everything about stored files (listing,
 // references, settings) goes through the library's own code.
@@ -120,8 +119,6 @@ enum Cmd {
     SetDataDir(Result<PathBuf, String>),
     Export { dest: PathBuf },
     Import { src: PathBuf },
-    VendorRead { propcode: u16, serial: Option<String> },
-    VendorWriteFtp { profile: FtpProfile, serial: Option<String> },
     /// Read-only: plan a guarded write (a transplant, a restore).
     Plan(PlanJob),
     /// WRITES TO THE CAMERA, only the plan with the digest and summary that were shown and confirmed.
@@ -271,25 +268,10 @@ enum Evt {
     Cameras(DiscoverResult),
     Listing(SnapListing),
     Done(OpDone),
-    Vendor { op: VendorOp, result: Result<VendorOut, String> },
     Planned(PlannedEvt),
     Applied(AppliedEvt),
     Checked { request: CheckRequest, result: Result<CheckView, String> },
     Err(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VendorOp {
-    Read,
-    WriteFtp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VendorOut {
-    text: String,
-    /// What the CLI said on stderr during a successful run (the unconfirmed-model
-    /// warning, a reply that did not match its command): shown next to the result.
-    stderr: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,13 +693,6 @@ struct FleetApp {
     /// The native macOS menu bar; `None` elsewhere, or if it could not be installed (the window draws its own).
     #[cfg(target_os = "macos")]
     native_menu: Option<menu::native::NativeMenu>,
-    // Vendor ops (raw USB PTP — see docs/nx-field-session-2026-07-09.md)
-    vendor_ops_open: bool,
-    vendor_propcode: String,
-    vendor_read_result: String,
-    ftp_form: FtpForm,
-    pending_write: Option<PendingWrite>,
-    vendor_write_result: String,
     transplant: TransplantUi,
     restore: RestoreUi,
     restore_ext: ExtRestoreUi,
@@ -767,12 +742,6 @@ impl FleetApp {
             about_open: false,
             #[cfg(target_os = "macos")]
             native_menu,
-            vendor_ops_open: false,
-            vendor_propcode: "0xD053".to_string(),
-            vendor_read_result: String::new(),
-            ftp_form: FtpForm::default(),
-            pending_write: None,
-            vendor_write_result: String::new(),
             transplant: TransplantUi::default(),
             restore: RestoreUi::default(),
             restore_ext: ExtRestoreUi::default(),
@@ -793,13 +762,6 @@ impl FleetApp {
 
     fn selected_camera(&self) -> Option<&CameraRow> {
         self.selected.and_then(|i| self.cameras.get(i))
-    }
-
-    /// Serial of the currently selected camera, if any. Vendor ops target
-    /// this the same way Snapshot does, but don't require it — the CLI/
-    /// library auto-selects when exactly one Nikon camera is on USB.
-    fn selected_serial(&self) -> Option<String> {
-        self.selected_camera().map(|c| c.serial.clone())
     }
 
     /// Hand `cmd` to the worker; false (with the status saying so) if the worker is gone.
@@ -840,20 +802,6 @@ impl FleetApp {
         }
         self.listing = None;
         self.refresh_listing();
-    }
-
-    /// A confirmation to write to a camera is only good for the exact target and form it
-    /// was asked for.
-    fn drop_stale_confirmation(&mut self) {
-        let stale = self
-            .pending_write
-            .as_ref()
-            .is_some_and(|p| p.is_stale(&self.ftp_form, self.selected_camera()));
-        if stale {
-            self.pending_write = None;
-            self.vendor_write_result =
-                "Confirmation withdrawn: the form or the selected camera changed. Nothing was written.".into();
-        }
     }
 
     /// Open the window for a stored snapshot and read its file off the UI thread. Reading is not
@@ -934,17 +882,6 @@ impl FleetApp {
                         self.refresh_listing();
                     }
                 }
-                Evt::Vendor { op, result } => {
-                    let (text, level) = match result {
-                        Ok(out) => (with_stderr(&out.text, &out.stderr), Level::Info),
-                        Err(msg) => (format!("Error: {msg}"), Level::Error),
-                    };
-                    self.status = Status::new(level, text.lines().next().unwrap_or("").to_string());
-                    match op {
-                        VendorOp::Read => self.vendor_read_result = text,
-                        VendorOp::WriteFtp => self.vendor_write_result = text,
-                    }
-                }
                 Evt::Planned(planned) => {
                     self.status = planned.status();
                     planned.deliver(self);
@@ -985,14 +922,6 @@ impl SettingsState {
     }
 }
 
-fn with_stderr(text: &str, stderr: &str) -> String {
-    if stderr.trim().is_empty() {
-        text.to_string()
-    } else {
-        format!("{text}\n[stderr]\n{}", stderr.trim_end())
-    }
-}
-
 fn level_color(level: Level) -> Option<egui::Color32> {
     match level {
         Level::Info => None,
@@ -1026,7 +955,6 @@ impl eframe::App for FleetApp {
         let ctx = &ctx;
         self.poll();
         self.poll_views();
-        self.drop_stale_confirmation();
         self.transplant.sync(&self.cameras);
         self.restore.sync(&self.cameras);
         self.restore_ext.sync(&self.cameras);
@@ -1038,7 +966,6 @@ impl eframe::App for FleetApp {
         self.ui_notices(root);
         self.ui_preferences(ctx);
         self.ui_about(ctx);
-        self.ui_vendor_ops(ctx);
         self.ui_transplant(ctx);
         self.ui_restore(ctx);
         self.ui_restore_ext(ctx);
@@ -1203,7 +1130,6 @@ impl FleetApp {
             | MenuAction::Restore
             | MenuAction::RestoreExtended
             | MenuAction::Check
-            | MenuAction::VendorOps
             | MenuAction::Firmware
             | MenuAction::About => true,
         }
@@ -1228,7 +1154,6 @@ impl FleetApp {
             MenuAction::Restore => self.restore.open = true,
             MenuAction::RestoreExtended => self.restore_ext.open = true,
             MenuAction::Check => self.check.open = true,
-            MenuAction::VendorOps => self.vendor_ops_open = true,
             MenuAction::Firmware => self.firmware.open = true,
             MenuAction::About => self.about_open = true,
         }
@@ -1317,160 +1242,6 @@ impl FleetApp {
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
             });
         self.about_open = open;
-    }
-
-    fn ui_vendor_ops(&mut self, ctx: &egui::Context) {
-        // Raw USB PTP vendor operations reverse-engineered from an NX Field
-        // WiFi capture (docs/nx-field-session-2026-07-09.md) — bypass the
-        // MAID SDK entirely. Unlike the rest of this GUI these don't need a
-        // prior Discover: they talk straight to the USB device and only need
-        // a serial when more than one Nikon camera is attached. They run as
-        // `nikon-fleet` CLI subprocesses, not in this process — see
-        // `do_vendor_read`.
-        let mut vendor_ops_open = self.vendor_ops_open;
-        let mut read_trigger = false;
-        let mut preview_trigger = false;
-        let mut write_request = false;
-        let mut confirm_write = false;
-        let mut cancel_write = false;
-        let busy = self.busy();
-        let target = match self.selected_camera() {
-            Some(c) => format!("Target: {} {}", c.model, c.serial),
-            None => "Target: (auto-detected — only one Nikon camera on USB)".to_string(),
-        };
-
-        egui::Window::new("Vendor Ops (raw USB PTP)")
-            .open(&mut vendor_ops_open)
-            .resizable(false)
-            .collapsible(false)
-            .min_width(420.0)
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new(target).small().weak());
-                ui.add_space(6.0);
-
-                ui.group(|ui| {
-                    ui.label(egui::RichText::new("Read Vendor Property (0x943B)").strong());
-                    ui.horizontal(|ui| {
-                        ui.label("Property code:");
-                        ui.add(egui::TextEdit::singleline(&mut self.vendor_propcode).desired_width(100.0));
-                        ui.add_enabled_ui(!busy, |ui| {
-                            if ui.button("Read").clicked() {
-                                read_trigger = true;
-                            }
-                        });
-                    });
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.vendor_read_result)
-                            .desired_rows(2)
-                            .desired_width(f32::INFINITY)
-                            .interactive(false)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                });
-
-                ui.add_space(8.0);
-
-                ui.group(|ui| {
-                    ui.label(egui::RichText::new("Write FTP Profile (0x90EE)").strong());
-                    let form = &mut self.ftp_form;
-                    egui::Grid::new("vendor_ftp_grid").num_columns(2).spacing([6.0, 4.0]).show(ui, |ui| {
-                        ui.label("Profile name:");
-                        ui.text_edit_singleline(&mut form.profile_name);
-                        ui.end_row();
-                        ui.label("SSID (2.4GHz):");
-                        ui.text_edit_singleline(&mut form.ssid_24ghz);
-                        ui.end_row();
-                        ui.label("SSID (5GHz):");
-                        ui.text_edit_singleline(&mut form.ssid_5ghz);
-                        ui.end_row();
-                        ui.label("FTP host:");
-                        ui.text_edit_singleline(&mut form.host);
-                        ui.end_row();
-                        ui.label("Port:");
-                        ui.text_edit_singleline(&mut form.port);
-                        ui.end_row();
-                        ui.label("Username:");
-                        ui.text_edit_singleline(&mut form.username);
-                        ui.end_row();
-                        ui.label("Password:");
-                        ui.add(egui::TextEdit::singleline(&mut form.password).password(true));
-                        ui.end_row();
-                    });
-
-                    ui.add_enabled_ui(!busy, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui.button("Preview (dry run)").clicked() {
-                                preview_trigger = true;
-                            }
-                            if self.pending_write.is_none() && ui.button("Write to Camera…").clicked() {
-                                write_request = true;
-                            }
-                        });
-                    });
-
-                    if let Some(pending) = &self.pending_write {
-                        ui.add_space(4.0);
-                        ui.colored_label(egui::Color32::from_rgb(200, 120, 0), pending.confirm_text());
-                        ui.add_enabled_ui(!busy, |ui| {
-                            ui.horizontal(|ui| {
-                                if ui.button("Confirm Write").clicked() {
-                                    confirm_write = true;
-                                }
-                                if ui.button("Cancel").clicked() {
-                                    cancel_write = true;
-                                }
-                            });
-                        });
-                    }
-
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.vendor_write_result)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY)
-                            .interactive(false)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                });
-            });
-        self.vendor_ops_open = vendor_ops_open;
-
-        if read_trigger {
-            match ptp_usb::parse_propcode(&self.vendor_propcode) {
-                Ok(propcode) => {
-                    let serial = self.selected_serial();
-                    self.send(Cmd::VendorRead { propcode, serial });
-                }
-                Err(e) => self.vendor_read_result = format!("Invalid property code: {e}"),
-            }
-        }
-        if preview_trigger {
-            self.pending_write = None;
-            self.vendor_write_result = match prepare_ftp(&self.ftp_form) {
-                Ok((_, preview)) => preview,
-                Err(e) => e,
-            };
-        }
-        if write_request {
-            match prepare_ftp(&self.ftp_form) {
-                Ok((profile, _)) => {
-                    self.vendor_write_result.clear();
-                    self.pending_write = Some(PendingWrite::new(profile, &self.ftp_form, self.selected_camera()));
-                }
-                Err(e) => self.vendor_write_result = e,
-            }
-        }
-        if cancel_write {
-            self.pending_write = None;
-            self.vendor_write_result = "Cancelled. Nothing was written.".into();
-        }
-        if confirm_write {
-            // The payload and the target are the ones the confirmation text named,
-            // not whatever the form and the selection say now.
-            if let Some(p) = self.pending_write.take() {
-                self.vendor_write_result = "Writing…".into();
-                self.send(Cmd::VendorWriteFtp { profile: p.profile, serial: p.target.map(|t| t.serial) });
-            }
-        }
     }
 
     fn ui_sidebar(&mut self, root: &mut egui::Ui) {
@@ -1911,12 +1682,6 @@ fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Evt>, ctx: egui::Context, in
                 Ok(report) => Evt::Done(describe_import(&report)),
                 Err(e) => Evt::Err(e),
             }),
-            Cmd::VendorRead { propcode, serial } => {
-                Evt::Vendor { op: VendorOp::Read, result: do_vendor_read(propcode, serial.as_deref()) }
-            }
-            Cmd::VendorWriteFtp { profile, serial } => {
-                Evt::Vendor { op: VendorOp::WriteFtp, result: do_vendor_write_ftp(&profile, serial.as_deref()) }
-            }
             Cmd::Plan(job) => match data_dir.as_ref() {
                 Ok(d) => job.run(d),
                 Err(e) => job.fail(e.clone()),
@@ -1950,8 +1715,6 @@ fn cmd_name(cmd: &Cmd) -> &'static str {
         Cmd::SetDataDir(_) => "set_data_dir",
         Cmd::Export { .. } => "export",
         Cmd::Import { .. } => "import",
-        Cmd::VendorRead { .. } => "vendor_read",
-        Cmd::VendorWriteFtp { .. } => "vendor_write_ftp",
         Cmd::Plan(_) => "plan",
         Cmd::Apply(_) => "apply",
         Cmd::Check { .. } => "check",
@@ -1973,7 +1736,6 @@ fn evt_outcome(evt: &Evt) -> nikon_fleet::diag::Outcome {
     }
     match evt {
         Evt::Err(_)
-        | Evt::Vendor { result: Err(_), .. }
         | Evt::Checked { result: Err(_), .. }
         | Evt::Planned(PlannedEvt::Transplant { result: Err(_), .. })
         | Evt::Planned(PlannedEvt::Restore { result: Err(_), .. })
@@ -1984,7 +1746,6 @@ fn evt_outcome(evt: &Evt) -> nikon_fleet::diag::Outcome {
         Evt::Cameras(_)
         | Evt::Listing(_)
         | Evt::Done(_)
-        | Evt::Vendor { result: Ok(_), .. }
         | Evt::Checked { result: Ok(_), .. }
         | Evt::Planned(_) => Outcome::Ok,
     }
@@ -2090,17 +1851,6 @@ impl CliError {
     /// A camera write that ended this way may or may not have reached the camera.
     fn outcome_unknown(&self) -> bool {
         matches!(self.kind, CliFailure::TimedOut | CliFailure::Wait)
-    }
-
-    /// For a real `vendor-write-ftp`: the camera may have changed. Beyond the cases above, only
-    /// the CLI's own definitive refusals (exit 1: an error before or without sending the data;
-    /// exit 2: a usage error) mean it did not. A child that died by signal (no exit code), panicked
-    /// (101) or exited with any other status may have done so after the data went out.
-    fn write_outcome_unknown(&self) -> bool {
-        self.outcome_unknown()
-            || self.kind == CliFailure::StdinWrite
-            || (self.kind == CliFailure::Exit
-                && !matches!(self.code.and_then(ExitKind::from_code), Some(ExitKind::Failure | ExitKind::Usage)))
     }
 }
 
@@ -2599,71 +2349,13 @@ fn describe_capture(stdout: &str, stderr: String) -> Result<OpDone, String> {
     })
 }
 
-fn do_vendor_read(propcode: u16, serial: Option<&str>) -> Result<VendorOut, String> {
-    vendor_read_via(&locate_cli()?, propcode, serial, CAMERA_CLI_TIMEOUT)
-}
-
-/// Read a vendor property via `0x943B`, bypassing the MAID SDK entirely —
-/// no Discover/connect needed first, unlike every other worker function
-/// here. Runs `nikon-fleet vendor-read` as a **subprocess**, not
-/// `ptp_usb::read_vendor_property` in-process.
-///
-/// Why (finding nikon-fleet-20260909-7b2e#12): in-process, this runs on the
-/// GUI worker thread and, via `ptp_usb::claim_with_retry`, SIGKILLs
-/// `ptpcamerad`/`icdd` and repeatedly re-asserts the USB configuration. The
-/// codebase already had to fix a crash of the same shape (commit 48704d5:
-/// USB device events reaching the AppKit run loop mid-frame invalidated the
-/// Metal surface and segfaulted the GUI), and whether this path triggers it
-/// was never verified. A subprocess takes the question away: the churn
-/// happens outside this process, and if the child dies it comes back as an
-/// error string.
-fn vendor_read_via(cli: &Path, propcode: u16, serial: Option<&str>, timeout: Duration) -> Result<VendorOut, String> {
-    let out = run_cli(cli, &vendor_read_argv(propcode, serial), None, timeout).map_err(|e| e.message)?;
-    Ok(VendorOut { text: out.stdout, stderr: out.stderr })
-}
-
-/// Write an FTP profile via `0x90EE`. Same no-Discover-needed property as
-/// `vendor_read_via`, same reason for the subprocess, with the password piped on stdin
-/// (never in argv, where `ps` would show it).
-///
-/// No GUI control for `--force-unconfirmed-model` yet — never passed, so the GUI can only
-/// write to models ptp_usb's confirmed-safe list covers.
-fn do_vendor_write_ftp(profile: &FtpProfile, serial: Option<&str>) -> Result<VendorOut, String> {
-    vendor_write_via(&locate_cli()?, profile, serial, CAMERA_CLI_TIMEOUT)
-}
-
-fn vendor_write_via(cli: &Path, profile: &FtpProfile, serial: Option<&str>, timeout: Duration) -> Result<VendorOut, String> {
-    let out = run_cli(cli, &vendor_write_ftp_argv(profile, serial), Some(&profile.password), timeout)
-        .map_err(|e| ftp_write_failure(&e))?;
-    let text = if out.stdout.is_empty() {
-        format!("The CLI reported success writing FTP profile {:?} but printed no confirmation.", profile.profile_name)
-    } else {
-        out.stdout
-    };
-    Ok(VendorOut { text, stderr: out.stderr })
-}
-
-/// A failed FTP write. When the run was cut off after the data may have gone out, or the
-/// child took a truncated password, the camera may have changed: not a plain failure.
-fn ftp_write_failure(e: &CliError) -> String {
-    if e.kind == CliFailure::Exit && e.code == Some(EXIT_WRITE_INDETERMINATE) {
-        format!(
-            "The camera may have changed: check the FTP profile in the camera's menu, or read it back with the command \
-             line (`nikon-fleet vendor-read-ftp --slot 0`, from a new session: a written profile moves to the front). {}",
-            e.message
-        )
-    } else if e.write_outcome_unknown() {
-        format!(
-            "{} The camera MAY have taken the profile (possibly an incomplete one): check its FTP settings before writing again.",
-            e.message
-        )
-    } else {
-        e.message.clone()
-    }
-}
-
 // ── The FTP profile form ──────────────────────────────────────────────────
+//
+// The entry form and its validation, left from the Vendor Ops window (removed: it wrote to a
+// camera, which the snapshot flows now do). Nothing draws it at the moment; it is kept, with its
+// tests, for the snapshot viewer's profile editor.
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FtpForm {
     profile_name: String,
@@ -2689,6 +2381,7 @@ impl Default for FtpForm {
     }
 }
 
+#[allow(dead_code)]
 impl FtpForm {
     fn raw(&self, field: FtpField) -> &str {
         match field {
@@ -2741,6 +2434,7 @@ impl FtpForm {
 /// with the password redacted — the hex dump would otherwise show it byte for byte — and that
 /// copy encodes exactly when the real profile does, so a profile the camera write would reject
 /// is rejected here, before anything is confirmed.
+#[allow(dead_code)]
 fn prepare_ftp(form: &FtpForm) -> Result<(FtpProfile, String), String> {
     let profile = form.build()?;
     let blob = ptp_usb::encode_ftp_profile(&profile.with_password_redacted()).map_err(|e| e.to_string())?;
@@ -2751,49 +2445,6 @@ fn prepare_ftp(form: &FtpForm) -> Result<(FtpProfile, String), String> {
     );
     Ok((profile, preview))
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WriteTarget {
-    model: String,
-    serial: String,
-}
-
-fn write_target(camera: Option<&CameraRow>) -> Option<WriteTarget> {
-    camera.map(|c| WriteTarget { model: c.model.clone(), serial: c.serial.clone() })
-}
-
-/// A write the user has been asked to confirm. It holds the exact profile and target the
-/// confirmation text names; "Confirm Write" sends these, not whatever the form and the
-/// camera selection say by then, and any change to either withdraws the confirmation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingWrite {
-    profile: FtpProfile,
-    form: FtpForm,
-    target: Option<WriteTarget>,
-}
-
-impl PendingWrite {
-    fn new(profile: FtpProfile, form: &FtpForm, camera: Option<&CameraRow>) -> Self {
-        PendingWrite { profile, form: form.clone(), target: write_target(camera) }
-    }
-
-    fn is_stale(&self, form: &FtpForm, camera: Option<&CameraRow>) -> bool {
-        self.form != *form || self.target != write_target(camera)
-    }
-
-    fn confirm_text(&self) -> String {
-        let p = &self.profile;
-        let target = match &self.target {
-            Some(t) => format!("{} (serial {})", t.model, t.serial),
-            None => "the only Nikon camera on USB (none is selected here; the CLI refuses if several are attached)".into(),
-        };
-        format!(
-            "Overwrite the FTP profile on {target} with {:?} ({}@{}:{})? This cannot be read back or undone from here.",
-            p.profile_name, p.username, p.host, p.port
-        )
-    }
-}
-
 
 // ── Transplant: plan, confirm, apply ──────────────────────────────────────
 //
@@ -5924,191 +5575,6 @@ mod tests {
         assert!(matches!(with_data_dir(&Ok(PathBuf::from("/d")), |d| Evt::Err(d.display().to_string())), Evt::Err(m) if m == "/d"));
     }
 
-    // ── vendor ops ──────────────────────────────────────────────────────────
-
-    fn sample_profile() -> FtpProfile {
-        FtpProfile {
-            profile_name: "CLAUDE".to_string(),
-            ssid_24ghz: "n24".to_string(),
-            ssid_5ghz: "n5".to_string(),
-            host: "ftp.example.com".to_string(),
-            port: 2121,
-            username: "user".to_string(),
-            password: "s3cret pw".to_string(),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn vendor_write_sends_the_password_on_stdin_and_never_in_argv() {
-        let dir = TempDir::new().unwrap();
-        let cli = recording_cli(dir.path(), "echo 'Wrote FTP profile \"CLAUDE\" (user@ftp.example.com:2121)'");
-        let p = sample_profile();
-        let out = vendor_write_via(&cli, &p, Some("SER1"), T).unwrap();
-        assert_eq!(out.text, "Wrote FTP profile \"CLAUDE\" (user@ftp.example.com:2121)");
-        assert_eq!(fs::read_to_string(dir.path().join("stdin.txt")).unwrap(), "s3cret pw");
-        let argv = argv_of(dir.path());
-        assert!(argv.iter().all(|a| !a.contains("s3cret")), "password leaked into argv:\n{argv:?}");
-        assert_eq!(argv, vendor_write_ftp_argv(&p, Some("SER1")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn vendor_stderr_from_a_successful_run_is_kept_and_shown_next_to_the_result() {
-        // H27: the unconfirmed-model warning and a reply that did not match its command.
-        let dir = TempDir::new().unwrap();
-        let cli = recording_cli(dir.path(), "echo 'warning: model not confirmed' >&2\necho '0xd053: 2 byte(s): aa bb'");
-        let out = vendor_read_via(&cli, 0xD053, Some("SER1"), T).unwrap();
-        assert_eq!(out.text, "0xd053: 2 byte(s): aa bb");
-        assert_eq!(out.stderr, "warning: model not confirmed");
-        assert_eq!(argv_of(dir.path()), ["vendor-read", "0xd053", "--serial=SER1"]);
-        let shown = with_stderr(&out.text, &out.stderr);
-        assert!(shown.contains("0xd053: 2 byte(s)") && shown.contains("[stderr]") && shown.contains("model not confirmed"), "{shown}");
-        assert_eq!(with_stderr("x", "  \n"), "x", "an empty stderr adds nothing");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn vendor_write_failure_is_an_error_and_no_success_message() {
-        let dir = TempDir::new().unwrap();
-        let cli = script(dir.path(), "nikon-fleet", "cat >/dev/null\necho 'Error: could not claim the PTP USB interface' >&2\nexit 1");
-        assert_eq!(vendor_write_via(&cli, &sample_profile(), None, T).unwrap_err(), "Error: could not claim the PTP USB interface");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn vendor_read_failure_is_an_error() {
-        let dir = TempDir::new().unwrap();
-        let cli = script(dir.path(), "nikon-fleet", "echo 'Error: no Nikon USB camera found' >&2\nexit 1");
-        assert_eq!(vendor_read_via(&cli, 0xD053, None, T).unwrap_err(), "Error: no Nikon USB camera found");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_write_that_was_cut_off_or_took_a_truncated_password_says_the_camera_may_have_changed() {
-        let dir = TempDir::new().unwrap();
-        // Hung: killed at the limit, after the data may have gone out.
-        let hung = script(dir.path(), "hung", "cat > /dev/null &\nexec sleep 30");
-        let e = vendor_write_via(&hung, &sample_profile(), None, Duration::from_millis(500)).unwrap_err();
-        assert!(e.contains("did not finish") && e.contains("MAY have taken the profile"), "{e}");
-        // Exit 0 without reading the whole password.
-        let early = script(dir.path(), "early", "exit 0");
-        let mut p = sample_profile();
-        p.password = "x".repeat(1_000_000);
-        let e = vendor_write_via(&early, &p, None, T).unwrap_err();
-        assert!(e.contains("could not be given its input") && e.contains("MAY have taken"), "{e}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn exit_status_4_from_the_write_command_means_the_camera_may_have_changed() {
-        let dir = TempDir::new().unwrap();
-        // The message text is deliberately unhelpful: only the exit status may decide.
-        let indeterminate =
-            script(dir.path(), "ind", &format!("cat > /dev/null\necho 'Error: write failed' >&2\nexit {EXIT_WRITE_INDETERMINATE}"));
-        let e = vendor_write_via(&indeterminate, &sample_profile(), None, T).unwrap_err();
-        assert!(e.contains("camera may have changed") && e.contains("camera's menu") && e.contains("vendor-read-ftp --slot 0"), "{e}");
-        assert!(!e.contains("cannot read it back"), "vendor-read-ftp works on the Z 9 and Z6III: {e}");
-        assert!(e.contains("Error: write failed"), "the CLI's own text is kept: {e}");
-        // The CLI's definitive refusals (1, 2) are plain failures.
-        for code in [1, 2] {
-            let plain = script(dir.path(), "plain", &format!("cat > /dev/null\necho 'Error: write failed' >&2\nexit {code}"));
-            assert_eq!(vendor_write_via(&plain, &sample_profile(), None, T).unwrap_err(), "Error: write failed", "exit {code}");
-        }
-        // A read is not a write: 4 means nothing special there.
-        let read = script(dir.path(), "read", &format!("echo 'Error: x' >&2\nexit {EXIT_WRITE_INDETERMINATE}"));
-        assert_eq!(vendor_read_via(&read, 0xD053, None, T).unwrap_err(), "Error: x");
-        // The code is carried typed on the error.
-        let (p, a) = sh(&format!("exit {EXIT_WRITE_INDETERMINATE}"));
-        assert_eq!(run_cli(&p, &a, None, T).unwrap_err().code, Some(EXIT_WRITE_INDETERMINATE));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_write_child_that_dies_or_panics_may_have_changed_the_camera() {
-        let dir = TempDir::new().unwrap();
-        let may = |e: &str| e.contains("MAY have taken the profile");
-        // Killed by a signal after reading its input: no exit code at all.
-        let killed = script(dir.path(), "killed", "cat > /dev/null\nkill -KILL $$");
-        let e = vendor_write_via(&killed, &sample_profile(), None, T).unwrap_err();
-        assert!(may(&e), "{e}");
-        // A Rust panic exits 101; any status other than the CLI's own 1 and 2 is unknown territory.
-        for code in [101, 3, 5, 127] {
-            let c = script(dir.path(), "panic", &format!("cat > /dev/null\necho 'thread main panicked' >&2\nexit {code}"));
-            let e = vendor_write_via(&c, &sample_profile(), None, T).unwrap_err();
-            assert!(may(&e) && e.contains("panicked"), "exit {code}: {e}");
-        }
-        // Exits 1 and 2 stay definitive, and 4 keeps its own wording.
-        for code in [1, 2] {
-            let c = script(dir.path(), "refused", &format!("cat > /dev/null\necho 'refused' >&2\nexit {code}"));
-            assert_eq!(vendor_write_via(&c, &sample_profile(), None, T).unwrap_err(), "refused", "exit {code}");
-        }
-        let four = script(dir.path(), "four", &format!("cat > /dev/null\necho 'x' >&2\nexit {EXIT_WRITE_INDETERMINATE}"));
-        let e = vendor_write_via(&four, &sample_profile(), None, T).unwrap_err();
-        assert!(e.contains("camera may have changed") && !may(&e), "{e}");
-        // A read that dies is just a failed read.
-        let read = script(dir.path(), "read", "kill -KILL $$");
-        assert!(!may(&vendor_read_via(&read, 0xD053, None, T).unwrap_err()));
-    }
-
-    #[test]
-    fn a_plain_exit_failure_of_a_write_is_not_dressed_up_as_indeterminate() {
-        let e = CliError { kind: CliFailure::Exit, message: "refused".into(), stdout: String::new(), stderr: String::new(), code: Some(1) };
-        assert_eq!(ftp_write_failure(&e), "refused");
-        for kind in [CliFailure::TimedOut, CliFailure::Wait, CliFailure::StdinWrite] {
-            let e = CliError { kind, ..e.clone() };
-            assert!(ftp_write_failure(&e).contains("MAY have taken"), "{kind:?}");
-        }
-    }
-
-    #[test]
-    fn the_guis_kill_timeouts_leave_the_clis_teardown_watchdog_room_to_end_the_run_first() {
-        // Three unrelated constants (finding 9): the watchdog in the library, the supervisor's grace in the MCP crate, and
-        // these. A run that is only waiting for its disconnect to be cut must not be killed by the GUI first. (The plan
-        // and apply timeouts also have to cover a whole camera session, 4-20 s a read, before any teardown.)
-        let worst = nikon_fleet::process_exit::TEARDOWN_WORST_CASE;
-        for (name, t) in [("CAMERA_CLI_TIMEOUT", CAMERA_CLI_TIMEOUT), ("TRANSPLANT_APPLY_TIMEOUT", TRANSPLANT_APPLY_TIMEOUT)] {
-            assert!(t > worst * 3, "{name} = {t:?} must leave the {worst:?} watchdog plenty of room");
-        }
-        assert!(TRANSPLANT_APPLY_TIMEOUT > CAMERA_CLI_TIMEOUT, "an apply adds a restore point and a read-back to the session");
-    }
-
-    #[test]
-    fn the_guis_reading_of_a_write_status_agrees_with_the_cli_for_every_kind_of_camera_error() {
-        // Finding 4: the GUI had its own `EXIT_FTP_WRITE_INDETERMINATE = 4` beside the CLI's constant, with nothing tying
-        // them together. Both now come from `nikon_fleet::exit_status`; this walks the camera errors a write can end
-        // with, takes the status the CLI would exit with for each (`write_kind_of_ptp_usb_error`, which the CLI's
-        // `exit_code_for` is built on) and checks what the GUI makes of a child that exited with it.
-        use nikon_fleet::exit_status::write_kind_of_ptp_usb_error;
-        use nikon_fleet::ptp_usb::PtpUsbError as E;
-        let cause = || Box::new(E::SessionPoisoned { cause: "x".into() });
-        let errors = [
-            (E::FtpWriteIndeterminate { cause: cause() }, true),
-            (E::PropWriteIndeterminate { propcode: 0xD090, cause: cause() }, true),
-            (E::NoDevice, false),
-            (E::ShortWrite { written: 1, expected: 2 }, false),
-            (E::SessionPoisoned { cause: "x".into() }, false),
-            (E::UnconfirmedModel("Z 5".into()), false),
-            (E::PropNotWritable { propcode: 0xD090, get_set: 0 }, false),
-            (E::FtpWriteRefused { slot: 9, param2: 1, why: ptp_usb::FtpWriteRefusal::SlotHangsCamera }, false),
-        ];
-        for (err, indeterminate) in errors {
-            let code = write_kind_of_ptp_usb_error(&err).code();
-            let e = CliError { kind: CliFailure::Exit, message: "m".into(), stdout: String::new(), stderr: String::new(), code: Some(code) };
-            let text = ftp_write_failure(&e);
-            assert_eq!(text.contains("camera may have changed"), indeterminate, "{err:?} -> exit {code} -> {text}");
-            // Whatever the wording, an indeterminate status is never read as a refusal that is safe to retry.
-            assert_eq!(e.write_outcome_unknown(), indeterminate || code != 1, "{err:?} -> exit {code}");
-            assert_eq!(code == EXIT_WRITE_INDETERMINATE, indeterminate, "{err:?}");
-        }
-        // The GUI's own constants are the library's: 4 is the indeterminate write, 1 and 2 stay definitive.
-        assert_eq!(ExitKind::WriteIndeterminate.code(), 4);
-        for definitive in [ExitKind::Failure, ExitKind::Usage] {
-            let e = CliError { kind: CliFailure::Exit, message: "m".into(), stdout: String::new(), stderr: String::new(), code: Some(definitive.code()) };
-            assert!(!e.write_outcome_unknown(), "{definitive:?}");
-        }
-    }
-
     // ── the FTP form (G50, G40, T04) ────────────────────────────────────────
 
     fn filled_form() -> FtpForm {
@@ -6210,58 +5676,6 @@ mod tests {
         assert!(prepare_ftp(&f).is_ok());
         f.ssid_5ghz = "caf\u{e9}".into();
         assert!(prepare_ftp(&f).is_err(), "non-ASCII where the wire format is ASCII");
-    }
-
-    #[test]
-    fn a_confirmation_names_the_exact_camera_and_not_the_password() {
-        let form = filled_form();
-        let (profile, _) = prepare_ftp(&form).unwrap();
-        let cam = row("Z 9", "30012345", 1);
-        let p = PendingWrite::new(profile.clone(), &form, Some(&cam));
-        let text = p.confirm_text();
-        assert!(text.contains("Z 9") && text.contains("30012345") && text.contains("CLAUDE") && text.contains("ftp.example.com:2121"), "{text}");
-        assert!(!text.contains("topsecret"));
-        let none = PendingWrite::new(profile, &form, None).confirm_text();
-        assert!(none.contains("only Nikon camera"), "{none}");
-    }
-
-    #[test]
-    fn a_confirmation_is_withdrawn_when_the_camera_or_any_form_field_changes() {
-        let form = filled_form();
-        let (profile, _) = prepare_ftp(&form).unwrap();
-        let cam = row("Z 9", "AAA", 2);
-        let p = PendingWrite::new(profile, &form, Some(&cam));
-        assert!(!p.is_stale(&form, Some(&cam)), "unchanged: still good");
-        // The other body of the same model (the case the finding describes).
-        assert!(p.is_stale(&form, Some(&row("Z 9", "BBB", 2))));
-        assert!(p.is_stale(&form, Some(&row("Z6_3", "AAA", 2))));
-        assert!(p.is_stale(&form, None));
-        let edits: [fn(&mut FtpForm); 7] = [
-            |f| f.profile_name.push('x'),
-            |f| f.ssid_24ghz.push('x'),
-            |f| f.ssid_5ghz.push('x'),
-            |f| f.host.push('x'),
-            |f| f.port = "22".into(),
-            |f| f.username.push('x'),
-            |f| f.password.push('x'),
-        ];
-        for (i, edit) in edits.iter().enumerate() {
-            let mut changed = form.clone();
-            edit(&mut changed);
-            assert!(p.is_stale(&changed, Some(&cam)), "field edit #{i}");
-        }
-        // A re-discover that merely re-reports the same body is not a change.
-        assert!(!p.is_stale(&form, Some(&CameraRow { firmware: "9.99".into(), ..cam.clone() })));
-    }
-
-    #[test]
-    fn what_is_sent_is_what_was_confirmed_not_the_form_as_it_is_later() {
-        let mut form = filled_form();
-        let (profile, _) = prepare_ftp(&form).unwrap();
-        let p = PendingWrite::new(profile, &form, Some(&row("Z 9", "AAA", 1)));
-        form.host = "attacker.example".into();
-        assert_eq!(p.profile.host, "ftp.example.com");
-        assert_eq!(p.target.as_ref().map(|t| t.serial.as_str()), Some("AAA"));
     }
 
     // ── archive names (T01, T02) ────────────────────────────────────────────
@@ -7432,10 +6846,6 @@ mod tests {
         std::path::absolute(Path::new(data_dir).join("snapshots").join(file)).unwrap().to_str().unwrap().to_string()
     }
 
-    fn pos(argv: &[String], what: &str) -> usize {
-        argv.iter().position(|a| a == what).unwrap_or_else(|| panic!("{what} not in {argv:?}"))
-    }
-
     #[test]
     fn a_plan_asks_for_a_dry_run_and_cannot_carry_a_confirmation() {
         let argv = transplant_argv(Path::new("/data"), &tp_request(&[]), None).unwrap();
@@ -8223,12 +7633,6 @@ mod tests {
             about_open: false,
             #[cfg(target_os = "macos")]
             native_menu: None,
-            vendor_ops_open: false,
-            vendor_propcode: String::new(),
-            vendor_read_result: String::new(),
-            ftp_form: FtpForm::default(),
-            pending_write: None,
-            vendor_write_result: String::new(),
             transplant: TransplantUi::default(),
             restore: RestoreUi::default(),
             restore_ext: ExtRestoreUi::default(),
@@ -8318,11 +7722,10 @@ mod tests {
             app.do_menu_action(&ctx, MenuAction::Transplant);
             app.do_menu_action(&ctx, MenuAction::Restore);
             app.do_menu_action(&ctx, MenuAction::Check);
-            app.do_menu_action(&ctx, MenuAction::VendorOps);
             app.do_menu_action(&ctx, MenuAction::Firmware);
             app.do_menu_action(&ctx, MenuAction::About);
             assert!(app.prefs_open && app.transplant.open && app.restore.open && app.check.open);
-            assert!(app.vendor_ops_open && app.firmware.open && app.about_open);
+            assert!(app.firmware.open && app.about_open);
         }
     }
 
@@ -8833,13 +8236,7 @@ mod tests {
         assert_eq!(cmd_name(&Cmd::Import { src: PathBuf::from("/x") }), "import");
         assert_eq!(cmd_name(&Cmd::Export { dest: PathBuf::from("/x") }), "export");
         assert_eq!(cmd_name(&Cmd::SetReference { file: "f".into() }), "set_reference");
-        assert_eq!(cmd_name(&Cmd::VendorRead { propcode: 1, serial: None }), "vendor_read");
         assert_eq!(evt_outcome(&Evt::Err("x".into())), nikon_fleet::diag::Outcome::Failed);
-        assert_eq!(evt_outcome(&Evt::Vendor { op: VendorOp::Read, result: Err("x".into()) }), nikon_fleet::diag::Outcome::Failed);
-        assert_eq!(
-            evt_outcome(&Evt::Vendor { op: VendorOp::Read, result: Ok(VendorOut { text: String::new(), stderr: String::new() }) }),
-            nikon_fleet::diag::Outcome::Ok
-        );
     }
 
     #[test]

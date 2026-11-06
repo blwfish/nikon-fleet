@@ -22,9 +22,7 @@ use std::process::{Command, Output};
 use std::sync::OnceLock;
 
 use nikon_fleet::ops::cameras::describe_device;
-use nikon_fleet::ptp_usb::FtpProfile;
 use nikon_fleet::sdk::{DeviceInfo, UsbCameraInfo};
-use nikon_fleet::vendor_argv::{vendor_read_argv, vendor_write_ftp_argv};
 
 use crate::check::{CheckRequest, check_argv};
 use crate::firmware_win::FwOp;
@@ -73,19 +71,6 @@ fn parse_only(argv: &[String]) -> Output {
 
 fn camera() -> CameraRow {
     CameraRow { model: "Z 9".into(), serial: "-S1".into(), firmware: "5.31".into(), known_model: true, baseline: true, model_count: 1 }
-}
-
-fn profile(dashed: bool) -> FtpProfile {
-    let v = |s: &str| if dashed { format!("-{s}") } else { s.to_string() };
-    FtpProfile {
-        profile_name: v("CLAUDE"),
-        ssid_24ghz: v("net24"),
-        ssid_5ghz: v("net5"),
-        host: v("ftp.example.com"),
-        port: 2121,
-        username: v("user"),
-        password: "-s3cret".into(),
-    }
 }
 
 /// Which `FwOp` variant, by an exhaustive match: a new variant stops compiling here until it is
@@ -175,11 +160,6 @@ fn all_shapes(dir: &Path) -> Vec<(String, Vec<String>)> {
     add("transplant apply", transplant_argv(dir, &transplant(&[]), Some(("abc123", "summary"))).unwrap());
     add("transplant apply, dashed summary", transplant_argv(dir, &transplant(&["kNkMAIDCapability_MeteringMode"]), Some(("-d", "-s: --x"))).unwrap());
 
-    add("vendor-read", vendor_read_argv(0xD053, None));
-    add("vendor-read, serial", vendor_read_argv(0x0053, Some("-S1")));
-    add("vendor-write-ftp", vendor_write_ftp_argv(&profile(false), None));
-    add("vendor-write-ftp, serial", vendor_write_ftp_argv(&profile(false), Some("30012345")));
-    add("vendor-write-ftp, dashed", vendor_write_ftp_argv(&profile(true), Some("-S1")));
     v
 }
 
@@ -220,7 +200,7 @@ fn the_shapes_cover_every_cli_command_the_gui_runs() {
     let (_d, cases) = shapes();
     let covered: BTreeSet<String> = cases.iter().map(|(_, a)| command_of(a)).collect();
     let expected: BTreeSet<String> = [
-        "discover", "snapshot", "check", "restore", "restore-extended", "transplant", "vendor-read", "vendor-write-ftp", "firmware latest",
+        "discover", "snapshot", "check", "restore", "restore-extended", "transplant", "firmware latest",
         "firmware browse", "firmware add", "firmware fetch", "firmware pin", "firmware rollback",
     ]
     .iter()
@@ -263,17 +243,17 @@ fn a_misspelled_flag_fails_the_parse_for_every_flag_of_every_shape() {
 #[test]
 fn a_dashed_value_in_the_space_separated_form_is_refused() {
     let (_d, cases) = shapes();
-    let (_, base) = cases.iter().find(|(n, _)| n == "vendor-write-ftp, dashed").unwrap();
+    let (_, base) = cases.iter().find(|(n, _)| n == "restore-extended apply, dashed summary").unwrap();
     assert!(parse_only(base).status.success(), "the unmodified argv must parse");
     let spaced: Vec<String> = base
         .iter()
         .flat_map(|a| match a.split_once('=') {
-            Some(("--profile-name", v)) => vec!["--profile-name".to_string(), v.to_string()],
+            Some(("--expect-summary", v)) => vec!["--expect-summary".to_string(), v.to_string()],
             _ => vec![a.clone()],
         })
         .collect();
     assert_ne!(&spaced, base, "the control must actually change something");
-    assert_eq!(parse_only(&spaced).status.code(), Some(2), "`--profile-name -CLAUDE` must be refused; the GUI uses `=`");
+    assert_eq!(parse_only(&spaced).status.code(), Some(2), "`--expect-summary -s: --x` must be refused; the GUI uses `=`");
 }
 
 #[test]
