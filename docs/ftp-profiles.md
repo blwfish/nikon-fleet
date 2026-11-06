@@ -12,8 +12,8 @@ Code: `src/ftp_edit.rs` (fields), `ptp_usb::encode_decoded_ftp_profile` (the wri
 | field | meaning | CLI |
 |---|---|---|
 | name | shown in the camera's menu | `--name` |
-| Wi-Fi name | the 2.4 GHz SSID field | `--wifi-name` |
-| Wi-Fi key | stored in what the encoder calls the 5 GHz SSID field; **probably** a passphrase, unconfirmed | `--wifi-key` |
+| Wi-Fi name | the field the encoder calls the 2.4 GHz SSID | `--wifi-name` |
+| Wi-Fi key | stored in what the encoder calls the 5 GHz SSID field; **probably** a passphrase, **unconfirmed** (never checked on a camera) | `--wifi-key` |
 | host, folder, login, password | the server | `--host`, `--folder`, `--user`, `--password` / `--password-stdin` |
 | port | the server's port (the field before the user name) | `--port` |
 | protocol | FTP or SFTP: option bit `0x0008`, confirmed on one profile | `--protocol ftp\|sftp` |
@@ -64,7 +64,27 @@ Steps, each reported with its outcome: look the host up, connect, (SFTP) the SSH
 and, unless `--no-file-check`, put a small uniquely-named file there, fetch it back, compare it and delete it. A failure
 names the step, the address and port tried, the server's own words and a hint in terms of the profile; a file that
 could not be deleted is named so it can be removed by hand. Exit status 0 only if every step passed. `--json` prints
-the report (never the password). FTP transfers are binary, as the camera's are.
+the report. FTP transfers are set to binary type (the client's default, ASCII, rewrites line endings); that the
+camera itself sends binary is an assumption, not something checked.
+
+The last line says what was tried: with `--no-file-check` a pass reads "the login and the folder passed; no test file was
+put, so writing to the folder is not tested", and only a run that also put, fetched, compared and deleted the file reads
+"the server accepted this profile". After a failed upload that may have left part of a file (a timeout, an aborted
+transfer; not a plain refusal) the test still tries to delete it, and names it if it cannot.
+
+**The report never holds the password**: it is not stored, and any copy of it in text the server or the client library
+produced (a server may echo it in a refusal) is replaced by `<password hidden>`. A server that echoes it altered is not
+caught. A failure keeps the server's own words; when the server answered with an FTP reply code the code is also a field
+(`reply_code` in the JSON), and what a code means goes through one table in `src/ftp_test.rs` (`classify_reply`): 530 at
+the login is a refused login, 421 is a server that will not serve right now (not a wrong password), 550 at the folder is a
+missing folder, and a code the table does not list is "other" with the server's words.
+
+**Time limits.** `--timeout` is seconds per step, and per address while connecting (a name with several addresses can take
+that long for each). For FTP it covers the connection, every read and write on the control connection, and the data
+connection (connecting to the passive address and each read and write on it), which the client library does not limit
+by itself. The window's worker has no cancel; it ends when the steps do. A data address the server announces that no
+packet can reach is waited on for at most the timeout. The test file is read back with a size limit (64 KiB); more than
+that is reported as a data mismatch.
 
 What it cannot tell: a wrong host name and a server on a network this computer is not on both look like "could not
 reach", and the hint says so. It tests the server side only; whether the camera can join the Wi-Fi network is not
@@ -80,5 +100,11 @@ current-thread tokio runtime the test creates for itself. About 60 crates are ne
   template. The check is to restore such a copy to a body and read the profile back (`vendor-read-ftp`).
 - Which option bit is passive mode, and whether any is FTPS: change one menu setting at a time and compare
   `vendor-read-ftp` (see `docs/property-sweep.md`).
-- The test against a real server (both protocols are tested against servers run in the tests, which found two bugs in
-  the test itself: ASCII-mode transfers rewriting line endings, and a wait with no timeout for a server's greeting).
+- The test against a real server. Nothing here has been run against a real FTP or SFTP server; both protocols are tested
+  only against servers written for the tests. Those servers behave as this program was written to expect: the FTP one
+  rewrites line endings in ASCII type and records `TYPE I`, so dropping the binary setting fails a test, and one that
+  accepts and never speaks must time out; how real servers differ (reply wording, ASCII/binary handling, passive-mode
+  address announcements, what they list for a login that may write but not read) is unknown.
+- How an SFTP server that offers only keys, or one that disconnects during the handshake, is reported by `russh`: the
+  kinds were set from the library's documented errors and from the test servers, not from real ones.
+- Whether a write-only upload folder passes the SFTP folder check, which lists the folder.

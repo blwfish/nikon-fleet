@@ -4,27 +4,47 @@
 //! The steps, in order, each with its own outcome: look the host name up; open a connection; (SFTP) the SSH
 //! handshake, which also yields the server's host key fingerprint; log in; go to the folder; and, if asked, put a
 //! small uniquely-named file there, fetch it, compare it with what was sent, and delete it. A step that fails ends the
-//! test, except that a file that was put is still deleted, and one that could not be deleted is named in
-//! [`TestReport::file_left_behind`] so it can be removed by hand.
+//! test, except that a file that was put (or that a failed upload may have left) is still deleted, and one that could
+//! not be deleted is named in [`TestReport::file_left_behind`] so it can be removed by hand.
 //!
 //! What a failure says: the step, the address and port that were tried, the server's own words, and a hint in terms of
 //! the camera's profile. It cannot tell a wrong host name from a server on a network this computer is not on; both are
-//! "could not reach", and the hint says so.
+//! "could not reach", and the hint says so. The server's reply code, when it sent one, is also a typed field
+//! ([`StepOutcome::Failed::reply_code`]); what a code MEANS goes through one table ([`classify_reply`]), not through
+//! the words of the reply.
 //!
 //! This tests the SERVER side only. Whether the camera can join the Wi-Fi network, and whether it behaves the same
 //! (its passive-mode setting, its FTP dialect), is not tested here. Plain FTP only: the profile has no known FTPS
 //! setting. The SFTP host key is not checked against anything (there is nothing to check it against): it is reported.
 //!
-//! The report never holds the password.
+//! Time limits: `step_timeout` applies to each step, and to each address tried while connecting, so a name with
+//! several addresses can take that long for each one. For FTP it also applies to the control connection's reads and
+//! writes and to the data connection (connecting to the passive address, and every read and write on it); the data
+//! connection is made by a builder this module supplies, because the client library's default one has no limit.
+//!
+//! The password is scrubbed from the report: it is not stored, and any place it appears in text the server or the
+//! client library produced (a server may echo it in a reply) is replaced by `<password hidden>` before the report is
+//! returned. This removes the password as typed; a server that echoes it altered (re-cased, encoded) is not caught.
+//!
+//! Nothing here has been run against a real camera, a real FTP server or a real SFTP server; the tests use servers
+//! written for them.
 
-use std::io::Cursor;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::io::{Cursor, Read};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt as _;
 
 pub use crate::ftp_edit::Protocol;
+
+/// The most of the test file that is read back. The file is a couple of hundred bytes; a server that sends more has
+/// not given back what was sent, and reading without a limit would let a server make this computer hold any amount.
+const MAX_TEST_FILE_BYTES: u64 = 64 * 1024;
+
+/// What is written over any copy of the password found in a report.
+const PASSWORD_HIDDEN: &str = "<password hidden>";
 
 impl TestRequest {
     /// Test a stored profile with its own settings (`ftp_edit::profile_view`). The one place that maps a profile's
@@ -55,7 +75,7 @@ pub struct TestRequest {
     pub folder: String,
     /// Also put, fetch, compare and delete a small file.
     pub file_check: bool,
-    /// How long each step may take.
+    /// How long each step may take (and each address tried while connecting; see the module doc).
     pub step_timeout: Duration,
 }
 
@@ -102,6 +122,22 @@ impl Step {
             Step::Delete => "delete it",
         }
     }
+
+    /// Whether this step comes before the server has accepted a login. A connection that dies or sends rubbish up to
+    /// here points at the wrong protocol or port; after it, at a network fault in the middle of a session.
+    fn before_login_accepted(self) -> bool {
+        matches!(self, Step::Resolve | Step::Connect | Step::Handshake | Step::Login)
+    }
+}
+
+/// The steps a protocol's report lists, in order: the one place that says which steps there are. Everything that
+/// skips "the rest" skips what this list says is not yet recorded, so a step added here is skipped everywhere it
+/// should be without anyone counting positions.
+fn plan(protocol: Protocol) -> &'static [Step] {
+    match protocol {
+        Protocol::Ftp => &[Step::Resolve, Step::Connect, Step::Login, Step::Folder, Step::Upload, Step::Download, Step::Compare, Step::Delete],
+        Protocol::Sftp => &[Step::Resolve, Step::Connect, Step::Handshake, Step::Login, Step::Folder, Step::Upload, Step::Download, Step::Compare, Step::Delete],
+    }
 }
 
 /// Why a step failed, as a closed vocabulary. Anything that branches on a failure uses this; the message is for a person.
@@ -122,10 +158,13 @@ pub enum FailKind {
     LoginRefused,
     FolderMissing,
     PermissionDenied,
+    /// The server said it cannot serve this connection now (FTP 421: too many users, shutting down, ...).
+    ServerUnavailable,
     /// The transfer or the delete failed for another reason.
     TransferFailed,
     /// What came back is not what was sent.
     DataMismatch,
+    /// None of the above; also what a reply this program has no entry for becomes. The message has the server's words.
     Other,
 }
 
@@ -133,7 +172,7 @@ impl FailKind {
     /// What to try, in terms of the camera's profile.
     pub fn hint(self) -> &'static str {
         match self {
-            FailKind::NameNotFound => "This computer could not find that host name. Check the spelling; if it is a name only the camera's network knows, try its IP address.",
+            FailKind::NameNotFound => "This computer could not find that host name. Check the spelling (and that this computer is online); if it is a name only the camera's network knows, try its IP address.",
             FailKind::ConnectionRefused => "The address answered but nothing accepted the connection on that port. Check the port (21 for FTP, 22 for SFTP is usual) and that the server is running.",
             FailKind::Unreachable => "There is no route from this computer to that address. If the camera will be on another network, this computer may simply not be on it; that is not necessarily a mistake in the profile.",
             FailKind::TimedOut => "Nothing answered in time. A wrong address, a firewall, or a network this computer is not on all look like this; it cannot tell them apart.",
@@ -142,6 +181,7 @@ impl FailKind {
             FailKind::LoginRefused => "The server refused this user name and password. Check both; the password is not shown here.",
             FailKind::FolderMissing => "The folder does not exist or this user cannot enter it. Check the spelling and capitals; it is relative to the login directory unless it starts with /.",
             FailKind::PermissionDenied => "This user is not allowed to do that in the folder (the test file could not be written, read or deleted). The camera needs to write there.",
+            FailKind::ServerUnavailable => "The server is there but would not serve this connection just now (it may be full, shutting down, or limiting logins). Try again later; this is not a mistake in the profile.",
             FailKind::TransferFailed => "The transfer failed. In FTP this is often the data connection (passive mode) being blocked between this computer and the server.",
             FailKind::DataMismatch => "The file came back different from what was sent; something between here and the server altered it.",
             FailKind::Other => "See the message.",
@@ -149,12 +189,50 @@ impl FailKind {
     }
 }
 
+/// What an FTP reply code means for the step it answered, as a closed table. A code this table does not list is
+/// [`FailKind::Other`]: the message still carries the server's words, and nothing guesses what an unlisted code
+/// meant from the step it arrived in (a 421 on the login is not a wrong password).
+///
+/// Codes are RFC 959's: 421 service not available; 430/530 not logged in / bad login; 450/550 file or folder
+/// unavailable; 451, 452, 552, 425, 426 a transfer that could not be done; 553 name not allowed.
+pub fn classify_reply(step: Step, code: u16) -> FailKind {
+    match (step, code) {
+        (_, 421) => FailKind::ServerUnavailable,
+        (Step::Login, 430 | 530) => FailKind::LoginRefused,
+        (Step::Folder, 450 | 550) => FailKind::FolderMissing,
+        (Step::Upload | Step::Download | Step::Delete, 550 | 553) => FailKind::PermissionDenied,
+        (Step::Upload | Step::Download | Step::Delete, 425 | 426 | 450 | 451 | 452 | 552) => FailKind::TransferFailed,
+        _ => FailKind::Other,
+    }
+}
+
+/// What a failure that did not come with a reply code (a library error that is neither an I/O error nor a reply)
+/// means for the step it happened in.
+fn unreplied_kind(step: Step) -> FailKind {
+    match step {
+        Step::Upload | Step::Download | Step::Compare | Step::Delete => FailKind::TransferFailed,
+        Step::Resolve | Step::Connect | Step::Handshake | Step::Login | Step::Folder => FailKind::Other,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum StepOutcome {
-    Ok { detail: String },
-    Failed { kind: FailKind, message: String, hint: String },
-    Skipped { because: String },
+    Ok {
+        detail: String,
+    },
+    Failed {
+        kind: FailKind,
+        message: String,
+        hint: String,
+        /// The FTP reply code the server answered with, when it answered with one. (SFTP statuses are not FTP codes
+        /// and are in the message only.)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_code: Option<u16>,
+    },
+    Skipped {
+        because: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,11 +250,13 @@ pub struct TestReport {
     pub protocol: Protocol,
     pub folder: String,
     pub steps: Vec<StepResult>,
-    /// Every step that was tried succeeded (and none was skipped for a failure).
+    /// Every step that was tried succeeded (and none was skipped for a failure). A step skipped because the file check
+    /// was not asked for does not make this false; see [`TestReport::fully_tested`].
     pub ok: bool,
     /// The server's host key fingerprint (SFTP), as `SHA256:…`.
     pub host_key: Option<String>,
-    /// The name of a test file put on the server that could not be deleted.
+    /// The name of a test file that was put (or that a failed upload may have left) on the server and could not be
+    /// deleted.
     pub file_left_behind: Option<String>,
 }
 
@@ -184,6 +264,23 @@ impl TestReport {
     /// The first step that failed.
     pub fn failure(&self) -> Option<&StepResult> {
         self.steps.iter().find(|s| matches!(s.outcome, StepOutcome::Failed { .. }))
+    }
+
+    /// Every step passed and none was skipped: the server took the login and the folder AND a file was put, fetched,
+    /// compared and deleted. A pass with the file check off is `ok` but not fully tested.
+    pub fn fully_tested(&self) -> bool {
+        self.ok && !self.steps.iter().any(|s| matches!(s.outcome, StepOutcome::Skipped { .. }))
+    }
+
+    /// The last line of the text report, worded for what was actually tried.
+    pub fn verdict(&self) -> &'static str {
+        if !self.ok {
+            "the test did not pass"
+        } else if self.fully_tested() {
+            "the server accepted this profile"
+        } else {
+            "the login and the folder passed; no test file was put, so writing to the folder is not tested"
+        }
     }
 
     /// For a person, one line per step.
@@ -201,10 +298,38 @@ impl TestReport {
             s.push_str(&format!("  server host key {k}\n"));
         }
         if let Some(f) = &self.file_left_behind {
-            s.push_str(&format!("  WARNING: the test file {f:?} could not be deleted and is still on the server; delete it by hand\n"));
+            let place = if self.folder.trim().is_empty() { "the login directory".to_string() } else { format!("folder {}", self.folder.trim()) };
+            s.push_str(&format!("  WARNING: the test file {f:?} in {place} may still be on the server (it could not be deleted); delete it by hand\n"));
         }
-        s.push_str(if self.ok { "result: the server accepted this profile\n" } else { "result: the test did not pass\n" });
+        s.push_str(&format!("result: {}\n", self.verdict()));
         s
+    }
+
+    /// Replace every copy of `secret` in the report's text. Applied to the password before a report leaves
+    /// [`run_test`]: the client library and the server both produce text (an error message, a reply) this module does
+    /// not control, and either may contain what was sent.
+    fn scrub(&mut self, secret: &str) {
+        if secret.is_empty() {
+            return;
+        }
+        let clean = |t: &mut String| {
+            if t.contains(secret) {
+                *t = t.replace(secret, PASSWORD_HIDDEN);
+            }
+        };
+        for r in &mut self.steps {
+            match &mut r.outcome {
+                StepOutcome::Ok { detail } => clean(detail),
+                StepOutcome::Failed { message, .. } => clean(message),
+                StepOutcome::Skipped { because } => clean(because),
+            }
+        }
+        if let Some(k) = &mut self.host_key {
+            clean(k);
+        }
+        if let Some(f) = &mut self.file_left_behind {
+            clean(f);
+        }
     }
 }
 
@@ -213,21 +338,53 @@ impl TestReport {
 struct Failure {
     kind: FailKind,
     message: String,
+    /// The FTP reply code, when the failure is a reply.
+    code: Option<u16>,
 }
 
 fn fail(kind: FailKind, message: impl Into<String>) -> Failure {
-    Failure { kind, message: message.into() }
+    Failure { kind, message: message.into(), code: None }
+}
+
+impl Failure {
+    /// The same failure with `what` in front of its message (an address, the thing that was being done).
+    fn in_context(self, what: &str) -> Failure {
+        Failure { message: format!("{what}: {}", self.message), ..self }
+    }
+}
+
+/// The failures of trying each address in turn: all of them are reported, not just the last.
+#[derive(Default)]
+struct ConnectTries(Vec<Failure>);
+
+impl ConnectTries {
+    fn note(&mut self, f: Failure) {
+        self.0.push(f);
+    }
+
+    /// One failure: the kind and code of the last attempt, the messages of all of them in the order tried.
+    fn into_failure(mut self) -> Failure {
+        match self.0.pop() {
+            None => fail(FailKind::Other, "no address could be tried"),
+            Some(last) if self.0.is_empty() => last,
+            Some(last) => {
+                let earlier: Vec<String> = self.0.into_iter().map(|f| f.message).collect();
+                Failure { message: format!("{}; {}", earlier.join("; "), last.message), ..last }
+            }
+        }
+    }
 }
 
 struct Recorder {
+    plan: &'static [Step],
     steps: Vec<StepResult>,
     failed: bool,
     started: Instant,
 }
 
 impl Recorder {
-    fn new() -> Recorder {
-        Recorder { steps: Vec::new(), failed: false, started: Instant::now() }
+    fn new(protocol: Protocol) -> Recorder {
+        Recorder { plan: plan(protocol), steps: Vec::new(), failed: false, started: Instant::now() }
     }
 
     fn lap(&mut self) -> u64 {
@@ -244,27 +401,58 @@ impl Recorder {
     fn fail(&mut self, step: Step, f: Failure) {
         let millis = self.lap();
         self.failed = true;
-        self.steps.push(StepResult { step, outcome: StepOutcome::Failed { kind: f.kind, message: f.message, hint: f.kind.hint().to_string() }, millis });
+        self.steps.push(StepResult { step, outcome: StepOutcome::Failed { kind: f.kind, message: f.message, hint: f.kind.hint().to_string(), reply_code: f.code }, millis });
     }
 
     fn skip(&mut self, step: Step, because: impl Into<String>) {
         self.steps.push(StepResult { step, outcome: StepOutcome::Skipped { because: because.into() }, millis: 0 });
     }
 
-    fn skip_rest(&mut self, steps: &[Step]) {
-        for s in steps {
-            self.skip(*s, "an earlier step failed");
+    fn recorded(&self, step: Step) -> bool {
+        self.steps.iter().any(|r| r.step == step)
+    }
+
+    /// Skip every step of the plan that has no outcome yet, saying why for each. Which steps are "the rest" is
+    /// whatever the plan lists and the report lacks, not a position someone counted.
+    fn skip_unrecorded(&mut self, why: impl Fn(Step) -> &'static str) {
+        for s in self.plan {
+            if !self.recorded(*s) {
+                self.skip(*s, why(*s));
+            }
         }
+    }
+
+    /// An earlier step failed: the rest is not tried.
+    fn skip_rest(&mut self) {
+        self.skip_unrecorded(|_| "an earlier step failed");
+    }
+
+    /// The file check was not asked for.
+    fn skip_unasked(&mut self) {
+        self.skip_unrecorded(|_| "not asked for");
+    }
+
+    /// The upload failed in a way that says the server took nothing (a refusal), so there is nothing to fetch or delete.
+    fn skip_after_refused_upload(&mut self) {
+        self.skip_unrecorded(|s| if s == Step::Delete { "nothing was put there" } else { "an earlier step failed" });
     }
 }
 
-fn io_kind(e: &std::io::Error) -> FailKind {
+fn io_kind(step: Step, e: &std::io::Error) -> FailKind {
     use std::io::ErrorKind as K;
     match e.kind() {
         K::ConnectionRefused => FailKind::ConnectionRefused,
         K::TimedOut | K::WouldBlock => FailKind::TimedOut,
         K::HostUnreachable | K::NetworkUnreachable | K::NetworkDown => FailKind::Unreachable,
-        K::UnexpectedEof | K::InvalidData | K::ConnectionReset | K::ConnectionAborted => FailKind::NotThisProtocol,
+        // A connection that dies or sends rubbish before the login is accepted points at the wrong protocol or port;
+        // the same thing in the middle of a session is a network fault, and "check the protocol" would be wrong.
+        K::UnexpectedEof | K::InvalidData | K::ConnectionReset | K::ConnectionAborted | K::BrokenPipe => {
+            if step.before_login_accepted() {
+                FailKind::NotThisProtocol
+            } else {
+                FailKind::TransferFailed
+            }
+        }
         _ => FailKind::Other,
     }
 }
@@ -279,18 +467,72 @@ fn test_file_body(name: &str) -> Vec<u8> {
     format!("nikon-fleet connection test file {name}\nIt was put here and will be deleted by the same test; if you can read this it was left behind.\n").into_bytes()
 }
 
+/// `bytes` limited to `cap`, and whether there was more: one byte past the cap is enough to know, so a reader only
+/// ever has to produce `cap + 1`.
+fn limit_to(mut bytes: Vec<u8>, cap: u64) -> (Vec<u8>, bool) {
+    let over = bytes.len() as u64 > cap;
+    if over {
+        bytes.truncate(cap as usize);
+    }
+    (bytes, over)
+}
+
+/// Read at most `cap` bytes (and learn whether there were more) without ever holding more than `cap + 1`.
+fn read_capped(reader: &mut dyn Read, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut buf = Vec::new();
+    reader.take(cap + 1).read_to_end(&mut buf)?;
+    Ok(limit_to(buf, cap))
+}
+
+/// [`read_capped`] for an async reader.
+async fn read_capped_async<R: tokio::io::AsyncRead + Unpin>(reader: &mut R, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut buf = Vec::new();
+    reader.take(cap + 1).read_to_end(&mut buf).await?;
+    Ok(limit_to(buf, cap))
+}
+
+/// What the comparison step records, from what was sent and what came back (`more` when the server sent more than
+/// the cap). Shared by both protocols.
+fn record_comparison(rec: &mut Recorder, sent: &[u8], got: &[u8], more: bool) {
+    if more {
+        rec.fail(Step::Compare, fail(FailKind::DataMismatch, format!("more than {} bytes came back for {} sent", got.len(), sent.len())));
+    } else if got == sent {
+        rec.ok(Step::Compare, "identical");
+    } else {
+        rec.fail(Step::Compare, fail(FailKind::DataMismatch, format!("{} bytes came back for {} sent", got.len(), sent.len())));
+    }
+}
+
+fn downloaded_words(got: &[u8], more: bool) -> String {
+    if more { format!("more than {} bytes", got.len()) } else { format!("{} bytes", got.len()) }
+}
+
+/// A failed upload leaves nothing to delete only if the server refused the write itself; any other failure (a
+/// timeout, a dropped data connection, an aborted transfer) may have left some of the file.
+fn upload_may_have_left_a_file(kind: FailKind) -> bool {
+    kind != FailKind::PermissionDenied
+}
+
+/// A limit in words for a message: whole seconds as "15", a shorter one as "0.4" (never "0").
+fn limit_words(d: Duration) -> String {
+    if d.subsec_nanos() == 0 { d.as_secs().to_string() } else { format!("{:.1}", d.as_secs_f64()) }
+}
+
 /// Resolve `host:port`, with a limit: the system resolver itself has none.
 fn resolve(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>, Failure> {
     let (tx, rx) = std::sync::mpsc::channel();
     let h = host.to_string();
     std::thread::spawn(move || {
+        // The receiver has gone if the wait below timed out; there is nobody to tell.
         let _ = tx.send((h.as_str(), port).to_socket_addrs().map(|i| i.collect::<Vec<_>>()));
     });
     match rx.recv_timeout(timeout) {
         Ok(Ok(addrs)) if !addrs.is_empty() => Ok(addrs),
         Ok(Ok(_)) => Err(fail(FailKind::NameNotFound, format!("{host:?} resolved to no address"))),
+        // std gives the resolver's failure only as text; there is no code to tell "no such name" from "no network",
+        // so the kind says what was asked (a name that did not resolve) and the hint covers both.
         Ok(Err(e)) => Err(fail(FailKind::NameNotFound, format!("{host:?} could not be resolved ({e})"))),
-        Err(_) => Err(fail(FailKind::TimedOut, format!("looking up {host:?} took more than {} s", timeout.as_secs()))),
+        Err(_) => Err(fail(FailKind::TimedOut, format!("looking up {host:?} took more than {} s", limit_words(timeout)))),
     }
 }
 
@@ -298,9 +540,24 @@ fn show_addrs(addrs: &[SocketAddr]) -> String {
     addrs.iter().map(SocketAddr::to_string).collect::<Vec<_>>().join(", ")
 }
 
+/// The first step, the same for both protocols: the addresses, or the report with everything else skipped.
+fn resolve_step(req: &TestRequest, rec: &mut Recorder) -> Option<Vec<SocketAddr>> {
+    match resolve(&req.host, req.port, req.step_timeout) {
+        Ok(a) => {
+            rec.ok(Step::Resolve, format!("{} -> {}", req.host, show_addrs(&a)));
+            Some(a)
+        }
+        Err(f) => {
+            rec.fail(Step::Resolve, f);
+            rec.skip_rest();
+            None
+        }
+    }
+}
+
 /// Run the test. Blocks; call it off any UI thread. Never panics on a server's behaviour.
 pub fn run_test(req: &TestRequest) -> TestReport {
-    let mut rec = Recorder::new();
+    let mut rec = Recorder::new(req.protocol);
     let mut host_key = None;
     let mut left_behind = None;
     match req.protocol {
@@ -308,150 +565,148 @@ pub fn run_test(req: &TestRequest) -> TestReport {
         Protocol::Sftp => sftp(req, &mut rec, &mut host_key, &mut left_behind),
     }
     let ok = !rec.failed && rec.steps.iter().all(|s| !matches!(s.outcome, StepOutcome::Failed { .. }));
-    TestReport { host: req.host.clone(), port: req.port, protocol: req.protocol, folder: req.folder.clone(), steps: rec.steps, ok, host_key, file_left_behind: left_behind }
+    let mut report = TestReport { host: req.host.clone(), port: req.port, protocol: req.protocol, folder: req.folder.clone(), steps: rec.steps, ok, host_key, file_left_behind: left_behind };
+    report.scrub(&req.password);
+    report
 }
 
 // ── FTP ──────────────────────────────────────────────────────────────────
 
-fn ftp_failure(step_default: FailKind, e: &suppaftp::FtpError) -> Failure {
+/// A TCP connection with the step limit on the connect AND on every later read and write. Every result is checked: a
+/// socket whose limits could not be set is not returned, since it would be waited on for ever.
+fn timed_connect(addr: &SocketAddr, limit: Duration) -> std::io::Result<TcpStream> {
+    let socket = TcpStream::connect_timeout(addr, limit)?;
+    socket.set_read_timeout(Some(limit))?;
+    socket.set_write_timeout(Some(limit))?;
+    Ok(socket)
+}
+
+fn ftp_failure(step: Step, e: &suppaftp::FtpError) -> Failure {
     use suppaftp::FtpError;
     match e {
-        FtpError::ConnectionError(io) => fail(io_kind(io), format!("{io}")),
+        FtpError::ConnectionError(io) => fail(io_kind(step, io), format!("{io}")),
         FtpError::UnexpectedResponse(r) => {
-            let code = r.status as u32;
+            let raw = r.status as u32;
             let text = String::from_utf8_lossy(&r.body).trim().to_string();
-            let kind = match (step_default, code) {
-                (FailKind::LoginRefused, _) => FailKind::LoginRefused,
-                (FailKind::FolderMissing, _) => FailKind::FolderMissing,
-                (_, 550 | 553) => FailKind::PermissionDenied,
-                (other, _) => other,
-            };
-            fail(kind, format!("the server answered {code} {text}"))
+            let code = u16::try_from(raw).ok();
+            Failure { kind: code.map_or(FailKind::Other, |c| classify_reply(step, c)), message: format!("the server answered {raw} {text}"), code }
         }
-        FtpError::BadResponse => fail(FailKind::NotThisProtocol, "the server's reply was not valid FTP"),
-        other => fail(step_default, other.to_string()),
+        FtpError::BadResponse => fail(if step.before_login_accepted() { FailKind::NotThisProtocol } else { FailKind::Other }, "the server's reply was not valid FTP"),
+        other => fail(unreplied_kind(step), other.to_string()),
     }
 }
 
 fn ftp(req: &TestRequest, rec: &mut Recorder, left_behind: &mut Option<String>) {
     use suppaftp::FtpStream;
-    let all = [Step::Resolve, Step::Connect, Step::Login, Step::Folder, Step::Upload, Step::Download, Step::Compare, Step::Delete];
-    let file_steps = [Step::Upload, Step::Download, Step::Compare, Step::Delete];
-    let addrs = match resolve(&req.host, req.port, req.step_timeout) {
-        Ok(a) => {
-            rec.ok(Step::Resolve, format!("{} -> {}", req.host, show_addrs(&a)));
-            a
-        }
-        Err(f) => {
-            rec.fail(Step::Resolve, f);
-            rec.skip_rest(&all[1..]);
-            return;
-        }
-    };
-    let mut last: Option<Failure> = None;
+    let t = req.step_timeout;
+    let Some(addrs) = resolve_step(req, rec) else { return };
+    let mut tries = ConnectTries::default();
     let mut stream = None;
     for a in &addrs {
         // The timeouts go on the socket BEFORE the greeting is read: `FtpStream::connect_timeout` limits only the
         // connect, so a server that accepts and never speaks would be waited on for ever.
-        let socket = match std::net::TcpStream::connect_timeout(a, req.step_timeout) {
+        let socket = match timed_connect(a, t) {
             Ok(sock) => sock,
             Err(e) => {
-                last = Some(fail(io_kind(&e), format!("{a}: {e}")));
+                tries.note(fail(io_kind(Step::Connect, &e), format!("{a}: {e}")));
                 continue;
             }
         };
-        let _ = socket.set_read_timeout(Some(req.step_timeout));
-        let _ = socket.set_write_timeout(Some(req.step_timeout));
         match FtpStream::connect_with_stream(socket) {
             Ok(s) => {
                 stream = Some((s, *a));
                 break;
             }
-            Err(e) => last = Some(Failure { message: format!("{a}: {}", ftp_failure(FailKind::Other, &e).message), ..ftp_failure(FailKind::Other, &e) }),
+            Err(e) => tries.note(ftp_failure(Step::Connect, &e).in_context(&a.to_string())),
         }
     }
-    let Some((mut s, addr)) = stream else {
-        rec.fail(Step::Connect, last.unwrap_or_else(|| fail(FailKind::Other, "no address could be tried")));
-        rec.skip_rest(&all[2..]);
+    let Some((s, addr)) = stream else {
+        rec.fail(Step::Connect, tries.into_failure());
+        rec.skip_rest();
         return;
     };
-    let banner = s.get_welcome_msg().map(|m| m.trim().replace('\n', " ")).unwrap_or_default();
-    rec.ok(Step::Connect, format!("{addr}{}", if banner.is_empty() { String::new() } else { format!(" said {banner:?}") }));
+    // The library's own passive-mode connection has no limit at all: a data address that never answers blocks for the
+    // operating system's connect timeout, and a data connection that goes quiet blocks for ever. This one has the
+    // step limit on the connect and on every read and write.
+    let mut s = s.passive_stream_builder(move |data_addr| timed_connect(&data_addr, t).map_err(suppaftp::FtpError::ConnectionError));
+    let banner = s.get_welcome_msg().map(|m| m.trim().replace('\n', " "));
+    rec.ok(Step::Connect, format!("{addr}{}", banner.filter(|b| !b.is_empty()).map_or_else(String::new, |b| format!(" said {b:?}"))));
 
     if let Err(e) = s.login(req.username.as_str(), req.password.as_str()) {
-        rec.fail(Step::Login, ftp_failure(FailKind::LoginRefused, &e));
-        rec.skip_rest(&all[3..]);
+        rec.fail(Step::Login, ftp_failure(Step::Login, &e));
+        rec.skip_rest();
+        // The verdict is in; the goodbye is courtesy and its failure changes nothing.
         let _ = s.quit();
         return;
     }
     rec.ok(Step::Login, format!("accepted {:?}", req.username));
-    // Binary, as the camera sends images. The client's default is ASCII, which rewrites line endings and would make a
-    // faithful server look like it altered the file.
+    // Binary, because the camera sends images. (Whether the camera itself sends binary is not something this test
+    // knows.) The client's default is ASCII, which rewrites line endings and would make a faithful server look like
+    // it altered the file.
     if let Err(e) = s.transfer_type(suppaftp::types::FileType::Binary) {
-        rec.fail(Step::Folder, ftp_failure(FailKind::TransferFailed, &e));
-        rec.skip_rest(&file_steps);
+        rec.fail(Step::Folder, ftp_failure(Step::Folder, &e).in_context("could not switch to binary transfer"));
+        rec.skip_rest();
         let _ = s.quit();
         return;
     }
 
-    let at = if req.folder.trim().is_empty() {
-        s.pwd().map(|p| format!("staying in the login directory {p}"))
-    } else {
-        s.cwd(req.folder.as_str()).map(|()| format!("in {}", req.folder))
-    };
+    let folder = req.folder.trim();
+    let at = if folder.is_empty() { s.pwd().map(|p| format!("staying in the login directory {p}")) } else { s.cwd(folder).map(|()| format!("in {folder}")) };
     match at {
         Ok(d) => rec.ok(Step::Folder, d),
         Err(e) => {
-            rec.fail(Step::Folder, ftp_failure(FailKind::FolderMissing, &e));
-            rec.skip_rest(&file_steps);
+            rec.fail(Step::Folder, ftp_failure(Step::Folder, &e));
+            rec.skip_rest();
             let _ = s.quit();
             return;
         }
     }
     if !req.file_check {
-        for st in file_steps {
-            rec.skip(st, "not asked for");
-        }
+        rec.skip_unasked();
         let _ = s.quit();
         return;
     }
 
     let name = test_file_name();
     let body = test_file_body(&name);
-    let mut uploaded = false;
-    match s.put_file(name.as_str(), &mut Cursor::new(body.clone())) {
+    let upload_failed = match s.put_file(name.as_str(), &mut Cursor::new(body.clone())) {
         Ok(n) => {
-            uploaded = true;
             rec.ok(Step::Upload, format!("{name} ({n} bytes)"));
+            false
         }
         Err(e) => {
-            rec.fail(Step::Upload, ftp_failure(FailKind::TransferFailed, &e));
-            rec.skip(Step::Download, "an earlier step failed");
-            rec.skip(Step::Compare, "an earlier step failed");
-            rec.skip(Step::Delete, "nothing was put there");
+            let f = ftp_failure(Step::Upload, &e);
+            let may_have_left_a_file = upload_may_have_left_a_file(f.kind);
+            rec.fail(Step::Upload, f);
+            if !may_have_left_a_file {
+                rec.skip_after_refused_upload();
+                let _ = s.quit();
+                return;
+            }
+            true
         }
-    }
-    if uploaded {
-        match s.retr_as_buffer(name.as_str()) {
-            Ok(got) => {
-                rec.ok(Step::Download, format!("{} bytes", got.get_ref().len()));
-                if got.get_ref() == &body {
-                    rec.ok(Step::Compare, "identical");
-                } else {
-                    rec.fail(Step::Compare, fail(FailKind::DataMismatch, format!("{} bytes came back for {} sent", got.get_ref().len(), body.len())));
-                }
+    };
+    if upload_failed {
+        rec.skip(Step::Download, "an earlier step failed");
+        rec.skip(Step::Compare, "an earlier step failed");
+    } else {
+        match s.retr(name.as_str(), |r| read_capped(r, MAX_TEST_FILE_BYTES).map_err(suppaftp::FtpError::ConnectionError)) {
+            Ok((got, more)) => {
+                rec.ok(Step::Download, downloaded_words(&got, more));
+                record_comparison(rec, &body, &got, more);
             }
             Err(e) => {
-                rec.fail(Step::Download, ftp_failure(FailKind::TransferFailed, &e));
+                rec.fail(Step::Download, ftp_failure(Step::Download, &e));
                 rec.skip(Step::Compare, "an earlier step failed");
             }
         }
-        match s.rm(name.as_str()) {
-            Ok(()) => rec.ok(Step::Delete, format!("{name} removed")),
-            Err(e) => {
-                rec.fail(Step::Delete, ftp_failure(FailKind::TransferFailed, &e));
-                *left_behind = Some(name);
-            }
+    }
+    // Whatever happened above, try to remove what may be there; a failed upload can leave part of a file.
+    match s.rm(name.as_str()) {
+        Ok(()) => rec.ok(Step::Delete, format!("{name} removed")),
+        Err(e) => {
+            rec.fail(Step::Delete, ftp_failure(Step::Delete, &e));
+            *left_behind = Some(name);
         }
     }
     let _ = s.quit();
@@ -461,31 +716,39 @@ fn ftp(req: &TestRequest, rec: &mut Recorder, left_behind: &mut Option<String>) 
 
 struct KeyCapture(Arc<Mutex<Option<String>>>);
 
+/// The `SHA256:…` fingerprint of a server's host key; for a host certificate, of the key the certificate carries.
+fn host_key_fingerprint(key: &russh::keys::PublicKeyOrCertificate) -> String {
+    use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate as K};
+    match key {
+        K::PublicKey { key, .. } => key.fingerprint(HashAlg::Sha256).to_string(),
+        K::Certificate(c) => PublicKey::from(c.public_key().clone()).fingerprint(HashAlg::Sha256).to_string(),
+    }
+}
+
 impl russh::client::Handler for KeyCapture {
     type Error = russh::Error;
 
     async fn check_server_key(&mut self, key: &russh::keys::PublicKeyOrCertificate) -> Result<bool, Self::Error> {
-        let fp = match key {
-            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => Some(key.fingerprint(russh::keys::HashAlg::Sha256).to_string()),
-            russh::keys::PublicKeyOrCertificate::Certificate(_) => None,
-        };
+        // The only way the lock is held is by this closure and by the one read after the handshake; neither panics.
         if let Ok(mut slot) = self.0.lock() {
-            *slot = fp.or_else(|| Some("(a certificate)".to_string()));
+            *slot = Some(host_key_fingerprint(key));
         }
         // Nothing to check it against: reported, not trusted.
         Ok(true)
     }
 }
 
+/// What an SFTP error means. `default` is what the step it happened in means by "failed"; a server's "no such file"
+/// is a missing folder only when the step was looking for the folder.
 fn sftp_status_failure(default: FailKind, e: &russh_sftp::client::error::Error) -> Failure {
     use russh_sftp::client::error::Error as E;
     use russh_sftp::protocol::StatusCode as C;
     match e {
         E::Status(st) => {
-            let kind = match (st.status_code, default) {
-                (C::NoSuchFile, FailKind::FolderMissing) | (C::NoSuchFile, _) => FailKind::FolderMissing,
-                (C::PermissionDenied, _) => FailKind::PermissionDenied,
-                (_, d) => d,
+            let kind = match st.status_code {
+                C::PermissionDenied => FailKind::PermissionDenied,
+                C::NoConnection | C::ConnectionLost => FailKind::Other,
+                _ => default,
             };
             fail(kind, format!("the server answered {:?}: {}", st.status_code, st.error_message))
         }
@@ -495,39 +758,38 @@ fn sftp_status_failure(default: FailKind, e: &russh_sftp::client::error::Error) 
 }
 
 fn sftp(req: &TestRequest, rec: &mut Recorder, host_key: &mut Option<String>, left_behind: &mut Option<String>) {
-    let all = [Step::Resolve, Step::Connect, Step::Handshake, Step::Login, Step::Folder, Step::Upload, Step::Download, Step::Compare, Step::Delete];
-    let file_steps = [Step::Upload, Step::Download, Step::Compare, Step::Delete];
-    let addrs = match resolve(&req.host, req.port, req.step_timeout) {
-        Ok(a) => {
-            rec.ok(Step::Resolve, format!("{} -> {}", req.host, show_addrs(&a)));
-            a
-        }
-        Err(f) => {
-            rec.fail(Step::Resolve, f);
-            rec.skip_rest(&all[1..]);
-            return;
-        }
-    };
+    let Some(addrs) = resolve_step(req, rec) else { return };
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
             rec.fail(Step::Connect, fail(FailKind::Other, format!("could not start the network runtime: {e}")));
-            rec.skip_rest(&all[2..]);
+            rec.skip_rest();
             return;
         }
     };
-    rt.block_on(sftp_steps(req, &addrs, rec, host_key, left_behind, &all, &file_steps));
+    rt.block_on(sftp_steps(req, &addrs, rec, host_key, left_behind));
 }
 
 async fn within<T>(limit: Duration, what: &str, f: impl std::future::Future<Output = T>) -> Result<T, Failure> {
-    tokio::time::timeout(limit, f).await.map_err(|_| fail(FailKind::TimedOut, format!("{what} took more than {} s", limit.as_secs())))
+    tokio::time::timeout(limit, f).await.map_err(|_| fail(FailKind::TimedOut, format!("{what} took more than {} s", limit_words(limit))))
 }
 
-async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder, host_key: &mut Option<String>, left_behind: &mut Option<String>, all: &[Step], file_steps: &[Step]) {
+/// A failure of the SSH connection (the handshake, or the login that rides on it). The library reports a closed or refused connection and a bad key exchange alike; only
+/// a peer that sent no SSH version line at all (`Version`) is evidence of the wrong protocol.
+fn ssh_failure(e: &russh::Error) -> Failure {
+    let kind = match e {
+        russh::Error::IO(io) => io_kind(Step::Handshake, io),
+        russh::Error::Version => FailKind::NotThisProtocol,
+        _ => FailKind::HandshakeFailed,
+    };
+    fail(kind, format!("{e}"))
+}
+
+async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder, host_key: &mut Option<String>, left_behind: &mut Option<String>) {
     use russh_sftp::client::SftpSession;
     let t = req.step_timeout;
     // connect
-    let mut last: Option<Failure> = None;
+    let mut tries = ConnectTries::default();
     let mut socket = None;
     for a in addrs {
         match within(t, &format!("connecting to {a}"), tokio::net::TcpStream::connect(*a)).await {
@@ -535,13 +797,13 @@ async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder,
                 socket = Some((s, *a));
                 break;
             }
-            Ok(Err(e)) => last = Some(fail(io_kind(&e), format!("{a}: {e}"))),
-            Err(f) => last = Some(f),
+            Ok(Err(e)) => tries.note(fail(io_kind(Step::Connect, &e), format!("{a}: {e}"))),
+            Err(f) => tries.note(f),
         }
     }
     let Some((socket, addr)) = socket else {
-        rec.fail(Step::Connect, last.unwrap_or_else(|| fail(FailKind::Other, "no address could be tried")));
-        rec.skip_rest(&all[2..]);
+        rec.fail(Step::Connect, tries.into_failure());
+        rec.skip_rest();
         return;
     };
     rec.ok(Step::Connect, addr.to_string());
@@ -553,18 +815,13 @@ async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder,
     let mut handle = match handle {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
-            let kind = match &e {
-                russh::Error::IO(io) => io_kind(io),
-                russh::Error::Disconnect | russh::Error::HUP => FailKind::NotThisProtocol,
-                _ => FailKind::HandshakeFailed,
-            };
-            rec.fail(Step::Handshake, fail(kind, format!("{e}")));
-            rec.skip_rest(&all[3..]);
+            rec.fail(Step::Handshake, ssh_failure(&e));
+            rec.skip_rest();
             return;
         }
         Err(f) => {
             rec.fail(Step::Handshake, f);
-            rec.skip_rest(&all[3..]);
+            rec.skip_rest();
             return;
         }
     };
@@ -573,20 +830,23 @@ async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder,
 
     // login
     match within(t, "logging in", handle.authenticate_password(req.username.as_str(), req.password.as_str())).await {
-        Ok(Ok(r)) if r.success() => rec.ok(Step::Login, format!("accepted {:?}", req.username)),
-        Ok(Ok(_)) => {
+        Ok(Ok(russh::client::AuthResult::Success)) => rec.ok(Step::Login, format!("accepted {:?}", req.username)),
+        Ok(Ok(russh::client::AuthResult::Failure { .. })) => {
+            // The methods the server lists in its refusal are not used: russh's own server leaves out the one just
+            // tried, so the list cannot say whether the server takes a password at all (it would need a separate
+            // "none" request, not checked against a real server).
             rec.fail(Step::Login, fail(FailKind::LoginRefused, "the server did not accept that user name and password (SFTP here tries a password only)"));
-            rec.skip_rest(&all[4..]);
+            rec.skip_rest();
             return;
         }
         Ok(Err(e)) => {
-            rec.fail(Step::Login, fail(FailKind::HandshakeFailed, e.to_string()));
-            rec.skip_rest(&all[4..]);
+            rec.fail(Step::Login, ssh_failure(&e));
+            rec.skip_rest();
             return;
         }
         Err(f) => {
             rec.fail(Step::Login, f);
-            rec.skip_rest(&all[4..]);
+            rec.skip_rest();
             return;
         }
     }
@@ -600,8 +860,9 @@ async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder,
     let sftp = match within(t, "starting SFTP", opened).await {
         Ok(Ok(s)) => s,
         Ok(Err(f)) | Err(f) => {
+            // There is no step of its own for opening the SFTP subsystem; the message says what failed.
             rec.fail(Step::Folder, f);
-            rec.skip_rest(file_steps);
+            rec.skip_rest();
             return;
         }
     };
@@ -621,56 +882,65 @@ async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder,
         }
         Ok(Err(e)) => {
             rec.fail(Step::Folder, sftp_status_failure(FailKind::FolderMissing, &e));
-            rec.skip_rest(file_steps);
+            rec.skip_rest();
             return;
         }
         Err(f) => {
             rec.fail(Step::Folder, f);
-            rec.skip_rest(file_steps);
+            rec.skip_rest();
             return;
         }
     };
     if !req.file_check {
-        for st in file_steps {
-            rec.skip(*st, "not asked for");
-        }
+        rec.skip_unasked();
         return;
     }
 
     let name = test_file_name();
     let path = format!("{}/{name}", folder.trim_end_matches('/'));
     let body = test_file_body(&name);
-    let mut uploaded = false;
-    match within(t, "putting the file", sftp.write(path.as_str(), &body)).await {
+    let upload_failure = match within(t, "putting the file", sftp.write(path.as_str(), &body)).await {
         Ok(Ok(())) => {
-            uploaded = true;
             rec.ok(Step::Upload, format!("{name} ({} bytes)", body.len()));
+            None
         }
-        Ok(Err(e)) => rec.fail(Step::Upload, sftp_status_failure(FailKind::TransferFailed, &e)),
-        Err(f) => rec.fail(Step::Upload, f),
+        Ok(Err(e)) => Some(sftp_status_failure(FailKind::TransferFailed, &e)),
+        Err(f) => Some(f),
+    };
+    let upload_failed = upload_failure.is_some();
+    if let Some(f) = upload_failure {
+        let may_have_left_a_file = upload_may_have_left_a_file(f.kind);
+        rec.fail(Step::Upload, f);
+        if !may_have_left_a_file {
+            rec.skip_after_refused_upload();
+            return;
+        }
     }
-    if !uploaded {
+    if upload_failed {
         rec.skip(Step::Download, "an earlier step failed");
         rec.skip(Step::Compare, "an earlier step failed");
-        rec.skip(Step::Delete, "nothing was put there");
-        return;
-    }
-    match within(t, "fetching the file", sftp.read(path.as_str())).await {
-        Ok(Ok(got)) => {
-            rec.ok(Step::Download, format!("{} bytes", got.len()));
-            if got == body {
-                rec.ok(Step::Compare, "identical");
-            } else {
-                rec.fail(Step::Compare, fail(FailKind::DataMismatch, format!("{} bytes came back for {} sent", got.len(), body.len())));
+    } else {
+        let read = within(t, "fetching the file", async {
+            let mut file = sftp.open(path.as_str()).await?;
+            let got = read_capped_async(&mut file, MAX_TEST_FILE_BYTES).await.map_err(|e| russh_sftp::client::error::Error::IO(e.to_string()));
+            // Reading is done and judged; failing to close a file that was only read changes nothing.
+            let _ = file.close().await;
+            got
+        })
+        .await;
+        match read {
+            Ok(Ok((got, more))) => {
+                rec.ok(Step::Download, downloaded_words(&got, more));
+                record_comparison(rec, &body, &got, more);
             }
-        }
-        Ok(Err(e)) => {
-            rec.fail(Step::Download, sftp_status_failure(FailKind::TransferFailed, &e));
-            rec.skip(Step::Compare, "an earlier step failed");
-        }
-        Err(f) => {
-            rec.fail(Step::Download, f);
-            rec.skip(Step::Compare, "an earlier step failed");
+            Ok(Err(e)) => {
+                rec.fail(Step::Download, sftp_status_failure(FailKind::TransferFailed, &e));
+                rec.skip(Step::Compare, "an earlier step failed");
+            }
+            Err(f) => {
+                rec.fail(Step::Download, f);
+                rec.skip(Step::Compare, "an earlier step failed");
+            }
         }
     }
     match within(t, "deleting the file", sftp.remove_file(path.as_str())).await {
@@ -684,6 +954,7 @@ async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder,
             *left_behind = Some(name);
         }
     }
+    // The verdict is in; closing the session is courtesy.
     let _ = sftp.close().await;
 }
 
@@ -705,7 +976,27 @@ mod tests {
         corrupt_retr: bool,
         deny_delete: bool,
         greeting: Option<&'static str>,
+        /// Answer to PASS (instead of the real one).
+        pass_reply: Option<&'static str>,
+        /// Answer to CWD (instead of the real one).
+        cwd_reply: Option<&'static str>,
+        /// Answer a refused login with the password it was given in the text.
+        echo_password: bool,
+        /// After the 150 for a RETR, take the data connection and say nothing for this long.
+        stall_retr: bool,
+        /// After the 150 for a STOR, take the data connection and never read it or answer.
+        stall_stor: bool,
+        /// Keep what arrived of a STOR, then answer 426 (an aborted transfer that leaves a partial file).
+        partial_stor: bool,
+        /// Send far more than was stored for a RETR.
+        oversize_retr: bool,
+        /// Close the control connection when this verb arrives.
+        hang_up_on: Option<&'static str>,
     }
+
+    /// How long a stalled fake holds its data connection: far longer than any timeout in these tests, short enough
+    /// that a test that fails to time out ends in a few seconds instead of hanging.
+    const STALL: Duration = Duration::from_secs(6);
 
     #[derive(Default)]
     struct FtpState {
@@ -740,7 +1031,9 @@ mod tests {
         let mut w = conn.try_clone().unwrap();
         let mut r = BufReader::new(conn);
         reply(&mut w, b.greeting.unwrap_or("220 fake ftp ready"));
-        let (mut user_ok, mut logged_in, mut cwd) = (false, false, String::from("/"));
+        // RFC 959: a session starts in ASCII type. In ASCII a server stores and sends text with its own line ending
+        // (here LF), so a client that forgot to ask for binary gets different bytes back than it sent.
+        let (mut user_ok, mut logged_in, mut cwd, mut binary) = (false, false, String::from("/"), false);
         let mut data: Option<TcpListener> = None;
         let mut line = String::new();
         loop {
@@ -749,8 +1042,13 @@ mod tests {
                 return;
             }
             let cmd = line.trim_end().to_string();
-            st.lock().unwrap().commands.push(cmd.replace(b.pass, "<pw>"));
+            // The password is kept out of the log so that a failing assertion cannot print it; nothing asserts on the
+            // log's absence of it (the report is what must not hold it, and the tests below check the report).
+            st.lock().unwrap().commands.push(if verb_is_pass(&cmd) { "PASS <pw>".to_string() } else { cmd.clone() });
             let (verb, arg) = cmd.split_once(' ').map_or((cmd.as_str(), ""), |(v, a)| (v, a));
+            if b.hang_up_on.is_some_and(|h| h.eq_ignore_ascii_case(verb)) {
+                return;
+            }
             match verb.to_uppercase().as_str() {
                 "USER" => {
                     user_ok = arg == b.user;
@@ -758,13 +1056,33 @@ mod tests {
                 }
                 "PASS" => {
                     logged_in = user_ok && arg == b.pass;
-                    reply(&mut w, if logged_in { "230 logged in" } else { "530 Login incorrect." });
+                    if let Some(r) = b.pass_reply {
+                        reply(&mut w, r);
+                    } else if logged_in {
+                        reply(&mut w, "230 logged in");
+                    } else if b.echo_password {
+                        reply(&mut w, &format!("530 Login incorrect for password {arg}"));
+                    } else {
+                        reply(&mut w, "530 Login incorrect.");
+                    }
                 }
-                "TYPE" => reply(&mut w, "200 ok"),
+                "TYPE" => match arg {
+                    "I" => {
+                        binary = true;
+                        reply(&mut w, "200 Type set to I");
+                    }
+                    "A" => {
+                        binary = false;
+                        reply(&mut w, "200 Type set to A");
+                    }
+                    _ => reply(&mut w, "504 type not supported"),
+                },
                 "SYST" => reply(&mut w, "215 UNIX Type: L8"),
                 "PWD" => reply(&mut w, &format!("257 \"{cwd}\" is the current directory")),
                 "CWD" => {
-                    if b.dirs.contains(&arg) {
+                    if let Some(r) = b.cwd_reply {
+                        reply(&mut w, r);
+                    } else if b.dirs.contains(&arg) {
                         cwd = format!("/{}", arg.trim_start_matches('/'));
                         reply(&mut w, "250 ok");
                     } else {
@@ -787,11 +1105,22 @@ mod tests {
                     let mut buf = Vec::new();
                     if let Some(l) = data.take() {
                         if let Ok((mut c, _)) = l.accept() {
+                            if b.stall_stor {
+                                std::thread::sleep(STALL);
+                                return;
+                            }
                             let _ = c.read_to_end(&mut buf);
                         }
                     }
+                    if !binary {
+                        buf = String::from_utf8_lossy(&buf).replace("\r\n", "\n").into_bytes();
+                    }
                     st.lock().unwrap().files.insert(arg.to_string(), buf);
-                    reply(&mut w, "226 transfer complete");
+                    if b.partial_stor {
+                        reply(&mut w, "426 Connection closed; transfer aborted.");
+                    } else {
+                        reply(&mut w, "226 transfer complete");
+                    }
                 }
                 "RETR" => {
                     let content = st.lock().unwrap().files.get(arg).cloned();
@@ -805,8 +1134,18 @@ mod tests {
                             if b.corrupt_retr {
                                 bytes.push(b'!');
                             }
+                            if b.oversize_retr {
+                                bytes = vec![b'x'; 4 * MAX_TEST_FILE_BYTES as usize];
+                            }
+                            if !binary {
+                                bytes = String::from_utf8_lossy(&bytes).replace('\n', "\r\n").into_bytes();
+                            }
                             if let Some(l) = data.take() {
                                 if let Ok((mut c, _)) = l.accept() {
+                                    if b.stall_retr {
+                                        std::thread::sleep(STALL);
+                                        return;
+                                    }
                                     let _ = c.write_all(&bytes);
                                 }
                             }
@@ -831,6 +1170,10 @@ mod tests {
             }
             let _ = logged_in;
         }
+    }
+
+    fn verb_is_pass(cmd: &str) -> bool {
+        cmd.split(' ').next().is_some_and(|v| v.eq_ignore_ascii_case("PASS"))
     }
 
     fn good_ftp() -> FtpBehaviour {
@@ -888,13 +1231,32 @@ mod tests {
         );
         assert!(srv.state.lock().unwrap().files.is_empty(), "the file that was put was deleted");
         assert!(r.file_left_behind.is_none());
-        let commands = srv.state.lock().unwrap().commands.join(" | ");
+        let log = srv.state.lock().unwrap().commands.clone();
+        let commands = log.join(" | ");
         assert!(commands.contains("CWD incoming") && commands.contains("STOR nikon-fleet-test-") && commands.contains("DELE nikon-fleet-test-"), "{commands}");
-        assert!(!commands.contains("s3cret!"), "the test's own log replaced the password: {commands}");
+        // Binary transfer is asked for, and before any file moves: in ASCII this fake (like a real server) rewrites line
+        // endings, so the comparison below passing is also evidence that the type was set in time.
+        let at = |verb: &str| log.iter().position(|c| c.starts_with(verb)).unwrap_or_else(|| panic!("no {verb} in {commands}"));
+        assert!(log.iter().any(|c| c == "TYPE I") && at("TYPE I") < at("STOR"), "{commands}");
         let text = r.to_text();
         assert!(text.contains("result: the server accepted this profile") && !text.contains("s3cret!"), "{text}");
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains("s3cret!"), "no password in the report");
+    }
+
+    #[test]
+    fn a_client_that_forgot_binary_transfer_would_be_caught_by_the_fake_server() {
+        // Proves the fake is not byte-transparent: the same file put and fetched in ASCII type does not come back equal,
+        // which is what `transfer_type(Binary)` in the client prevents. (Without this, "the comparison passed" would say
+        // nothing about the type.)
+        let srv = fake_ftp(good_ftp());
+        let mut s = suppaftp::FtpStream::connect(("127.0.0.1", srv.port)).unwrap();
+        s.login("fleet", "s3cret!").unwrap();
+        let body = test_file_body("x");
+        s.put_file("ascii.txt", &mut Cursor::new(body.clone())).unwrap();
+        let back = s.retr_as_buffer("ascii.txt").unwrap().into_inner();
+        assert_ne!(back, body, "ASCII type rewrote the line endings");
+        let _ = s.quit();
     }
 
     #[test]
@@ -905,6 +1267,10 @@ mod tests {
         assert!(srv.state.lock().unwrap().commands.iter().all(|c| !c.starts_with("STOR")));
         assert_eq!(outcomes(&r).iter().filter(|(_, o)| o == "skipped").count(), 4);
         assert!(r.steps.iter().any(|s| matches!(&s.outcome, StepOutcome::Skipped { because } if because == "not asked for")));
+        // A pass that never put a file must not claim the server accepted the profile.
+        assert!(r.ok && !r.fully_tested());
+        let text = r.to_text();
+        assert!(!text.contains("result: the server accepted this profile") && text.contains("result: the login and the folder passed") && text.contains("writing to the folder is not tested"), "{text}");
     }
 
     #[test]
@@ -933,6 +1299,10 @@ mod tests {
         let StepOutcome::Ok { detail } = &r.steps[3].outcome else { panic!() };
         assert!(detail.contains("login directory"), "{detail}");
         assert!(run_test(&TestRequest { folder: "   ".into(), ..request(srv.port, Protocol::Ftp) }).ok, "a blank folder is no folder");
+        // surrounding blanks are not part of the folder name (the same for SFTP, which trims)
+        let r = run_test(&TestRequest { folder: " incoming ".into(), ..request(srv.port, Protocol::Ftp) });
+        assert!(r.ok, "{}", r.to_text());
+        assert!(srv.state.lock().unwrap().commands.iter().any(|c| c == "CWD incoming"), "{:?}", srv.state.lock().unwrap().commands);
     }
 
     #[test]
@@ -942,6 +1312,10 @@ mod tests {
         assert_eq!(outcomes(&r)[4], (Step::Upload, "failed:permission_denied".to_string()));
         assert_eq!(outcomes(&r)[5..], all(&[(Step::Download, "skipped"), (Step::Compare, "skipped"), (Step::Delete, "skipped")])[..]);
         assert!(r.file_left_behind.is_none());
+        // "Nothing left" is checked from the server's side, and a refused write is not followed by a delete it would
+        // also refuse: the server saw a STOR and no DELE.
+        let st = srv.state.lock().unwrap();
+        assert!(st.files.is_empty() && st.commands.iter().any(|c| c.starts_with("STOR")) && !st.commands.iter().any(|c| c.starts_with("DELE")), "{:?}", st.commands);
     }
 
     #[test]
@@ -961,6 +1335,283 @@ mod tests {
         let left = r.file_left_behind.clone().expect("named");
         assert!(left.starts_with("nikon-fleet-test-") && srv.state.lock().unwrap().files.contains_key(&left));
         assert!(r.to_text().contains(&left) && r.to_text().contains("delete it by hand"));
+        assert!(r.to_text().contains("folder incoming"), "the warning says where: {}", r.to_text());
+    }
+
+    fn kind_of(r: &TestReport, step: Step) -> Option<FailKind> {
+        r.steps.iter().find(|s| s.step == step).and_then(|s| match &s.outcome {
+            StepOutcome::Failed { kind, .. } => Some(*kind),
+            _ => None,
+        })
+    }
+
+    fn code_of(r: &TestReport, step: Step) -> Option<u16> {
+        r.steps.iter().find(|s| s.step == step).and_then(|s| match &s.outcome {
+            StepOutcome::Failed { reply_code, .. } => *reply_code,
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_failed_upload_that_may_have_left_part_of_a_file_is_cleaned_up_or_named() {
+        // The server keeps what arrived and then aborts the transfer (426): a partial file is on the server. The upload
+        // failed, and the test still removes it.
+        let srv = fake_ftp(FtpBehaviour { partial_stor: true, ..good_ftp() });
+        let r = run_test(&request(srv.port, Protocol::Ftp));
+        assert_eq!(outcomes(&r)[4], (Step::Upload, "failed:transfer_failed".to_string()), "{}", r.to_text());
+        assert_eq!(outcomes(&r)[5..], all(&[(Step::Download, "skipped"), (Step::Compare, "skipped"), (Step::Delete, "ok")])[..], "{}", r.to_text());
+        assert!(srv.state.lock().unwrap().files.is_empty(), "the partial file was removed");
+        assert!(r.file_left_behind.is_none());
+
+        // The same, but the server will not delete it: the file is named so it can be removed by hand.
+        let srv = fake_ftp(FtpBehaviour { partial_stor: true, deny_delete: true, ..good_ftp() });
+        let r = run_test(&request(srv.port, Protocol::Ftp));
+        assert_eq!(outcomes(&r)[7], (Step::Delete, "failed:permission_denied".to_string()), "{}", r.to_text());
+        let left = r.file_left_behind.clone().expect("a partial upload that cannot be deleted is named");
+        assert!(srv.state.lock().unwrap().files.contains_key(&left));
+    }
+
+    #[test]
+    fn an_upload_that_stalls_is_a_timeout_and_the_file_it_may_have_left_is_named() {
+        let srv = fake_ftp(FtpBehaviour { stall_stor: true, ..good_ftp() });
+        let started = Instant::now();
+        let r = run_test(&TestRequest { step_timeout: Duration::from_millis(500), ..request(srv.port, Protocol::Ftp) });
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(kind_of(&r, Step::Upload), Some(FailKind::TimedOut), "{}", r.to_text());
+        // the clean-up was tried, the stalled server did not answer it, and so the name is given
+        assert!(r.file_left_behind.as_deref().is_some_and(|f| f.starts_with("nikon-fleet-test-")), "{}", r.to_text());
+    }
+
+    // ── time limits on the data connection ──
+
+    #[test]
+    fn a_data_connection_that_goes_quiet_is_a_timeout_within_the_step_limit() {
+        // The server accepts the data connection for a fetch and then sends nothing. The library's own connection has no
+        // read limit, so without ours this waits for the server to close it (STALL).
+        let srv = fake_ftp(FtpBehaviour { stall_retr: true, ..good_ftp() });
+        let limit = Duration::from_millis(500);
+        let started = Instant::now();
+        let r = run_test(&TestRequest { step_timeout: limit, ..request(srv.port, Protocol::Ftp) });
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5) && took < STALL, "{took:?}");
+        assert_eq!(kind_of(&r, Step::Download), Some(FailKind::TimedOut), "{}", r.to_text());
+        assert_eq!(outcomes(&r)[6], (Step::Compare, "skipped".to_string()));
+    }
+
+    #[test]
+    fn the_sockets_this_module_opens_carry_the_step_limit_in_both_directions() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let s = timed_connect(&addr, Duration::from_millis(1234)).unwrap();
+        assert_eq!((s.read_timeout().unwrap(), s.write_timeout().unwrap()), (Some(Duration::from_millis(1234)), Some(Duration::from_millis(1234))));
+        // a zero limit is refused by the operating system's API rather than meaning "none": no socket comes back
+        assert!(timed_connect(&addr, Duration::ZERO).is_err());
+        // and a run with such a limit fails at once instead of waiting
+        let started = Instant::now();
+        let r = run_test(&TestRequest { step_timeout: Duration::ZERO, ..request(addr.port(), Protocol::Ftp) });
+        assert!(!r.ok && started.elapsed() < Duration::from_secs(3), "{}", r.to_text());
+    }
+
+    // ── the test file is read back with a limit ──
+
+    #[test]
+    fn what_is_read_back_is_limited_at_the_cap_and_the_cap_itself_is_not_too_much() {
+        // below, at and above the cap; and empty
+        for (len, over) in [(0usize, false), (9, false), (10, false), (11, true), (12, true)] {
+            let (kept, more) = limit_to(vec![7; len], 10);
+            assert_eq!((kept.len(), more), (len.min(10), over), "{len} bytes against a cap of 10");
+        }
+        // a reader that would give 100 times the cap gives up what it was asked for and no more
+        let mut flood = std::io::repeat(b'x').take(1000);
+        let (kept, more) = read_capped(&mut flood, 10).unwrap();
+        assert_eq!((kept.len(), more), (10, true));
+        assert_eq!(flood.limit(), 989, "only cap + 1 = 11 bytes were taken from the source");
+        // exactly the cap is not "more"
+        let (kept, more) = read_capped(&mut Cursor::new(vec![1u8; 10]), 10).unwrap();
+        assert_eq!((kept.len(), more), (10, false));
+    }
+
+    #[test]
+    fn a_server_that_sends_far_more_than_was_stored_is_a_data_mismatch_not_a_big_buffer() {
+        let srv = fake_ftp(FtpBehaviour { oversize_retr: true, ..good_ftp() });
+        let r = run_test(&request(srv.port, Protocol::Ftp));
+        let StepOutcome::Failed { kind, message, .. } = &r.steps[6].outcome else { panic!("{}", r.to_text()) };
+        assert_eq!((r.steps[6].step, *kind), (Step::Compare, FailKind::DataMismatch));
+        assert!(message.contains(&format!("more than {MAX_TEST_FILE_BYTES} bytes")), "{message}");
+    }
+
+    // ── what a reply means ──
+
+    #[test]
+    fn reply_codes_mean_what_the_table_says_and_an_unlisted_one_is_other() {
+        use FailKind as K;
+        use Step::*;
+        for (step, code, want) in [
+            // login: only 430/530 are a refused name or password; 421 is a server that will not serve
+            (Login, 530, K::LoginRefused),
+            (Login, 430, K::LoginRefused),
+            (Login, 421, K::ServerUnavailable),
+            (Login, 531, K::Other),
+            (Login, 332, K::Other),
+            (Login, 500, K::Other),
+            // folder
+            (Folder, 550, K::FolderMissing),
+            (Folder, 450, K::FolderMissing),
+            (Folder, 421, K::ServerUnavailable),
+            (Folder, 530, K::Other),
+            (Folder, 551, K::Other),
+            // a transfer step: 550/553 a refusal, 450-452/552/425/426 a failed transfer
+            (Upload, 550, K::PermissionDenied),
+            (Upload, 553, K::PermissionDenied),
+            (Upload, 552, K::TransferFailed),
+            (Upload, 452, K::TransferFailed),
+            (Upload, 426, K::TransferFailed),
+            (Upload, 421, K::ServerUnavailable),
+            (Upload, 530, K::Other),
+            (Download, 550, K::PermissionDenied),
+            (Download, 451, K::TransferFailed),
+            (Delete, 550, K::PermissionDenied),
+            (Delete, 450, K::TransferFailed),
+            // the greeting
+            (Connect, 421, K::ServerUnavailable),
+            (Connect, 530, K::Other),
+            (Connect, 550, K::Other),
+        ] {
+            assert_eq!(classify_reply(step, code), want, "{step:?} {code}");
+        }
+    }
+
+    #[test]
+    fn a_421_is_a_server_that_will_not_serve_not_a_wrong_password_and_not_a_missing_folder() {
+        let srv = fake_ftp(FtpBehaviour { pass_reply: Some("421 Too many users logged in."), ..good_ftp() });
+        let r = run_test(&request(srv.port, Protocol::Ftp));
+        assert_eq!(outcomes(&r)[2], (Step::Login, "failed:server_unavailable".to_string()), "{}", r.to_text());
+        assert_eq!(code_of(&r, Step::Login), Some(421));
+        let StepOutcome::Failed { hint, message, .. } = &r.failure().unwrap().outcome else { panic!() };
+        assert!(!hint.contains("user name and password") && message.contains("Too many users"), "{hint} / {message}");
+
+        let srv = fake_ftp(FtpBehaviour { cwd_reply: Some("421 Service not available, closing control connection."), ..good_ftp() });
+        let r = run_test(&request(srv.port, Protocol::Ftp));
+        assert_eq!(outcomes(&r)[3], (Step::Folder, "failed:server_unavailable".to_string()), "{}", r.to_text());
+
+        // an unlisted code at the login is Other, with the server's words and its code
+        let srv = fake_ftp(FtpBehaviour { pass_reply: Some("503 Bad sequence of commands."), ..good_ftp() });
+        let r = run_test(&request(srv.port, Protocol::Ftp));
+        assert_eq!((kind_of(&r, Step::Login), code_of(&r, Step::Login)), (Some(FailKind::Other), Some(503)), "{}", r.to_text());
+    }
+
+    #[test]
+    fn the_reply_code_is_a_field_in_the_json_and_absent_when_there_was_no_reply() {
+        let srv = fake_ftp(good_ftp());
+        let r = run_test(&TestRequest { password: "wrong".into(), ..request(srv.port, Protocol::Ftp) });
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["steps"][2]["reply_code"], 530, "{v}");
+        assert!(v["steps"][0].get("reply_code").is_none() && v["steps"][1].get("reply_code").is_none());
+        // refused connection: a failure with no reply, so no code
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let v = serde_json::to_value(run_test(&request(port, Protocol::Ftp))).unwrap();
+        assert!(v["steps"][1].get("reply_code").is_none(), "{v}");
+    }
+
+    #[test]
+    fn a_connection_that_dies_is_the_wrong_protocol_before_the_login_and_a_network_fault_after_it() {
+        let before = fake_ftp(FtpBehaviour { hang_up_on: Some("USER"), ..good_ftp() });
+        let r = run_test(&request(before.port, Protocol::Ftp));
+        assert_eq!(kind_of(&r, Step::Login), Some(FailKind::NotThisProtocol), "{}", r.to_text());
+        let after = fake_ftp(FtpBehaviour { hang_up_on: Some("CWD"), ..good_ftp() });
+        let r = run_test(&request(after.port, Protocol::Ftp));
+        assert_eq!(kind_of(&r, Step::Folder), Some(FailKind::TransferFailed), "{}", r.to_text());
+    }
+
+    // ── the password ──
+
+    #[test]
+    fn a_server_that_echoes_the_password_does_not_get_it_into_the_report() {
+        let srv = fake_ftp(FtpBehaviour { echo_password: true, ..good_ftp() });
+        let r = run_test(&TestRequest { password: "hunter2-not-the-real-one".into(), ..request(srv.port, Protocol::Ftp) });
+        let StepOutcome::Failed { message, .. } = &r.failure().expect("refused").outcome else { panic!() };
+        assert!(message.contains("530") && message.contains(PASSWORD_HIDDEN), "{message}");
+        let everything = format!("{}{}{r:?}", r.to_text(), serde_json::to_string(&r).unwrap());
+        assert!(!everything.contains("hunter2"), "{everything}");
+    }
+
+    #[test]
+    fn scrubbing_replaces_every_copy_and_does_nothing_for_an_empty_password() {
+        let mut r = TestReport {
+            host: "h".into(),
+            port: 21,
+            protocol: Protocol::Ftp,
+            folder: String::new(),
+            steps: vec![
+                StepResult { step: Step::Connect, outcome: StepOutcome::Ok { detail: "said pw pw".into() }, millis: 0 },
+                StepResult { step: Step::Login, outcome: StepOutcome::Failed { kind: FailKind::Other, message: "pw!".into(), hint: "h".into(), reply_code: None }, millis: 0 },
+                StepResult { step: Step::Folder, outcome: StepOutcome::Skipped { because: "pw".into() }, millis: 0 },
+            ],
+            ok: false,
+            host_key: Some("pw".into()),
+            file_left_behind: Some("pw".into()),
+        };
+        let untouched = r.clone();
+        r.scrub("");
+        assert_eq!(r, untouched, "an empty password is not a pattern");
+        r.scrub("pw");
+        let all = format!("{r:?}");
+        assert!(!all.contains("\"pw\"") && !all.contains("pw pw") && all.matches(PASSWORD_HIDDEN).count() == 6, "{all}");
+    }
+
+    // ── the report's own words ──
+
+    #[test]
+    fn the_verdict_says_what_was_tried() {
+        let step = |outcome| StepResult { step: Step::Upload, outcome, millis: 0 };
+        let mut r = TestReport { host: "h".into(), port: 1, protocol: Protocol::Ftp, folder: String::new(), steps: vec![step(StepOutcome::Ok { detail: String::new() })], ok: true, host_key: None, file_left_behind: None };
+        assert!((r.fully_tested(), r.verdict()) == (true, "the server accepted this profile"));
+        r.steps.push(step(StepOutcome::Skipped { because: "x".into() }));
+        assert!(r.ok && !r.fully_tested() && r.verdict().contains("not tested"));
+        r.ok = false;
+        assert_eq!((r.fully_tested(), r.verdict()), (false, "the test did not pass"));
+    }
+
+    // ── choreography ──
+
+    #[test]
+    fn skipping_the_rest_skips_exactly_the_steps_with_no_outcome_for_every_prefix_of_both_plans() {
+        for protocol in [Protocol::Ftp, Protocol::Sftp] {
+            let p = plan(protocol);
+            for done in 0..=p.len() {
+                let mut rec = Recorder::new(protocol);
+                for s in &p[..done] {
+                    rec.ok(*s, "d");
+                }
+                rec.skip_rest();
+                let got: Vec<(Step, bool)> = rec.steps.iter().map(|r| (r.step, matches!(r.outcome, StepOutcome::Skipped { .. }))).collect();
+                let want: Vec<(Step, bool)> = p.iter().enumerate().map(|(i, s)| (*s, i >= done)).collect();
+                assert_eq!(got, want, "{protocol:?}, {done} done");
+            }
+        }
+        // a step recorded out of the usual run (the clean-up after a failed compare) is not skipped again
+        let mut rec = Recorder::new(Protocol::Ftp);
+        for s in [Step::Resolve, Step::Connect, Step::Login, Step::Folder, Step::Upload] {
+            rec.ok(s, "d");
+        }
+        rec.skip_after_refused_upload();
+        assert_eq!(rec.steps.iter().filter(|r| r.step == Step::Upload).count(), 1);
+        assert!(matches!(&rec.steps.last().unwrap().outcome, StepOutcome::Skipped { because } if because == "nothing was put there"));
+        assert!(matches!(&rec.steps[rec.steps.len() - 2].outcome, StepOutcome::Skipped { because } if because == "an earlier step failed"));
+    }
+
+    #[test]
+    fn every_address_that_was_tried_is_in_the_failure_and_the_last_one_decides_the_kind() {
+        let mut t = ConnectTries::default();
+        assert!(matches!(t.0.len(), 0));
+        t.note(fail(FailKind::Unreachable, "[::1]:21: no route"));
+        t.note(fail(FailKind::ConnectionRefused, "127.0.0.1:21: refused"));
+        let f = t.into_failure();
+        assert_eq!(f.kind, FailKind::ConnectionRefused);
+        assert_eq!(f.message, "[::1]:21: no route; 127.0.0.1:21: refused");
+        let one = { let mut t = ConnectTries::default(); t.note(fail(FailKind::TimedOut, "a")); t.into_failure() };
+        assert_eq!((one.kind, one.message.as_str()), (FailKind::TimedOut, "a"));
+        assert_eq!(ConnectTries::default().into_failure().kind, FailKind::Other);
     }
 
     #[test]
@@ -995,13 +1646,22 @@ mod tests {
         let r = run_test(&TestRequest { step_timeout: Duration::from_millis(400), ..request(port, Protocol::Ftp) });
         assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
         assert!(!r.ok);
-        let k = r.failure().expect("a failure");
-        assert!(matches!(&k.outcome, StepOutcome::Failed { kind: FailKind::TimedOut | FailKind::NotThisProtocol, .. }), "{:?}", k);
+        // A read that gives up is reported as a timeout, never as "not this protocol".
+        assert_eq!(outcomes(&r)[1], (Step::Connect, "failed:timed_out".to_string()), "{}", r.to_text());
         // and the same for SSH: a socket that connects and never speaks
         let started = Instant::now();
         let r = run_test(&TestRequest { step_timeout: Duration::from_millis(400), ..request(port, Protocol::Sftp) });
         assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
         assert_eq!(outcomes(&r)[2], (Step::Handshake, "failed:timed_out".to_string()), "{}", r.to_text());
+        let StepOutcome::Failed { message, .. } = &r.failure().unwrap().outcome else { panic!() };
+        assert!(message.contains("more than 0.4 s"), "a limit under a second is not shown as 0: {message}");
+    }
+
+    #[test]
+    fn limits_are_worded_as_they_are() {
+        for (d, want) in [(Duration::from_secs(15), "15"), (Duration::from_secs(1), "1"), (Duration::from_millis(400), "0.4"), (Duration::from_millis(1500), "1.5"), (Duration::ZERO, "0")] {
+            assert_eq!(limit_words(d), want, "{d:?}");
+        }
     }
 
     #[test]
@@ -1009,12 +1669,21 @@ mod tests {
         let srv = fake_ftp(FtpBehaviour { greeting: Some("SSH-2.0-OpenSSH_9.0"), ..good_ftp() });
         let r = run_test(&request(srv.port, Protocol::Ftp));
         assert!(!r.ok);
-        assert!(matches!(&r.failure().unwrap().outcome, StepOutcome::Failed { kind: FailKind::NotThisProtocol | FailKind::Other, .. }), "{}", r.to_text());
+        // exactly this kind, at the greeting: not "Other", and not a login failure
+        assert_eq!(outcomes(&r)[1], (Step::Connect, "failed:not_this_protocol".to_string()), "{}", r.to_text());
+        // a server that accepts and hangs up at once is the same
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || l.incoming().flatten().for_each(drop));
+        let r = run_test(&request(port, Protocol::Ftp));
+        assert_eq!(outcomes(&r)[1], (Step::Connect, "failed:not_this_protocol".to_string()), "{}", r.to_text());
     }
 
     #[test]
     fn every_failure_kind_has_a_hint_that_names_what_to_check() {
-        for k in [
+        // Each kind's hint must say the thing that sets it apart from the others. The match has no wildcard: a new kind
+        // has to be listed here with the word its hint is about, and every hint has to differ from every other.
+        let kinds = [
             FailKind::NameNotFound,
             FailKind::ConnectionRefused,
             FailKind::Unreachable,
@@ -1024,18 +1693,33 @@ mod tests {
             FailKind::LoginRefused,
             FailKind::FolderMissing,
             FailKind::PermissionDenied,
+            FailKind::ServerUnavailable,
             FailKind::TransferFailed,
             FailKind::DataMismatch,
             FailKind::Other,
-        ] {
-            // No wildcard in this match: a new kind has to be listed above and worded.
-            match k {
-                FailKind::NameNotFound | FailKind::ConnectionRefused | FailKind::Unreachable | FailKind::TimedOut | FailKind::NotThisProtocol | FailKind::HandshakeFailed | FailKind::LoginRefused | FailKind::FolderMissing | FailKind::PermissionDenied | FailKind::TransferFailed | FailKind::DataMismatch | FailKind::Other => {
-                    assert!(k.hint().len() > 10, "{k:?}");
-                }
-            }
+        ];
+        for k in kinds {
+            let about = match k {
+                FailKind::NameNotFound => "host name",
+                FailKind::ConnectionRefused => "port",
+                FailKind::Unreachable => "no route",
+                FailKind::TimedOut => "in time",
+                FailKind::NotThisProtocol => "protocol",
+                FailKind::HandshakeFailed => "handshake",
+                FailKind::LoginRefused => "user name and password",
+                FailKind::FolderMissing => "folder",
+                FailKind::PermissionDenied => "not allowed",
+                FailKind::ServerUnavailable => "would not serve",
+                FailKind::TransferFailed => "data connection",
+                FailKind::DataMismatch => "different from what was sent",
+                FailKind::Other => "See the message",
+            };
+            assert!(k.hint().contains(about), "{k:?}: {:?} should be about {about:?}", k.hint());
         }
+        let hints: BTreeSet<&str> = kinds.iter().map(|k| k.hint()).collect();
+        assert_eq!(hints.len(), kinds.len(), "two kinds share a hint");
         assert!(FailKind::Unreachable.hint().contains("may simply not be on it") && FailKind::TimedOut.hint().contains("cannot tell them apart"), "the hints say what this test cannot know");
+        assert!(FailKind::NameNotFound.hint().contains("online"), "an offline computer is told so, since a resolver failure cannot be told from a missing name");
     }
 
     #[test]
@@ -1075,6 +1759,8 @@ mod tests {
         deny_write: bool,
         corrupt_read: bool,
         deny_delete: bool,
+        /// Give far more than was stored when the file is read.
+        oversize_read: bool,
     }
 
     #[derive(Default)]
@@ -1193,6 +1879,9 @@ mod tests {
             if self.b.corrupt_read {
                 f.push(b'!');
             }
+            if self.b.oversize_read {
+                f = vec![b'x'; 4 * MAX_TEST_FILE_BYTES as usize];
+            }
             if offset as usize >= f.len() {
                 return Err(russh_sftp::protocol::StatusCode::Eof);
             }
@@ -1267,7 +1956,7 @@ mod tests {
     }
 
     fn good_sftp() -> SftpBehaviour {
-        SftpBehaviour { user: "fleet", pass: "s3cret!", dirs: vec!["incoming", "incoming/raw"], deny_write: false, corrupt_read: false, deny_delete: false }
+        SftpBehaviour { user: "fleet", pass: "s3cret!", dirs: vec!["incoming", "incoming/raw"], deny_write: false, corrupt_read: false, deny_delete: false, oversize_read: false }
     }
 
     #[test]
@@ -1312,6 +2001,48 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_sftp_password_says_what_was_tried() {
+        let r = run_test(&TestRequest { password: "wrong".into(), ..request(fake_sftp(good_sftp()).port, Protocol::Sftp) });
+        let StepOutcome::Failed { message, .. } = &r.failure().unwrap().outcome else { panic!() };
+        assert!(message.contains("did not accept that user name and password") && message.contains("password only"), "{message}");
+    }
+
+    #[test]
+    fn an_sftp_server_that_sends_far_more_than_was_stored_is_a_data_mismatch() {
+        let srv = fake_sftp(SftpBehaviour { oversize_read: true, ..good_sftp() });
+        let r = run_test(&request(srv.port, Protocol::Sftp));
+        let StepOutcome::Failed { kind, message, .. } = &r.steps[7].outcome else { panic!("{}", r.to_text()) };
+        assert_eq!((r.steps[7].step, *kind), (Step::Compare, FailKind::DataMismatch));
+        assert!(message.contains(&format!("more than {MAX_TEST_FILE_BYTES} bytes")), "{message}");
+        assert_eq!(outcomes(&r)[8], (Step::Delete, "ok".to_string()));
+    }
+
+    #[test]
+    fn the_async_read_back_holds_at_most_the_cap_plus_one_like_the_blocking_one() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        // a source 100 times the cap: the answer is the cap, and the source was not drained
+        let mut flood = tokio::io::repeat(b'x').take(1000);
+        let (kept, more) = rt.block_on(read_capped_async(&mut flood, 10)).unwrap();
+        assert_eq!((kept.len(), more), (10, true));
+        assert_eq!(flood.limit(), 989, "only cap + 1 = 11 bytes were taken from the source");
+        // parity with the blocking reader, at and around the cap
+        for len in [0usize, 9, 10, 11, 12] {
+            let a = rt.block_on(read_capped_async(&mut Cursor::new(vec![3u8; len]), 10)).unwrap();
+            let b = read_capped(&mut Cursor::new(vec![3u8; len]), 10).unwrap();
+            assert_eq!(a, b, "{len} bytes");
+        }
+    }
+
+    #[test]
+    fn host_key_fingerprints_are_sha256_of_the_key() {
+        let key = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519).unwrap();
+        let public = key.public_key().clone();
+        let expect = public.fingerprint(russh::keys::HashAlg::Sha256).to_string();
+        let got = host_key_fingerprint(&russh::keys::PublicKeyOrCertificate::PublicKey { key: public, hash_alg: None });
+        assert!(got.starts_with("SHA256:") && got == expect, "{got}");
+    }
+
+    #[test]
     fn an_sftp_test_without_the_file_check_puts_nothing_there() {
         let srv = fake_sftp(good_sftp());
         let r = run_test(&TestRequest { file_check: false, ..request(srv.port, Protocol::Sftp) });
@@ -1326,6 +2057,76 @@ mod tests {
         assert!(!r.ok && started.elapsed() < Duration::from_secs(6), "{:?}\n{}", started.elapsed(), r.to_text());
         let f = r.failure().unwrap();
         assert_eq!(f.step, Step::Handshake, "the FTP server's greeting is not an SSH banner: {}", r.to_text());
-        assert!(matches!(&f.outcome, StepOutcome::Failed { kind: FailKind::NotThisProtocol | FailKind::HandshakeFailed | FailKind::TimedOut, .. }), "{f:?}");
+        // What actually happens (russh skips lines that are not an SSH version line and keeps waiting for one, and an
+        // FTP server is waiting for a command), so the handshake times out. That is what is pinned; the hint's "nothing
+        // answered" is not accurate here, and this test is where a change to a better answer would show.
+        assert!(matches!(&f.outcome, StepOutcome::Failed { kind: FailKind::TimedOut, .. }), "{f:?}");
+    }
+
+    #[test]
+    fn an_ssh_server_given_to_an_ftp_test_is_not_this_protocol_at_the_greeting() {
+        let ssh = fake_sftp(good_sftp());
+        let r = run_test(&TestRequest { step_timeout: Duration::from_millis(600), ..request(ssh.port, Protocol::Ftp) });
+        assert_eq!(outcomes(&r)[1], (Step::Connect, "failed:not_this_protocol".to_string()), "{}", r.to_text());
+    }
+
+    #[test]
+    fn ssh_failures_are_kinds_by_what_the_library_reports() {
+        use std::io::ErrorKind as IO;
+        let kind = |e: russh::Error| ssh_failure(&e).kind;
+        // only a peer with no SSH version line is "not this protocol"; a closed or refused handshake is a failed one
+        assert_eq!(kind(russh::Error::Version), FailKind::NotThisProtocol);
+        assert_eq!(kind(russh::Error::HUP), FailKind::HandshakeFailed);
+        assert_eq!(kind(russh::Error::Disconnect), FailKind::HandshakeFailed);
+        assert_eq!(kind(russh::Error::Kex), FailKind::HandshakeFailed);
+        assert_eq!(kind(russh::Error::NoAuthMethod), FailKind::HandshakeFailed);
+        // transport errors keep their own kind
+        assert_eq!(kind(russh::Error::IO(IO::ConnectionRefused.into())), FailKind::ConnectionRefused);
+        assert_eq!(kind(russh::Error::IO(IO::TimedOut.into())), FailKind::TimedOut);
+        assert_eq!(kind(russh::Error::IO(IO::ConnectionReset.into())), FailKind::NotThisProtocol);
+    }
+
+    #[test]
+    fn io_errors_are_kinds_by_the_step_they_happened_in() {
+        use std::io::ErrorKind as IO;
+        let e = |k: IO| std::io::Error::from(k);
+        // a connection that dies: wrong protocol until the login is accepted, a network fault after
+        for k in [IO::UnexpectedEof, IO::InvalidData, IO::ConnectionReset, IO::ConnectionAborted, IO::BrokenPipe] {
+            for step in [Step::Resolve, Step::Connect, Step::Handshake, Step::Login] {
+                assert_eq!(io_kind(step, &e(k)), FailKind::NotThisProtocol, "{k:?} in {step:?}");
+            }
+            for step in [Step::Folder, Step::Upload, Step::Download, Step::Compare, Step::Delete] {
+                assert_eq!(io_kind(step, &e(k)), FailKind::TransferFailed, "{k:?} in {step:?}");
+            }
+        }
+        // the kinds that do not depend on the step
+        for step in [Step::Connect, Step::Download] {
+            assert_eq!(io_kind(step, &e(IO::ConnectionRefused)), FailKind::ConnectionRefused);
+            assert_eq!(io_kind(step, &e(IO::TimedOut)), FailKind::TimedOut);
+            assert_eq!(io_kind(step, &e(IO::WouldBlock)), FailKind::TimedOut);
+            assert_eq!(io_kind(step, &e(IO::HostUnreachable)), FailKind::Unreachable);
+            assert_eq!(io_kind(step, &e(IO::PermissionDenied)), FailKind::Other);
+        }
+    }
+
+    #[test]
+    fn an_sftp_status_means_what_the_step_that_got_it_means_by_failed() {
+        use russh_sftp::client::error::Error as E;
+        use russh_sftp::protocol::{Status, StatusCode as C};
+        let st = |c: C| E::Status(Status { id: 1, status_code: c, error_message: "words".into(), language_tag: "en".into() });
+        // a missing file is a missing FOLDER only when the step was looking for the folder
+        assert_eq!(sftp_status_failure(FailKind::FolderMissing, &st(C::NoSuchFile)).kind, FailKind::FolderMissing);
+        assert_eq!(sftp_status_failure(FailKind::TransferFailed, &st(C::NoSuchFile)).kind, FailKind::TransferFailed);
+        assert_eq!(sftp_status_failure(FailKind::NotThisProtocol, &st(C::NoSuchFile)).kind, FailKind::NotThisProtocol);
+        // a refusal is a refusal wherever it came
+        for d in [FailKind::FolderMissing, FailKind::TransferFailed] {
+            assert_eq!(sftp_status_failure(d, &st(C::PermissionDenied)).kind, FailKind::PermissionDenied);
+            assert_eq!(sftp_status_failure(d, &st(C::ConnectionLost)).kind, FailKind::Other);
+            assert_eq!(sftp_status_failure(d, &st(C::NoConnection)).kind, FailKind::Other);
+        }
+        assert_eq!(sftp_status_failure(FailKind::TransferFailed, &E::Timeout).kind, FailKind::TimedOut);
+        let f = sftp_status_failure(FailKind::TransferFailed, &st(C::Failure));
+        assert_eq!(f.kind, FailKind::TransferFailed);
+        assert!(f.message.contains("words") && f.code.is_none(), "{}", f.message);
     }
 }

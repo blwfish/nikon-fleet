@@ -6,17 +6,25 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Output, Stdio};
+use std::sync::{Arc, Mutex};
 
 mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
-/// An FTP server that knows login, PWD and CWD (no transfers: the tests use `--no-file-check`).
-fn ftp_server(user: &'static str, pass: &'static str) -> u16 {
+/// What the server was sent (the password replaced), in order.
+type Log = Arc<Mutex<Vec<String>>>;
+
+/// An FTP server that knows login, PWD and CWD (no transfers: the tests use `--no-file-check`). It takes only
+/// `TYPE I` (binary) and answers any other type with 504, and it keeps a log so a test can see what the client asked.
+fn ftp_server(user: &'static str, pass: &'static str) -> (u16, Log) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
+    let log: Log = Default::default();
+    let shared = log.clone();
     std::thread::spawn(move || {
         for conn in l.incoming().flatten() {
+            let log = shared.clone();
             std::thread::spawn(move || {
                 let mut w = conn.try_clone().unwrap();
                 let mut r = BufReader::new(conn);
@@ -32,13 +40,14 @@ fn ftp_server(user: &'static str, pass: &'static str) -> u16 {
                     }
                     let c = line.trim_end();
                     let (v, a) = c.split_once(' ').unwrap_or((c, ""));
+                    log.lock().unwrap().push(if v.eq_ignore_ascii_case("PASS") { "PASS <pw>".to_string() } else { c.to_string() });
                     match v.to_uppercase().as_str() {
                         "USER" => {
                             user_ok = a == user;
                             say(&mut w, "331 password");
                         }
                         "PASS" => say(&mut w, if user_ok && a == pass { "230 ok" } else { "530 Login incorrect." }),
-                        "TYPE" => say(&mut w, "200 ok"),
+                        "TYPE" => say(&mut w, if a == "I" { "200 Type set to I" } else { "504 only binary" }),
                         "PWD" => say(&mut w, "257 \"/\" current"),
                         "CWD" => say(&mut w, if a == "incoming" { "250 ok" } else { "550 No such file or directory." }),
                         "QUIT" => {
@@ -51,7 +60,7 @@ fn ftp_server(user: &'static str, pass: &'static str) -> u16 {
             });
         }
     });
-    port
+    (port, log)
 }
 
 fn run(data_dir: &Path, args: &[&str]) -> Output {
@@ -68,12 +77,17 @@ fn err(o: &Output) -> String {
 
 #[test]
 fn a_server_that_accepts_the_login_and_the_folder_passes_and_the_password_is_never_printed() {
-    let port = ftp_server("fleet", "s3cret!");
+    let (port, log) = ftp_server("fleet", "s3cret!");
     let d = tempfile::tempdir().unwrap();
     let p = port.to_string();
     let o = run(d.path(), &["ftp-test", "--host", "127.0.0.1", "--port", &p, "--user", "fleet", "--password", "s3cret!", "--folder", "incoming", "--no-file-check"]);
     assert!(o.status.success(), "{}\n{}", out(&o), err(&o));
-    assert!(out(&o).contains("result: the server accepted this profile") && out(&o).contains("skipped  put a test file: not asked for"), "{}", out(&o));
+    // with the file check off the result line must not say the profile was accepted whole: nothing was written
+    assert!(out(&o).contains("result: the login and the folder passed; no test file was put") && !out(&o).contains("the server accepted this profile") && out(&o).contains("skipped  put a test file: not asked for"), "{}", out(&o));
+    // the client asks for binary before it goes to the folder (this server takes no other type and answers 504)
+    let seen = log.lock().unwrap().clone();
+    let at = |v: &str| seen.iter().position(|c| c == v).unwrap_or_else(|| panic!("no {v:?} in {seen:?}"));
+    assert!(at("TYPE I") < at("CWD incoming"), "{seen:?}");
     assert!(!out(&o).contains("s3cret!") && !err(&o).contains("s3cret!"));
     // JSON
     let o = run(d.path(), &["ftp-test", "--host", "127.0.0.1", "--port", &p, "--user", "fleet", "--password", "s3cret!", "--no-file-check", "--json"]);
@@ -84,7 +98,7 @@ fn a_server_that_accepts_the_login_and_the_folder_passes_and_the_password_is_nev
 
 #[test]
 fn the_password_can_come_from_stdin() {
-    let port = ftp_server("fleet", "from stdin");
+    let (port, _) = ftp_server("fleet", "from stdin");
     let d = tempfile::tempdir().unwrap();
     let mut child = common::cli(BIN)
         .arg("--data-dir")
@@ -102,11 +116,15 @@ fn the_password_can_come_from_stdin() {
 
 #[test]
 fn a_refused_login_exits_non_zero_names_the_step_and_shows_the_servers_words() {
-    let port = ftp_server("fleet", "right");
+    let (port, _) = ftp_server("fleet", "right");
     let d = tempfile::tempdir().unwrap();
     let o = run(d.path(), &["ftp-test", "--host", "127.0.0.1", "--port", &port.to_string(), "--user", "fleet", "--password", "wrong", "--no-file-check"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(out(&o).contains("FAILED   log in") && out(&o).contains("530") && out(&o).contains("Login incorrect") && out(&o).contains("did not pass"), "{}", out(&o));
+    // the reply code is a field of its own in the JSON, not only part of the words
+    let o = run(d.path(), &["ftp-test", "--host", "127.0.0.1", "--port", &port.to_string(), "--user", "fleet", "--password", "wrong", "--no-file-check", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!((v["steps"][2]["kind"].clone(), v["steps"][2]["reply_code"].clone()), ("login_refused".into(), 530.into()), "{}", out(&o));
     let o = run(d.path(), &["ftp-test", "--host", "127.0.0.1", "--port", &port.to_string(), "--user", "fleet", "--password", "right", "--folder", "nope", "--no-file-check"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(out(&o).contains("FAILED   go to the folder") && out(&o).contains("550"), "{}", out(&o));
@@ -128,7 +146,7 @@ fn a_profile_stored_in_a_snapshot_is_tested_with_its_own_settings() {
     use nikon_fleet::extended::{Extended, FtpProfileEntry, FtpState, FtpStore, IptcState, ReadFrom};
     use nikon_fleet::ftp_edit::{ProfileFields, ftp_add};
     use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
-    let port = ftp_server("fleet", "s3cret!");
+    let (port, _) = ftp_server("fleet", "s3cret!");
     let d = tempfile::tempdir().unwrap();
     let mut s = Snapshot::new(Camera { model: "Z 9".into(), serial: "S1".into(), firmware: "5.31".into() }, Transport::Usb, "2026-11-05T10:00:00Z".into());
     s.extended = Some(Extended {
@@ -155,6 +173,38 @@ fn a_profile_stored_in_a_snapshot_is_tested_with_its_own_settings() {
     assert!(out(&o).contains(&format!("FTP 127.0.0.1:{port}  folder incoming")) && !out(&o).contains("s3cret!"), "{}", out(&o));
     let o = run(d.path(), &["ftp-test", "--snapshot", "copy.json", "--profile", "5"]);
     assert!(!o.status.success() && err(&o).contains("ftp_index"), "{}", err(&o));
+}
+
+#[test]
+fn the_timeout_range_is_one_to_three_hundred_seconds_inclusive() {
+    let (port, _) = ftp_server("fleet", "pw");
+    let d = tempfile::tempdir().unwrap();
+    let p = port.to_string();
+    for t in ["1", "2", "299", "300"] {
+        let o = run(d.path(), &["ftp-test", "--host", "127.0.0.1", "--port", &p, "--user", "fleet", "--password", "pw", "--no-file-check", "--timeout", t]);
+        assert!(o.status.success(), "--timeout {t}: {}\n{}", out(&o), err(&o));
+    }
+    // and just outside it, on either side, is a usage error (exit 2), not a run
+    for t in ["0", "301"] {
+        let o = run(d.path(), &["ftp-test", "--host", "127.0.0.1", "--port", &p, "--user", "fleet", "--password", "pw", "--no-file-check", "--timeout", t]);
+        assert_eq!(o.status.code(), Some(2), "--timeout {t}: {}", err(&o));
+    }
+}
+
+#[test]
+fn a_port_zero_and_an_empty_host_never_pass() {
+    // Whatever the command line decides about these (a usage error, or a failed connect), they are not a pass, and the
+    // run does not panic or hang. The library and the editor refuse port 0 ("1 to 65535"); this pins only that it
+    // cannot succeed.
+    let d = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["ftp-test", "--host", "127.0.0.1", "--port", "0", "--user", "u", "--no-file-check", "--timeout", "2"],
+        vec!["ftp-test", "--host", "", "--user", "u", "--no-file-check", "--timeout", "2"],
+        vec!["ftp-test", "--host", "127.0.0.1", "--port", "65536", "--user", "u", "--no-file-check", "--timeout", "2"],
+    ] {
+        let o = run(d.path(), &args);
+        assert!(matches!(o.status.code(), Some(1) | Some(2)), "{args:?}: {:?}\n{}\n{}", o.status.code(), out(&o), err(&o));
+    }
 }
 
 #[test]

@@ -676,7 +676,11 @@ fn draw_ftp_test(ui: &mut egui::Ui, t: &FtpTestState) -> bool {
                 ui.colored_label(bad, format!("The test file {f:?} could not be deleted and is still on the server; delete it by hand."));
             }
             ui.horizontal(|ui| {
-                ui.colored_label(if r.ok { ok } else { bad }, if r.ok { "The server accepted this profile." } else { "The test did not pass." });
+                // The wording follows what was tried: with the test-file check off, "accepted" would overstate it.
+                let verdict = r.verdict();
+                let mut chars = verdict.chars();
+                let sentence = chars.next().map(|c| c.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default();
+                ui.colored_label(if r.ok { ok } else { bad }, format!("{sentence}."));
                 dismiss = ui.small_button("Close").clicked();
             });
             ui.label(egui::RichText::new("This tests the server only, not whether the camera can join the Wi-Fi network.").small().weak());
