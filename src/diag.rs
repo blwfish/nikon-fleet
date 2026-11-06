@@ -9,7 +9,7 @@
 //!   machine) on every begin and end. A process that hangs, is killed or aborts leaves it behind;
 //!   a process that finishes everything leaves no file. This is the mechanism that worked in
 //!   freecad-mcp (a "last op" record written before the risky call and cleared after).
-//! - **Bounded ring of completed entries.** An in-memory ring (default [`DEFAULT_RING_CAP`]) mirrored
+//! - **Bounded ring of completed entries.** An in-memory ring (default `DEFAULT_RING_CAP`, 1024 entries) mirrored
 //!   to `ring-<pid>.jsonl`, append-only, compacted from memory when it reaches twice the capacity, so
 //!   the cost of an entry does not grow with the capacity. Eviction is by priority, not age alone:
 //!   routine successful leaf spans (one SDK read of two hundred) go first, then successful top-level
@@ -53,16 +53,24 @@ pub const DIR_ENV: &str = "NIKON_FLEET_DIAG_DIR";
 pub const DIR_NAME: &str = "diag";
 /// Default number of completed entries kept in the ring. Not a hard design limit: any value from
 /// [`MIN_RING_CAP`] up works, and the disk cost per entry does not depend on it.
-pub const DEFAULT_RING_CAP: usize = 1024;
+const DEFAULT_RING_CAP: usize = 1024;
 pub const MIN_RING_CAP: usize = 8;
 /// How many processes' files are kept when a new process starts: the newest by pid-file mtime, but
 /// never the files of a process that is still running (an idle GUI or MCP server must not lose its
 /// files to the short-lived processes that come after it), so a running process can push the total
 /// above this.
-pub const KEEP_PROCESSES: usize = 20;
-/// The version of the in-flight file format. The ring lines are one self-contained JSON object each
-/// and carry no version: a line this build cannot understand is counted separately from a cut line.
-pub const SCHEMA: u32 = 1;
+const KEEP_PROCESSES: usize = 20;
+/// The version of the in-flight file format (and of the vocabulary both files use). A ring line is one
+/// self-contained JSON object and carries no version: a line this build cannot understand is counted
+/// separately from a cut line.
+///
+/// - 1: the first format. Text longer than [`TEXT_MAX_CHARS`] was cut and ended with an in-band
+///   ` …[truncated]`; the subsystems `ptp_ip` and `settings` existed in the vocabulary (nothing ever
+///   recorded under them).
+/// - 2: a cut text is a [`Val::TruncatedText`] that says how long the original was, and `ptp_ip` and
+///   `settings` are gone. A version-1 file still loads (the in-band mark is read as ordinary text);
+///   a ring line or open span naming a removed subsystem is counted as one this build does not understand.
+pub const SCHEMA: u32 = 2;
 /// A process whose OS start time is later than the recorded start by more than this is not the
 /// process that wrote the files: its pid was reused.
 pub const PID_REUSE_SLACK_MS: u64 = 5_000;
@@ -72,12 +80,11 @@ pub const FIELD_CODE: &str = "code";
 pub const FIELD_CUT_OFF: &str = "cut_off";
 pub const FIELD_WRITE_FAILURES: &str = "write_failures";
 pub const FIELD_EVICTED: &str = "evicted";
-/// Longest [`Val::Text`], in characters, before it is cut and marked.
+/// Longest [`Val::Text`], in characters, before it is cut and becomes a [`Val::TruncatedText`].
 pub const TEXT_MAX_CHARS: usize = 256;
-pub const TRUNCATED_MARK: &str = " …[truncated]";
 /// The operation name of the entry [`Diag::shutdown`] records, and of the panic hook's.
 pub const OP_EXIT: &str = "exit";
-pub const OP_PANIC: &str = "panic";
+const OP_PANIC: &str = "panic";
 
 // ─────────────────────────────────────────────────────────────────────────
 // Closed vocabularies
@@ -91,34 +98,16 @@ pub enum Subsystem {
     Gui,
     Mcp,
     Usb,
-    PtpIp,
     MaidSdk,
     Snapshot,
     Transplant,
     Restore,
     Firmware,
-    Settings,
     Lock,
     Diag,
 }
 
 impl Subsystem {
-    pub const ALL: [Subsystem; 13] = [
-        Subsystem::Cli,
-        Subsystem::Gui,
-        Subsystem::Mcp,
-        Subsystem::Usb,
-        Subsystem::PtpIp,
-        Subsystem::MaidSdk,
-        Subsystem::Snapshot,
-        Subsystem::Transplant,
-        Subsystem::Restore,
-        Subsystem::Firmware,
-        Subsystem::Settings,
-        Subsystem::Lock,
-        Subsystem::Diag,
-    ];
-
     /// Whether this subsystem names what a whole process is (the `role` of a recorder). The exit entry
     /// is recorded under the role, so an entry named `exit` by any other subsystem is not an exit.
     pub const fn is_role(self) -> bool {
@@ -131,13 +120,11 @@ impl Subsystem {
             Subsystem::Gui => "gui",
             Subsystem::Mcp => "mcp",
             Subsystem::Usb => "usb",
-            Subsystem::PtpIp => "ptp_ip",
             Subsystem::MaidSdk => "maid_sdk",
             Subsystem::Snapshot => "snapshot",
             Subsystem::Transplant => "transplant",
             Subsystem::Restore => "restore",
             Subsystem::Firmware => "firmware",
-            Subsystem::Settings => "settings",
             Subsystem::Lock => "lock",
             Subsystem::Diag => "diag",
         }
@@ -161,17 +148,6 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    pub const ALL: [Outcome; 8] = [
-        Outcome::Ok,
-        Outcome::Failed,
-        Outcome::Timeout,
-        Outcome::Stalled,
-        Outcome::Indeterminate,
-        Outcome::Panicked,
-        Outcome::Abandoned,
-        Outcome::Cancelled,
-    ];
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Outcome::Ok => "ok",
@@ -216,20 +192,33 @@ pub enum Val {
     Len(u64),
     /// The first 8 bytes of a SHA-256, hex. Identifies a payload without storing it.
     Hash(String),
-    /// A short identifier (a model name, a serial, a path). Bounded: see [`Val::text`].
+    /// A short identifier (a model name, a serial, a path), at most [`TEXT_MAX_CHARS`] characters. A longer
+    /// one is a [`Val::TruncatedText`]: see [`Val::text`].
     Text(String),
+    /// A text that was longer than [`TEXT_MAX_CHARS`]: its first [`TEXT_MAX_CHARS`] characters, and how
+    /// many characters the original had. A typed marker, so it cannot be mistaken for a text that really
+    /// ends in a marker-looking string.
+    TruncatedText { text: String, original_chars: u64 },
 }
 
 impl Val {
-    /// A text value, cut to [`TEXT_MAX_CHARS`] characters with [`TRUNCATED_MARK`] appended when it was longer, so
-    /// a reader can tell a cut value from a short one.
+    /// A text value: [`Val::Text`] when it fits in [`TEXT_MAX_CHARS`] characters, else a
+    /// [`Val::TruncatedText`] holding the first [`TEXT_MAX_CHARS`] and the original length, so a reader
+    /// can tell a cut value from a short one without reading the text.
     pub fn text(s: &str) -> Val {
-        if s.chars().count() <= TEXT_MAX_CHARS {
+        let original_chars = s.chars().count();
+        if original_chars <= TEXT_MAX_CHARS {
             Val::Text(s.to_string())
         } else {
-            let mut cut: String = s.chars().take(TEXT_MAX_CHARS).collect();
-            cut.push_str(TRUNCATED_MARK);
-            Val::Text(cut)
+            Val::TruncatedText { text: s.chars().take(TEXT_MAX_CHARS).collect(), original_chars: original_chars as u64 }
+        }
+    }
+
+    /// The text of a [`Val::Text`] or [`Val::TruncatedText`] (the kept part), else `None`.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Val::Text(s) | Val::TruncatedText { text: s, .. } => Some(s),
+            _ => None,
         }
     }
 
@@ -251,6 +240,7 @@ impl Val {
             Val::Len(n) => format!("{n}B"),
             Val::Hash(h) => format!("#{h}"),
             Val::Text(s) => format!("{s:?}"),
+            Val::TruncatedText { text, original_chars } => format!("{text:?}[cut, {original_chars} chars in all]"),
         }
     }
 }
@@ -291,6 +281,11 @@ pub struct OpenSpan {
     pub fields: Vec<(String, Val)>,
     pub depth: u32,
     pub thread: u64,
+    /// When it began, on the monotonic clock: what a duration is measured from when [`Diag::shutdown`]
+    /// closes the span (the wall-clock `ts_ms` can step). Not written to the file; `None` for a span
+    /// read back from one.
+    #[serde(skip)]
+    started: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,6 +562,7 @@ impl Diag {
     pub fn span(&self, subsystem: Subsystem, op: &str, class: Class, fields: &[(&'static str, Val)]) -> Span<'_> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let thread = thread_num();
+        let started = Instant::now();
         {
             let mut st = self.lock();
             let depth = st.open.iter().filter(|o| o.thread == thread).count() as u32;
@@ -579,11 +575,12 @@ impl Diag {
                 fields: own_fields(fields),
                 depth,
                 thread,
+                started: Some(started),
             });
             self.write_inflight(&st);
         }
         self.flush_warning();
-        Span { diag: Some(self), seq, started: Instant::now(), finished: false }
+        Span { diag: Some(self), seq, started }
     }
 
     /// Record something that happened, with no duration.
@@ -673,7 +670,8 @@ impl Diag {
                         (Class::Leaf, _) => Outcome::Abandoned,
                     }
                 };
-                let dur_us = unix_ms().saturating_sub(o.ts_ms) * 1000;
+                // Monotonic, like every other span's duration: a wall-clock step must not make it negative or huge.
+                let dur_us = o.started.map_or(0, |s| s.elapsed().as_micros() as u64);
                 self.finish_open(&mut st, o, outcome, &[], dur_us);
             }
             self.write_inflight(&st);
@@ -853,7 +851,9 @@ impl Diag {
     /// Turn an open span (already removed from `st.open`) into a completed ring entry.
     fn finish_open(&self, st: &mut State, open: OpenSpan, outcome: Outcome, extra: &[(&'static str, Val)], dur_us: u64) {
         let mut fields = open.fields;
-        fields.extend(extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
+        for (k, v) in extra {
+            put_field(&mut fields, k, v.clone());
+        }
         let entry = Entry {
             seq: open.seq,
             ts_ms: open.ts_ms,
@@ -876,10 +876,7 @@ impl Diag {
         {
             let mut st = self.lock();
             if let Some(o) = st.open.iter_mut().find(|o| o.seq == seq) {
-                match o.fields.iter_mut().find(|(k, _)| k == key) {
-                    Some(slot) => slot.1 = v,
-                    None => o.fields.push((key.to_string(), v)),
-                }
+                put_field(&mut o.fields, key, v);
                 self.write_inflight(&st);
             } else {
                 self.unmatched.fetch_add(1, Ordering::Relaxed);
@@ -899,8 +896,22 @@ impl Diag {
     }
 }
 
+/// Set `key` to `v`: replace the value if the key is there, else append. The one place fields are added,
+/// so a key given at the start and again at the finish (or set mid-flight) is one field with the latest
+/// value, not two entries of which a reader finds the first.
+fn put_field(fields: &mut Vec<(String, Val)>, key: &str, v: Val) {
+    match fields.iter_mut().find(|(k, _)| k == key) {
+        Some(slot) => slot.1 = v,
+        None => fields.push((key.to_string(), v)),
+    }
+}
+
 fn own_fields(fields: &[(&'static str, Val)]) -> Vec<(String, Val)> {
-    fields.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
+    let mut out = Vec::with_capacity(fields.len());
+    for (k, v) in fields {
+        put_field(&mut out, k, v.clone());
+    }
+    out
 }
 
 /// Whether the process that wrote `pid`'s files is still running: its pid exists and is not a later
@@ -990,10 +1001,10 @@ fn temp_owner_pid(name: &str) -> Option<u32> {
 /// either it ends as [`Outcome::Abandoned`], or [`Outcome::Panicked`] when the thread is unwinding.
 #[must_use = "a span records its outcome when finished or dropped; binding it to _ ends it at once"]
 pub struct Span<'a> {
+    /// `None` for a span that records nothing, and once it has ended (taken by whoever ends it).
     diag: Option<&'a Diag>,
     seq: u64,
     started: Instant,
-    finished: bool,
 }
 
 impl std::fmt::Debug for Span<'_> {
@@ -1005,7 +1016,7 @@ impl std::fmt::Debug for Span<'_> {
 impl Span<'static> {
     /// A span that records nothing: what the code uses when diagnostics are not running.
     pub fn none() -> Span<'static> {
-        Span { diag: None, seq: 0, started: Instant::now(), finished: false }
+        Span { diag: None, seq: 0, started: Instant::now() }
     }
 }
 
@@ -1030,8 +1041,7 @@ impl Span<'_> {
 
     /// Finish with extra fields known only now (a response code, a byte count).
     pub fn finish_with(mut self, outcome: Outcome, extra: &[(&'static str, Val)]) {
-        self.finished = true;
-        if let Some(d) = self.diag {
+        if let Some(d) = self.diag.take() {
             d.end(self.seq, outcome, extra, self.started.elapsed().as_micros() as u64);
         }
     }
@@ -1039,10 +1049,8 @@ impl Span<'_> {
 
 impl Drop for Span<'_> {
     fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        if let Some(d) = self.diag {
+        // Already ended (finish_with took it), or a span that records nothing.
+        if let Some(d) = self.diag.take() {
             let outcome = if std::thread::panicking() { Outcome::Panicked } else { Outcome::Abandoned };
             d.end(self.seq, outcome, &[], self.started.elapsed().as_micros() as u64);
         }
@@ -1192,8 +1200,8 @@ impl Diag {
 /// before the previous hook runs, which still prints the message for the user. The hook never waits for
 /// the recorder's lock ([`Diag::try_event`]): a panic on a thread that holds it would wait for itself.
 /// With `panic = "abort"` the open spans are never dropped, so the in-flight file keeps them and this
-/// entry says why. Safe to call once per process.
-pub fn install_panic_hook() {
+/// entry says why. Safe to call more than once (only the first call installs).
+fn install_panic_hook() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(install_panic_hook_once);
 }
@@ -1444,6 +1452,13 @@ fn read_inflight(dir: &Path, pid: u32) -> InflightRead {
         }
     }
     let num = |k: &str| value.get(k).and_then(serde_json::Value::as_u64);
+    let role = match value.get("role").map(|v| serde_json::from_value::<Subsystem>(v.clone())) {
+        Some(Ok(role)) => role,
+        _ => {
+            r.problems.push(format!("{} names a role this build does not know (or none): shown as `diag`", path.display()));
+            Subsystem::Diag
+        }
+    };
     r.problems.push(format!(
         "{} was not fully understood (written by a different build?): {} open span(s) could not be read",
         path.display(),
@@ -1452,7 +1467,7 @@ fn read_inflight(dir: &Path, pid: u32) -> InflightRead {
     r.file = Some(InflightFile {
         schema: num("schema").map_or(1, |n| n as u32),
         pid: num("pid").map_or(pid, |n| n as u32),
-        role: value.get("role").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or(Subsystem::Diag),
+        role,
         process_started_ms: num("process_started_ms").unwrap_or(0),
         spans: ok,
         write_failures: num("write_failures").unwrap_or(0),
@@ -1476,12 +1491,8 @@ pub fn load_with(dir: &Path, alive: &dyn Fn(u32) -> Option<bool>, start_of: &dyn
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    let mut pids = std::collections::BTreeSet::new();
-    for entry in read.flatten() {
-        if let Some(pid) = pid_of_file_name(&entry.file_name().to_string_lossy()) {
-            pids.insert(pid);
-        }
-    }
+    let pids = pids_in(read.map(|e| e.map(|e| e.file_name())))
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{} could not be listed completely, so processes may be missing from a report: {e}", dir.display())))?;
     let mut out = Vec::new();
     for pid in pids {
         let inflight = read_inflight(dir, pid);
@@ -1533,6 +1544,18 @@ pub fn load_with(dir: &Path, alive: &dyn Fn(u32) -> Option<bool>, start_of: &dyn
     Ok(out)
 }
 
+/// The pids named by a directory listing's file names. A listing error is an error, not a skipped name:
+/// a report that silently left a process out would read as "that process never ran".
+fn pids_in(names: impl Iterator<Item = std::io::Result<OsString>>) -> std::io::Result<std::collections::BTreeSet<u32>> {
+    let mut pids = std::collections::BTreeSet::new();
+    for name in names {
+        if let Some(pid) = pid_of_file_name(&name?.to_string_lossy()) {
+            pids.insert(pid);
+        }
+    }
+    Ok(pids)
+}
+
 fn fields_text(fields: &[(String, Val)]) -> String {
     fields.iter().map(|(k, v)| format!("{k}={}", v.display())).collect::<Vec<_>>().join(" ")
 }
@@ -1545,22 +1568,54 @@ fn age_text(ms: u64) -> String {
     }
 }
 
+/// One line of the report: an entry, or a run of consecutive successful leaf spans collapsed into it.
+struct Run<'a> {
+    first: &'a Entry,
+    /// The newest member: the one nearest a hang, so its fields are shown too. Equal to `first` for a run of one.
+    last: &'a Entry,
+    count: u32,
+    /// The members' durations summed.
+    total_us: u64,
+}
+
 /// Collapse runs of consecutive successful leaf spans of the same subsystem and operation into one
 /// line with a count. A failed one is never merged into a run.
-fn aggregated(entries: &[Entry]) -> Vec<(Entry, u32, u64)> {
-    let mut out: Vec<(Entry, u32, u64)> = Vec::new();
+fn aggregated(entries: &[Entry]) -> Vec<Run<'_>> {
+    let mut out: Vec<Run<'_>> = Vec::new();
     for e in entries {
-        if let Some((last, n, total)) = out.last_mut() {
+        if let Some(run) = out.last_mut() {
             let mergeable = |x: &Entry| x.kind == Kind::Span && x.class == Class::Leaf && x.outcome == Some(Outcome::Ok);
-            if mergeable(last) && mergeable(e) && last.subsystem == e.subsystem && last.op == e.op && last.thread == e.thread {
-                *n += 1;
-                *total += e.dur_us;
+            if mergeable(run.last) && mergeable(e) && run.last.subsystem == e.subsystem && run.last.op == e.op && run.last.thread == e.thread {
+                run.last = e;
+                run.count += 1;
+                run.total_us += e.dur_us;
                 continue;
             }
         }
-        out.push((e.clone(), 1, e.dur_us));
+        out.push(Run { first: e, last: e, count: 1, total_us: e.dur_us });
     }
     out
+}
+
+/// One completed entry (or collapsed run) as a report line: its sequence number (the range for a run),
+/// what it was, how it ended and how long it took, then when it began, on which thread, its class and
+/// nesting depth, then its fields. A run shows the fields of its first and of its last member.
+fn run_line(run: &Run<'_>, now_ms: u64) -> String {
+    let (f, l) = (run.first, run.last);
+    let outcome = f.outcome.map_or("event", Outcome::as_str);
+    let seq = if run.count > 1 { format!("#{}..#{}", f.seq, l.seq) } else { format!("#{}", f.seq) };
+    let took = if run.count > 1 { format!(" x{} ({} total)", run.count, age_text(run.total_us / 1000)) } else { format!(" ({})", age_text(f.dur_us / 1000)) };
+    let class = match f.class {
+        Class::Top => "top",
+        Class::Leaf => "leaf",
+    };
+    let began = format!("began {} ago, thread {}, {class}, depth {}", age_text(now_ms.saturating_sub(f.ts_ms)), f.thread, f.depth);
+    let fields = if run.count > 1 {
+        format!("first: {} last: {}", fields_text(&f.fields), fields_text(&l.fields))
+    } else {
+        fields_text(&f.fields)
+    };
+    format!("    {seq} {} {} {outcome}{took} [{began}] {fields}\n", f.subsystem.as_str(), f.op)
 }
 
 /// The report text. `now_ms` is the current unix time in milliseconds; `last_n` is how many of each
@@ -1574,10 +1629,7 @@ pub fn render(traces: &[ProcessTrace], now_ms: u64, last_n: usize) -> String {
         // The process's role: from its `start` event (the entry's own subsystem is `diag`, which says nothing), else
         // its in-flight file, else the first entry's subsystem.
         let start_role = t.entries.iter().find(|e| e.kind == Kind::Event && e.op == OP_START).and_then(|e| {
-            e.fields.iter().find_map(|(k, v)| match (k.as_str(), v) {
-                ("role", Val::Text(r)) => Some(r.as_str()),
-                _ => None,
-            })
+            e.fields.iter().find_map(|(k, v)| if k == "role" { v.as_text() } else { None })
         });
         let role = start_role.or(t.inflight.as_ref().map(|f| f.role.as_str())).or_else(|| t.entries.first().map(|e| e.subsystem.as_str())).unwrap_or("?");
         out.push_str(&format!("pid {} ({role}): {} entr{}", t.pid, t.entries.len(), if t.entries.len() == 1 { "y" } else { "ies" }));
@@ -1642,16 +1694,12 @@ pub fn render(traces: &[ProcessTrace], now_ms: u64, last_n: usize) -> String {
         let agg = aggregated(&t.entries);
         let skipped = agg.len().saturating_sub(last_n);
         if skipped > 0 {
-            out.push_str(&format!("  last {last_n} of {} entries (aggregated):\n", agg.len()));
+            out.push_str(&format!("  last {last_n} of {} retained entries (aggregated):\n", agg.len()));
         } else {
-            out.push_str("  entries (aggregated):\n");
+            out.push_str("  retained entries (aggregated):\n");
         }
-        for (e, n, total) in agg.iter().skip(skipped) {
-            let outcome = e.outcome.map(|o| o.as_str()).unwrap_or("event");
-            let count = if *n > 1 { format!(" x{n} ({} total)", age_text(total / 1000)) } else { format!(" ({})", age_text(e.dur_us / 1000)) };
-            // A collapsed run shows its first entry's fields, and says so.
-            let first = if *n > 1 { "first: " } else { "" };
-            out.push_str(&format!("    #{} {} {} {outcome}{count} {first}{}\n", e.seq, e.subsystem.as_str(), e.op, fields_text(&e.fields)));
+        for run in agg.iter().skip(skipped) {
+            out.push_str(&run_line(run, now_ms));
         }
     }
     out

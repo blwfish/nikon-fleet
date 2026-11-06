@@ -483,6 +483,15 @@ pub enum PtpUsbError {
     PropWriteIndeterminate { propcode: u16, cause: Box<PtpUsbError> },
 }
 
+/// The eviction class of a transaction's diagnostics span. A transaction with a data phase out sends
+/// something to the camera (a property write, an FTP profile write, a vendor probe with data): a
+/// `Class::Top` span, so the ring keeps a successful one longer than the routine reads and a failed one
+/// longer than anything else. Every other transaction (a read, a session open or close) is one of
+/// hundreds and a `Class::Leaf`, which the ring evicts first and the report collapses in runs.
+fn txn_span_class(data_out: Option<&[u8]>) -> crate::diag::Class {
+    if data_out.is_some() { crate::diag::Class::Top } else { crate::diag::Class::Leaf }
+}
+
 /// Whether the data phase of `op` carries an FTP profile (so a password). Diagnostics record the length
 /// of such a payload and nothing else about it: not the bytes, and not a hash either.
 fn op_payload_holds_a_secret(op: u16) -> bool {
@@ -2901,7 +2910,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
     /// and a hash, never the bytes (an FTP profile carries a password). The operation and parameters
     /// are what the camera was asked; they are codes and slot numbers.
     fn begin_txn_span(&self, op: u16, params: &[u32], data_out: Option<&[u8]>) -> crate::diag::Span<'static> {
-        use crate::diag::{Class, Subsystem, Val};
+        use crate::diag::{Subsystem, Val};
         let Some(d) = self.diag else { return crate::diag::Span::none() };
         let mut fields: Vec<(&'static str, Val)> = vec![
             ("op", Val::Hex(u64::from(op))),
@@ -2919,7 +2928,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         }
         // The operation code is part of the name so the report only collapses runs of the *same*
         // operation, never a close, an open and a read into one line.
-        d.span(Subsystem::Usb, &format!("ptp_{op:04x}"), Class::Leaf, &fields)
+        d.span(Subsystem::Usb, &format!("ptp_{op:04x}"), txn_span_class(data_out), &fields)
     }
 
     /// Mark the session unusable: clear the halt on both bulk endpoints (the
@@ -6512,6 +6521,22 @@ mod tests {
     }
 
     #[test]
+    fn a_transaction_that_sends_data_is_a_top_span_and_one_that_does_not_is_a_leaf() {
+        use crate::diag::{Class, Outcome};
+        // Both neighbours of the boundary: no data phase, an empty one, a non-empty one.
+        assert_eq!(txn_span_class(None), Class::Leaf);
+        assert_eq!(txn_span_class(Some(&[])), Class::Top, "an empty data phase is still a write");
+        assert_eq!(txn_span_class(Some(&[1])), Class::Top);
+        // The spans the session records carry it: a property write is Top, a property read Leaf.
+        let (mut s, _t, d, _dir) = recorded(vec![resp(RESP_OK), data_c(OP_VENDOR_PROP_READ, &[1]), resp(RESP_OK)], "Z 9");
+        s.transact(OP_SET_DEVICE_PROP_VALUE, &[0xD090], Some(&[1, 0, 0]), TxidCheck::Unchecked).unwrap();
+        s.read_vendor_property(0xD053).unwrap();
+        let ring = d.snapshot();
+        assert_eq!((ring[0].op.as_str(), ring[0].class, ring[0].outcome), ("ptp_1016", Class::Top, Some(Outcome::Ok)));
+        assert_eq!((ring[1].op.as_str(), ring[1].class), ("ptp_943b", Class::Leaf));
+    }
+
+    #[test]
     fn up_to_five_parameters_are_recorded_individually_and_the_count_is_always_there() {
         use crate::diag::Val;
         let (mut s, _t, d, _dir) = recorded(vec![resp(RESP_OK), resp(RESP_OK)], "Z 9");
@@ -8303,9 +8328,9 @@ mod tests {
         use crate::diag::Val;
         for e in every_ptp_usb_error() {
             for (k, v) in e.diag_fields() {
-                if let Val::Text(t) = &v {
+                if let Some(t) = v.as_text() {
                     assert!(["error_kind", "usb_error", "cause_kind"].contains(&k), "{k} is text for {e}");
-                    assert_ne!(t, &e.to_string(), "{k} must not be the Display text of {e}");
+                    assert_ne!(t, e.to_string(), "{k} must not be the Display text of {e}");
                 }
             }
         }

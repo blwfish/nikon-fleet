@@ -4,12 +4,14 @@
 //!
 //! Findings nikon-fleet-20261105-b7d3#05, #11, #12, #13, #37.
 
-use std::process::{Command, Output};
+use std::process::Output;
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
 fn run(args: &[&str]) -> Output {
-    Command::new(BIN).args(args).output().expect("run CLI")
+    common::cli(BIN).args(args).output().expect("run CLI")
 }
 
 fn help_of(args: &[&str]) -> String {

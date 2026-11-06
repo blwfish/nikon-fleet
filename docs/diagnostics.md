@@ -23,6 +23,13 @@ For each process it says one of:
 | **gone, spans still open** | Killed or crashed. The spans listed under "in flight" are what it was doing, oldest first, each with how long ago it began. |
 | **running, spans open** | Hung, or just busy. Same list. |
 | gone, nothing open, no exit | Killed between operations. |
+| running (or cannot be checked), nothing open | Idle, or between operations. |
+| spans open, liveness unknown | This platform cannot say whether the process is still running; the open spans are listed. |
+
+The completed entries of each process follow, oldest first, one line each: `#seq subsystem op outcome (duration)
+[began X ago, thread T, top|leaf, depth D] fields`. A run of consecutive successful leaf spans of one operation on one thread
+is collapsed into one line `#first..#last ... xN (total)` that shows the fields of its first and of its last member
+(the last is the one nearest a hang); a failed span is never collapsed.
 
 A pid that is running now but started after the process's files were written is a different process that reused
 the number; the report says so and treats the original as gone. (Start times are available on macOS; elsewhere the
@@ -41,15 +48,20 @@ call the child's pid. A line cut off by a kill is counted, not hidden.
   process that hangs or is killed leaves it behind.
 - `ring-<pid>.jsonl`: completed spans and events, newest last, in a ring of 1024 entries. Append-only, rewritten from
   memory when it reaches twice that, so the cost of an entry does not grow with the size. When the ring is full the
-  routine successes (one SDK read of two hundred) go first, then other successes, then events and failed routine
-  calls, and **failed top-level steps last**, so a burst of reads cannot push out the failure that matters.
+  oldest entry of the lowest rank goes. The ranks, lowest first: successful routine (leaf) spans such as one SDK read
+  of two hundred; successful top-level spans (a whole command, step, **or a write to the camera**); events and failed
+  routine spans; **failed top-level spans last**. So a burst of reads cannot push out a write or the failure that
+  matters, but a *successful* write is still evicted before an event or a failed read, and a burst of failed reads can
+  evict older failed reads (the count of what was evicted is kept, see below).
 
 The newest 20 processes' files are kept, except that the files of a process that is still running are never removed (an
 idle GUI or MCP server keeps its files however many short-lived processes start after it), so the total can exceed 20 by
 the number of running processes. Leftover temp files (`.inflight-<pid>.json.<writer>.<n>.tmp`) of dead writers are
 removed at the same time. A directory you name in `NIKON_FLEET_DIAG_DIR` that already exists keeps its permissions; one
 the program creates is owner-only. `cargo run` and `cargo test` write to `target/diag-dev` instead
-(`.cargo/config.toml`), so test runs never touch the real directory. `--trace FILE` (CLI only) also appends every
+(`.cargo/config.toml`), and every test that spawns the CLI or the MCP server sets `NIKON_FLEET_DIAG_DIR` to a scratch directory
+itself (`tests/common`), so test runs never touch the real directory even when cargo does not find that file (a test binary
+run directly, cargo started from outside the tree). `--trace FILE` (CLI only) also appends every
 entry to FILE, uncompacted.
 
 ## What is recorded
@@ -63,7 +75,7 @@ camera is unknown (a write whose data went out and whose reply never came; an ap
 | cli | `command` (top) | `name`, the subcommand clap matched |
 | gui | `gui` (process), `gui_cmd` (top), `cli_child` (top) | `cmd` (a closed list), `program`, `argc`, `timeout_ms`, `child_pid`, `request_id`, `exit_code`, `stdin_len`, output lengths |
 | mcp | `server` (process), `tool_call` (top), `worker_call` (top), `kill_worker` (top) | `tool`, `worker_op`, `deadline_ms`, `queue_wait_ms`, `child_pid`, `phase`, `cause`, `request_id` |
-| usb | `ptp_<op code>` (leaf, one per PTP transaction), `usb_scan`, `usb_reset` | `op`, `txid`, `p0`..`p4`, `phase` (`command_sent`, `data_sent`), `response`, `data_len`, `data_hash`, `reply_len`, `reply_hash` (`data_hash`/`reply_hash` are omitted for FTP-profile payloads, `0x90EE` and `0x90ED`); `usb_scan`: `cameras`, `unreadable`, `enumeration_error` (ends `failed` if the bus could not be listed or a device on it could not be read; a device whose descriptor will not read is counted in `unreadable`); `usb_reset`: `devices`, `reset`, `open_failed`, `reset_failed`, `enumeration_failed` (ends `failed` if any body was not reset) |
+| usb | `ptp_<op code>` (one per PTP transaction: **top** when the transaction sends a data phase to the camera, so a property write or an FTP-profile write, **leaf** for every other one), `usb_scan`, `usb_reset` | `op`, `txid`, `p0`..`p4`, `phase` (`command_sent`, `data_sent`), `response`, `data_len`, `data_hash`, `reply_len`, `reply_hash` (`data_hash`/`reply_hash` are omitted for FTP-profile payloads, `0x90EE` and `0x90ED`); `usb_scan`: `cameras`, `unreadable`, `enumeration_error` (ends `failed` if the bus could not be listed or a device on it could not be read; a device whose descriptor will not read is counted in `unreadable`); `usb_reset`: `devices`, `reset`, `open_failed`, `reset_failed`, `enumeration_failed` (ends `failed` if any body was not reset) |
 | maid_sdk | `sdk_load`, `initialize_sdk`, `enum_devices` (with `attempt`), `connect_device`, `disconnect_device` (all top); `read_cap` (leaf); `write_cap` (top) | `cap`, `kind`, `value_hash` (or `value_unhashable` if the value could not be serialised), `code`, `capabilities`, `attempts` (`enum_devices`), `data_type`, `placeholder` (the type has no decoder), `values_missing` and `array_code` (an enum read whose options list could not be had); a failure carries `error_kind` (a closed tag) and, for an SDK call, `call` and `code`; a load failure also `load_error` (the loader's reason); on `disconnect_device` also `pump_rc` and `pump_ms` (what the run-loop pump before it returned and how long it really ran: `pump_ms` far below 300 means the pump did nothing) |
 | lock | `camera_lock_held` (top, open for the whole hold); event `lock_refused` | `reason` |
 | snapshot | `capture_snapshot`, `restore_point`, `check`, `save_new`, `capture_reads` | `gate_waived`; `capture_reads`: `read_ok`, `read_err`, `skipped_no_get`, `unknown_schema` (ends `failed` only if reads were attempted and none came back; some unreadable properties are normal) |
@@ -110,12 +122,20 @@ the bytes are never stored. Tests check this for the PTP layer, the GUI's `cli_c
   every span begun on **another thread** as `abandoned`, counting them in `cut_off`. So the GUI's `on_exit` (UI thread) may
   call `diag::shutdown(0)` while `cli_child` spans run on worker threads: those come out `abandoned`, its own `gui` span `ok`.
   Only the first shutdown records; a second waits for it. A span begun after the exit does not recreate the in-flight file.
-- File formats: the in-flight file carries `schema` (1); a file from a newer build is still read and named in a `problem:`
-  line, and an in-flight span this build cannot parse is listed as "could not be read" but still counts as open. A ring line
-  that is JSON but not an entry this build understands is counted apart ("does not understand") from a line cut by a kill.
-  Ring lines have no version of their own. Ring and trace lines are written with one `write` each.
-- Ring eviction is counted (`evicted`) and the report says how many older entries are gone; text values cut at 256 characters
-  carry the in-band marker ` …[truncated]` (no separate flag).
+- File formats: the in-flight file carries `schema` (now 2); a file from a newer build is still read and named in a
+  `problem:` line, and an in-flight span this build cannot parse is listed as "could not be read" but still counts as open.
+  A ring line that is JSON but not an entry this build understands is counted apart ("does not understand") from a line cut
+  by a kill. Ring lines have no version of their own. Ring and trace lines are written with one `write` each.
+  Schema 2 changed the vocabulary: a text longer than 256 characters is a typed `truncated_text` value (the first 256
+  characters and `original_chars`; the report prints `[cut, N chars in all]`) instead of text ending in the in-band mark
+  ` …[truncated]`, and the subsystems `ptp_ip` and `settings` (never recorded under) were removed. Files written by the
+  first build still load: its in-band mark is read as ordinary text (those old values stay ambiguous), and a line or open
+  span naming a removed subsystem is counted as one this build does not understand, which cannot occur in practice because
+  nothing ever recorded under them.
+- Ring eviction is counted (`evicted`) and the report says how many older entries are gone, and its "last N of M" line
+  counts the *retained* entries only. A field key given when a span begins and again when it finishes (or `set` in between)
+  is one field with the latest value. A shutdown-closed span's duration is measured on the monotonic clock like any other.
+  A directory entry that cannot be listed makes `diag-report` fail with that error rather than leave a process out.
 
 ## Adding a span
 

@@ -2,10 +2,12 @@
 //! unchanged, and `--json` must put exactly one JSON document on stdout.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use serde_json::{Value, json};
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
@@ -21,7 +23,7 @@ fn snap(model: &str, serial: &str, label: Option<&str>) -> Snapshot {
 }
 
 fn run(data_dir: &Path, args: &[&str]) -> Output {
-    Command::new(BIN).arg("--data-dir").arg(data_dir).args(args).output().expect("spawn CLI")
+    common::cli(BIN).arg("--data-dir").arg(data_dir).args(args).output().expect("spawn CLI")
 }
 
 fn stdout(o: &Output) -> String {

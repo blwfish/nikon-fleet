@@ -4,10 +4,12 @@
 //! files are written here (invented, not the SDK's), so nothing depends on the machine's sdk-runtime/.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use serde_json::{Value, json};
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
@@ -91,7 +93,7 @@ impl Env {
     }
 
     fn show_with_schema(&self, schema: &Path, args: &[&str]) -> Output {
-        Command::new(BIN)
+        common::cli(BIN)
             .current_dir(self.dir.path())
             .arg("--data-dir")
             .arg(self.dir.path())

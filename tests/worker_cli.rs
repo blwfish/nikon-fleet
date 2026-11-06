@@ -7,12 +7,14 @@ use std::fs::File;
 use std::io::BufReader;
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use nikon_fleet::camera_lock::CameraLock;
 use nikon_fleet::ops::worker::{Outcome, Read, ReadEnd, read_until_result};
 use serde_json::json;
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 const CHANNEL_FD: i32 = 3;
@@ -28,7 +30,7 @@ fn spawn(global: &[&str], op: &[&str], env: &[(&str, &str)]) -> Worker {
     let mut fds = [0i32; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     let (r, w) = (fds[0], fds[1]);
-    let mut cmd = Command::new(BIN);
+    let mut cmd = common::cli(BIN);
     cmd.args(global).arg("worker").arg("--result-fd").arg(CHANNEL_FD.to_string()).args(op);
     for (k, v) in env {
         cmd.env(k, v);
@@ -158,7 +160,7 @@ fn the_exit_status_is_not_the_answer() {
 #[test]
 fn a_result_channel_that_is_not_open_or_is_a_standard_stream_is_refused() {
     for (fd, needle) in [("77", "not open"), ("1", "stdout"), ("2", "standard stream"), ("0", "standard stream")] {
-        let out = Command::new(BIN)
+        let out = common::cli(BIN)
             .args(["worker", "--result-fd", fd, "selftest"])
             .stdin(Stdio::null())
             .output()
@@ -232,7 +234,7 @@ fn a_result_that_cannot_be_delivered_is_exit_status_2_not_a_success() {
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     let (r, w) = (fds[0], fds[1]);
     unsafe { libc::close(r) };
-    let mut cmd = Command::new(BIN);
+    let mut cmd = common::cli(BIN);
     cmd.args(["worker", "--result-fd", &CHANNEL_FD.to_string(), "selftest"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -1,10 +1,12 @@
 //! `nikon-fleet baseline seed` through the real binary (no camera needed).
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use serde_json::json;
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
@@ -27,7 +29,7 @@ fn source_of(dir: &Path, name: &str, model: &str, firmware: &str, codes: &[u32])
 }
 
 fn seed(src: &Path, out: &Path, extra: &[&str]) -> Output {
-    Command::new(BIN).arg("baseline").arg("seed").arg(src).arg("--out-dir").arg(out).args(extra).output().unwrap()
+    common::cli(BIN).arg("baseline").arg("seed").arg(src).arg("--out-dir").arg(out).args(extra).output().unwrap()
 }
 
 #[test]

@@ -3,15 +3,17 @@
 //! checks that run before the SDK is opened.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use serde_json::json;
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
 fn help(cmd: &str) -> String {
-    let o = Command::new(BIN).arg(cmd).arg("--help").output().expect("spawn CLI");
+    let o = common::cli(BIN).arg(cmd).arg("--help").output().expect("spawn CLI");
     assert!(o.status.success());
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
@@ -29,7 +31,7 @@ fn snapshot_file(dir: &Path) -> std::path::PathBuf {
 }
 
 fn run(dir: &Path, args: &[&str]) -> Output {
-    Command::new(BIN)
+    common::cli(BIN)
         .arg("--data-dir")
         .arg(dir)
         .arg("--sdk-bundle")

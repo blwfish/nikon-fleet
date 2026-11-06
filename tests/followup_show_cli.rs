@@ -2,10 +2,12 @@
 //! alone (no camera, no SDK), with missing data shown as missing and failures as exit status 1.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use serde_json::{Value, json};
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
@@ -39,7 +41,7 @@ fn run_in(cwd: &Path, data: &Path, args: &[&str]) -> Output {
     // with files it writes itself.
     let (cmd, rest) = args.split_first().expect("a subcommand");
     let raw: &[&str] = if *cmd == "show" { &["--raw"] } else { &[] };
-    Command::new(BIN)
+    common::cli(BIN)
         .current_dir(cwd)
         .arg("--data-dir")
         .arg(data)

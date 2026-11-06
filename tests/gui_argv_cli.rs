@@ -15,11 +15,13 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use nikon_fleet::gui_argv::{restore_argv, transplant_argv};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use serde_json::json;
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
@@ -41,13 +43,13 @@ fn set(names: &[&str]) -> BTreeSet<String> {
 }
 
 fn parse_only(argv: &[String]) -> Output {
-    Command::new(BIN).args(argv).env("NIKON_FLEET_PARSE_ONLY", "1").output().expect("spawn CLI")
+    common::cli(BIN).args(argv).env("NIKON_FLEET_PARSE_ONLY", "1").output().expect("spawn CLI")
 }
 
 fn run(dir: &Path, argv: &[String]) -> Output {
     let mut full = vec!["--sdk-bundle".to_string(), dir.join("no-such-sdk-bundle").to_str().unwrap().to_string()];
     full.extend_from_slice(argv);
-    Command::new(BIN).args(full).output().expect("spawn CLI")
+    common::cli(BIN).args(full).output().expect("spawn CLI")
 }
 
 fn stderr(o: &Output) -> String {

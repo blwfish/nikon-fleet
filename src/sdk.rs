@@ -978,8 +978,10 @@ impl<'sdk> Device<'sdk> {
     /// to the index-only representation already stored in `values: []`.
     pub fn read_capability(&self, capability_id: u32) -> Result<Value, SdkError> {
         use crate::diag::{self, Class, Subsystem, Val};
-        // A capture reads about two hundred of these, so it is a Leaf with the least that identifies it; the
-        // report collapses a run of successes and keeps every failure.
+        // A capture reads about two hundred of these, so it is a Leaf with the least that identifies it: the
+        // ring evicts a successful Leaf first and the report collapses a run of them. A failed Leaf is kept
+        // longer than a success but not as long as a failed Top span (see `diag::eviction_rank`); a burst of
+        // failed reads can still push out older ones, which `evicted` counts.
         let span = diag::span(Subsystem::MaidSdk, "read_cap", Class::Leaf, &[("cap", Val::Hex(u64::from(capability_id)))]);
         let result = self.read_capability_inner(capability_id, &span);
         // What the read found (`data_type`, and `values_missing`/`placeholder` when the value is degraded) was
@@ -1079,8 +1081,10 @@ impl<'sdk> Device<'sdk> {
     /// this capability (or an equivalent with the same structure).
     pub fn write_capability(&self, capability_id: u32, cap_kind: u32, value: &Value) -> Result<(), SdkError> {
         use crate::diag::{self, Class, Subsystem, Val};
-        // The only place the SDK path changes a camera. A Top span so writes are the last thing the ring evicts,
-        // and the value is recorded only as a hash: enough to see that two writes carried the same value.
+        // The only place the SDK path changes a camera. A Top span, so a successful write outlives the routine
+        // reads (they go first) and a failed write is the last thing the ring evicts; a successful write is
+        // still evicted before events and failed Leaf spans (see `diag::eviction_rank`). The value is recorded
+        // only as a hash: enough to see that two writes carried the same value.
         let span = diag::span(
             Subsystem::MaidSdk,
             "write_cap",
@@ -2186,7 +2190,7 @@ mod tests {
             let sym = SdkError::Symbol("FreeSDK".into(), load_error()).diag_fields();
             assert_eq!(field(&sym, "symbol"), Some(&Val::text("FreeSDK")));
             let load = SdkError::Load { path: PathBuf::from("/x"), source: load_error() }.diag_fields();
-            assert!(matches!(field(&load, "load_error"), Some(Val::Text(t)) if !t.is_empty()), "{load:?}");
+            assert!(field(&load, "load_error").and_then(Val::as_text).is_some_and(|t| !t.is_empty()), "{load:?}");
             assert_eq!(field(&SdkError::UnsupportedWrite(12).diag_fields(), "kind"), Some(&Val::U64(12)));
             assert_eq!(field(&SdkError::StringTooLong { len: 300 }.diag_fields(), "len"), Some(&Val::U64(300)));
         }
@@ -2197,7 +2201,7 @@ mod tests {
         fn no_variant_records_its_display_text() {
             for e in every_error() {
                 for (k, v) in e.diag_fields() {
-                    if let Val::Text(t) = v {
+                    if let Some(t) = v.as_text() {
                         assert!(["error_kind", "call", "symbol", "load_error"].contains(&k), "{k} is text for {e}");
                         assert_ne!(t, e.to_string(), "{k} must not be the Display text of {e}");
                     }

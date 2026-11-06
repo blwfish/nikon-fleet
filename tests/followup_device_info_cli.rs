@@ -3,16 +3,18 @@
 //! a CLI-only command. What it prints for a dataset is pinned by the unit tests in `src/main.rs`;
 //! reading a real body needs hardware.
 
-use std::process::{Command, Output};
+use std::process::Output;
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
 fn run(args: &[&str]) -> Output {
-    Command::new(BIN).args(args).output().expect("run CLI")
+    common::cli(BIN).args(args).output().expect("run CLI")
 }
 
 fn parse_only(args: &[&str]) -> Output {
-    Command::new(BIN).env("NIKON_FLEET_PARSE_ONLY", "1").args(args).output().expect("run CLI")
+    common::cli(BIN).env("NIKON_FLEET_PARSE_ONLY", "1").args(args).output().expect("run CLI")
 }
 
 fn help() -> String {

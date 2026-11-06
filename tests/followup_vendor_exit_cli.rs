@@ -4,12 +4,13 @@
 //! unit tests of `exit_code_for` in `src/main.rs`; the real path needs a camera. What a binary test
 //! can pin is that the status is DOCUMENTED where a script author looks: `--help`.
 
-use std::process::Command;
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
 fn help_of(args: &[&str]) -> String {
-    let out = Command::new(BIN).args(args).arg("--help").output().expect("run CLI");
+    let out = common::cli(BIN).args(args).arg("--help").output().expect("run CLI");
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).expect("help is UTF-8")
 }

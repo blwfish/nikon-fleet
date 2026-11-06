@@ -3,10 +3,12 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use nikon_fleet::settings::{Os, default_data_dir_for};
 use serde_json::{Value, json};
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
@@ -31,7 +33,7 @@ fn sandbox() -> Sandbox {
 
 impl Sandbox {
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(BIN)
+        common::cli(BIN)
             .env("HOME", &self.home)
             .env("APPDATA", self.appdata())
             .env("NIKON_FLEET_SETTINGS", &self.file)
@@ -167,7 +169,7 @@ fn the_cli_keeps_its_default_of_the_current_directory_and_says_so() {
     let want = format!("(no snapshots — directory {} does not exist)", Path::new(".").join("snapshots").display());
     assert!(stdout(&o).starts_with(&want), "{}", stdout(&o));
     // And the shell form the help text gives reaches the GUIs' directory.
-    let help = Command::new(BIN).arg("--help").output().unwrap();
+    let help = common::cli(BIN).arg("--help").output().unwrap();
     let help = String::from_utf8_lossy(&help.stdout).into_owned();
     assert!(help.contains("CURRENT DIRECTORY") && help.contains("settings data-dir"), "{help}");
 }

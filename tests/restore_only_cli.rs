@@ -7,10 +7,12 @@
 //! "succeeded" would look exactly like an undo that had nothing to do.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use serde_json::json;
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
@@ -28,7 +30,7 @@ fn write_snapshot(dir: &Path) -> std::path::PathBuf {
 }
 
 fn run(dir: &Path, snap: &Path, extra: &[&str]) -> Output {
-    Command::new(BIN)
+    common::cli(BIN)
         .arg("--data-dir")
         .arg(dir)
         .arg("--sdk-bundle")

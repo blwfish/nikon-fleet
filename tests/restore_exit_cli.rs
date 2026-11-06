@@ -6,11 +6,13 @@
 //! SDK, which is before any write by construction. A dry run never writes and keeps its plain 1.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use nikon_fleet::ops::apply::{EXIT_REFUSED_BEFORE_WRITE, EXIT_STALE_PLAN};
 use nikon_fleet::snapshot::{Camera, Snapshot, Transport};
 use serde_json::json;
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
@@ -27,7 +29,7 @@ fn write_snapshot(dir: &Path) -> std::path::PathBuf {
 }
 
 fn run(dir: &Path, args: &[&str]) -> Output {
-    Command::new(BIN)
+    common::cli(BIN)
         .arg("--data-dir")
         .arg(dir)
         .arg("--sdk-bundle")
@@ -103,7 +105,7 @@ fn the_flags_that_hold_an_apply_to_a_plan_are_checked_by_the_parser_before_anyth
 
 #[test]
 fn the_help_documents_every_status_a_caller_tests() {
-    let out = Command::new(BIN).args(["restore", "--help"]).output().expect("run CLI");
+    let out = common::cli(BIN).args(["restore", "--help"]).output().expect("run CLI");
     let help = String::from_utf8(out.stdout).unwrap();
     for status in [0, 1, 2, EXIT_STALE_PLAN, EXIT_REFUSED_BEFORE_WRITE] {
         assert!(help.contains(&format!("\n  {status}  ")), "status {status} missing from:\n{help}");

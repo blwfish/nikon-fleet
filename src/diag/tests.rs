@@ -27,66 +27,122 @@ fn leaf_ok(d: &Diag, op: &str) {
 
 // ── vocabulary ───────────────────────────────────────────────────────────
 
+/// Every subsystem. Test-only: the production code needs no list of them. The match below has no
+/// wildcard, so adding a variant breaks this until the list and the count are updated too.
+const SUBSYSTEMS: [Subsystem; 11] = [
+    Subsystem::Cli,
+    Subsystem::Gui,
+    Subsystem::Mcp,
+    Subsystem::Usb,
+    Subsystem::MaidSdk,
+    Subsystem::Snapshot,
+    Subsystem::Transplant,
+    Subsystem::Restore,
+    Subsystem::Firmware,
+    Subsystem::Lock,
+    Subsystem::Diag,
+];
+
+fn subsystem_index(s: Subsystem) -> usize {
+    match s {
+        Subsystem::Cli => 0,
+        Subsystem::Gui => 1,
+        Subsystem::Mcp => 2,
+        Subsystem::Usb => 3,
+        Subsystem::MaidSdk => 4,
+        Subsystem::Snapshot => 5,
+        Subsystem::Transplant => 6,
+        Subsystem::Restore => 7,
+        Subsystem::Firmware => 8,
+        Subsystem::Lock => 9,
+        Subsystem::Diag => 10,
+    }
+}
+
+/// Every outcome; test-only, guarded like [`SUBSYSTEMS`].
+const OUTCOMES: [Outcome; 8] = [
+    Outcome::Ok,
+    Outcome::Failed,
+    Outcome::Timeout,
+    Outcome::Stalled,
+    Outcome::Indeterminate,
+    Outcome::Panicked,
+    Outcome::Abandoned,
+    Outcome::Cancelled,
+];
+
+fn outcome_index(o: Outcome) -> usize {
+    match o {
+        Outcome::Ok => 0,
+        Outcome::Failed => 1,
+        Outcome::Timeout => 2,
+        Outcome::Stalled => 3,
+        Outcome::Indeterminate => 4,
+        Outcome::Panicked => 5,
+        Outcome::Abandoned => 6,
+        Outcome::Cancelled => 7,
+    }
+}
+
 #[test]
-fn the_hand_written_names_are_the_serde_names_and_all_lists_every_variant() {
+fn the_hand_written_names_are_the_serde_names_and_the_test_lists_cover_every_variant() {
     // Two spellings of one vocabulary (as_str and serde) must not drift.
-    for s in Subsystem::ALL {
+    for s in SUBSYSTEMS {
         assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{}\"", s.as_str()), "{s:?}");
     }
-    for o in Outcome::ALL {
+    for o in OUTCOMES {
         assert_eq!(serde_json::to_string(&o).unwrap(), format!("\"{}\"", o.as_str()), "{o:?}");
     }
-    // An exhaustive match: adding a variant breaks this until ALL and the count are updated too.
-    fn sub_index(s: Subsystem) -> usize {
-        match s {
-            Subsystem::Cli => 0,
-            Subsystem::Gui => 1,
-            Subsystem::Mcp => 2,
-            Subsystem::Usb => 3,
-            Subsystem::PtpIp => 4,
-            Subsystem::MaidSdk => 5,
-            Subsystem::Snapshot => 6,
-            Subsystem::Transplant => 7,
-            Subsystem::Restore => 8,
-            Subsystem::Firmware => 9,
-            Subsystem::Settings => 10,
-            Subsystem::Lock => 11,
-            Subsystem::Diag => 12,
-        }
-    }
-    let mut idx: Vec<usize> = Subsystem::ALL.iter().map(|s| sub_index(*s)).collect();
+    let mut idx: Vec<usize> = SUBSYSTEMS.iter().map(|s| subsystem_index(*s)).collect();
     idx.sort_unstable();
-    assert_eq!(idx, (0..13).collect::<Vec<_>>());
-    fn out_index(o: Outcome) -> usize {
-        match o {
-            Outcome::Ok => 0,
-            Outcome::Failed => 1,
-            Outcome::Timeout => 2,
-            Outcome::Stalled => 3,
-            Outcome::Indeterminate => 4,
-            Outcome::Panicked => 5,
-            Outcome::Abandoned => 6,
-            Outcome::Cancelled => 7,
-        }
-    }
-    let mut idx: Vec<usize> = Outcome::ALL.iter().map(|o| out_index(*o)).collect();
+    assert_eq!(idx, (0..SUBSYSTEMS.len()).collect::<Vec<_>>());
+    let mut idx: Vec<usize> = OUTCOMES.iter().map(|o| outcome_index(*o)).collect();
     idx.sort_unstable();
-    assert_eq!(idx, (0..8).collect::<Vec<_>>());
+    assert_eq!(idx, (0..OUTCOMES.len()).collect::<Vec<_>>());
+    // The two names version 1 had and nothing ever recorded under are gone, not defaulted to something else.
+    assert!(serde_json::from_str::<Subsystem>("\"ptp_ip\"").is_err());
+    assert!(serde_json::from_str::<Subsystem>("\"settings\"").is_err());
     // An unknown name is refused, not defaulted.
     assert!(serde_json::from_str::<Subsystem>("\"usbb\"").is_err());
     assert!(serde_json::from_str::<Outcome>("\"success\"").is_err());
 }
 
 #[test]
-fn val_text_is_cut_only_above_the_limit_and_marked_when_cut() {
+fn val_text_is_cut_only_above_the_limit_and_the_cut_is_a_typed_variant_with_the_original_length() {
+    // At the limit: whole.
     assert_eq!(Val::text(&"a".repeat(TEXT_MAX_CHARS)), Val::Text("a".repeat(TEXT_MAX_CHARS)));
-    let Val::Text(cut) = Val::text(&"a".repeat(TEXT_MAX_CHARS + 1)) else { panic!("text") };
-    assert!(cut.ends_with(TRUNCATED_MARK), "{cut}");
-    assert_eq!(cut.chars().count(), TEXT_MAX_CHARS + TRUNCATED_MARK.chars().count());
-    // The limit counts characters, not bytes: 256 two-byte characters are not cut.
+    // One above: cut to the limit, nothing appended to the text, the original length recorded.
+    let one_over = Val::text(&"a".repeat(TEXT_MAX_CHARS + 1));
+    assert_eq!(one_over, Val::TruncatedText { text: "a".repeat(TEXT_MAX_CHARS), original_chars: TEXT_MAX_CHARS as u64 + 1 });
+    // One below: whole.
+    assert_eq!(Val::text(&"a".repeat(TEXT_MAX_CHARS - 1)), Val::Text("a".repeat(TEXT_MAX_CHARS - 1)));
+    // The limit counts characters, not bytes: 256 two-byte characters are not cut, 257 are.
     assert_eq!(Val::text(&"\u{e9}".repeat(TEXT_MAX_CHARS)), Val::Text("\u{e9}".repeat(TEXT_MAX_CHARS)));
-    assert!(matches!(Val::text(&"\u{e9}".repeat(TEXT_MAX_CHARS + 1)), Val::Text(t) if t.ends_with(TRUNCATED_MARK)));
+    assert!(matches!(Val::text(&"\u{e9}".repeat(TEXT_MAX_CHARS + 1)), Val::TruncatedText { original_chars, .. } if original_chars == TEXT_MAX_CHARS as u64 + 1));
     assert_eq!(Val::text(""), Val::Text(String::new()));
+    // A text that really ends in the string version 1 appended is just text: only the variant says "cut".
+    let lookalike = format!("{} …[truncated]", "b".repeat(10));
+    assert_eq!(Val::text(&lookalike), Val::Text(lookalike.clone()));
+    // Both variants read back as text; a number does not.
+    assert_eq!(one_over.as_text().map(str::len), Some(TEXT_MAX_CHARS));
+    assert_eq!(Val::text("x").as_text(), Some("x"));
+    assert_eq!(Val::U64(1).as_text(), None);
+    // The marker survives a trip through the file format, and the report says the value was cut.
+    let json = serde_json::to_string(&one_over).unwrap();
+    assert!(json.contains("\"truncated_text\"") && json.contains("original_chars"), "{json}");
+    assert_eq!(serde_json::from_str::<Val>(&json).unwrap(), one_over);
+    assert!(one_over.display().contains(&format!("{} chars in all", TEXT_MAX_CHARS + 1)), "{}", one_over.display());
+}
+
+#[test]
+fn a_cut_text_in_a_span_reaches_the_ring_file_and_the_report_as_a_cut() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4100, 64);
+    d.span(Subsystem::Cli, "c", Class::Top, &[("path", Val::text(&"p".repeat(TEXT_MAX_CHARS * 2)))]).finish(Outcome::Ok);
+    let t = trace_of(dir.path(), 4100, Some(false));
+    assert!(matches!(field_of(&t.entries[0].fields, "path"), Some(Val::TruncatedText { original_chars, .. }) if *original_chars == TEXT_MAX_CHARS as u64 * 2));
+    let text = render(&[t], unix_ms(), 10);
+    assert!(text.contains(&format!("{} chars in all", TEXT_MAX_CHARS * 2)), "{text}");
 }
 
 #[test]
@@ -183,11 +239,11 @@ fn a_span_dropped_without_a_result_is_abandoned_and_one_dropped_while_unwinding_
     let dir = tempdir().unwrap();
     let d = mk(dir.path(), 4004, 64);
     {
-        let _s = d.span(Subsystem::Settings, "load", Class::Top, &[]);
+        let _s = d.span(Subsystem::Lock, "load", Class::Top, &[]);
     }
     assert_eq!(d.snapshot().last().unwrap().outcome, Some(Outcome::Abandoned));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _s = d.span(Subsystem::Settings, "save", Class::Top, &[]);
+        let _s = d.span(Subsystem::Lock, "save", Class::Top, &[]);
         panic!("boom");
     }));
     assert!(r.is_err());
@@ -269,7 +325,7 @@ fn eviction_ranks_routine_leaf_successes_first_and_failed_top_spans_last() {
     assert_eq!(eviction_rank(&event), eviction_rank(&leaf_bad));
     assert!(eviction_rank(&leaf_bad) < eviction_rank(&top_bad));
     // Every non-ok outcome ranks as failed, including the ones that mean "unknown".
-    for o in Outcome::ALL.into_iter().filter(|o| *o != Outcome::Ok) {
+    for o in OUTCOMES.into_iter().filter(|o| *o != Outcome::Ok) {
         assert!(eviction_rank(&mk_entry(Kind::Span, Class::Leaf, Some(o))) >= 2, "{o:?}");
     }
 }
@@ -537,7 +593,7 @@ fn an_unparseable_inflight_file_is_reported_as_a_problem_not_as_nothing_in_fligh
 }
 
 #[test]
-fn a_collapsed_run_in_the_report_says_its_fields_are_the_first_ones() {
+fn a_collapsed_run_in_the_report_shows_the_seq_range_and_the_first_and_the_last_members_fields() {
     let dir = tempdir().unwrap();
     let d = mk(dir.path(), 4050, 64);
     for i in 0..3u64 {
@@ -545,10 +601,10 @@ fn a_collapsed_run_in_the_report_says_its_fields_are_the_first_ones() {
     }
     d.span(Subsystem::MaidSdk, "write", Class::Leaf, &[("cap", Val::U64(9))]).finish(Outcome::Ok);
     let text = render(&load_t(dir.path(), &|_| Some(false)).unwrap(), unix_ms(), 10);
-    assert!(text.contains("read ok x3"), "{text}");
-    assert!(text.contains("first: cap=0"), "{text}");
-    assert!(!text.contains("cap=2"), "only the first entry's fields are shown for a run: {text}");
-    assert!(text.contains("write ok (") && !text.contains("write ok x"), "a single entry has no count and no 'first': {text}");
+    assert!(text.contains("#0..#2 maid_sdk read ok x3"), "the run's seq range, not only its first seq: {text}");
+    assert!(text.contains("first: cap=0 last: cap=2"), "the member nearest a hang is not dropped: {text}");
+    assert!(!text.contains("cap=1"), "the middle members are summarised, not listed: {text}");
+    assert!(text.contains("#3 maid_sdk write ok (") && !text.contains("write ok x"), "a single entry has one seq, no count and no 'first': {text}");
 }
 
 #[test]
@@ -575,9 +631,71 @@ fn runs_of_routine_successes_collapse_but_a_failure_or_another_thread_or_a_top_s
     v.push(e(8, Class::Leaf, Outcome::Ok, "read", 2));
     v.push(e(9, Class::Top, Outcome::Ok, "read", 2));
     v.push(e(10, Class::Top, Outcome::Ok, "read", 2));
-    let counts: Vec<u32> = aggregated(&v).iter().map(|(_, n, _)| *n).collect();
+    let runs = aggregated(&v);
+    let counts: Vec<u32> = runs.iter().map(|r| r.count).collect();
     assert_eq!(counts, vec![5, 1, 2, 1, 1, 1]);
-    assert_eq!(aggregated(&v)[0].2, 5000, "the total duration is the sum");
+    assert_eq!(runs[0].total_us, 5000, "the total duration is the sum");
+    assert_eq!((runs[0].first.seq, runs[0].last.seq), (0, 4));
+    assert_eq!((runs[2].first.seq, runs[2].last.seq), (6, 7));
+    assert_eq!((runs[1].first.seq, runs[1].last.seq), (5, 5), "a run of one has the same first and last");
+}
+
+#[test]
+fn a_completed_entry_line_says_when_it_began_on_which_thread_its_class_and_depth() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4051, 64);
+    let outer = d.span(Subsystem::Cli, "outer", Class::Top, &[]);
+    d.span(Subsystem::MaidSdk, "inner", Class::Leaf, &[]).finish(Outcome::Failed);
+    outer.finish(Outcome::Ok);
+    let ts = d.snapshot().iter().map(|e| e.ts_ms).max().unwrap();
+    let text = render(&load_t(dir.path(), &|_| Some(false)).unwrap(), ts + 1500, 10);
+    let inner = text.lines().find(|l| l.contains(" inner ")).unwrap_or_else(|| panic!("{text}"));
+    assert!(inner.contains("leaf, depth 1]") && inner.contains("thread ") && inner.contains(" ago,"), "{inner}");
+    let outer_line = text.lines().find(|l| l.contains(" outer ")).unwrap_or_else(|| panic!("{text}"));
+    assert!(outer_line.contains("top, depth 0]"), "{outer_line}");
+}
+
+#[test]
+fn a_key_given_at_the_start_and_again_at_the_finish_is_one_field_with_the_latest_value() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4052, 64);
+    let s = d.span(Subsystem::Cli, "c", Class::Top, &[("phase", Val::text("begin")), ("n", Val::U64(1))]);
+    s.set("phase", Val::text("middle"));
+    s.finish_with(Outcome::Ok, &[("phase", Val::text("end")), ("extra", Val::U64(2))]);
+    let e = d.snapshot().pop().unwrap();
+    let phases: Vec<&Val> = e.fields.iter().filter(|(k, _)| k == "phase").map(|(_, v)| v).collect();
+    assert_eq!(phases, vec![&Val::text("end")], "{:?}", e.fields);
+    assert_eq!(e.fields.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec!["phase", "n", "extra"], "position kept, new keys appended");
+    // Duplicates inside one begin call collapse the same way (the later value wins).
+    let s = d.span(Subsystem::Cli, "d", Class::Top, &[("k", Val::U64(1)), ("k", Val::U64(2))]);
+    assert_eq!(d.open_spans().last().unwrap().fields, vec![("k".to_string(), Val::U64(2))]);
+    s.finish(Outcome::Ok);
+}
+
+#[test]
+fn a_span_closed_by_shutdown_gets_a_monotonic_duration_not_a_wall_clock_difference() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4053, 64);
+    std::mem::forget(d.span(Subsystem::Cli, "cmd", Class::Top, &[]));
+    // A clock that stepped far back after the span began: the wall-clock difference would be 0 (saturated)
+    // or enormous; the monotonic one is the time it really ran.
+    d.lock().open[0].ts_ms = unix_ms() + 3_600_000;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    d.shutdown(0);
+    let e = d.snapshot().into_iter().find(|e| e.op == "cmd").unwrap();
+    assert!(e.dur_us >= 20_000, "it ran at least 20 ms: {} us", e.dur_us);
+    assert!(e.dur_us < 60_000_000, "and nowhere near a wall-clock hour: {} us", e.dur_us);
+}
+
+#[test]
+fn a_directory_listing_error_fails_the_listing_instead_of_dropping_the_entry() {
+    let names = vec![Ok(OsString::from("inflight-5.json")), Ok(OsString::from("ring-9.jsonl")), Ok(OsString::from("notes.txt"))];
+    assert_eq!(pids_in(names.into_iter()).unwrap().into_iter().collect::<Vec<_>>(), vec![5, 9]);
+    let broken = vec![Ok(OsString::from("inflight-5.json")), Err(std::io::Error::other("stale handle")), Ok(OsString::from("ring-9.jsonl"))];
+    let err = pids_in(broken.into_iter()).unwrap_err();
+    assert!(err.to_string().contains("stale handle"), "{err}");
+    // The empty listing is an empty set, not an error.
+    assert!(pids_in(Vec::new().into_iter()).unwrap().is_empty());
 }
 
 // ── the process-wide entry points ────────────────────────────────────────
@@ -1146,7 +1264,7 @@ fn an_event_named_exit_by_a_subsystem_that_is_not_a_process_role_is_not_an_exit(
     assert_eq!(trace_of(dir.path(), 4153, Some(false)).verdict(), Verdict::GoneWithoutExit);
     d.event(Subsystem::Cli, OP_EXIT, &[(FIELD_CODE, Val::I64(0))]);
     assert_eq!(trace_of(dir.path(), 4153, Some(false)).verdict(), Verdict::ExitedCleanly { code: 0 });
-    for s in Subsystem::ALL {
+    for s in SUBSYSTEMS {
         assert_eq!(s.is_role(), matches!(s, Subsystem::Cli | Subsystem::Gui | Subsystem::Mcp), "{s:?}");
     }
 }
@@ -1212,6 +1330,55 @@ fn the_inflight_schema_defaults_to_one_and_a_newer_one_is_named_in_a_problem() {
     let t = trace_of(dir.path(), 4162, Some(true));
     assert_eq!(t.inflight.as_ref().unwrap().spans.len(), 1, "still read");
     assert!(t.read_problems.iter().any(|p| p.contains("newer build")), "{:?}", t.read_problems);
+}
+
+/// A ring line as the version-1 build wrote it.
+fn v1_line(seq: u64, subsystem: &str, fields: &str) -> String {
+    format!("{{\"seq\":{seq},\"ts_ms\":5,\"kind\":\"span\",\"class\":\"leaf\",\"subsystem\":\"{subsystem}\",\"op\":\"x\",\"fields\":{fields},\"depth\":0,\"thread\":1,\"outcome\":\"ok\",\"dur_us\":7}}\n")
+}
+
+#[test]
+fn files_written_by_the_version_1_build_still_load_and_what_the_new_vocabulary_dropped_is_counted() {
+    let dir = tempdir().unwrap();
+    let pid = 4170;
+    // Ring: a line with the in-band truncation mark (still plain text), and lines naming the two subsystems version 2 removed.
+    let cut = "{\"t\":\"text\",\"v\":\"aaaa …[truncated]\"}";
+    let ring = [v1_line(0, "usb", &format!("[[\"path\",{cut}]]")), v1_line(1, "settings", "[]"), v1_line(2, "ptp_ip", "[]"), v1_line(3, "maid_sdk", "[]")].concat();
+    fs::write(ring_path(dir.path(), pid), ring).unwrap();
+    // In flight: schema 1 with one span this build reads and one under a removed subsystem.
+    let open = |seq: u64, subsystem: &str| format!("{{\"seq\":{seq},\"ts_ms\":5,\"class\":\"top\",\"subsystem\":\"{subsystem}\",\"op\":\"cmd\",\"fields\":[],\"depth\":0,\"thread\":1}}");
+    let inflight = format!("{{\"schema\":1,\"pid\":{pid},\"role\":\"cli\",\"process_started_ms\":1,\"spans\":[{},{}]}}", open(4, "usb"), open(5, "ptp_ip"));
+    fs::write(inflight_path(dir.path(), pid), inflight).unwrap();
+
+    let t = trace_of(dir.path(), pid, Some(false));
+    assert_eq!(t.entries.len(), 2, "the readable lines load");
+    assert!(matches!(field_of(&t.entries[0].fields, "path"), Some(Val::Text(s)) if s.ends_with("…[truncated]")), "the old mark is plain text now");
+    assert_eq!(t.unrecognised_lines, 2, "the two removed subsystems are counted, not called cut lines");
+    assert_eq!(t.malformed_lines, 0);
+    assert_eq!(t.inflight.as_ref().unwrap().spans.len(), 1);
+    assert_eq!(t.unreadable_open_spans, 1, "an open span under a removed subsystem still counts as open");
+    assert_eq!(t.verdict(), Verdict::GoneWithSpansOpen);
+    let text = render(&[t], unix_ms(), 10);
+    assert!(text.contains("2 line(s) this build does not understand") && text.contains("1 open span(s)"), "{text}");
+
+    // A clean version-1 in-flight file (every span readable) loads with no problem line.
+    let pid = 4171;
+    let inflight = format!("{{\"schema\":1,\"pid\":{pid},\"role\":\"gui\",\"process_started_ms\":1,\"spans\":[{}]}}", open(0, "usb"));
+    fs::write(inflight_path(dir.path(), pid), inflight).unwrap();
+    let t = trace_of(dir.path(), pid, Some(true));
+    assert_eq!((t.inflight.as_ref().map(|f| f.schema), t.read_problems.len(), t.unreadable_open_spans), (Some(1), 0, 0), "{:?}", t.read_problems);
+    // A file this build writes says version 2.
+    assert_eq!(SCHEMA, 2);
+}
+
+#[test]
+fn an_unknown_role_in_a_salvaged_inflight_file_is_a_problem_line_not_a_silent_diag() {
+    let dir = tempdir().unwrap();
+    let inflight = "{\"schema\":1,\"pid\":4172,\"role\":\"settings\",\"process_started_ms\":1,\"spans\":[{\"seq\":0,\"ts_ms\":5,\"class\":\"top\",\"subsystem\":\"ptp_ip\",\"op\":\"c\",\"fields\":[],\"depth\":0,\"thread\":1}]}";
+    fs::write(inflight_path(dir.path(), 4172), inflight).unwrap();
+    let t = trace_of(dir.path(), 4172, Some(true));
+    assert!(t.read_problems.iter().any(|p| p.contains("role this build does not know")), "{:?}", t.read_problems);
+    assert_eq!(t.unreadable_open_spans, 1);
 }
 
 #[test]
@@ -1314,7 +1481,7 @@ fn the_report_says_last_n_of_m_only_when_entries_were_actually_left_out() {
         assert_eq!(text.contains("last "), expect_last, "last_n {last_n}: {text}");
     }
     let text = render(&[t], unix_ms(), 2);
-    assert!(text.contains("last 2 of 3 entries") && !text.contains("op0") && text.contains("op1") && text.contains("op2"), "{text}");
+    assert!(text.contains("last 2 of 3 retained entries") && !text.contains("op0") && text.contains("op1") && text.contains("op2"), "{text}");
 }
 
 // ── #90 ─────────────────────────────────────────────────────────────────────────────────────────────

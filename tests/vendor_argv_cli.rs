@@ -9,10 +9,12 @@
 //! and exits before the command body).
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use nikon_fleet::ptp_usb::{FtpProfile, encode_ftp_profile, hex_bytes};
 use nikon_fleet::vendor_argv::{vendor_read_argv, vendor_write_ftp_argv};
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nikon-fleet");
 
@@ -31,7 +33,7 @@ fn profile() -> FtpProfile {
 }
 
 fn run_with_stdin(args: &[String], stdin: &str) -> std::process::Output {
-    let mut child = Command::new(BIN)
+    let mut child = common::cli(BIN)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -85,7 +87,7 @@ fn read_argv_is_accepted_by_the_real_cli() {
     for serial in [None, Some("0000003029610"), Some("-weird")] {
         let mut argv = vendor_read_argv(0xD053, serial);
         argv.push("--help".to_string());
-        let out = Command::new(BIN).args(&argv).output().expect("run CLI");
+        let out = common::cli(BIN).args(&argv).output().expect("run CLI");
         assert!(
             out.status.success(),
             "CLI rejected vendor-read argv {argv:?}: {}",
