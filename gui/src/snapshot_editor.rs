@@ -67,9 +67,9 @@ impl EditModel {
             None => Err("the snapshot has no extended section".to_string()),
             Some(Err(why)) => Err(why.clone()),
             Some(Ok(names)) => {
-                let mut copy = s.clone();
+                // `profile_view` only reads the snapshot, so it is borrowed, not copied.
                 Ok((0..names.len())
-                    .map(|i| match nikon_fleet::ftp_edit::profile_view(&mut copy, i) {
+                    .map(|i| match nikon_fleet::ftp_edit::profile_view(s, i) {
                         Ok(v) => FtpRow::Fields(v),
                         Err(e) => FtpRow::Unreadable { name: names[i].clone(), why: e.to_string() },
                     })
@@ -713,10 +713,27 @@ pub(crate) fn draw_edit_header(ui: &mut egui::Ui, file: &str, model: &EditModel,
             if d.edits.is_empty() {
                 ui.label(egui::RichText::new("No changes yet.").weak());
             }
-            for e in d.edits.iter().rev() {
-                ui.label(format!("{}  {}", e.at.get(..19).unwrap_or(&e.at), nikon_fleet::ops::render::printable(&e.change)));
+            // Built only while the header is open (this closure does not run when it is closed), and never more than
+            // `HISTORY_SHOWN` lines: the file keeps every entry, the window shows the latest ones.
+            for line in history_lines(&d.edits, HISTORY_SHOWN) {
+                ui.label(line);
             }
         });
+}
+
+/// The most edit-log entries the History section draws. The snapshot file keeps all of them; only the window is capped.
+pub(crate) const HISTORY_SHOWN: usize = 100;
+
+/// The lines of the History section, latest edit first: at most `shown` entries, then, when there are more, one line
+/// that says how many earlier ones are not drawn. `edits` is the log as stored, oldest first.
+pub(crate) fn history_lines(edits: &[nikon_fleet::snapshot::EditRecord], shown: usize) -> Vec<String> {
+    let mut lines: Vec<String> =
+        edits.iter().rev().take(shown).map(|e| format!("{}  {}", e.at.get(..19).unwrap_or(&e.at), nikon_fleet::ops::render::printable(&e.change))).collect();
+    let earlier = edits.len().saturating_sub(shown);
+    if earlier > 0 {
+        lines.push(format!("… and {earlier} earlier edit{} (all are kept in the file)", if earlier == 1 { "" } else { "s" }));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -1841,5 +1858,106 @@ mod tests {
         assert_eq!(field_key(&ViewEdit::FtpDelete(0)), None);
         assert_eq!(field_key(&ViewEdit::Property { name: "N".into(), text: String::new() }).as_deref(), Some("property:N"));
         assert_eq!(field_key(&ViewEdit::Iptc { slot: 2, field: "Headline".into(), text: String::new() }).as_deref(), Some("iptc:2:Headline"));
+    }
+
+    // ── the History section: capped on screen, never in the file ──
+
+    fn log_of(n: usize) -> Vec<nikon_fleet::snapshot::EditRecord> {
+        (0..n).map(|i| nikon_fleet::snapshot::EditRecord { at: format!("2026-11-06T12:00:{:02}Z", i % 60), item: format!("property:p{i}"), change: format!("change {i}") }).collect()
+    }
+
+    #[test]
+    fn the_history_shows_the_latest_entries_first_and_says_how_many_earlier_ones_it_leaves_out_at_below_and_above_the_cap() {
+        let cap = HISTORY_SHOWN;
+        assert_eq!(history_lines(&[], cap), Vec::<String>::new(), "an empty log draws nothing here");
+        // below the cap: everything, newest first, no remainder line
+        let below = history_lines(&log_of(cap - 1), cap);
+        assert_eq!(below.len(), cap - 1);
+        assert!(below[0].ends_with(&format!("change {}", cap - 2)) && below[cap - 2].ends_with("change 0"), "{:?}", (&below[0], &below[cap - 2]));
+        // at the cap: everything, no remainder line
+        let at = history_lines(&log_of(cap), cap);
+        assert_eq!(at.len(), cap);
+        assert!(at.iter().all(|l| !l.contains("earlier")), "nothing is left out at the cap");
+        assert!(at[cap - 1].ends_with("change 0"));
+        // one above: the cap's worth of the latest, then one line naming the one left out
+        let above = history_lines(&log_of(cap + 1), cap);
+        assert_eq!(above.len(), cap + 1);
+        assert!(above[0].ends_with(&format!("change {cap}")), "{}", above[0]);
+        assert!(above[cap - 1].ends_with("change 1"), "{}", above[cap - 1]);
+        assert!(above[cap].starts_with("… and 1 earlier edit ") && !above[cap].contains("edits"), "{}", above[cap]);
+        // many above: the count is the number left out
+        let many = history_lines(&log_of(cap + 25), cap);
+        assert_eq!(many.len(), cap + 1);
+        assert!(many[cap].starts_with("… and 25 earlier edits"), "{}", many[cap]);
+        // a cap of 0 shows no entries, only the count (the boundary is `take(shown)`, not `take(shown + 1)`)
+        assert_eq!(history_lines(&log_of(2), 0), ["… and 2 earlier edits (all are kept in the file)"]);
+    }
+
+    /// The text the frame drew.
+    fn drawn_text(out: &egui::FullOutput) -> Vec<String> {
+        fn walk(s: &egui::epaint::Shape, into: &mut Vec<String>) {
+            match s {
+                egui::epaint::Shape::Text(t) => into.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
+                _ => {}
+            }
+        }
+        let mut v = Vec::new();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut v));
+        v
+    }
+
+    fn draw_header_frame(m: &EditModel, open: bool) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let mut last = Vec::new();
+        // tall enough that no row is culled for being off screen
+        for frame in 0..3 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 20000.0)));
+            raw.time = Some(f64::from(frame) * 0.1);
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // the header sits in a child ui whose id the test cannot name, so open it by making everything visible
+                    // (the History section is the only collapsing header drawn here)
+                    ctx.memory_mut(|mem| mem.set_everything_is_visible(open));
+                    draw_edit_header(ui, "f.json", m, None, false);
+                });
+            });
+            last = drawn_text(&out);
+        }
+        last
+    }
+
+    #[test]
+    fn the_open_history_draws_at_most_the_cap_and_a_closed_one_draws_none_of_it() {
+        let mut copy = copy_of_captured();
+        copy.derived_from.as_mut().unwrap().edits = log_of(HISTORY_SHOWN + 1);
+        let m = EditModel::build(&copy, &no_labels()).unwrap();
+        let shown = draw_header_frame(&m, true);
+        let entries = shown.iter().filter(|l| l.contains("  change ")).count();
+        assert_eq!(entries, HISTORY_SHOWN, "{shown:?}");
+        assert!(shown.iter().any(|l| l.starts_with("… and 1 earlier edit")), "{shown:?}");
+        assert!(shown.iter().any(|l| l.starts_with(&format!("History ({} changes)", HISTORY_SHOWN + 1))), "the heading still counts them all: {shown:?}");
+        let closed = draw_header_frame(&m, false);
+        assert_eq!(closed.iter().filter(|l| l.contains("  change ")).count(), 0, "a closed section builds no lines: {closed:?}");
+        assert!(closed.iter().any(|l| l.starts_with("History (")));
+    }
+
+    #[test]
+    fn the_file_keeps_every_edit_however_many_the_window_shows() {
+        let (d, file) = data_dir_with(&captured());
+        let copy = make_edit_copy(d.path(), &file, NOW).unwrap();
+        // alternate one switch so every request is a real change and is logged
+        let n = HISTORY_SHOWN + 1;
+        for i in 0..n {
+            let a = apply_view_edit(d.path(), &copy, &ViewEdit::Property { name: "Flag".into(), text: if i % 2 == 0 { "false" } else { "true" }.into() }, NOW).unwrap();
+            assert!(a.changed, "edit {i}");
+        }
+        let s = Snapshot::load_from_file(d.path().join("snapshots").join(&copy)).unwrap();
+        let edits = s.derived_from.as_ref().unwrap().edits.clone();
+        assert_eq!(edits.len(), n, "nothing was dropped from the stored history");
+        let m = EditModel::build(&s, &no_labels()).unwrap();
+        assert_eq!(m.derived.edits.len(), n, "the model holds the whole log too");
+        assert_eq!(history_lines(&m.derived.edits, HISTORY_SHOWN).len(), HISTORY_SHOWN + 1);
     }
 }

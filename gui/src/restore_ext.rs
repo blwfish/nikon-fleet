@@ -43,13 +43,33 @@ pub(crate) struct ExtRestoreRequest {
 // refused with the parse error, nothing is written (fails safe; same-commit builds never meet this).
 // The two the library only serialises (`ItemAction`, `ItemOutcome`) are read here, and one this build
 // does not know is `Unknown`: shown (an unknown outcome as an error), and a plan containing an unknown
-// action is not offered for confirmation. `Unknown` does not keep the raw tag (serde's `other` drops it).
+// action is not offered for confirmation. `ExtActionJson::Unknown` keeps the raw tag (serde's `other` alone would drop
+// it, so `ExtActionJson` reads through `ActionWire`, below), so the blocked-plan message can name the action.
 // The mirror structs do not deny unknown fields, so a field the library adds is ignored here until it is
 // added to the mirror; `the_mirror_structs_read_every_field_the_library_writes` holds them to the library's key sets in tests.
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExtActionJson {
+    Unchanged,
+    NotSelected,
+    Write {
+        from: Option<String>,
+        to: String,
+    },
+    Skip {
+        reason: SkipKind,
+        detail: Option<String>,
+    },
+    /// An action tag this build does not know, as the CLI wrote it. The plan is blocked (never offered for confirmation).
+    Unknown(String),
+}
+
+/// How an action is read off the wire: the known actions by serde's own tag matching, and any other tag as `Other`
+/// (whose text is then taken from the same document by [`ExtActionJson`]'s `Deserialize`). A known tag with fields that
+/// do not fit (a `write` without its `to`) is a parse error, not an `Unknown`.
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum ActionWire {
     Unchanged,
     NotSelected,
     Write {
@@ -62,7 +82,26 @@ pub(crate) enum ExtActionJson {
         detail: Option<String>,
     },
     #[serde(other)]
-    Unknown,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for ExtActionJson {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let doc = serde_json::Value::deserialize(d)?;
+        let wire = ActionWire::deserialize(&doc).map_err(D::Error::custom)?;
+        Ok(match wire {
+            ActionWire::Unchanged => ExtActionJson::Unchanged,
+            ActionWire::NotSelected => ExtActionJson::NotSelected,
+            ActionWire::Write { from, to } => ExtActionJson::Write { from, to },
+            ActionWire::Skip { reason, detail } => ExtActionJson::Skip { reason, detail },
+            // `Other` matched, so serde read a string tag under "action": take it from the same document.
+            ActionWire::Other => match doc.get("action").and_then(serde_json::Value::as_str) {
+                Some(tag) => ExtActionJson::Unknown(tag.to_string()),
+                None => return Err(D::Error::custom("an action without a text tag")),
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -214,10 +253,28 @@ impl PlannedExt {
         if writes == 0 {
             return Some("This plan would change nothing, so there is nothing to restore.".to_string());
         }
-        if self.plan.items.iter().any(|i| i.action == ExtActionJson::Unknown) {
-            return Some("The plan contains an action this program does not understand, so it cannot be applied.".to_string());
+        let unknown = self.unknown_actions();
+        if !unknown.is_empty() {
+            let named = unknown.iter().map(|t| format!("\"{}\"", nikon_fleet::ops::render::printable(t))).collect::<Vec<_>>().join(", ");
+            return Some(format!(
+                "The plan contains {} this program does not understand ({named}), so it cannot be applied.",
+                if unknown.len() == 1 { "an action" } else { "actions" }
+            ));
         }
         None
+    }
+
+    /// The action tags of this plan that this build does not know, each once, in the order first met.
+    pub(crate) fn unknown_actions(&self) -> Vec<&str> {
+        let mut seen: Vec<&str> = Vec::new();
+        for i in &self.plan.items {
+            if let ExtActionJson::Unknown(tag) = &i.action {
+                if !seen.contains(&tag.as_str()) {
+                    seen.push(tag);
+                }
+            }
+        }
+        seen
     }
 
     pub(crate) fn applicable(&self) -> bool {
@@ -532,8 +589,8 @@ fn draw_ext_plan(ui: &mut egui::Ui, p: &PlannedExt) {
                     let detail = detail.as_deref().map(|d| format!(" ({})", nikon_fleet::ops::render::printable(d))).unwrap_or_default();
                     ui.colored_label(WARN_COLOR, format!("skip   {label}: {}{detail}", skip_words(*reason)));
                 }
-                ExtActionJson::Unknown => {
-                    ui.colored_label(ERROR_COLOR, format!("?      {label}: an action this program does not know"));
+                ExtActionJson::Unknown(tag) => {
+                    ui.colored_label(ERROR_COLOR, format!("?      {label}: an action this program does not know (\"{}\")", nikon_fleet::ops::render::printable(tag)));
                 }
             }
         }
@@ -793,11 +850,68 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert_eq!(plan.items[1].action, ExtActionJson::Unknown);
+        assert_eq!(plan.items[1].action, ExtActionJson::Unknown("teleport".into()), "the tag the CLI wrote is kept");
         let p = PlannedExt { request: request(None), plan, cli_log: String::new() };
-        assert!(p.blocked_reason().unwrap().contains("does not understand"));
+        let why = p.blocked_reason().unwrap();
+        assert!(why.contains("does not understand") && why.contains("\"teleport\""), "the blocked-plan message names the action: {why}");
+        assert!(!p.applicable(), "an unknown action still blocks the apply");
         let r: ExtResultJson = serde_json::from_value(serde_json::json!({"id": "i", "label": "l", "category": "ftp", "outcome": "levitated"})).unwrap();
         assert_eq!(r.outcome, ExtOutcomeJson::Unknown);
+    }
+
+    fn plan_with_actions(actions: &[serde_json::Value]) -> Result<ExtPlanJson, serde_json::Error> {
+        let items: Vec<serde_json::Value> = actions
+            .iter()
+            .enumerate()
+            .map(|(n, a)| {
+                let mut item = serde_json::json!({"id": format!("i{n}"), "label": format!("L{n}"), "category": "strings"});
+                item.as_object_mut().unwrap().extend(a.as_object().unwrap().clone());
+                item
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "camera": {"model": "Z 9", "serial": "T1", "firmware": "5.31"},
+            "source": FILE, "would_change": 1, "summary": "s", "digest": "d", "items": items
+        }))
+    }
+
+    #[test]
+    fn every_unknown_action_tag_is_named_once_and_each_known_tag_is_still_known() {
+        let write = serde_json::json!({"action": "write", "from": "x", "to": "y"});
+        // two unknown tags, one of them twice, with fields this build has never seen, among known ones
+        let plan = plan_with_actions(&[
+            write.clone(),
+            serde_json::json!({"action": "teleport", "to": "mars", "extra": [1, 2]}),
+            serde_json::json!({"action": "levitate"}),
+            serde_json::json!({"action": "teleport"}),
+            serde_json::json!({"action": "unchanged"}),
+            serde_json::json!({"action": "not_selected"}),
+            serde_json::json!({"action": "skip", "reason": "body_lacks_it"}),
+        ])
+        .unwrap();
+        let p = PlannedExt { request: request(None), plan, cli_log: String::new() };
+        assert_eq!(p.unknown_actions(), ["teleport", "levitate"], "each once, in the order first met");
+        let why = p.blocked_reason().unwrap();
+        assert!(why.contains("actions this program does not understand (\"teleport\", \"levitate\")"), "{why}");
+        // the same plan without the unknown items is offered (a write, all tags known)
+        let clean = plan_with_actions(&[write, serde_json::json!({"action": "unchanged"})]).unwrap();
+        let p = PlannedExt { request: request(None), plan: clean, cli_log: String::new() };
+        assert!(p.unknown_actions().is_empty());
+        assert_eq!(p.blocked_reason(), None);
+        // an empty tag is still a tag: kept as it is, and it blocks
+        let empty = plan_with_actions(&[serde_json::json!({"action": "write", "from": null, "to": "y"}), serde_json::json!({"action": ""})]).unwrap();
+        assert_eq!(empty.items[1].action, ExtActionJson::Unknown(String::new()));
+        assert!(!PlannedExt { request: request(None), plan: empty, cli_log: String::new() }.applicable());
+    }
+
+    #[test]
+    fn a_known_action_with_fields_that_do_not_fit_and_a_missing_or_non_text_tag_are_parse_errors_not_unknowns() {
+        // `write` without its `to`: refused, not quietly turned into an Unknown
+        assert!(plan_with_actions(&[serde_json::json!({"action": "write", "from": "x"})]).is_err());
+        assert!(plan_with_actions(&[serde_json::json!({"action": "skip"})]).is_err(), "skip without its reason");
+        assert!(plan_with_actions(&[serde_json::json!({})]).is_err(), "no action at all");
+        assert!(plan_with_actions(&[serde_json::json!({"action": 7})]).is_err(), "a tag that is not text");
+        assert!(plan_with_actions(&[serde_json::json!({"action": null})]).is_err());
     }
 
     #[test]
