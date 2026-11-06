@@ -24,7 +24,10 @@ use nikon_fleet::camera_lock::CameraLock;
 use nikon_fleet::diff::{Diff, DiffOptions, diff_with_schema, is_volatile};
 // The exit statuses, `ExitCodeError` and `exit_code_for` live in the library's `exit_status` module, so the GUI and the
 // tests consume the same ones (a renumbering cannot reach one side only).
-use nikon_fleet::exit_status::{EXIT_ALREADY_ARCHIVED, EXIT_WRITE_INDETERMINATE, ExitCodeError, exit_code_for, is_already_archived};
+use nikon_fleet::exit_status::{
+    EXIT_ALREADY_ARCHIVED, EXIT_REFUSED_BEFORE_WRITE, EXIT_STALE_PLAN, EXIT_WRITE_INDETERMINATE, ExitCodeError, exit_code_for,
+    is_already_archived,
+};
 use nikon_fleet::firmware::{
     ArchiveListing, FirmwareError, FirmwareMeta, FIRMWARE_META_FORMAT_VERSION,
     archive_dir, archive_exists, format_size, ingest_bundle, load_meta,
@@ -162,6 +165,13 @@ enum Cmd {
     #[command(after_help = RESTORE_HELP)]
     Restore(RestoreArgs),
 
+    /// Put a snapshot's owner strings, copyright and IPTC-preset switches, IPTC presets and FTP profiles back on a body
+    /// (the `extended` section; `restore` does not touch them). Raw USB only: no SDK. Plans, then applies the plan it
+    /// computed, or the one named by --expect-digest and --expect-summary. A restore point is written before the first
+    /// write; restoring from it undoes the restore. The FTP list is rebuilt by deleting every stored profile and adding
+    /// the snapshot's, so use --dry-run first.
+    RestoreExtended(RestoreExtendedArgs),
+
     /// Copy settings from a snapshot onto a live camera of a possibly
     /// *different* model, translating enum/range values into the target's
     /// own equivalents instead of assuming the same code/index means the
@@ -232,10 +242,10 @@ enum Cmd {
     /// session, and both are printed. It changes the camera. Confirmed only on a Z6III by replaying a captured blob; any
     /// other model needs `--force-unconfirmed-model`. `--dry-run` prints the data phase and sends nothing.
     VendorWriteIptc(VendorWriteIptcArgs),
-    /// EXPERIMENTAL. Select the IPTC preset (`0xD060`, 0..=13; 0 is none) with the standard `SetDevicePropValue`, and read
-    /// it back. This changes which IPTC profile the camera embeds in photos. The value before is printed so it can be put
-    /// back. Confirmed only on a Z6III; any other model needs `--force-unconfirmed-model`.
-    VendorSetIptcPreset(VendorSetIptcPresetArgs),
+    /// EXPERIMENTAL. Write a one-byte property with the standard `SetDevicePropValue` and read it back: 0xD053
+    /// EnableCopyright (0 or 1) or 0xD060 IPTC preset (0..=13; 0 is none, and it changes which IPTC profile the camera
+    /// embeds in photos). The value before is printed so it can be put back. Model-gated like the other writes.
+    VendorSetByteProp(VendorSetBytePropArgs),
     #[command(after_help = VENDOR_SET_STRING_HELP)]
     /// EXPERIMENTAL. Write one string property (0xD072 Artist, 0xD073 Copyright, 0xD090 Image
     /// comment) with the standard PTP `SetDevicePropValue` (0x1016), then read it back and say whether
@@ -793,10 +803,12 @@ struct VendorWriteIptcArgs {
 }
 
 #[derive(Args, Debug)]
-struct VendorSetIptcPresetArgs {
-    /// 0 (none) to 13.
-    #[arg(value_parser = clap::value_parser!(u8).range(0..=13))]
-    preset: u8,
+struct VendorSetBytePropArgs {
+    /// 0xD053 or 0xD060.
+    #[arg(value_parser = nikon_fleet::ptp_usb::parse_propcode)]
+    prop: u16,
+    /// The new value.
+    value: u8,
     #[arg(long)]
     force_unconfirmed_model: bool,
     /// Camera serial to target; same rules as vendor-read's --serial.
@@ -999,6 +1011,31 @@ struct RestoreArgs {
     expect_summary: Option<String>,
     /// Print the plan (with --dry-run) or the result as JSON on stdout (the same value the MCP
     /// worker's `restore-plan` / `restore-apply` return); progress and warnings go to stderr.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct RestoreExtendedArgs {
+    /// Snapshot to restore from. Resolved relative to snapshots/ if not absolute.
+    snapshot_path: PathBuf,
+    /// Target camera serial. Defaults to the serial recorded in the snapshot.
+    #[arg(long)]
+    serial: Option<String>,
+    /// Print what would be written and write nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Restore only this category: strings, iptc, switches or ftp. Repeatable.
+    #[arg(long = "only", value_name = "CATEGORY")]
+    only: Vec<String>,
+    /// Apply only the plan that has this digest (from a `--dry-run` of the same snapshot, target and `--only`). The plan is
+    /// recomputed on the body as it is now; if it differs, nothing is written and the command exits 5. Needs --expect-summary.
+    #[arg(long, value_name = "DIGEST", requires = "expect_summary", conflicts_with = "dry_run")]
+    expect_digest: Option<String>,
+    /// The plan's summary line, copied from the same dry run.
+    #[arg(long, value_name = "SUMMARY", requires = "expect_digest", conflicts_with = "dry_run")]
+    expect_summary: Option<String>,
+    /// Print the plan or the result as JSON on stdout.
     #[arg(long)]
     json: bool,
 }
@@ -2153,12 +2190,12 @@ fn print_iptc_bytes(data: &[u8]) {
     }
 }
 
-fn cmd_vendor_set_iptc_preset(args: &VendorSetIptcPresetArgs) -> Result<()> {
+fn cmd_vendor_set_byte_prop(args: &VendorSetBytePropArgs) -> Result<()> {
     let r = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
-        nikon_fleet::ptp_usb::set_iptc_preset_locked(lock, serial, args.preset, args.force_unconfirmed_model)
+        nikon_fleet::ptp_usb::set_byte_property_locked(lock, serial, args.prop, args.value, args.force_unconfirmed_model)
     })
-    .context("selecting the IPTC preset (0xD060) over USB PTP; if the reply never came the camera MAY have changed: read it with vendor-get-prop 0xD060")?;
-    println!("0xD060 was {}; wrote {}", nikon_fleet::ptp_usb::hex_bytes(&r.previous), r.written);
+    .with_context(|| format!("writing property {:#06x} over USB PTP; if the reply never came the camera MAY have changed: read it with vendor-get-prop", args.prop))?;
+    println!("{:#06x} was {}; wrote {}", r.propcode, nikon_fleet::ptp_usb::hex_bytes(&r.previous), r.written);
     match &r.read_back {
         Ok(b) => println!("read back {}: {}", nikon_fleet::ptp_usb::hex_bytes(b), if r.verified() { "verified" } else { "NOT what was written" }),
         Err(e) => println!("could not be read back: {e}"),
@@ -3584,6 +3621,104 @@ fn restore_refusal(e: nikon_fleet::ops::restore_flow::RestoreApplyError, json: b
     }
 }
 
+fn cmd_restore_extended(data_dir: &Path, args: &RestoreExtendedArgs) -> Result<()> {
+    use nikon_fleet::ops::restore_extended::{
+        Category, ExtendedApplyError, ExtendedApplyRequest, ExtendedRestoreInput, apply_extended_restore, build_extended_restore_plan,
+    };
+    use nikon_fleet::ptp_usb::PtpUsbSession;
+    let refused = |e: &dyn std::fmt::Display| -> anyhow::Error {
+        ExitCodeError { code: EXIT_REFUSED_BEFORE_WRITE, message: format!("{e}") }.into()
+    };
+    let path = resolve_snapshot_path(data_dir, &args.snapshot_path);
+    let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let snapshot = Snapshot::from_json(std::str::from_utf8(&bytes).context("the snapshot is not UTF-8")?)
+        .with_context(|| format!("loading {}", path.display()))?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let only: Option<std::collections::BTreeSet<Category>> = if args.only.is_empty() {
+        None
+    } else {
+        Some(args.only.iter().map(|c| Category::parse(c)).collect::<Result<_, _>>().map_err(|e| refused(&e))?)
+    };
+    let mut target = snapshot.camera.clone();
+    if let Some(s) = &args.serial {
+        target.serial = s.clone();
+    }
+    let serial = args.serial.clone().or_else(|| Some(snapshot.camera.serial.clone())).filter(|s| !s.is_empty());
+    let input = ExtendedRestoreInput { source: &snapshot, source_bytes: &bytes, source_name: &name, target: &target, only: only.as_ref() };
+    let snapshots = snapshots_dir(data_dir);
+
+    // One raw session does everything, so the plan an apply recomputes is of the body it just read.
+    let outcome = with_vendor_camera(serial.as_deref(), |lock, serial| {
+        let mut session = PtpUsbSession::open_locked(lock, serial)?;
+        let planned = if args.expect_digest.is_some() { None } else { Some(build_extended_restore_plan(&mut session, &input)) };
+        if args.dry_run {
+            return Ok((planned, None));
+        }
+        let (digest, summary) = match (&planned, &args.expect_digest, &args.expect_summary) {
+            (_, Some(d), Some(s)) => (d.clone(), s.clone()),
+            (Some(Ok(p)), ..) => (p.digest.clone(), p.summary.clone()),
+            (Some(Err(_)), ..) => return Ok((planned, None)),
+            _ => unreachable!("an expected digest comes with its summary (clap `requires`)"),
+        };
+        let req = ExtendedApplyRequest {
+            input,
+            snapshots_dir: &snapshots,
+            expected_digest: &digest,
+            expected_summary: &summary,
+            captured_at: OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+        };
+        let applied = apply_extended_restore(&mut session, &req, &mut |p| {
+            if !args.json {
+                eprintln!("  [{p}]");
+            }
+        });
+        Ok((planned, Some(applied)))
+    })?;
+    let (planned, applied) = outcome;
+
+    if let Some(plan) = &planned {
+        match plan {
+            Ok(p) if args.dry_run || applied.is_none() => {
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(p)?);
+                } else {
+                    print!("{}", p.to_text());
+                }
+                return Ok(());
+            }
+            Ok(p) if !args.json => print!("{}", p.to_text()),
+            Ok(_) => {}
+            Err(e) => return Err(refused(e)),
+        }
+    }
+    match applied {
+        None => Ok(()),
+        Some(Err(ExtendedApplyError::Apply(nikon_fleet::ops::apply::ApplyError::StalePlan { what }))) => Err(ExitCodeError {
+            code: EXIT_STALE_PLAN,
+            message: format!("the plan no longer matches the body ({what} differs); nothing was written. Run --dry-run again"),
+        }
+        .into()),
+        Some(Err(e)) => Err(refused(&e)),
+        Some(Ok(report)) => {
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report.to_text());
+            }
+            use nikon_fleet::ops::apply::ApplyStatus;
+            match report.status {
+                ApplyStatus::AppliedVerified => Ok(()),
+                ApplyStatus::Indeterminate => Err(ExitCodeError {
+                    code: EXIT_WRITE_INDETERMINATE,
+                    message: "a write may or may not have taken effect: read the body again (`snapshot`) before deciding what to do".to_string(),
+                }
+                .into()),
+                _ => bail!("the restore did not complete cleanly (status {:?}); see the lines above", report.status),
+            }
+        }
+    }
+}
+
 /// Restore settings onto the camera. An apply that fails before it has a report in hand (every
 /// `RestoreApplyError` is raised before the first write) exits `EXIT_REFUSED_BEFORE_WRITE`, as a
 /// transplant does (see `transplant_exit`).
@@ -4170,10 +4305,11 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::VendorReadFtp(args) => cmd_vendor_read_ftp(args),
         Cmd::VendorWriteFtpBlob(args) => cmd_vendor_write_ftp_blob(args),
         Cmd::VendorOpSupport(args) => cmd_vendor_op_support(args),
+        Cmd::RestoreExtended(args) => cmd_restore_extended(&cli.data_dir, args),
         Cmd::VendorGetProp(args) => cmd_vendor_get_prop(args),
         Cmd::VendorReadIptc(args) => cmd_vendor_read_iptc(args),
         Cmd::VendorWriteIptc(args) => cmd_vendor_write_iptc(args),
-        Cmd::VendorSetIptcPreset(args) => cmd_vendor_set_iptc_preset(args),
+        Cmd::VendorSetByteProp(args) => cmd_vendor_set_byte_prop(args),
         Cmd::VendorSetString(args) => cmd_vendor_set_string(args),
         Cmd::DiagReport(args) => cmd_diag_report(args),
         Cmd::VendorProbeOp(args) => cmd_vendor_probe_op(args),

@@ -64,33 +64,56 @@ is not a change), then by name (field-level changes), the rest as added or remov
 with no section against one with a section is a single entry. `check` leaves the section out (`skip_extended`): its
 live capture is MAID only, so a reference's section would otherwise show as a difference every time.
 
+## Restore
+
+`restore-extended <snapshot> [--dry-run] [--only strings|iptc|switches|ftp] [--serial S] [--expect-digest D
+--expect-summary T] [--json]`, in `src/ops/restore_extended.rs`. It is its own operation, raw USB only (no SDK): the
+MAID `restore` does not touch the extended section. One raw session reads the body, plans and writes. The shape is the
+MAID restore's: a pure plan with a digest and a summary the caller echoes back, a restore point before the first write,
+and a read of the body afterwards to check what was written.
+
+| category | write | read-back |
+|---|---|---|
+| `strings` (Artist, Copyright, Image comment) | `SetDevicePropValue` | the value, by the write path |
+| `iptc` (each preset slot) | `0x9413` | the slot read again, byte for byte |
+| `switches` (EnableCopyright, IPTC preset) | `SetDevicePropValue`, one byte | the value |
+| `ftp` (the whole list) | `0x90EA` delete-all, then `0x90EE` adds last-first (an add lands at the front) | each add read back; the list read again at the end |
+
+Order: strings, IPTC, switches, FTP (the preset switch comes after the presets). The plan is one line per item: `same`,
+`WRITE old -> new` (never a password), `skip` with a closed reason, or `not selected`. The digest covers every item's
+action and the hash of what would be written, so a body that changed under a reviewed plan is refused (exit 5), and a
+plan whose overwritten value changed is stale even when the count of changes is the same. Apply writes the restore point
+first, as a snapshot with no MAID properties and the extended section as it was (label `restore-ext`); restoring from
+it undoes the restore. Status: verified only if every write's read-back matched and the body, read again, matches the
+snapshot for every item written; indeterminate (exit 4) if any write's data may have gone out and the reply failed.
+
+Skips (each a typed reason, never silent): the snapshot has no value (an older snapshot, a body without it); the body
+lacks it; the body's current value was unreadable; a value the camera cannot hold (text outside Latin-1); a model the
+write is not confirmed on; an IPTC slot of another record kind; a snapshot slot the body lacks; a truncated or
+undecodable FTP list; a list longer than the body's limit. Not possible: choosing the active FTP profile (no op that
+selects one was found).
+
+**Verified on hardware (2026-11-06):** strings and the `EnableCopyright` switch on a Z 5, through the whole sequence:
+dry run, apply with the echoed digest, restore point, undo from the restore point, restore again, final dry run `0 items
+would change`. Write paths verified earlier: strings on Z 9 / Z6III / Z 5, IPTC slot writes on Z 9 and Z6III (read back
+byte for byte), FTP adds and deletes on Z 9 and Z6III.
+**Not yet run on hardware through `restore-extended`:** the IPTC slots and the FTP rebuild (delete-all then reversed
+adds, and that the list ends in the snapshot's order), and `EnableCopyright` on a Z 9 or Z6III (the gate allows only
+the Z 5 until then). The `0xD060` preset switch is allowed on a Z6III only (a Z 9 refused it while its presets were
+empty). Surfaces: the CLI only; the MCP and the GUI do not offer it yet.
+
 ## Not done
 
-- **Restore and transplant do not write the section.** The write paths exist separately (`vendor-set-string`,
-  `vendor-write-ftp-blob`, both verified by read-back), but rebuilding a stored FTP list needs a design: a write lands
-  at the front and shifts the rest, `0x90EA` deletes everything, and the Z 5 has none of it.
-- **IPTC write is understood but not wired into restore.** Layout (Z 9, confirmed by writing a preset to an empty slot
-  and reading back the same 193 bytes): a 12-byte header `01 00 00 00 c9 00 01 00 00 00 00 00`, then 15 entries
+- **IPTC write is understood and used by the restore.** Layout (Z 9 and Z6III, confirmed by writing a preset to an
+  empty slot and reading back the same bytes): a 12-byte header `01 00 00 00 c9 00 01 00 00 00 00 00`, then 15 entries
   `[u32 length incl. NUL][UTF-8][NUL]` (empty: a zero length), the first the preset's name, then Caption, Event ID,
   Headline, Object name, City, State, Country, Category, Supplemental categories, Byline, Byline title, Writer/editor,
   Credit, Source. An empty preset is 72 bytes. Slots 1..10 are presets; 11..13 are a 20-byte record of kind 2 whose
-  meaning is unknown. Read from a preset the owner typed in at the camera ("A", one to three characters per field).
-  Same layout on a Z6III (verified 2026-11-06: its preset 1, left from the July NX Field test, decodes unchanged, and a
-  write of a new preset to an empty slot read back identical, then was restored). The July notes' "two leading entries,
-  `""` and `1`" are this header's last zero u32 and the preset's name `1`; omitting the 8 header bytes before them is what
-  a Z 9 refused with `0xA210`.
-- **IPTC write experiments on the Z 9 (2026-11-06; empty slot, baseline restored byte for byte).**
-  `vendor-write-iptc` writes a slot; `vendor-set-iptc-preset` selects `0xD060`.
-  - Slots 1..10 read as 72 bytes (`01 00 00 00 c9 00 01 00 00 00` then zeros); slots 11..13 read as 20 bytes
-    (`01 00 00 00 c9 00 02 00 00 00` then zeros): two record types, not one layout.
-  - Writing the 72 bytes just read: accepted, unchanged. Writing the Z6III-capture layout (two leading entries, `""`
-    and `"1"`, then 14 length-prefixed names): refused, `0xA210`. Writing the 72-byte header plus 14 length-prefixed
-    names: accepted, **ignored** (slot still empty).
-  - `0xD060` set to 1: `AccessDenied` (0x200F), though its descriptor says read-write, 0..13. Probably the camera
-    only selects or accepts a registered preset, and all thirteen here are empty.
-  - The failed attempt had a 16-byte header, one u32 too many; with the 12-byte header the write is stored.
-  - Selecting a preset (`0xD060`) was `AccessDenied` while every preset was empty; not retried with a preset in use.
-- **Other bodies.** A Z 9 and a Z6III have been captured with this section (the Z6III by both the CLI and the worker:
-  200 properties, 5 extended properties, 3 FTP profiles, 13 IPTC slots, identical diffs). The Z 5 still needs a run
-  (expect FTP and IPTC `not_on_model`, and the IPTC preset `not_supported`). A second Z 9 would also show whether the
-  section differs between bodies of one model.
+  meaning is unknown. The Z6III capture notes' "two leading entries, `""` and `1`" are this header's last zero u32 and
+  the preset's name `1`; omitting the 8 header bytes before them is what a Z 9 refused with `0xA210`.
+- **IPTC write experiments on the Z 9 (2026-11-06; empty slot, baseline restored byte for byte).** Writing the 72 bytes
+  just read: accepted, unchanged. A 16-byte header (one u32 too many): accepted and ignored. The 12-byte header: stored.
+  Selecting a preset (`0xD060`) was `AccessDenied` while every preset was empty; not retried with a preset in use.
+- **Other bodies.** A Z 9, a Z6III and a Z 5 have been captured with this section (CLI and worker identical on each).
+  A second Z 9 would show whether the section differs between bodies of one model.
+- **MCP and GUI surfaces for the restore.**

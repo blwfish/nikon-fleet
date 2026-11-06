@@ -111,7 +111,9 @@ impl std::error::Error for ExitCodeError {}
 /// failure filed under "plain failure" invites the blind retry exit 4 exists to prevent.
 pub fn write_kind_of_ptp_usb_error(e: &PtpUsbError) -> ExitKind {
     match e {
-        PtpUsbError::FtpWriteIndeterminate { .. } | PtpUsbError::PropWriteIndeterminate { .. } => ExitKind::WriteIndeterminate,
+        PtpUsbError::FtpWriteIndeterminate { .. }
+        | PtpUsbError::PropWriteIndeterminate { .. }
+        | PtpUsbError::IptcWriteIndeterminate { .. } => ExitKind::WriteIndeterminate,
         PtpUsbError::NoDevice
         | PtpUsbError::AmbiguousDevice(_)
         | PtpUsbError::SerialNotFound { .. }
@@ -268,7 +270,12 @@ mod tests {
     /// Whether `e` is one of the two "data was sent, then it failed" variants, spelled out apart from the production
     /// match so the two can disagree and a test fail.
     fn is_indeterminate_variant(e: &PtpUsbError) -> bool {
-        matches!(e, PtpUsbError::FtpWriteIndeterminate { .. } | PtpUsbError::PropWriteIndeterminate { .. })
+        matches!(
+            e,
+            PtpUsbError::FtpWriteIndeterminate { .. }
+                | PtpUsbError::PropWriteIndeterminate { .. }
+                | PtpUsbError::IptcWriteIndeterminate { .. }
+        )
     }
 
     #[test]

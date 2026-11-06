@@ -284,6 +284,41 @@ impl<T: crate::ptp_usb::BulkTransport> ExtendedSource for PtpUsbSession<T> {
     }
 }
 
+/// What the restore needs from a raw-PTP session beyond reading: one method per kind of write, each returning
+/// whether the write's own read-back matched. A trait so the restore logic runs against a scripted body in tests.
+pub trait ExtendedSink: ExtendedSource {
+    fn write_string(&mut self, code: u16, text: &str) -> Result<bool, PtpUsbError>;
+    fn write_byte(&mut self, code: u16, value: u8) -> Result<bool, PtpUsbError>;
+    fn write_iptc(&mut self, slot: u32, data: &[u8]) -> Result<bool, PtpUsbError>;
+    /// Delete every stored FTP profile; the count the camera reports afterwards.
+    fn delete_all_ftp(&mut self) -> Result<u32, PtpUsbError>;
+    /// Add one profile (it lands at the front of the list); `count_before` is the stored count.
+    fn add_ftp(&mut self, blob: &[u8], count_before: u32) -> Result<bool, PtpUsbError>;
+}
+
+impl<T: crate::ptp_usb::BulkTransport> ExtendedSink for PtpUsbSession<T> {
+    fn write_string(&mut self, code: u16, text: &str) -> Result<bool, PtpUsbError> {
+        self.set_string_property(code, text, false).map(|r| r.verified)
+    }
+
+    fn write_byte(&mut self, code: u16, value: u8) -> Result<bool, PtpUsbError> {
+        self.set_byte_property(code, value, false).map(|r| r.verified())
+    }
+
+    fn write_iptc(&mut self, slot: u32, data: &[u8]) -> Result<bool, PtpUsbError> {
+        let out = self.write_iptc_slot(slot, data, false)?;
+        Ok(matches!(&out.after, Ok(after) if after.data == data))
+    }
+
+    fn delete_all_ftp(&mut self) -> Result<u32, PtpUsbError> {
+        self.delete_all_ftp_profiles()
+    }
+
+    fn add_ftp(&mut self, blob: &[u8], count_before: u32) -> Result<bool, PtpUsbError> {
+        self.write_ftp_profile_blob_verified(count_before, 1, blob, false).map(|o| o.verification.is_verified())
+    }
+}
+
 fn failed(e: &PtpUsbError) -> (String, String) {
     (e.tag().to_string(), e.to_string())
 }
