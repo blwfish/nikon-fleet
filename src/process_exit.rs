@@ -14,6 +14,10 @@ use std::io::Write;
 /// Flush stdout and stderr, then end the process with `code` without running destructors,
 /// `atexit` handlers or `Drop` impls.
 pub fn exit_now(code: i32) -> ! {
+    // The one place every `_exit` path passes: record the planned exit and close the spans still
+    // open, since no destructor will run to do it. (A write to the diagnostics files is a plain
+    // `write`, so it is in the OS's hands before `_exit`.)
+    crate::diag::shutdown(code);
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     #[cfg(unix)]

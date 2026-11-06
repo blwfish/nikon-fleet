@@ -1,0 +1,6 @@
+# `cargo run` and `cargo test` (and the CLI processes the integration tests spawn) keep their
+# diagnostics under target/, so they neither pollute the real diagnostics directory nor push out the
+# evidence of a real crash. A binary run directly (./target/debug/nikon-fleet) uses the real
+# directory; NIKON_FLEET_DIAG_DIR set in the shell still wins over this.
+[env]
+NIKON_FLEET_DIAG_DIR = { value = "target/diag-dev", relative = true }

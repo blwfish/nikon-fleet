@@ -81,6 +81,28 @@ const OP_CLOSE_SESSION: u16 = 0x1003;
 
 /// `0x943B` — generic vendor-property read wrapper. Param is
 /// `0x10000 | propcode`; response data is the property's raw bytes.
+/// The stages a transaction records as its `phase` field while it is in flight: the command is out, or
+/// the data-out is out too (after which the camera may have acted). A hang shows the last one set.
+const TXN_PHASE_COMMAND_SENT: &str = "command_sent";
+const TXN_PHASE_DATA_SENT: &str = "data_sent";
+/// Field names for the first parameters of a transaction; a count of all of them is recorded too.
+const TXN_PARAM_KEYS: [&str; 5] = ["p0", "p1", "p2", "p3", "p4"];
+
+/// How a transaction ended, as the diagnostics vocabulary. A camera that answers with a non-OK code
+/// completed the transaction but refused it (`Failed`); an error after the data-out went out means
+/// the effect is unknown (`Indeterminate`); a timeout and a stalled pipe are their own outcomes.
+fn txn_outcome(result: &Result<Reply, PtpUsbError>, data_sent: bool) -> crate::diag::Outcome {
+    use crate::diag::Outcome;
+    match result {
+        Ok(reply) if reply.code == RESP_OK => Outcome::Ok,
+        Ok(_) => Outcome::Failed,
+        Err(_) if data_sent => Outcome::Indeterminate,
+        Err(PtpUsbError::Usb(rusb::Error::Timeout) | PtpUsbError::TransactionTimedOut(_)) => Outcome::Timeout,
+        Err(PtpUsbError::Usb(rusb::Error::Pipe)) => Outcome::Stalled,
+        Err(_) => Outcome::Failed,
+    }
+}
+
 /// Standard PTP `GetDevicePropDesc` (ISO 15740 §10.5.3): one param, the property code; the data
 /// phase is the property's descriptor (type, get/set flag, default, current value, form).
 const OP_GET_DEVICE_PROP_DESC: u16 = 0x1014;
@@ -2073,6 +2095,10 @@ pub struct PtpUsbSession<T: BulkTransport = rusb::DeviceHandle<GlobalContext>> {
     /// Held for the session's life (dropped after the interface is released);
     /// `None` only for the test constructor.
     _camera_lock: Option<CameraLock>,
+    /// Where this session's transactions are recorded: the process-wide recorder when the program
+    /// started one, else nothing. A field and not a global lookup per call so a test can give a
+    /// session a recorder of its own.
+    diag: Option<&'static crate::diag::Diag>,
 }
 
 impl PtpUsbSession {
@@ -2156,6 +2182,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
             data_phase_started: false,
             unrecognized_containers: 0,
             _camera_lock: camera_lock,
+            diag: crate::diag::global(),
         }
     }
 
@@ -2297,13 +2324,52 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         if let Some(cause) = &self.poisoned {
             return Err(PtpUsbError::SessionPoisoned { cause: cause.clone() });
         }
-        let result = self.run_transaction(op, params, data_out, check, timeout);
+        let span = self.begin_txn_span(op, params, data_out);
+        let result = self.run_transaction(&span, op, params, data_out, check, timeout);
+        let outcome = txn_outcome(&result, self.data_phase_started);
+        match &result {
+            Ok(reply) => {
+                let mut extra = vec![
+                    ("response", crate::diag::Val::Hex(u64::from(reply.code))),
+                    ("reply_len", crate::diag::Val::len(reply.data.len())),
+                ];
+                // A hash of nothing identifies nothing: only when the camera sent data.
+                if !reply.data.is_empty() {
+                    extra.push(("reply_hash", crate::diag::Val::hash(&reply.data)));
+                }
+                span.finish_with(outcome, &extra);
+            }
+            Err(e) => span.finish_with(outcome, &[("error", crate::diag::Val::text(&e.to_string()))]),
+        }
         if let Err(e) = &result
             && !e.leaves_stream_in_sync()
         {
             self.poison(e);
         }
         result
+    }
+
+    /// Open the diagnostics span for one transaction. What it records about the payload is its length
+    /// and a hash, never the bytes (an FTP profile carries a password). The operation and parameters
+    /// are what the camera was asked; they are codes and slot numbers.
+    fn begin_txn_span(&self, op: u16, params: &[u32], data_out: Option<&[u8]>) -> crate::diag::Span<'static> {
+        use crate::diag::{Class, Subsystem, Val};
+        let Some(d) = self.diag else { return crate::diag::Span::none() };
+        let mut fields: Vec<(&'static str, Val)> = vec![
+            ("op", Val::Hex(u64::from(op))),
+            ("txid", Val::U64(u64::from(self.transaction_id))),
+            ("params", Val::U64(params.len() as u64)),
+        ];
+        for (key, p) in TXN_PARAM_KEYS.iter().zip(params) {
+            fields.push((key, Val::Hex(u64::from(*p))));
+        }
+        if let Some(data) = data_out {
+            fields.push(("data_len", Val::len(data.len())));
+            fields.push(("data_hash", Val::hash(data)));
+        }
+        // The operation code is part of the name so the report only collapses runs of the *same*
+        // operation, never a close, an open and a read into one line.
+        d.span(Subsystem::Usb, &format!("ptp_{op:04x}"), Class::Leaf, &fields)
     }
 
     /// Mark the session unusable: clear the halt on both bulk endpoints (the
@@ -2324,6 +2390,7 @@ impl<T: BulkTransport> PtpUsbSession<T> {
 
     fn run_transaction(
         &mut self,
+        span: &crate::diag::Span<'_>,
         op: u16,
         params: &[u32],
         data_out: Option<&[u8]>,
@@ -2336,9 +2403,11 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         self.transaction_id = next_transaction_id(txid);
         let deadline = Instant::now() + timeout;
         self.send_container(&command)?;
+        span.set("phase", crate::diag::Val::text(TXN_PHASE_COMMAND_SENT));
         if let Some(data) = data {
             self.data_phase_started = true;
             self.send_container(&data)?;
+            span.set("phase", crate::diag::Val::text(TXN_PHASE_DATA_SENT));
         }
         let mut reply = Reply {
             code: 0,
@@ -5307,6 +5376,158 @@ mod tests {
         let (mut s, t) = session(vec![data_c(OP_VENDOR_PROP_READ, &[0xAA, 0xBB]), resp(RESP_OK)], "Z 9");
         assert_eq!(s.read_vendor_property(0xD053).unwrap(), vec![0xAA, 0xBB]);
         assert_eq!(t.sent(), vec![(CONTAINER_COMMAND, OP_VENDOR_PROP_READ, 0, le(0x1D053))]);
+    }
+
+    // ── diagnostics: every transaction is one span ───────────────────────
+
+    /// A session over a scripted transport with a recorder of its own (leaked: it must be
+    /// `'static`, and a test process is short-lived). The temp dir is returned to keep it alive.
+    fn recorded(steps: Vec<Step>, model: &str) -> (PtpUsbSession<ScriptedTransport>, ScriptedTransport, &'static crate::diag::Diag, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::diag::Config::new(dir.path().to_path_buf(), crate::diag::Subsystem::Cli);
+        cfg.pid = 7000 + dir.path().to_string_lossy().len() as u32; // distinct enough: each test has its own directory
+        let d: &'static crate::diag::Diag = Box::leak(Box::new(crate::diag::Diag::new(cfg).unwrap()));
+        let (mut s, t) = session(steps, model);
+        s.diag = Some(d);
+        (s, t, d, dir)
+    }
+    fn field<'a>(e: &'a crate::diag::Entry, key: &str) -> Option<&'a crate::diag::Val> {
+        e.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn a_read_transaction_is_one_leaf_span_with_the_op_params_response_and_no_payload() {
+        use crate::diag::{Class, Kind, Outcome, Subsystem, Val};
+        let (mut s, _t, d, _dir) = recorded(vec![data_c(OP_VENDOR_PROP_READ, &[0xAA, 0xBB]), resp(RESP_OK)], "Z 9");
+        s.read_vendor_property(0xD053).unwrap();
+        let ring = d.snapshot();
+        assert_eq!(ring.len(), 1);
+        let e = &ring[0];
+        assert_eq!((e.kind, e.class, e.subsystem, e.op.as_str(), e.outcome), (Kind::Span, Class::Leaf, Subsystem::Usb, "ptp_943b", Some(Outcome::Ok)));
+        assert_eq!(field(e, "op"), Some(&Val::Hex(0x943B)));
+        assert_eq!(field(e, "txid"), Some(&Val::U64(0)));
+        assert_eq!(field(e, "params"), Some(&Val::U64(1)));
+        assert_eq!(field(e, "p0"), Some(&Val::Hex(0x1D053)));
+        assert_eq!(field(e, "response"), Some(&Val::Hex(0x2001)));
+        assert_eq!(field(e, "reply_len"), Some(&Val::Len(2)));
+        assert_eq!(field(e, "reply_hash"), Some(&Val::hash(&[0xAA, 0xBB])));
+        assert_eq!(field(e, "phase"), Some(&Val::text("command_sent")), "no data-out, so never past command_sent");
+        assert!(field(e, "data_len").is_none(), "a read has no data-out fields");
+        assert!(d.open_spans().is_empty());
+    }
+
+    #[test]
+    fn a_write_records_the_length_and_hash_of_its_payload_never_the_bytes_and_reaches_data_sent() {
+        use crate::diag::{Outcome, Val};
+        let payload = b"profile-with-password-hunter2";
+        let (mut s, _t, d, dir) = recorded(vec![resp(RESP_OK)], "Z 9");
+        s.transact(OP_FTP_PROFILE_WRITE, &[0, 1], Some(payload), TxidCheck::Unchecked).unwrap();
+        let e = d.snapshot().pop().unwrap();
+        assert_eq!(e.outcome, Some(Outcome::Ok));
+        assert_eq!(field(&e, "data_len"), Some(&Val::Len(payload.len() as u64)));
+        assert_eq!(field(&e, "data_hash"), Some(&Val::hash(payload)));
+        assert_eq!(field(&e, "phase"), Some(&Val::text("data_sent")));
+        assert_eq!((field(&e, "p0"), field(&e, "p1")), (Some(&Val::Hex(0)), Some(&Val::Hex(1))));
+        let on_disk: String = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|f| f.path().extension().is_some_and(|x| x == "jsonl" || x == "json"))
+            .map(|f| std::fs::read_to_string(f.path()).unwrap())
+            .collect();
+        assert!(!on_disk.contains("hunter2"), "the payload must not reach any diagnostics file");
+        assert!(!on_disk.contains("profile-with"), "{on_disk}");
+    }
+
+    #[test]
+    fn up_to_five_parameters_are_recorded_individually_and_the_count_is_always_there() {
+        use crate::diag::Val;
+        let (mut s, _t, d, _dir) = recorded(vec![resp(RESP_OK), resp(RESP_OK)], "Z 9");
+        s.transact(0x9999, &[], None, TxidCheck::Unchecked).unwrap();
+        s.transact(0x9999, &[1, 2, 3, 4, 5], None, TxidCheck::Unchecked).unwrap();
+        let ring = d.snapshot();
+        assert_eq!(field(&ring[0], "params"), Some(&Val::U64(0)));
+        assert!(field(&ring[0], "p0").is_none());
+        assert_eq!(field(&ring[1], "params"), Some(&Val::U64(5)));
+        assert_eq!(field(&ring[1], "p4"), Some(&Val::Hex(5)));
+    }
+
+    #[test]
+    fn a_non_ok_answer_is_failed_a_timeout_is_timeout_a_stall_is_stalled() {
+        use crate::diag::{Outcome, Val};
+        // The camera answered and said no: the transaction completed, the operation was refused.
+        let (mut s, _t, d, _dir) = recorded(vec![resp(0x200A)], "Z 9");
+        let _ = s.read_vendor_property(0xD072);
+        let e = d.snapshot().pop().unwrap();
+        assert_eq!((e.outcome, field(&e, "response")), (Some(Outcome::Failed), Some(&Val::Hex(0x200A))));
+        // Silence from the camera, no data-out sent.
+        let (mut s, _t, d, _dir) = recorded(vec![Step::Err(rusb::Error::Timeout)], "Z 9");
+        let _ = s.transact(OP_GET_DEVICE_INFO, &[], None, TxidCheck::Unchecked);
+        assert_eq!(d.snapshot().pop().unwrap().outcome, Some(Outcome::Timeout));
+        // A stalled pipe.
+        let (mut s, _t, d, _dir) = recorded(vec![Step::Err(rusb::Error::Pipe)], "Z 9");
+        let _ = s.transact(OP_GET_DEVICE_INFO, &[], None, TxidCheck::Unchecked);
+        assert_eq!(d.snapshot().pop().unwrap().outcome, Some(Outcome::Stalled));
+        // Any other failure before data-out.
+        let (mut s, _t, d, _dir) = recorded(vec![Step::Err(rusb::Error::NoDevice)], "Z 9");
+        let _ = s.transact(OP_GET_DEVICE_INFO, &[], None, TxidCheck::Unchecked);
+        let e = d.snapshot().pop().unwrap();
+        assert_eq!(e.outcome, Some(Outcome::Failed));
+        assert!(matches!(field(&e, "error"), Some(Val::Text(t)) if !t.is_empty()));
+    }
+
+    #[test]
+    fn an_error_after_the_data_went_out_is_indeterminate_whatever_the_error() {
+        use crate::diag::{Outcome, Val};
+        for err in [rusb::Error::Timeout, rusb::Error::Pipe, rusb::Error::NoDevice] {
+            let (mut s, _t, d, _dir) = recorded(vec![Step::Err(err)], "Z 9");
+            let _ = s.transact(OP_FTP_PROFILE_WRITE, &[0, 0], Some(&[1, 2, 3]), TxidCheck::Unchecked);
+            let e = d.snapshot().pop().unwrap();
+            assert_eq!(e.outcome, Some(Outcome::Indeterminate), "{err:?}");
+            assert_eq!(field(&e, "phase"), Some(&Val::text("data_sent")), "{err:?}: the last stage reached");
+        }
+        // The same error with no data-out is not indeterminate: nothing the camera could act on went out.
+        let (mut s, _t, d, _dir) = recorded(vec![Step::Err(rusb::Error::Timeout)], "Z 9");
+        let _ = s.transact(OP_FTP_PROFILE_WRITE, &[0, 0], None, TxidCheck::Unchecked);
+        assert_eq!(d.snapshot().pop().unwrap().outcome, Some(Outcome::Timeout));
+    }
+
+    #[test]
+    fn a_refusal_from_a_poisoned_session_records_nothing_because_nothing_was_sent() {
+        let (mut s, t, d, _dir) = recorded(vec![Step::Err(rusb::Error::Pipe)], "Z 9");
+        assert!(s.query_vendor_op(0x90ED).is_err());
+        assert_eq!(d.snapshot().len(), 1);
+        let sent_before = t.sent().len();
+        assert!(matches!(s.query_vendor_op(0x90ED), Err(PtpUsbError::SessionPoisoned { .. })));
+        assert_eq!(d.snapshot().len(), 1, "no span for a transaction that never started");
+        assert_eq!(t.sent().len(), sent_before, "and nothing went to the pipe");
+    }
+
+    #[test]
+    fn the_span_name_carries_the_operation_code_and_an_empty_reply_has_no_hash() {
+        use crate::diag::Val;
+        let (mut s, _t, d, _dir) = recorded(vec![resp(RESP_OK), data_c(OP_GET_DEVICE_PROP_VALUE, &[1, 0, 0]), resp(RESP_OK), resp(RESP_OK)], "Z 9");
+        s.transact(OP_CLOSE_SESSION, &[], None, TxidCheck::Unchecked).unwrap();
+        s.get_device_prop_value(0xD090).unwrap();
+        s.transact(OP_CLOSE_SESSION, &[], None, TxidCheck::Unchecked).unwrap();
+        let ring = d.snapshot();
+        assert_eq!(ring.iter().map(|e| e.op.as_str()).collect::<Vec<_>>(), vec!["ptp_1003", "ptp_1015", "ptp_1003"]);
+        assert_eq!(field(&ring[0], "reply_len"), Some(&Val::Len(0)));
+        assert!(field(&ring[0], "reply_hash").is_none(), "no data, no hash");
+        assert!(field(&ring[1], "reply_hash").is_some());
+        // Leading zeros are kept so a name always has four hex digits.
+        assert_eq!(format!("ptp_{:04x}", 0x0u16), "ptp_0000");
+    }
+
+    #[test]
+    fn txn_outcome_pins_each_branch() {
+        use crate::diag::Outcome;
+        let reply = |code| Reply { code, params: vec![], data: vec![], data_containers: 0, deviations: vec![], unrecognized_containers: 0 };
+        assert_eq!(txn_outcome(&Ok(reply(RESP_OK)), false), Outcome::Ok);
+        assert_eq!(txn_outcome(&Ok(reply(RESP_OK)), true), Outcome::Ok, "a completed write is ok");
+        assert_eq!(txn_outcome(&Ok(reply(0x2002)), true), Outcome::Failed, "a refusal after data-out is definite");
+        assert_eq!(txn_outcome(&Ok(reply(0x2001 + 1)), false), Outcome::Failed);
+        assert_eq!(txn_outcome(&Err(PtpUsbError::TransactionTimedOut(Duration::from_secs(1))), false), Outcome::Timeout);
+        assert_eq!(txn_outcome(&Err(PtpUsbError::TransactionTimedOut(Duration::from_secs(1))), true), Outcome::Indeterminate);
     }
 
     // ── GetDevicePropValue / GetDevicePropDesc ───────────────────────────

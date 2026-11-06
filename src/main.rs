@@ -16,7 +16,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -98,6 +98,14 @@ struct Cli {
     /// GUI context (AppKit run loop active) to avoid invalidating Metal surfaces.
     #[arg(long, global = true)]
     no_usb_reset: bool,
+
+    /// Also append every diagnostics record of this run to FILE, uncompacted (JSON lines, owner-only).
+    /// Diagnostics are always on: a bounded record of what each process was doing is kept in the
+    /// diagnostics directory (`NIKON_FLEET_DIAG_DIR` replaces its default location) and read back
+    /// with `diag-report`. Payloads such as an FTP profile are never recorded, only their length
+    /// and a hash.
+    #[arg(long, global = true, value_name = "FILE")]
+    trace: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -217,6 +225,11 @@ enum Cmd {
     /// the change can be undone. `--dry-run` shows the current value and sends nothing. No other
     /// property can be written with this. Confirmed over USB on a Z 9, a Z6III and a Z 5 for the image comment only; see the handoff doc.
     VendorSetString(VendorSetStringArgs),
+    /// Show what each recent nikon-fleet process (CLI, GUI, MCP server) was doing, from the
+    /// diagnostics files they leave behind: the operation in flight when one hung or was killed, how
+    /// long it had been open, whether the process is still running, and what ran just before. Reads
+    /// only; starts no diagnostics of its own.
+    DiagReport(DiagReportArgs),
     /// EXPERIMENTAL. Send ONE bare operation (no parameters, no data) from a
     /// short fixed list (0x90E9, 0x90EA, 0x90EC, 0x90EF in the FTP-profile
     /// range, and 0x9FFF as a control that should not exist) and print the
@@ -687,6 +700,17 @@ struct VendorGetPropArgs {
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
     serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct DiagReportArgs {
+    /// How many of each process's most recent entries to show. Runs of routine successful
+    /// operations (one SDK read of two hundred) are collapsed into one line first.
+    #[arg(long, default_value_t = 20)]
+    last: usize,
+    /// Read this diagnostics directory instead of the default one.
+    #[arg(long)]
+    dir: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -3585,6 +3609,7 @@ fn run(cli: Cli) -> Result<()> {
         #[cfg(unix)]
         Cmd::Worker(args) => {
             let code = worker_cmd::run(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args);
+            nikon_fleet::diag::shutdown(code);
             std::process::exit(code)
         }
         Cmd::Restore(args) => cmd_restore(&cli.data_dir, &cli.sdk_bundle, &cli.schema, args, no_reset),
@@ -3597,6 +3622,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::VendorOpSupport(args) => cmd_vendor_op_support(args),
         Cmd::VendorGetProp(args) => cmd_vendor_get_prop(args),
         Cmd::VendorSetString(args) => cmd_vendor_set_string(args),
+        Cmd::DiagReport(args) => cmd_diag_report(args),
         Cmd::VendorProbeOp(args) => cmd_vendor_probe_op(args),
         Cmd::Firmware(sub) => match sub {
             FirmwareCmd::Add(args) => cmd_firmware_add(&cli.data_dir, args),
@@ -3611,8 +3637,60 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// `diag-report`: what each recent process was doing, from the files they left.
+fn cmd_diag_report(args: &DiagReportArgs) -> Result<()> {
+    let dir = match &args.dir {
+        Some(d) => d.clone(),
+        None => nikon_fleet::diag::dir().context(
+            "there is no diagnostics directory: no home directory is set and NIKON_FLEET_DIAG_DIR is not set",
+        )?,
+    };
+    let traces = nikon_fleet::diag::load(&dir, &nikon_fleet::diag::pid_alive)
+        .with_context(|| format!("reading the diagnostics directory {}", dir.display()))?;
+    println!("diagnostics directory: {}", dir.display());
+    print!("{}", nikon_fleet::diag::render(&traces, nikon_fleet::diag::unix_ms(), args.last));
+    Ok(())
+}
+
+/// Start diagnostics for this process and open the span that covers the whole command. Never
+/// fatal: if they cannot be set up the command runs without them and says so once.
+fn start_diagnostics(trace: Option<&Path>, command: &str) -> Option<nikon_fleet::diag::Span<'static>> {
+    use nikon_fleet::diag::{self, Class, Subsystem, Val};
+    let Some(dir) = diag::dir() else {
+        eprintln!("warning: diagnostics are off: no home directory is set and NIKON_FLEET_DIAG_DIR is not set");
+        return None;
+    };
+    let mut cfg = diag::Config::new(dir, Subsystem::Cli);
+    cfg.trace_file = trace.map(Path::to_path_buf);
+    if let Err(e) = diag::init(cfg) {
+        eprintln!("warning: diagnostics are off: {e}");
+        return None;
+    }
+    diag::install_panic_hook();
+    Some(diag::span(Subsystem::Cli, "command", Class::Top, &[("name", Val::text(command))]))
+}
+
+/// The subcommand name clap matched ("vendor-read", "firmware add"), from clap itself, never by
+/// looking at the argument text.
+fn matched_command_name(matches: &clap::ArgMatches) -> String {
+    match matches.subcommand() {
+        Some((name, sub)) => match sub.subcommand_name() {
+            Some(inner) => format!("{name} {inner}"),
+            None => name.to_string(),
+        },
+        None => String::new(),
+    }
+}
+
 fn main() {
-    let cli = Cli::parse();
+    use nikon_fleet::diag::{self, Outcome};
+    let mut matches = Cli::command().get_matches();
+    // Before `from_arg_matches_mut`, which takes the matches apart: afterwards there is no subcommand left to name.
+    let command_name = matched_command_name(&matches);
+    let cli = match Cli::from_arg_matches_mut(&mut matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
     // Test hook, not an option: with this variable set the command line is parsed and nothing runs.
     // tests/gui_argv_cli.rs feeds it every argv the GUI builds. An environment
     // variable rather than a flag, so no wrapper script can turn a real command into a silent
@@ -3620,11 +3698,30 @@ fn main() {
     if std::env::var_os("NIKON_FLEET_PARSE_ONLY").is_some_and(|v| v == "1") {
         return;
     }
-    if let Err(e) = run(cli) {
-        // Exactly what returning the error from `main` printed, with the exit status chosen
-        // by `exit_code_for` instead of always 1.
-        eprintln!("Error: {e:?}");
-        std::process::exit(exit_code_for(&e));
+    // `diag-report` only reads: it must not start a recorder of its own and add a process to what it reports.
+    let span = if matches!(cli.cmd, Cmd::DiagReport(_)) {
+        None
+    } else {
+        start_diagnostics(cli.trace.as_deref(), &command_name)
+    };
+    match run(cli) {
+        Ok(()) => {
+            if let Some(s) = span {
+                s.finish(Outcome::Ok);
+            }
+            diag::shutdown(0);
+        }
+        Err(e) => {
+            // Exactly what returning the error from `main` printed, with the exit status chosen
+            // by `exit_code_for` instead of always 1.
+            let code = exit_code_for(&e);
+            if let Some(s) = span {
+                s.finish(if code == EXIT_WRITE_INDETERMINATE { Outcome::Indeterminate } else { Outcome::Failed });
+            }
+            diag::shutdown(code);
+            eprintln!("Error: {e:?}");
+            std::process::exit(code);
+        }
     }
 }
 
@@ -4965,6 +5062,19 @@ mod tests {
         r.read_back = Err("boom".into());
         let t = vendor_set_string_text(&r);
         assert!(t.contains("previous \"old\"") && t.ends_with("Not confirmed: boom."), "{t}");
+    }
+
+    #[test]
+    fn the_command_name_comes_from_clap_and_must_be_read_before_the_matches_are_consumed() {
+        let mut m = Cli::command().get_matches_from(["fleet", "ls"]);
+        assert_eq!(matched_command_name(&m), "ls");
+        let _ = Cli::from_arg_matches_mut(&mut m).unwrap();
+        // The pin: after the matches are consumed the name is gone, which is why main reads it first.
+        assert_eq!(matched_command_name(&m), "", "if this starts returning the name, main's ordering can be simplified");
+        let m = Cli::command().get_matches_from(["fleet", "firmware", "ls"]);
+        assert_eq!(matched_command_name(&m), "firmware ls");
+        let m = Cli::command().get_matches_from(["fleet", "--trace", "/tmp/t.jsonl", "diag-report"]);
+        assert_eq!(matched_command_name(&m), "diag-report");
     }
 
     #[test]

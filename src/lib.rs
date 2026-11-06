@@ -5,6 +5,7 @@
 
 pub mod camera_lock;
 mod config_parse;
+pub mod diag;
 pub mod diff;
 pub mod firmware;
 pub mod firmware_browse;
