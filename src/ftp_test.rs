@@ -596,6 +596,32 @@ fn ftp_failure(step: Step, e: &suppaftp::FtpError) -> Failure {
     }
 }
 
+/// What a server's STAT of a path says about it. A server that sends no permissions field, or one with none of the
+/// file-type bits set (some send only `rwx` bits), has given no file type: `TypeNotGiven` is not an answer either way.
+#[derive(Debug, PartialEq, Eq)]
+enum FolderProbe {
+    Folder,
+    /// Not a folder: what it is, worded to follow "is".
+    NotAFolder(&'static str),
+    TypeNotGiven,
+}
+
+/// The POSIX file-type bits of a mode (`S_IFMT`) and the ones this reads.
+const MODE_TYPE_MASK: u32 = 0o170000;
+const MODE_DIR: u32 = 0o040000;
+const MODE_FILE: u32 = 0o100000;
+const MODE_LINK: u32 = 0o120000;
+
+fn folder_probe(attrs: &russh_sftp::client::fs::Metadata) -> FolderProbe {
+    match attrs.permissions.map(|p| p & MODE_TYPE_MASK) {
+        None | Some(0) => FolderProbe::TypeNotGiven,
+        Some(MODE_DIR) => FolderProbe::Folder,
+        Some(MODE_FILE) => FolderProbe::NotAFolder("a file, not a folder"),
+        Some(MODE_LINK) => FolderProbe::NotAFolder("a link to something that is not a folder"),
+        Some(_) => FolderProbe::NotAFolder("a special file, not a folder"),
+    }
+}
+
 fn ftp(req: &TestRequest, rec: &mut Recorder, left_behind: &mut Option<String>) {
     use suppaftp::FtpStream;
     let t = req.step_timeout;
@@ -869,16 +895,31 @@ async fn sftp_steps(req: &TestRequest, addrs: &[SocketAddr], rec: &mut Recorder,
 
     // folder
     let wanted = if req.folder.trim().is_empty() { ".".to_string() } else { req.folder.trim().to_string() };
+    // The question is only "is there a folder here": a STAT answers it without reading what is in it (a camera's upload
+    // folder can hold thousands of files, and the library's `read_dir` reads every one of them before it returns). A
+    // server that gives no file type in its answer is asked the old way, by opening the folder and reading it.
     let folder = match within(t, "finding the folder", async {
         let real = sftp.canonicalize(wanted.as_str()).await?;
-        sftp.read_dir(real.as_str()).await?;
-        Ok::<String, russh_sftp::client::error::Error>(real)
+        let attrs = sftp.metadata(real.as_str()).await?;
+        match folder_probe(&attrs) {
+            FolderProbe::Folder => {}
+            FolderProbe::NotAFolder(what) => return Ok::<Result<String, String>, russh_sftp::client::error::Error>(Err(format!("{real} is {what}"))),
+            FolderProbe::TypeNotGiven => {
+                sftp.read_dir(real.as_str()).await?;
+            }
+        }
+        Ok(Ok(real))
     })
     .await
     {
-        Ok(Ok(real)) => {
+        Ok(Ok(Ok(real))) => {
             rec.ok(Step::Folder, format!("in {real}"));
             real
+        }
+        Ok(Ok(Err(message))) => {
+            rec.fail(Step::Folder, fail(FailKind::FolderMissing, message));
+            rec.skip_rest();
+            return;
         }
         Ok(Err(e)) => {
             rec.fail(Step::Folder, sftp_status_failure(FailKind::FolderMissing, &e));
@@ -1761,6 +1802,8 @@ mod tests {
         deny_delete: bool,
         /// Give far more than was stored when the file is read.
         oversize_read: bool,
+        /// Answer STAT with a file type (a folder, a file, or no such file). Off: the answer carries a size and no type.
+        report_types: bool,
     }
 
     #[derive(Default)]
@@ -1834,6 +1877,7 @@ mod tests {
         }
 
         async fn opendir(&mut self, id: u32, path: String) -> Result<russh_sftp::protocol::Handle, Self::Error> {
+            self.fs.lock().unwrap().ops.push(format!("opendir {path}"));
             let bare = path.trim_matches('/');
             if bare.is_empty() || self.b.dirs.contains(&bare) {
                 Ok(russh_sftp::protocol::Handle { id, handle: path })
@@ -1907,7 +1951,19 @@ mod tests {
 
         async fn stat(&mut self, id: u32, path: String) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
             let size = self.fs.lock().unwrap().files.get(&path).map(|f| f.len() as u64);
-            Ok(russh_sftp::protocol::Attrs { id, attrs: russh_sftp::protocol::FileAttributes { size, ..Default::default() } })
+            let mut attrs = russh_sftp::protocol::FileAttributes { size, ..Default::default() };
+            if self.b.report_types {
+                let bare = path.trim_matches('/');
+                if bare.is_empty() || self.b.dirs.contains(&bare) {
+                    attrs.permissions = Some(0o040755);
+                } else if size.is_some() {
+                    attrs.permissions = Some(0o100644);
+                } else {
+                    return Err(russh_sftp::protocol::StatusCode::NoSuchFile);
+                }
+            }
+            self.fs.lock().unwrap().ops.push(format!("stat {path}"));
+            Ok(russh_sftp::protocol::Attrs { id, attrs })
         }
 
         async fn lstat(&mut self, id: u32, path: String) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
@@ -1956,7 +2012,7 @@ mod tests {
     }
 
     fn good_sftp() -> SftpBehaviour {
-        SftpBehaviour { user: "fleet", pass: "s3cret!", dirs: vec!["incoming", "incoming/raw"], deny_write: false, corrupt_read: false, deny_delete: false, oversize_read: false }
+        SftpBehaviour { user: "fleet", pass: "s3cret!", dirs: vec!["incoming", "incoming/raw"], deny_write: false, corrupt_read: false, deny_delete: false, oversize_read: false, report_types: true }
     }
 
     #[test]
@@ -1974,6 +2030,60 @@ mod tests {
         assert!(srv.fs.lock().unwrap().ops.iter().any(|o| o.starts_with("open /incoming/nikon-fleet-test-")), "{:?}", srv.fs.lock().unwrap().ops);
         assert!(!serde_json::to_string(&r).unwrap().contains("s3cret!"));
         assert!(r.to_text().contains("server host key SHA256:"));
+    }
+
+    fn mode(permissions: Option<u32>) -> russh_sftp::client::fs::Metadata {
+        russh_sftp::protocol::FileAttributes { permissions, ..Default::default() }
+    }
+
+    #[test]
+    fn a_stat_is_read_for_the_file_type_bits_and_a_mode_without_them_says_nothing() {
+        use super::FolderProbe::*;
+        // at the type: a folder, a file, a link, and the others
+        assert_eq!(super::folder_probe(&mode(Some(0o040755))), Folder);
+        assert_eq!(super::folder_probe(&mode(Some(0o040000))), Folder, "no permission bits at all is still a folder");
+        assert_eq!(super::folder_probe(&mode(Some(0o100644))), NotAFolder("a file, not a folder"));
+        assert_eq!(super::folder_probe(&mode(Some(0o120777))), NotAFolder("a link to something that is not a folder"));
+        for other in [0o020644, 0o060644, 0o010644, 0o140755] {
+            assert_eq!(super::folder_probe(&mode(Some(other))), NotAFolder("a special file, not a folder"), "{other:o}");
+        }
+        // below: no type given at all. Some servers send only the rwx bits; that is not "not a folder".
+        assert_eq!(super::folder_probe(&mode(Some(0o755))), TypeNotGiven);
+        assert_eq!(super::folder_probe(&mode(Some(0))), TypeNotGiven);
+        assert_eq!(super::folder_probe(&mode(None)), TypeNotGiven);
+    }
+
+    #[test]
+    fn the_sftp_folder_step_asks_what_the_path_is_and_does_not_read_what_is_in_it() {
+        let srv = fake_sftp(good_sftp());
+        let r = run_test(&TestRequest { folder: "incoming".into(), ..request(srv.port, Protocol::Sftp) });
+        assert!(r.ok, "{}", r.to_text());
+        let ops = srv.fs.lock().unwrap().ops.clone();
+        assert!(ops.iter().any(|o| o == "stat /incoming"), "{ops:?}");
+        assert!(!ops.iter().any(|o| o.starts_with("opendir")), "the folder was opened and listed: {ops:?}");
+    }
+
+    #[test]
+    fn a_server_that_gives_no_file_type_is_asked_the_old_way_by_opening_the_folder() {
+        let srv = fake_sftp(SftpBehaviour { report_types: false, ..good_sftp() });
+        let r = run_test(&TestRequest { folder: "incoming".into(), ..request(srv.port, Protocol::Sftp) });
+        assert!(r.ok, "{}", r.to_text());
+        assert!(srv.fs.lock().unwrap().ops.iter().any(|o| o == "opendir /incoming"), "{:?}", srv.fs.lock().unwrap().ops);
+        // and the fallback still tells a missing folder from a good one
+        let missing = run_test(&TestRequest { folder: "nope".into(), ..request(srv.port, Protocol::Sftp) });
+        assert_eq!(outcomes(&missing)[4], (Step::Folder, "failed:folder_missing".to_string()), "{}", missing.to_text());
+    }
+
+    #[test]
+    fn a_path_that_is_a_file_is_not_a_folder_and_nothing_is_uploaded() {
+        let srv = fake_sftp(good_sftp());
+        srv.fs.lock().unwrap().files.insert("/incoming/notes.txt".to_string(), b"x".to_vec());
+        let r = run_test(&TestRequest { folder: "incoming/notes.txt".into(), ..request(srv.port, Protocol::Sftp) });
+        assert_eq!(outcomes(&r)[4], (Step::Folder, "failed:folder_missing".to_string()), "{}", r.to_text());
+        let StepOutcome::Failed { message, .. } = &r.steps[4].outcome else { panic!("{}", r.to_text()) };
+        assert!(message.contains("/incoming/notes.txt is a file, not a folder"), "{message}");
+        assert!(outcomes(&r)[5..].iter().all(|(_, o)| o == "skipped"));
+        assert!(!srv.fs.lock().unwrap().ops.iter().any(|o| o.starts_with("open /incoming/notes.txt/")), "nothing was put inside a file");
     }
 
     #[test]
@@ -2046,7 +2156,10 @@ mod tests {
     fn an_sftp_test_without_the_file_check_puts_nothing_there() {
         let srv = fake_sftp(good_sftp());
         let r = run_test(&TestRequest { file_check: false, ..request(srv.port, Protocol::Sftp) });
-        assert!(r.ok && srv.fs.lock().unwrap().ops.is_empty(), "{}", r.to_text());
+        // The folder is looked up (a stat), but no file is opened, written or removed.
+        let ops = srv.fs.lock().unwrap().ops.clone();
+        assert!(r.ok && ops.iter().all(|o| o.starts_with("stat ") || o.starts_with("opendir ")), "{ops:?}\n{}", r.to_text());
+        assert!(ops.iter().any(|o| o.starts_with("stat ")), "the folder was looked up: {ops:?}");
     }
 
     #[test]

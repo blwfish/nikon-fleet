@@ -116,4 +116,4 @@ current-thread tokio runtime the test creates for itself. About 60 crates are ne
   address announcements, what they list for a login that may write but not read) is unknown.
 - How an SFTP server that offers only keys, or one that disconnects during the handshake, is reported by `russh`: the
   kinds were set from the library's documented errors and from the test servers, not from real ones.
-- Whether a write-only upload folder passes the SFTP folder check, which lists the folder.
+- Whether a real SFTP server answers STAT with a file type. The SFTP folder step now asks the server what the path is (a STAT, nothing is listed) and falls back to opening and reading the folder only when the answer carries no file type bits; the first path is tested against a stand-in server only. A write-only upload folder passes the STAT path (it needs no listing right) but would fail the fallback, which lists the folder.
