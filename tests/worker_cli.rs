@@ -485,3 +485,101 @@ fn list_cameras_needs_no_sdk_bundle_and_no_lock_and_keeps_stdout_empty() {
     let (code, stdout, _) = w.finish();
     assert_eq!((code, stdout.as_str()), (Some(0), ""));
 }
+
+// ── diagnostics ──────────────────────────────────────────────────────────
+
+/// What the worker process left in `diag_dir`, read back with the real reader.
+fn worker_trace(diag_dir: &std::path::Path, pid: u32) -> nikon_fleet::diag::ProcessTrace {
+    let traces = nikon_fleet::diag::load(diag_dir, &nikon_fleet::diag::pid_alive).unwrap();
+    traces.into_iter().find(|t| t.pid == pid).unwrap_or_else(|| panic!("no diagnostics for pid {pid}"))
+}
+
+fn field<'a>(e: &'a nikon_fleet::diag::Entry, key: &str) -> Option<&'a nikon_fleet::diag::Val> {
+    e.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+#[test]
+fn a_worker_records_its_phases_its_parent_and_the_request_id_and_a_clean_exit() {
+    use nikon_fleet::diag::{Outcome as O, Val, Verdict};
+    let dir = tempfile::tempdir().unwrap();
+    let diag = dir.path().join("diag");
+    let env = [("NIKON_FLEET_DIAG_DIR", diag.to_str().unwrap()), ("NIKON_FLEET_REQUEST_ID", "req-test-1")];
+    let mut w = spawn(&[], &["selftest"], &env);
+    let _ = w.read();
+    let pid = w.child.id();
+    assert_eq!(w.finish().0, Some(0));
+
+    let t = worker_trace(&diag, pid);
+    assert_eq!(t.verdict(), Verdict::ExitedCleanly { code: 0 });
+    let start = t.entries.iter().find(|e| e.op == "start").expect("a start event");
+    assert_eq!(field(start, "request_id"), Some(&Val::text("req-test-1")), "the id the parent gave it");
+    assert_eq!(field(start, "ppid"), Some(&Val::U64(u64::from(std::process::id()))), "and who the parent was");
+    assert_eq!(field(start, "role"), Some(&Val::text("cli")));
+    let phases: Vec<&Val> = t.entries.iter().filter(|e| e.op == "phase").filter_map(|e| field(e, "phase")).collect();
+    assert_eq!(phases, vec![&Val::text("starting"), &Val::text("working")], "each progress line, in order");
+    let command = t.entries.iter().find(|e| e.op == "command").unwrap();
+    assert_eq!((command.outcome, field(command, "name")), (Some(O::Ok), Some(&Val::text("worker selftest"))));
+}
+
+#[test]
+fn a_failing_worker_records_a_failed_command_and_its_exit_code() {
+    use nikon_fleet::diag::{Outcome as O, Val, Verdict};
+    let dir = tempfile::tempdir().unwrap();
+    let diag = dir.path().join("diag");
+    let mut w = spawn(&[], &["selftest", "--fail"], &[("NIKON_FLEET_DIAG_DIR", diag.to_str().unwrap())]);
+    let _ = w.read();
+    let pid = w.child.id();
+    assert_eq!(w.finish().0, Some(1));
+    let t = worker_trace(&diag, pid);
+    assert_eq!(t.verdict(), Verdict::ExitedCleanly { code: 1 });
+    let command = t.entries.iter().find(|e| e.op == "command").unwrap();
+    assert_eq!(command.outcome, Some(O::Failed));
+    let start = t.entries.iter().find(|e| e.op == "start").unwrap();
+    assert!(field(start, "request_id").is_none(), "no parent gave one");
+    let _ = Val::U64(0);
+}
+
+#[test]
+fn a_worker_that_hangs_after_its_result_is_a_running_process_with_its_command_open() {
+    use nikon_fleet::diag::Verdict;
+    let dir = tempfile::tempdir().unwrap();
+    let diag = dir.path().join("diag");
+    // The result is out, then the worker sleeps forever: the teardown hang the supervisor has to kill.
+    let mut w = spawn(&[], &["selftest", "--hang-after-result"], &[("NIKON_FLEET_DIAG_DIR", diag.to_str().unwrap())]);
+    let _ = w.read();
+    let pid = w.child.id();
+    let t = worker_trace(&diag, pid);
+    assert_eq!(t.verdict(), Verdict::RunningWithSpansOpen, "alive, with its command span still open");
+    // Killed from outside, as the supervisor does: it never reached its exit.
+    w.child.kill().unwrap();
+    let _ = w.child.wait();
+    let t = worker_trace(&diag, pid);
+    assert_eq!(t.verdict(), Verdict::GoneWithSpansOpen);
+    assert!(t.entries.iter().filter(|e| e.op == "phase").count() == 2, "the phases before the hang are in the ring");
+}
+
+#[test]
+fn a_refused_camera_lock_is_recorded_as_an_event_in_the_refused_process() {
+    use nikon_fleet::diag::Val;
+    let schema = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk-runtime/MaidLayer.config");
+    if !schema.exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let lock_path = dir.path().join("camera.lock");
+    let diag = dir.path().join("diag");
+    let _held = CameraLock::acquire_at(&lock_path).unwrap();
+    let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let mut w = spawn(
+        &["--sdk-bundle", bundle.to_str().unwrap(), "--schema", schema.to_str().unwrap()],
+        &["capture", "--serial", "0000003023668"],
+        &[("NIKON_FLEET_CAMERA_LOCK", lock_path.to_str().unwrap()), ("NIKON_FLEET_DIAG_DIR", diag.to_str().unwrap())],
+    );
+    let _ = w.read();
+    let pid = w.child.id();
+    assert_eq!(w.finish().0, Some(1));
+    let t = worker_trace(&diag, pid);
+    let refused = t.entries.iter().find(|e| e.op == "lock_refused").expect("a lock_refused event");
+    assert_eq!(field(refused, "reason"), Some(&Val::text("camera_busy")));
+    assert!(t.entries.iter().all(|e| e.op != "camera_lock_held"), "it never held the lock");
+}

@@ -491,58 +491,60 @@ pub fn execute_from<P: CameraPort + ?Sized>(
     dry_run: bool,
     source: Source,
 ) -> RestoreRun {
-    let cap_map: HashMap<u32, &CapabilityInfo> = port.capabilities().iter().map(|c| (c.id, c)).collect();
-    let steps = plan_from(properties, only, &cap_map, source)
-        .into_iter()
-        .map(|step| {
-            let outcome = match step.decision {
-                Decision::NotSelected => StepOutcome::NotSelected,
-                Decision::Skip(skip) => StepOutcome::Skipped(skip),
-                Decision::Write(cap) => {
-                    let value = &properties[step.name].value;
-                    // A stored range with no usable position (a stepped range whose index is missing
-                    // or past its last step) is a corrupt snapshot: writing it would hand the body a
-                    // struct whose `value` is 0.0. A transplant refuses the same shape as malformed.
-                    if is_range_shape(value) && range_value(value).is_none() {
-                        return StepResult {
-                            name: step.name.to_string(),
-                            code: step.code,
-                            outcome: StepOutcome::WriteFailed(
-                                "the snapshot's range has no usable position (a stepped range with no valid index); not written".to_string(),
-                            ),
+    crate::diag::scoped_with(crate::diag::Subsystem::Restore, "execute_writes", crate::diag::Class::Top, &[("dry_run", crate::diag::Val::Bool(dry_run))], |_span| {
+        let cap_map: HashMap<u32, &CapabilityInfo> = port.capabilities().iter().map(|c| (c.id, c)).collect();
+        let steps = plan_from(properties, only, &cap_map, source)
+            .into_iter()
+            .map(|step| {
+                let outcome = match step.decision {
+                    Decision::NotSelected => StepOutcome::NotSelected,
+                    Decision::Skip(skip) => StepOutcome::Skipped(skip),
+                    Decision::Write(cap) => {
+                        let value = &properties[step.name].value;
+                        // A stored range with no usable position (a stepped range whose index is missing
+                        // or past its last step) is a corrupt snapshot: writing it would hand the body a
+                        // struct whose `value` is 0.0. A transplant refuses the same shape as malformed.
+                        if is_range_shape(value) && range_value(value).is_none() {
+                            return StepResult {
+                                name: step.name.to_string(),
+                                code: step.code,
+                                outcome: StepOutcome::WriteFailed(
+                                    "the snapshot's range has no usable position (a stepped range with no valid index); not written".to_string(),
+                                ),
+                            };
+                        }
+                        // A range is read first, for two reasons. A body ignores a blind write of a
+                        // stepped range and honours one made after a read (F18), so the read is the
+                        // priming read (its result is not used for that). And a stored position only
+                        // means the same value on the scale it was read on: if the body's scale for
+                        // this range differs now, the range is left alone, as a transplant does.
+                        let scale_differs = is_range_shape(value) && {
+                            let live = port.read_capability(step.code).ok();
+                            match (range_scale(value), live.as_ref().and_then(range_scale)) {
+                                (Some(stored), Some(now)) => stored != now,
+                                // No scale on one side (the read failed, or a malformed value): nothing
+                                // to compare, so nothing to refuse on; the write and read-back judge it.
+                                _ => false,
+                            }
                         };
-                    }
-                    // A range is read first, for two reasons. A body ignores a blind write of a
-                    // stepped range and honours one made after a read (F18), so the read is the
-                    // priming read (its result is not used for that). And a stored position only
-                    // means the same value on the scale it was read on: if the body's scale for
-                    // this range differs now, the range is left alone, as a transplant does.
-                    let scale_differs = is_range_shape(value) && {
-                        let live = port.read_capability(step.code).ok();
-                        match (range_scale(value), live.as_ref().and_then(range_scale)) {
-                            (Some(stored), Some(now)) => stored != now,
-                            // No scale on one side (the read failed, or a malformed value): nothing
-                            // to compare, so nothing to refuse on; the write and read-back judge it.
-                            _ => false,
-                        }
-                    };
-                    if scale_differs {
-                        StepOutcome::Skipped(RestoreSkip::RangeScaleDiffers)
-                    } else if dry_run {
-                        StepOutcome::WouldWrite
-                    } else {
-                        match port.write_capability(step.code, cap.kind, &coherent_for_write(value)) {
-                            Ok(()) => StepOutcome::Written,
-                            Err(SdkError::UnsupportedWrite(_)) => StepOutcome::UnsupportedWriteType,
-                            Err(e) => StepOutcome::WriteFailed(truncate_with_marker(e.to_string(), MAX_ERROR_MESSAGE_LEN)),
+                        if scale_differs {
+                            StepOutcome::Skipped(RestoreSkip::RangeScaleDiffers)
+                        } else if dry_run {
+                            StepOutcome::WouldWrite
+                        } else {
+                            match port.write_capability(step.code, cap.kind, &coherent_for_write(value)) {
+                                Ok(()) => StepOutcome::Written,
+                                Err(SdkError::UnsupportedWrite(_)) => StepOutcome::UnsupportedWriteType,
+                                Err(e) => StepOutcome::WriteFailed(truncate_with_marker(e.to_string(), MAX_ERROR_MESSAGE_LEN)),
+                            }
                         }
                     }
-                }
-            };
-            StepResult { name: step.name.to_string(), code: step.code, outcome }
-        })
-        .collect();
-    RestoreRun { steps }
+                };
+                StepResult { name: step.name.to_string(), code: step.code, outcome }
+            })
+            .collect();
+        RestoreRun { steps }
+    }, |run| (crate::diag::Outcome::Ok, vec![("steps", crate::diag::Val::U64(run.steps.len() as u64))]))
 }
 
 /// What a read-back after a restore showed.

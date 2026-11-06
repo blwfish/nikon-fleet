@@ -108,8 +108,30 @@ fn default_worker() -> anyhow::Result<PathBuf> {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    use nikon_fleet::diag::{self, Class, Outcome, Subsystem};
     let args = Args::parse();
+    // Diagnostics for the whole server process: the in-flight file, the ring, the panic hook. They are off,
+    // with one warning, if their directory cannot be made; the server runs either way.
+    diag::start(Subsystem::Mcp, None);
+    let span = diag::span(Subsystem::Mcp, "server", Class::Top, &[]);
+    // `main` used to return the Result, which printed `Error: {e:?}` and exited 1; keep exactly that,
+    // after the exit is recorded.
+    match run(args).await {
+        Ok(()) => {
+            span.finish(Outcome::Ok);
+            diag::shutdown(0);
+        }
+        Err(e) => {
+            span.finish(Outcome::Failed);
+            diag::shutdown(1);
+            eprintln!("Error: {e:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run(args: Args) -> anyhow::Result<()> {
     let worker = match args.worker {
         Some(w) => w,
         None => default_worker()?,
@@ -160,6 +182,9 @@ async fn main() -> anyhow::Result<()> {
         if let Err(e) = record_in_flight_at_exit(&data_dir, reason, sup.in_flight().as_ref()) {
             eprintln!("fleet-mcp: could not record the call that was in flight: {e}");
         }
+        // Not unwinding on purpose (the worker must finish), so the exit is recorded here, and the
+        // server span closes with it.
+        nikon_fleet::diag::shutdown(128 + signo);
         std::process::exit(128 + signo);
     }
 

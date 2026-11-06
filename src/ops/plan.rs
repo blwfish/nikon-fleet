@@ -197,8 +197,17 @@ fn rank(o: &TransplantOutcome) -> u8 {
 
 /// Run the transplant as a dry run on `port` and build the report.
 pub fn build_plan<P: CameraPort + ?Sized>(port: &P, guard: &CodeNameGuard, input: &PlanInput<'_>) -> PlanReport {
-    let outcomes = transplant(port, &input.source.properties, guard, input.options, true);
-    report_from(outcomes, input)
+    crate::diag::scoped_with(
+        crate::diag::Subsystem::Transplant,
+        "plan",
+        crate::diag::Class::Top,
+        &[],
+        |_span| {
+            let outcomes = transplant(port, &input.source.properties, guard, input.options, true);
+            report_from(outcomes, input)
+        },
+        |_| (crate::diag::Outcome::Ok, Vec::new()),
+    )
 }
 
 /// Build the report from outcomes already computed (the apply path reuses it).

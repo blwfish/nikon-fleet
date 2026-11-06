@@ -22,6 +22,7 @@ const FAKE_WORKER: &str = r#"#!/bin/sh
 # args: --data-dir D [...] worker --result-fd 3 OP ...
 LOG="$2/args.log"
 echo "$@" >> "$LOG"
+echo "$NIKON_FLEET_REQUEST_ID" >> "$2/reqid.log"
 for a in "$@"; do op=$a; done
 # the op is the first word after "3"
 op=""; seen=0
@@ -94,6 +95,8 @@ impl Server {
             .arg("--worker")
             .arg(&worker)
             .args(extra)
+            // Each test's server keeps its diagnostics in that test's own directory.
+            .env(nikon_fleet::diag::DIR_ENV, dir.path().join("diag"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -190,6 +193,28 @@ impl Server {
             .map_while(|n| std::fs::read_to_string(self.dir.path().join(format!("stderr-{n}.log"))).ok())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// This server process's diagnostics, read back with the real reader (liveness from the real pid check).
+    fn diag(&self) -> nikon_fleet::diag::ProcessTrace {
+        let traces = nikon_fleet::diag::load(&self.dir.path().join("diag"), &nikon_fleet::diag::pid_alive).unwrap();
+        traces.into_iter().find(|t| t.pid == self.child.id()).unwrap_or_else(|| panic!("no diagnostics for pid {}", self.child.id()))
+    }
+
+    /// Wait until the in-flight file lists a span named `op` with a `phase` field, and return the file.
+    fn wait_in_flight(&self, op: &str, phase: &str) -> nikon_fleet::diag::InflightFile {
+        let path = nikon_fleet::diag::inflight_path(&self.dir.path().join("diag"), self.child.id());
+        let end = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(f) = serde_json::from_slice::<nikon_fleet::diag::InflightFile>(&bytes)
+                && f.spans.iter().any(|sp| sp.op == op && sp.fields.iter().any(|(k, v)| k == "phase" && v == &nikon_fleet::diag::Val::text(phase)))
+            {
+                return f;
+            }
+            assert!(Instant::now() < end, "the in-flight file never showed {op} at phase {phase}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Wait for the process to exit on its own.
@@ -728,4 +753,98 @@ fn with_writes_the_apply_strategy_is_in_the_overview() {
     let mut s = Server::start(&["--enable-writes"]);
     let r = s.call("get_usage_guidance", json!({"operation": "strategy"}));
     assert!(text_of(&r).contains("Never compose either one yourself"), "{r}");
+}
+
+// ── diagnostics ──────────────────────────────────────────────────────────
+
+fn field<'a>(e: &'a nikon_fleet::diag::Entry, key: &str) -> Option<&'a nikon_fleet::diag::Val> {
+    e.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+#[test]
+fn a_camera_call_is_recorded_end_to_end_and_its_request_id_reaches_the_worker() {
+    use nikon_fleet::diag::{Outcome, Val, Verdict};
+    let mut s = Server::start(&[]);
+    let pid = s.child.id();
+    let dir = s.dir.clone();
+    let r = s.call("capture_snapshot", json!({"serial": "0000003023668", "label": "before"}));
+    assert!(!is_error(&r), "{r}");
+    let worker_ids = std::fs::read_to_string(dir.path().join("reqid.log")).unwrap();
+    assert!(s.shutdown().success());
+
+    let traces = nikon_fleet::diag::load(&dir.path().join("diag"), &nikon_fleet::diag::pid_alive).unwrap();
+    let t = traces.into_iter().find(|t| t.pid == pid).expect("this server's files");
+    assert_eq!(t.verdict(), Verdict::ExitedCleanly { code: 0 }, "{:?}", t.verdict());
+    let by_op = |op: &str| t.entries.iter().find(|e| e.op == op).unwrap_or_else(|| panic!("no {op} entry in {:#?}", t.entries.iter().map(|e| &e.op).collect::<Vec<_>>()));
+    let tool = by_op("tool_call");
+    assert_eq!((tool.outcome, field(tool, "tool")), (Some(Outcome::Ok), Some(&Val::text("capture_snapshot"))));
+    let call = by_op("worker_call");
+    assert_eq!((call.outcome, field(call, "worker_op")), (Some(Outcome::Ok), Some(&Val::text("capture"))));
+    assert_eq!(field(call, "phase"), Some(&Val::text("connected")), "the last stage the worker reported");
+    assert!(matches!(field(call, "child_pid"), Some(Val::U64(p)) if *p > 0));
+    assert!(matches!(field(call, "queue_wait_ms"), Some(Val::U64(_))));
+    // The id the supervisor recorded is the one the worker was started with.
+    let Some(Val::Text(id)) = field(call, "request_id") else { panic!("no request_id on {call:?}") };
+    assert_eq!(worker_ids.trim(), id, "the worker saw the request id the span recorded");
+    assert!(id.starts_with(&format!("{pid}-")), "{id}");
+    assert_eq!(by_op("server").outcome, Some(Outcome::Ok));
+    // Started in that order (the depth is per OS thread, and these run on different tokio threads).
+    assert!(by_op("server").seq < tool.seq && tool.seq < call.seq, "seqs {} {} {}", by_op("server").seq, tool.seq, call.seq);
+}
+
+#[test]
+fn a_hung_worker_shows_in_the_report_after_the_server_is_killed() {
+    use nikon_fleet::diag::{Val, Verdict};
+    let mut s = Server::start(&[]);
+    // `check` makes the fake worker report `starting` and then sleep for 60 s: a hang.
+    let id = s.send_request("tools/call", json!({"name": "check_against_reference", "arguments": {"serial": "S"}}));
+    let file = s.wait_in_flight("worker_call", "starting");
+    let worker_pid = file
+        .spans
+        .iter()
+        .find(|sp| sp.op == "worker_call")
+        .and_then(|sp| sp.fields.iter().find_map(|(k, v)| if k == "child_pid" { if let Val::U64(p) = v { Some(*p as i32) } else { None } } else { None }))
+        .expect("the in-flight worker_call names the child");
+    // In the order they began: the server, then the tool call, then the worker call.
+    let ops: Vec<&str> = {
+        let mut sp: Vec<_> = file.spans.iter().collect();
+        sp.sort_by_key(|x| x.seq);
+        sp.iter().map(|x| x.op.as_str()).collect()
+    };
+    assert_eq!(ops, vec!["server", "tool_call", "worker_call"], "{file:#?}");
+
+    // Kill the server hard, as a crash or the user would.
+    s.child.kill().unwrap();
+    let _ = s.child.wait();
+    let t = s.diag();
+    assert_eq!(t.verdict(), Verdict::GoneWithSpansOpen);
+    let text = nikon_fleet::diag::render(&[t], nikon_fleet::diag::unix_ms(), 10);
+    assert!(text.contains("killed or crashed"), "{text}");
+    assert!(text.contains("mcp worker_call") && text.contains("phase=\"starting\""), "{text}");
+    assert!(text.contains("worker_op=\"check\""), "{text}");
+    let _ = id;
+    // Clean up the orphaned fake worker.
+    unsafe { libc::kill(worker_pid, libc::SIGKILL) };
+}
+
+#[test]
+fn a_worker_killed_at_its_deadline_is_a_timeout_with_its_own_kill_span() {
+    use nikon_fleet::diag::{Outcome, Val};
+    let mut s = Server::start(&["--deadline-secs", "2"]);
+    let r = s.call("check_against_reference", json!({"serial": "S"}));
+    assert!(is_error(&r), "{r}");
+    let pid = s.child.id();
+    let dir = s.dir.clone();
+    assert!(s.shutdown().success());
+    let traces = nikon_fleet::diag::load(&dir.path().join("diag"), &nikon_fleet::diag::pid_alive).unwrap();
+    let t = traces.into_iter().find(|t| t.pid == pid).unwrap();
+    let call = t.entries.iter().find(|e| e.op == "worker_call").unwrap();
+    assert_eq!(call.outcome, Some(Outcome::Timeout), "{call:?}");
+    assert_eq!(field(call, "cause"), Some(&Val::text("deadline")));
+    assert_eq!(field(call, "phase"), Some(&Val::text("starting")), "the stage it was stuck at");
+    let kill = t.entries.iter().find(|e| e.op == "kill_worker").expect("the kill is a span of its own");
+    assert_eq!(kill.outcome, Some(Outcome::Ok));
+    assert_eq!(field(kill, "child_pid"), field(call, "child_pid"), "the span that killed it names the same child");
+    let tool = t.entries.iter().find(|e| e.op == "tool_call").unwrap();
+    assert_eq!(tool.outcome, Some(Outcome::Failed), "a refused/errored tool result is a failed call");
 }

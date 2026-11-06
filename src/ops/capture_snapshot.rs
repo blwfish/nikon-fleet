@@ -223,34 +223,36 @@ pub fn capture_snapshot<P: CameraPort + ?Sized>(
     req: &CaptureRequest<'_>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<CaptureOutcome, CaptureError> {
-    let label = retention::capture_label(req.label).map_err(CaptureError::Label)?;
-    let counts = retention::count_for_camera(req.snapshots_dir, &req.camera.model, &req.camera.serial)
-        .map_err(CaptureError::List)?;
-    retention::check_capture_cap(&counts).map_err(CaptureError::DataDirFull)?;
+    crate::diag::scoped(crate::diag::Subsystem::Snapshot, "capture_snapshot", crate::diag::Class::Top, &[], |_span| {
+        let label = retention::capture_label(req.label).map_err(CaptureError::Label)?;
+        let counts = retention::count_for_camera(req.snapshots_dir, &req.camera.model, &req.camera.serial)
+            .map_err(CaptureError::List)?;
+        retention::check_capture_cap(&counts).map_err(CaptureError::DataDirFull)?;
 
-    let mut snap = Snapshot::new(req.camera.clone(), Transport::Usb, req.captured_at.clone());
-    snap.label = Some(label.clone());
-    let stats = capture(port, req.name_lookup, &mut snap);
-    progress("captured");
+        let mut snap = Snapshot::new(req.camera.clone(), Transport::Usb, req.captured_at.clone());
+        snap.label = Some(label.clone());
+        let stats = capture(port, req.name_lookup, &mut snap);
+        progress("captured");
 
-    if stats.read_ok == 0 {
-        return Err(CaptureError::NothingReadable { read_err: stats.read_err });
-    }
-    let verdict = gate(&snap);
-    if let GateOutcome::Failed { missing } = verdict {
-        return Err(CaptureError::Incomplete { missing, stats });
-    }
-    if let Some(shortfall) = firmware_shortfall(&snap, &verdict) {
-        return Err(CaptureError::FirmwareShortfall { shortfall, stats });
-    }
+        if stats.read_ok == 0 {
+            return Err(CaptureError::NothingReadable { read_err: stats.read_err });
+        }
+        let verdict = gate(&snap);
+        if let GateOutcome::Failed { missing } = verdict {
+            return Err(CaptureError::Incomplete { missing, stats });
+        }
+        if let Some(shortfall) = firmware_shortfall(&snap, &verdict) {
+            return Err(CaptureError::FirmwareShortfall { shortfall, stats });
+        }
 
-    std::fs::create_dir_all(req.snapshots_dir)
-        .map_err(|e| CaptureError::Write(SnapshotError::Io(e)))?;
-    let file = snap.suggested_filename();
-    snap.save_new(req.snapshots_dir.join(&file)).map_err(CaptureError::Write)?;
-    progress("written");
+        std::fs::create_dir_all(req.snapshots_dir)
+            .map_err(|e| CaptureError::Write(SnapshotError::Io(e)))?;
+        let file = snap.suggested_filename();
+        snap.save_new(req.snapshots_dir.join(&file)).map_err(CaptureError::Write)?;
+        progress("written");
 
-    Ok(CaptureOutcome::new(file, Some(label), req.camera.clone(), snap.properties.len(), stats, verdict))
+        Ok(CaptureOutcome::new(file, Some(label), req.camera.clone(), snap.properties.len(), stats, verdict))
+    })
 }
 
 #[cfg(test)]

@@ -237,7 +237,14 @@ fn finish(em: &mut Emitter<File>, outcome: Outcome) -> i32 {
     }
 }
 
+/// Record the phase in the diagnostics ring as well as on the result channel: the last phase is what a
+/// hung worker was doing, and the supervisor that killed it may be the only other place that has it.
+fn note_phase(phase: &str) {
+    nikon_fleet::diag::event(nikon_fleet::diag::Subsystem::Cli, "phase", &[("phase", nikon_fleet::diag::Val::text(phase))]);
+}
+
 fn progress(em: &mut Emitter<File>, phase: &str) {
+    note_phase(phase);
     if let Err(e) = em.progress(phase) {
         eprintln!("worker: {e}");
     }
@@ -247,6 +254,7 @@ fn progress(em: &mut Emitter<File>, phase: &str) {
 /// never arrives, so if it cannot be delivered the apply must not go on to write: returns `false`
 /// for that case. Any other line that cannot be delivered is only logged, as before.
 fn progress_for_apply<W: std::io::Write>(em: &mut Emitter<W>, phase: &str) -> bool {
+    note_phase(phase);
     match em.progress(phase) {
         Ok(()) => true,
         Err(e) => {

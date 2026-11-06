@@ -965,6 +965,12 @@ fn level_color(level: Level) -> Option<egui::Color32> {
 }
 
 impl eframe::App for FleetApp {
+    /// Called once on a normal quit. The window system may end the process without returning from
+    /// `run_native`, so the exit is recorded here too (a second record is ignored).
+    fn on_exit(&mut self) {
+        nikon_fleet::diag::shutdown(0);
+    }
+
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // The floating windows and the viewports still take the context; the
         // panels are laid out inside the root `Ui`.
@@ -1717,11 +1723,16 @@ fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) {
 // ── Worker thread ─────────────────────────────────────────────────────────
 
 fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Evt>, ctx: egui::Context, initial_data_dir: Result<PathBuf, String>) {
+    use nikon_fleet::diag::{self, Class, Outcome, Subsystem, Val};
     let mut data_dir = initial_data_dir;
     for cmd in rx {
+        // One span per command: from the moment the worker takes it to the moment its result is sent. A
+        // command that hangs (a camera session, a slow listing) is the open span in the in-flight file.
+        let span = diag::span(Subsystem::Gui, "gui_cmd", Class::Top, &[("cmd", Val::text(cmd_name(&cmd)))]);
         let evt = match cmd {
             Cmd::SetDataDir(dir) => {
                 data_dir = dir;
+                span.finish(Outcome::Ok);
                 continue;
             }
             Cmd::Discover => do_discover(&list_cameras),
@@ -1761,10 +1772,35 @@ fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Evt>, ctx: egui::Context, in
                 Err(e) => Evt::Checked { request, result: Err(e.clone()) },
             },
         };
+        span.finish(if evt_failed(&evt) { Outcome::Failed } else { Outcome::Ok });
         // The receiver is gone only when the window closed; there is no one to tell.
         let _ = tx.send(evt);
         ctx.request_repaint();
     }
+}
+
+/// The command's name for the diagnostics: a closed set, one per variant, never the command's data.
+fn cmd_name(cmd: &Cmd) -> &'static str {
+    match cmd {
+        Cmd::Discover => "discover",
+        Cmd::Snapshot { .. } => "snapshot",
+        Cmd::RefreshListing => "refresh_listing",
+        Cmd::SetReference { .. } => "set_reference",
+        Cmd::SetDataDir(_) => "set_data_dir",
+        Cmd::Export { .. } => "export",
+        Cmd::Import { .. } => "import",
+        Cmd::VendorRead { .. } => "vendor_read",
+        Cmd::VendorWriteFtp { .. } => "vendor_write_ftp",
+        Cmd::Plan(_) => "plan",
+        Cmd::Apply(_) => "apply",
+        Cmd::Check { .. } => "check",
+    }
+}
+
+/// Whether the result the worker is about to send is a failure. Only the variants that carry a plain
+/// failure are looked at; a plan or an apply carries its own status for the window to show.
+fn evt_failed(evt: &Evt) -> bool {
+    matches!(evt, Evt::Err(_) | Evt::Vendor { result: Err(_), .. } | Evt::Checked { result: Err(_), .. })
 }
 
 fn with_data_dir(data_dir: &Result<PathBuf, String>, f: impl FnOnce(&Path) -> Evt) -> Evt {
@@ -1914,9 +1950,58 @@ fn collect(rx: mpsc::Receiver<Vec<u8>>) -> String {
 /// status if stderr was empty; a stdin write that failed fails the call even when the
 /// child exited 0; a child still running after `timeout` is killed.
 fn run_cli(program: &Path, args: &[String], stdin_data: Option<&str>, timeout: Duration) -> Result<CliOutput, CliError> {
+    use nikon_fleet::diag::{self, Class, Outcome, Subsystem, Val};
+    // One span per child process. What it records is the program, the argument count, the timeout and a request
+    // id (which the child records too, so the two sides' files join), then the child's pid, and at the end the exit
+    // code and the output lengths. NEVER the arguments (a plan's digest and summary ride there) and never the
+    // stdin data (an FTP password goes down it): only its length. The child names its own command.
+    let request_id = diag::next_request_id();
+    let span = diag::span(
+        Subsystem::Gui,
+        "cli_child",
+        Class::Top,
+        &[
+            ("program", Val::text(&program.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+            ("argc", Val::U64(args.len() as u64)),
+            ("timeout_ms", Val::U64(timeout.as_millis() as u64)),
+            ("stdin_len", Val::U64(stdin_data.map_or(0, str::len) as u64)),
+            ("request_id", Val::text(&request_id)),
+        ],
+    );
+    let result = run_cli_inner(program, args, stdin_data, timeout, &span, &request_id);
+    match &result {
+        Ok(out) => span.finish_with(
+            Outcome::Ok,
+            &[("exit_code", Val::I64(0)), ("stdout_len", Val::U64(out.stdout.len() as u64)), ("stderr_len", Val::U64(out.stderr.len() as u64))],
+        ),
+        Err(e) => {
+            let outcome = if e.kind == CliFailure::TimedOut { Outcome::Timeout } else { Outcome::Failed };
+            let mut extra = vec![
+                ("failure", Val::text(&format!("{:?}", e.kind))),
+                ("stdout_len", Val::U64(e.stdout.len() as u64)),
+                ("stderr_len", Val::U64(e.stderr.len() as u64)),
+            ];
+            if let Some(c) = e.code {
+                extra.push(("exit_code", Val::I64(i64::from(c))));
+            }
+            span.finish_with(outcome, &extra);
+        }
+    }
+    result
+}
+
+fn run_cli_inner(
+    program: &Path,
+    args: &[String],
+    stdin_data: Option<&str>,
+    timeout: Duration,
+    span: &nikon_fleet::diag::Span<'_>,
+    request_id: &str,
+) -> Result<CliOutput, CliError> {
     let fail = |kind, message: String, stdout: String, stderr: String| CliError { kind, message, stdout, stderr, code: None };
     let mut cmd = Command::new(program);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.env(nikon_fleet::diag::REQUEST_ID_ENV, request_id);
     cmd.stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() });
     let mut child = cmd
         .spawn()
@@ -1924,6 +2009,7 @@ fn run_cli(program: &Path, args: &[String], stdin_data: Option<&str>, timeout: D
 
     // Written on its own thread: a child that never reads its input must not stop the
     // timeout from firing. The write's result is checked below.
+    span.set("child_pid", nikon_fleet::diag::Val::U64(u64::from(child.id())));
     let stdin_thread = stdin_data.map(|data| {
         let mut stdin = child.stdin.take().expect("stdin was configured as piped");
         let data = data.as_bytes().to_vec();
@@ -4669,13 +4755,21 @@ fn describe_import(r: &ImportReport) -> OpDone {
 // ── Entry point ───────────────────────────────────────────────────────────
 
 fn main() {
+    use nikon_fleet::diag::{self, Class, Subsystem};
+    // Diagnostics for the GUI process: the in-flight file, the ring and the panic hook. The commands it runs are
+    // spans (see `worker`), and each CLI child it starts is one too (see `run_cli`).
+    diag::start(Subsystem::Gui, None);
+    let span = diag::span(Subsystem::Gui, "gui", Class::Top, &[]);
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([820.0, 520.0])
             .with_title("Fleet — Nikon Camera Manager"),
         ..Default::default()
     };
-    eframe::run_native("fleet-gui", opts, Box::new(|cc| Ok(Box::new(FleetApp::new(cc))))).unwrap();
+    let result = eframe::run_native("fleet-gui", opts, Box::new(|cc| Ok(Box::new(FleetApp::new(cc)))));
+    span.done(&result);
+    diag::shutdown(if result.is_ok() { 0 } else { 1 });
+    result.unwrap();
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -8347,5 +8441,125 @@ mod tests {
             let parsed: OutcomeJson = serde_json::from_value(serde_json::to_value(&o).unwrap()).unwrap();
             assert_eq!(parsed.would_change(), nikon_fleet::ops::plan::would_change(&o), "{}", o.name);
         }
+    }
+
+    // ── diagnostics ──────────────────────────────────────────────────────
+
+    /// The process-wide recorder for this test binary: set up once, in a directory that lives as long as it does.
+    /// Other tests in the binary also run `run_cli`, so each test below finds its own entries by request id.
+    fn test_diag() -> &'static nikon_fleet::diag::Diag {
+        use std::sync::OnceLock;
+        static DIR: OnceLock<TempDir> = OnceLock::new();
+        let dir = DIR.get_or_init(|| TempDir::new().unwrap());
+        nikon_fleet::diag::init(nikon_fleet::diag::Config::new(dir.path().join("diag"), nikon_fleet::diag::Subsystem::Gui)).unwrap()
+    }
+
+    fn diag_field<'a>(e: &'a nikon_fleet::diag::Entry, key: &str) -> Option<&'a nikon_fleet::diag::Val> {
+        e.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    fn sh_args(script: &str) -> Vec<String> {
+        vec!["-c".to_string(), script.to_string()]
+    }
+
+    #[test]
+    fn a_cli_child_is_one_span_with_its_pid_request_id_and_lengths_and_never_the_stdin_or_the_arguments() {
+        use nikon_fleet::diag::{Outcome, Val};
+        let d = test_diag();
+        let secret = "hunter2-ftp-password";
+        // The child echoes the request id it was given in its environment, so the id the span recorded can be compared
+        // with the one the child actually saw.
+        let out = run_cli(
+            Path::new("/bin/sh"),
+            &sh_args("cat > /dev/null; printf %s \"$NIKON_FLEET_REQUEST_ID\""),
+            Some(secret),
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        let e = d
+            .snapshot()
+            .into_iter()
+            .find(|e| e.op == "cli_child" && diag_field(e, "request_id") == Some(&Val::text(&out.stdout)))
+            .expect("a cli_child span with the id the child saw");
+        assert_eq!(e.outcome, Some(Outcome::Ok));
+        assert_eq!(diag_field(&e, "program"), Some(&Val::text("sh")));
+        assert_eq!(diag_field(&e, "argc"), Some(&Val::U64(2)));
+        assert_eq!(diag_field(&e, "stdin_len"), Some(&Val::U64(secret.len() as u64)), "only the length of what went down stdin");
+        assert!(matches!(diag_field(&e, "child_pid"), Some(Val::U64(p)) if *p > 0));
+        assert_eq!(diag_field(&e, "exit_code"), Some(&Val::I64(0)));
+        assert_eq!(diag_field(&e, "stdout_len"), Some(&Val::U64(out.stdout.len() as u64)));
+        // The secret, and the script text, appear nowhere in the record or in the files.
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("hunter2") && !json.contains("cat >"), "{json}");
+        let on_disk: String = std::fs::read_dir(d.config().dir.clone())
+            .unwrap()
+            .flatten()
+            .filter_map(|f| std::fs::read_to_string(f.path()).ok())
+            .collect();
+        assert!(!on_disk.contains("hunter2"), "the password must not reach any diagnostics file");
+    }
+
+    #[test]
+    fn a_cli_child_that_exits_non_zero_or_overruns_is_failed_or_timeout_with_the_reason() {
+        use nikon_fleet::diag::{Outcome, Val};
+        let d = test_diag();
+        let id_of = |args: &[String], t: Duration| -> (nikon_fleet::diag::Entry, Result<CliOutput, CliError>) {
+            // `printf $NIKON_FLEET_REQUEST_ID >&2` puts the id on stderr so it can be found even though the call fails.
+            let r = run_cli(Path::new("/bin/sh"), args, None, t);
+            let id = match &r {
+                Err(e) => e.stderr.clone(),
+                Ok(o) => o.stdout.clone(),
+            };
+            let e = d.snapshot().into_iter().find(|e| e.op == "cli_child" && diag_field(e, "request_id") == Some(&Val::text(&id))).unwrap_or_else(|| panic!("no span for {id:?}"));
+            (e, r)
+        };
+        let (e, r) = id_of(&sh_args("printf %s \"$NIKON_FLEET_REQUEST_ID\" >&2; exit 3"), Duration::from_secs(20));
+        assert_eq!(r.unwrap_err().code, Some(3));
+        assert_eq!((e.outcome, diag_field(&e, "failure"), diag_field(&e, "exit_code")), (Some(Outcome::Failed), Some(&Val::text("Exit")), Some(&Val::I64(3))));
+        // The 300 ms limit is the boundary: a child that outlives it is killed and is a timeout, not a failure.
+        let (e, r) = id_of(&sh_args("printf %s \"$NIKON_FLEET_REQUEST_ID\" >&2; exec sleep 30"), Duration::from_millis(300));
+        assert_eq!(r.unwrap_err().kind, CliFailure::TimedOut);
+        assert_eq!((e.outcome, diag_field(&e, "failure")), (Some(Outcome::Timeout), Some(&Val::text("TimedOut"))));
+        // A program that cannot be started is a failure with no child pid.
+        let r = run_cli(Path::new("/nonexistent/program"), &[], None, Duration::from_secs(5));
+        assert_eq!(r.unwrap_err().kind, CliFailure::Spawn);
+        assert!(d.snapshot().iter().any(|e| e.op == "cli_child" && diag_field(e, "program") == Some(&Val::text("program")) && e.outcome == Some(Outcome::Failed) && diag_field(e, "child_pid").is_none()));
+    }
+
+    #[test]
+    fn every_command_has_a_name_and_only_the_plain_failure_variants_count_as_failed() {
+        assert_eq!(cmd_name(&Cmd::Discover), "discover");
+        assert_eq!(cmd_name(&Cmd::RefreshListing), "refresh_listing");
+        assert_eq!(cmd_name(&Cmd::SetDataDir(Ok(PathBuf::from("/x")))), "set_data_dir");
+        assert_eq!(cmd_name(&Cmd::Import { src: PathBuf::from("/x") }), "import");
+        assert_eq!(cmd_name(&Cmd::Export { dest: PathBuf::from("/x") }), "export");
+        assert_eq!(cmd_name(&Cmd::SetReference { file: "f".into() }), "set_reference");
+        assert_eq!(cmd_name(&Cmd::VendorRead { propcode: 1, serial: None }), "vendor_read");
+        assert!(evt_failed(&Evt::Err("x".into())));
+        assert!(evt_failed(&Evt::Vendor { op: VendorOp::Read, result: Err("x".into()) }));
+        assert!(!evt_failed(&Evt::Vendor { op: VendorOp::Read, result: Ok(VendorOut { text: String::new(), stderr: String::new() }) }));
+    }
+
+    #[test]
+    fn the_gui_worker_records_one_span_per_command_and_has_closed_it_before_the_result_reaches_the_window() {
+        use nikon_fleet::diag::{Outcome, Val};
+        let d = test_diag();
+        let dir = TempDir::new().unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let data = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || worker(cmd_rx, evt_tx, ctx, Ok(data)));
+        cmd_tx.send(Cmd::SetDataDir(Ok(dir.path().to_path_buf()))).unwrap();
+        cmd_tx.send(Cmd::RefreshListing).unwrap();
+        let evt = evt_rx.recv_timeout(Duration::from_secs(20)).expect("a listing result");
+        assert!(matches!(evt, Evt::Listing(_)));
+        // The result is in hand, so the span for it must already be finished (and successful).
+        let done = |name: &str| d.snapshot().into_iter().any(|e| e.op == "gui_cmd" && diag_field(&e, "cmd") == Some(&Val::text(name)) && e.outcome == Some(Outcome::Ok));
+        assert!(done("refresh_listing"), "closed before the send");
+        assert!(done("set_data_dir"), "the command that sends no result is closed too, not left abandoned");
+        assert!(!d.snapshot().iter().any(|e| e.op == "gui_cmd" && e.outcome == Some(Outcome::Abandoned)), "nothing was dropped unfinished");
+        drop(cmd_tx);
+        handle.join().unwrap();
     }
 }

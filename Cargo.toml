@@ -56,6 +56,13 @@ url = "2"
 wry = { version = "0.57.1", optional = true }
 tao = { version = "0.37.2", optional = true }
 
+# macOS dev builds default to `split-debuginfo = "unpacked"`, which keeps every build's object files (a few hundred
+# `.rcgu.o` per rebuild of a crate) in target/debug/deps for ever; cargo never removes them. A pile of 733,000 of them made
+# the first launch of every newly linked executable stall for ~30 s while `syspolicyd` scanned the directory. "packed" runs
+# dsymutil, keeps one .dSYM per binary and deletes the objects. Measured: no growth over repeated relinks, relink 2.1 s.
+[profile.dev]
+split-debuginfo = "packed"
+
 [features]
 webview = ["dep:wry", "dep:tao"]
 

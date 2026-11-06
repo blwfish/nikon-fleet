@@ -135,18 +135,57 @@ impl Default for UreqHttp {
     }
 }
 
+/// The diagnostics span for one request. It records the host, never the URL (a query can carry a token) and never
+/// an error's text (a [`SourceError::Http`] embeds the URL): the host, the timeouts that apply, then how many bytes
+/// came back and a closed kind for a failure. A request can sit for the whole 600 s timeout, and the in-flight
+/// file shows which host it is waiting on.
+fn http_span(op: &str, url: &str) -> crate::diag::Span<'static> {
+    use crate::diag::{self, Class, Subsystem, Val};
+    diag::span(Subsystem::Firmware, op, Class::Top, &[("host", Val::text(&host_of(url)))])
+}
+
+/// Just the host of `url`: no scheme, credentials, port, path or query. Empty when it does not parse.
+fn host_of(url: &str) -> String {
+    url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default()
+}
+
+/// Finish an HTTP span from its result: `bytes` on success, a closed `error_kind` on failure.
+fn finish_http<T>(span: crate::diag::Span<'static>, result: &Result<T, SourceError>, bytes: impl FnOnce(&T) -> u64) {
+    use crate::diag::{Outcome, Val};
+    match result {
+        Ok(v) => span.finish_with(Outcome::Ok, &[("bytes", Val::U64(bytes(v)))]),
+        Err(e) => {
+            let kind = match e {
+                SourceError::UnsupportedModel { .. } => "unsupported_model",
+                SourceError::Http { .. } => "http",
+                SourceError::Parse { .. } => "parse",
+                SourceError::Io(_) => "io",
+            };
+            span.finish_with(Outcome::Failed, &[("error_kind", Val::text(kind))]);
+        }
+    }
+}
+
 impl HttpGet for UreqHttp {
     fn get_text(&self, url: &str) -> Result<String, SourceError> {
-        self.call(url)?.into_string().map_err(SourceError::from)
+        let span = http_span("http_get", url);
+        let result = self.call(url).and_then(|r| r.into_string().map_err(SourceError::from));
+        finish_http(span, &result, |s| s.len() as u64);
+        result
     }
 
     fn get_to_file(&self, url: &str, dest: &Path) -> Result<u64, SourceError> {
-        let resp = self.call(url)?;
-        let mut reader = resp.into_reader();
-        let mut out = fs::File::create(dest)?;
-        let n = std::io::copy(&mut reader, &mut out)?;
-        out.flush()?;
-        Ok(n)
+        let span = http_span("http_download", url);
+        let result = (|| {
+            let resp = self.call(url)?;
+            let mut reader = resp.into_reader();
+            let mut out = fs::File::create(dest)?;
+            let n = std::io::copy(&mut reader, &mut out)?;
+            out.flush()?;
+            Ok(n)
+        })();
+        finish_http(span, &result, |n| *n);
+        result
     }
 }
 
@@ -477,36 +516,38 @@ pub fn fetch_direct(
     scratch_dir: &Path,
     retrieved_at: &str,
 ) -> Result<IngestOutcome, FetchError> {
-    let DownloadAccess::Direct { url, expected_size, expected_sha256 } = &release.download else {
-        return Err(FetchError::Gated(release.model.clone()));
-    };
-    let tmp = scratch_dir.join("download.part");
-    let got = http.get_to_file(url, &tmp)?;
-    if let Some(expected) = *expected_size {
-        if expected != got {
-            return Err(FetchError::SizeMismatch { expected, got });
+    crate::diag::scoped_with(crate::diag::Subsystem::Firmware, "fetch", crate::diag::Class::Top, &[("model", crate::diag::Val::text(&release.model)), ("source", crate::diag::Val::text(source_id))], |_span| {
+        let DownloadAccess::Direct { url, expected_size, expected_sha256 } = &release.download else {
+            return Err(FetchError::Gated(release.model.clone()));
+        };
+        let tmp = scratch_dir.join("download.part");
+        let got = http.get_to_file(url, &tmp)?;
+        if let Some(expected) = *expected_size {
+            if expected != got {
+                return Err(FetchError::SizeMismatch { expected, got });
+            }
         }
-    }
-    let sha = sha256_file(&tmp).map_err(FirmwareError::from)?;
-    if let Some(expected) = expected_sha256 {
-        if !expected.eq_ignore_ascii_case(&sha) {
-            return Err(FetchError::HashMismatch { expected: expected.clone(), got: sha });
+        let sha = sha256_file(&tmp).map_err(FirmwareError::from)?;
+        if let Some(expected) = expected_sha256 {
+            if !expected.eq_ignore_ascii_case(&sha) {
+                return Err(FetchError::HashMismatch { expected: expected.clone(), got: sha });
+            }
         }
-    }
-    let prov = Provenance {
-        source_id: source_id.to_owned(),
-        source_url: url.clone(),
-        page_url: release.page_url.clone(),
-        released: release.released.clone(),
-        retrieved_at: retrieved_at.to_owned(),
-        method: RetrievalMethod::DirectDownload,
-        published_size: *expected_size,
-        published_sha256: expected_sha256.clone(),
-        original_filename: None,
-    };
-    Ok(ingest_bundle(
-        data_dir, &release.model, &release.version.to_string(), &tmp, &prov, Some(&release.raw_page),
-    )?)
+        let prov = Provenance {
+            source_id: source_id.to_owned(),
+            source_url: url.clone(),
+            page_url: release.page_url.clone(),
+            released: release.released.clone(),
+            retrieved_at: retrieved_at.to_owned(),
+            method: RetrievalMethod::DirectDownload,
+            published_size: *expected_size,
+            published_sha256: expected_sha256.clone(),
+            original_filename: None,
+        };
+        Ok(ingest_bundle(
+            data_dir, &release.model, &release.version.to_string(), &tmp, &prov, Some(&release.raw_page),
+        )?)
+    }, |r| match r { Ok(_) => (crate::diag::Outcome::Ok, Vec::new()), Err(_) => (crate::diag::Outcome::Failed, Vec::new()) })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -515,6 +556,16 @@ pub fn fetch_direct(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_diagnostics_host_is_only_the_host_never_credentials_path_or_query() {
+        assert_eq!(host_of("https://downloadcenter.nikonimglib.com/ja/download/fw/123.html?token=SECRET&x=1"), "downloadcenter.nikonimglib.com");
+        assert_eq!(host_of("https://user:hunter2@example.com:8443/a/b?q=1#frag"), "example.com");
+        assert_eq!(host_of("http://192.0.2.7/x"), "192.0.2.7");
+        // Not a URL: empty, never the input echoed back.
+        assert_eq!(host_of("not a url?token=SECRET"), "");
+        assert_eq!(host_of(""), "");
+    }
+
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;

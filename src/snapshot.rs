@@ -232,8 +232,10 @@ impl Snapshot {
     /// rename instead, with a small window between the existence check and the rename. A failure at
     /// any step leaves neither the file nor the temporary.
     pub fn save_new<P: AsRef<Path>>(&self, path: P) -> Result<(), SnapshotError> {
-        publish_new(path.as_ref(), self.to_pretty_json()?.as_bytes(), &write_synced, &link_no_replace)?;
-        Ok(())
+    crate::diag::scoped(crate::diag::Subsystem::Snapshot, "save_new", crate::diag::Class::Top, &[], |_span| {
+            publish_new(path.as_ref(), self.to_pretty_json()?.as_bytes(), &write_synced, &link_no_replace)?;
+            Ok(())
+    })
     }
 
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, SnapshotError> {

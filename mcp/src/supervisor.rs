@@ -237,7 +237,7 @@ impl Supervisor {
         }
     }
 
-    fn spawn(&self, op_args: &[String]) -> Result<(Child, pipe::Receiver), SpawnError> {
+    fn spawn(&self, op_args: &[String], request_id: &str) -> Result<(Child, pipe::Receiver), SpawnError> {
         let (r, w) = pipe_pair().map_err(SpawnError::Pipe)?;
         let wfd = w.as_raw_fd();
         let mut cmd = Command::new(&self.program);
@@ -249,6 +249,8 @@ impl Supervisor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
+            // The child records the same id in its diagnostics `start` event, so the two sides' records join.
+            .env(nikon_fleet::diag::REQUEST_ID_ENV, request_id)
             .kill_on_drop(true);
         // SAFETY: only async-signal-safe calls (dup2, fcntl) run between fork and exec.
         unsafe {
@@ -271,17 +273,69 @@ impl Supervisor {
     }
 
     /// Run one worker call. `on_progress` is told each phase as it arrives.
+    ///
+    /// Recorded as one `worker_call` span that covers the queue wait: the worker op, the deadline and
+    /// the request id at the start; the queue wait, the child's pid and the last phase as they become
+    /// known (so a hang shows the stage the worker reached); and how it ended. A kill at the deadline
+    /// is a timeout, a kill on cancellation is cancelled, a worker that died or a broken channel is
+    /// failed. The kill itself is its own span, see [`Supervisor::kill_and_reap`].
     pub async fn run(
         &self,
         spec: &Spec,
         ct: &CancellationToken,
         on_progress: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Finished, SpawnError> {
+        use nikon_fleet::diag::{self, Class, Outcome as DiagOutcome, Subsystem, Val};
+        let request_id = diag::next_request_id();
+        let queued_at = std::time::Instant::now();
+        let span = diag::span(
+            Subsystem::Mcp,
+            "worker_call",
+            Class::Top,
+            &[
+                ("worker_op", Val::text(spec.op_args.first().map(String::as_str).unwrap_or(""))),
+                ("deadline_ms", Val::U64(spec.deadline.as_millis() as u64)),
+                ("request_id", Val::text(&request_id)),
+            ],
+        );
+        let result = self.run_inner(spec, ct, on_progress, &span, &request_id, queued_at).await;
+        let (outcome, extra): (DiagOutcome, Vec<(&'static str, Val)>) = match &result {
+            Ok(Finished::Result { outcome, garbage_lines, .. }) => (
+                if matches!(outcome, Outcome::Ok { .. }) { DiagOutcome::Ok } else { DiagOutcome::Failed },
+                vec![("garbage_lines", Val::U64(*garbage_lines as u64))],
+            ),
+            Ok(Finished::NoResult { cause, garbage_lines, .. }) => (
+                match cause {
+                    NoResultCause::Deadline => DiagOutcome::Timeout,
+                    NoResultCause::Cancelled => DiagOutcome::Cancelled,
+                    NoResultCause::WorkerDied | NoResultCause::ChannelError => DiagOutcome::Failed,
+                },
+                vec![("cause", Val::text(cause.tag())), ("garbage_lines", Val::U64(*garbage_lines as u64))],
+            ),
+            Ok(Finished::CancelledBeforeStart) => (DiagOutcome::Cancelled, vec![("cause", Val::text("cancelled_before_start"))]),
+            Err(e) => (DiagOutcome::Failed, vec![("error", Val::text(&e.to_string()))]),
+        };
+        span.finish_with(outcome, &extra);
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        spec: &Spec,
+        ct: &CancellationToken,
+        on_progress: &mut (dyn FnMut(&str) + Send),
+        span: &nikon_fleet::diag::Span<'_>,
+        request_id: &str,
+        queued_at: std::time::Instant,
+    ) -> Result<Finished, SpawnError> {
+        use nikon_fleet::diag::Val;
         let _turn = tokio::select! {
             g = self.queue.lock() => g,
             _ = ct.cancelled() => return Ok(Finished::CancelledBeforeStart),
         };
-        let (mut child, rx) = self.spawn(&spec.op_args)?;
+        span.set("queue_wait_ms", Val::U64(queued_at.elapsed().as_millis() as u64));
+        let (mut child, rx) = self.spawn(&spec.op_args, request_id)?;
+        span.set("child_pid", Val::U64(u64::from(child.id().unwrap_or(0))));
         *lock(&self.in_flight) = Some(InFlight::begin(spec));
         let _in_flight = InFlightGuard(&self.in_flight);
         let mut lines = ChannelLines::new(BufReader::new(rx));
@@ -304,6 +358,10 @@ impl Supervisor {
                     Ok(Some(l)) => {
                         absorb(&l, &mut last_phase, &mut garbage, &mut writing_seen, &mut answer, on_progress);
                         self.note_progress(&last_phase, writing_seen);
+                        if let Some(p) = &last_phase {
+                            // The stage the worker has reached, in the in-flight file: what a hang is judged by.
+                            span.set("phase", Val::text(p));
+                        }
                     }
                     Ok(None) => stop = Some(NoResultCause::WorkerDied),
                     Err(e) => {
@@ -366,8 +424,16 @@ impl Supervisor {
     /// the call goes on: the queue lock is released when `run` returns, and `kill_on_drop` kills
     /// the child again when it is dropped.
     async fn kill_and_reap(&self, child: &mut Child) {
-        if let Err(e) = bounded_reap(child.kill(), self.reap).await {
-            eprintln!("fleet-mcp: {e}");
+        use nikon_fleet::diag::{self, Class, Outcome as DiagOutcome, Subsystem, Val};
+        // A kill that does not return is exactly what this span is for.
+        let span = diag::span(Subsystem::Mcp, "kill_worker", Class::Top, &[("child_pid", Val::U64(u64::from(child.id().unwrap_or(0))))]);
+        match bounded_reap(child.kill(), self.reap).await {
+            Ok(()) => span.finish(DiagOutcome::Ok),
+            Err(e) => {
+                eprintln!("fleet-mcp: {e}");
+                let outcome = if matches!(e, ReapError::TimedOut(_)) { DiagOutcome::Timeout } else { DiagOutcome::Failed };
+                span.finish_with(outcome, &[("error", Val::text(&e.to_string()))]);
+            }
         }
     }
 }

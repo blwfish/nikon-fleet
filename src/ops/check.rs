@@ -93,21 +93,23 @@ impl CheckError {
 }
 
 pub fn check<P: CameraPort + ?Sized>(port: &P, req: &CheckRequest<'_>) -> Result<CheckReport, CheckError> {
-    let mut live = Snapshot::new(req.live_camera.clone(), Transport::Usb, req.captured_at.clone());
-    live.label = Some("live".into());
-    let stats = capture(port, req.name_lookup, &mut live);
-    if stats.read_ok == 0 {
-        return Err(CheckError::NothingReadable { read_err: stats.read_err });
-    }
-    let verdict = gate(&live);
-    if let GateOutcome::Failed { missing } = verdict {
-        return Err(CheckError::Incomplete { missing, stats });
-    }
-    if let Some(shortfall) = firmware_shortfall(&live, &verdict) {
-        return Err(CheckError::FirmwareShortfall { shortfall, stats });
-    }
-    let d = diff_with_schema(req.reference, &live, &DiffOptions::default(), req.schema).map_err(CheckError::Diff)?;
-    Ok(CheckReport::new(req.live_camera.clone(), req.reference, verdict, stats, d))
+    crate::diag::scoped(crate::diag::Subsystem::Snapshot, "check", crate::diag::Class::Top, &[], |_span| {
+        let mut live = Snapshot::new(req.live_camera.clone(), Transport::Usb, req.captured_at.clone());
+        live.label = Some("live".into());
+        let stats = capture(port, req.name_lookup, &mut live);
+        if stats.read_ok == 0 {
+            return Err(CheckError::NothingReadable { read_err: stats.read_err });
+        }
+        let verdict = gate(&live);
+        if let GateOutcome::Failed { missing } = verdict {
+            return Err(CheckError::Incomplete { missing, stats });
+        }
+        if let Some(shortfall) = firmware_shortfall(&live, &verdict) {
+            return Err(CheckError::FirmwareShortfall { shortfall, stats });
+        }
+        let d = diff_with_schema(req.reference, &live, &DiffOptions::default(), req.schema).map_err(CheckError::Diff)?;
+        Ok(CheckReport::new(req.live_camera.clone(), req.reference, verdict, stats, d))
+    })
 }
 
 impl CheckReport {

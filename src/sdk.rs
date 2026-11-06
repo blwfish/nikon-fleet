@@ -452,6 +452,18 @@ fn read_usb_identity(device: &rusb::Device<rusb::GlobalContext>) -> Result<UsbCa
 /// One pass over the USB bus, reporting what could not be read instead of
 /// dropping it.
 pub fn usb_camera_scan() -> UsbScan {
+    use crate::diag::{self, Class, Outcome, Subsystem, Val};
+    // Opening a USB handle to read a serial can stall, so the scan is a span of its own.
+    let span = diag::span(Subsystem::Usb, "usb_scan", Class::Top, &[]);
+    let scan = usb_camera_scan_inner();
+    span.finish_with(
+        if scan.enumeration_error.is_some() { Outcome::Failed } else { Outcome::Ok },
+        &[("cameras", Val::U64(scan.cameras.len() as u64)), ("unreadable", Val::U64(scan.unreadable.len() as u64))],
+    );
+    scan
+}
+
+fn usb_camera_scan_inner() -> UsbScan {
     let list = match rusb::DeviceList::new() {
         Ok(l) => l,
         Err(e) => return UsbScan { enumeration_error: Some(e.to_string()), ..UsbScan::default() },
@@ -567,7 +579,17 @@ impl Sdk {
     /// Typical path:
     ///   `<sdk-runtime>/TypeCommon Module.bundle/Contents/MacOS/TypeCommon Module`
     pub fn open<P: AsRef<Path>>(bundle_exe_path: P) -> Result<Self, SdkError> {
-        let path = bundle_exe_path.as_ref().to_path_buf();
+        use crate::diag::{self, Class, Subsystem, Val};
+        let path = bundle_exe_path.as_ref();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let span = diag::span(Subsystem::MaidSdk, "sdk_load", Class::Top, &[("bundle", Val::text(&name))]);
+        let result = Self::open_inner(path);
+        span.done(&result);
+        result
+    }
+
+    fn open_inner(bundle_exe_path: &Path) -> Result<Self, SdkError> {
+        let path = bundle_exe_path.to_path_buf();
         let lib = unsafe { Library::new(&path) }
             .map_err(|e| SdkError::Load { path: path.clone(), source: e })?;
 
@@ -605,7 +627,12 @@ impl Sdk {
         // Reset first, then immediately call InitializeSDK. The camera will
         // finish reconnecting while InitializeSDK is running or shortly after,
         // and devices() will pick it up via the run-loop-pumped retry loop.
-        reset_nikon_usb_cameras();
+        {
+            use crate::diag::{self, Class, Subsystem};
+            let span = diag::span(Subsystem::Usb, "usb_reset", Class::Top, &[]);
+            reset_nikon_usb_cameras();
+            span.finish(crate::diag::Outcome::Ok);
+        }
         self.initialize_sdk()
     }
 
@@ -620,6 +647,14 @@ impl Sdk {
     }
 
     fn initialize_sdk(&mut self) -> Result<(), SdkError> {
+        // InitializeSDK can block waiting for IOKit, so it is a span of its own.
+        let span = crate::diag::span(crate::diag::Subsystem::MaidSdk, "initialize_sdk", crate::diag::Class::Top, &[]);
+        let result = self.initialize_sdk_inner();
+        span.done(&result);
+        result
+    }
+
+    fn initialize_sdk_inner(&mut self) -> Result<(), SdkError> {
         let callback = NkMAIDCSCallback {
             p_ui_req_proc: cb_ui_request,
             p_event_proc: cb_event,
@@ -645,9 +680,13 @@ impl Sdk {
     /// post-reset USB reconnection) is delivered to the SDK's callback before
     /// we give up.
     pub fn devices(&self) -> Result<Vec<DeviceInfo>, SdkError> {
+        use crate::diag::{self, Class, Outcome, Subsystem, Val};
+        let span = diag::span(Subsystem::MaidSdk, "enum_devices", Class::Top, &[]);
         let mut list: *mut NkMAIDEnumDevices = ptr::null_mut();
         let mut code = 0i32;
-        for _ in 0..10u32 {
+        for attempt in 0..10u32 {
+            // The retry loop sleeps between attempts; the in-flight file shows which one a hang is in.
+            span.set("attempt", Val::U64(u64::from(attempt) + 1));
             list = ptr::null_mut();
             code = unsafe {
                 (self.enum_devices)(&mut list, ptr::null_mut(), ptr::null_mut())
@@ -665,6 +704,7 @@ impl Sdk {
             // anyway (unconfirmed, but not ruled out) would otherwise skip
             // freeing it via the old `?`.
             unsafe { free_device_list(list) };
+            span.finish_with(Outcome::Failed, &[("code", Val::I64(i64::from(code)))]);
             return Err(e);
         }
         let mut out = Vec::new();
@@ -684,15 +724,19 @@ impl Sdk {
             }
             unsafe { free_device_list(list) };
         }
+        span.finish_with(Outcome::Ok, &[("devices", Val::U64(out.len() as u64))]);
         Ok(out)
     }
 
     /// Open a session on the given device. Returns a `Device` that holds
     /// the connection and disconnects on drop.
     pub fn connect(&mut self, device_id: u32) -> Result<Device<'_>, SdkError> {
+        use crate::diag::{self, Class, Outcome, Subsystem, Val};
+        let span = diag::span(Subsystem::MaidSdk, "connect_device", Class::Top, &[("device_id", Val::U64(u64::from(device_id)))]);
         let mut cap_info: *mut NkMAIDEnumCapInfo = ptr::null_mut();
         let code = unsafe { (self.connect_device)(device_id, &mut cap_info) };
         if let Err(e) = check("ConnectDevice", code) {
+            span.finish_with(Outcome::Failed, &[("code", Val::I64(i64::from(code)))]);
             // take_capabilities is a no-op on a still-null cap_info (the
             // ordinary case), but frees it if the SDK populated the
             // out-pointer despite returning an error code.
@@ -700,6 +744,7 @@ impl Sdk {
             return Err(e);
         }
         let capabilities = unsafe { take_capabilities(cap_info) };
+        span.finish_with(Outcome::Ok, &[("capabilities", Val::U64(capabilities.len() as u64))]);
         Ok(Device { sdk: self, capabilities })
     }
 }
@@ -743,6 +788,19 @@ impl<'sdk> Device<'sdk> {
     /// If GET_ARRAY fails (unknown e_type on older firmware, etc.) we fall back
     /// to the index-only representation already stored in `values: []`.
     pub fn read_capability(&self, capability_id: u32) -> Result<Value, SdkError> {
+        use crate::diag::{self, Class, Outcome, Subsystem, Val};
+        // A capture reads about two hundred of these, so it is a Leaf with the least that identifies it; the
+        // report collapses a run of successes and keeps every failure.
+        let span = diag::span(Subsystem::MaidSdk, "read_cap", Class::Leaf, &[("cap", Val::Hex(u64::from(capability_id)))]);
+        let result = self.read_capability_inner(capability_id);
+        match &result {
+            Ok(_) => span.finish(Outcome::Ok),
+            Err(e) => span.finish_with(Outcome::Failed, &[("error", Val::text(&e.to_string()))]),
+        }
+        result
+    }
+
+    fn read_capability_inner(&self, capability_id: u32) -> Result<Value, SdkError> {
         let mut data_ptr: *mut c_void = ptr::null_mut();
         let mut data_type: u32 = 0;
         let code = unsafe {
@@ -819,7 +877,22 @@ impl<'sdk> Device<'sdk> {
     /// `value` must be the JSON that `read_capability` previously returned for
     /// this capability (or an equivalent with the same structure).
     pub fn write_capability(&self, capability_id: u32, cap_kind: u32, value: &Value) -> Result<(), SdkError> {
-        unsafe { write_cap_value(self.sdk, capability_id, cap_kind, value) }
+        use crate::diag::{self, Class, Outcome, Subsystem, Val};
+        // The only place the SDK path changes a camera. A Top span so writes are the last thing the ring evicts,
+        // and the value is recorded only as a hash: enough to see that two writes carried the same value.
+        let bytes = serde_json::to_vec(value).unwrap_or_default();
+        let span = diag::span(
+            Subsystem::MaidSdk,
+            "write_cap",
+            Class::Top,
+            &[("cap", Val::Hex(u64::from(capability_id))), ("kind", Val::U64(u64::from(cap_kind))), ("value_hash", Val::hash(&bytes))],
+        );
+        let result = unsafe { write_cap_value(self.sdk, capability_id, cap_kind, value) };
+        match &result {
+            Ok(()) => span.finish(Outcome::Ok),
+            Err(e) => span.finish_with(Outcome::Failed, &[("error", Val::text(&e.to_string()))]),
+        }
+        result
     }
 }
 
@@ -841,9 +914,16 @@ fn teardown(pump: impl FnOnce(), disconnect: impl FnOnce()) {
 
 impl<'sdk> Drop for Device<'sdk> {
     fn drop(&mut self) {
+        use crate::diag::{self, Class, Outcome, Subsystem, Val};
         teardown(
             || pump_cf_runloop(PRE_DISCONNECT_PUMP),
-            || { let _ = unsafe { (self.sdk.disconnect_device)() }; },
+            || {
+                // The known hang (F24): DisconnectDevice sometimes never returns. If it does not, this span stays
+                // open in the in-flight file with the process still alive.
+                let span = diag::span(Subsystem::MaidSdk, "disconnect_device", Class::Top, &[]);
+                let code = unsafe { (self.sdk.disconnect_device)() };
+                span.finish_with(if code < 0 { Outcome::Failed } else { Outcome::Ok }, &[("code", Val::I64(i64::from(code)))]);
+            },
         );
     }
 }

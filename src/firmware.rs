@@ -208,65 +208,67 @@ pub fn ingest_bundle(
     provenance: &Provenance,
     source_page: Option<&str>,
 ) -> Result<IngestOutcome, FirmwareError> {
-    safe_component("model", &model_slug(model))?;
-    safe_component("version", version)?;
+    crate::diag::scoped(crate::diag::Subsystem::Firmware, "ingest", crate::diag::Class::Top, &[("model", crate::diag::Val::text(model)), ("version", crate::diag::Val::text(version))], |_span| {
+        safe_component("model", &model_slug(model))?;
+        safe_component("version", version)?;
 
-    if fs::metadata(src)?.len() == 0 {
-        return Err(FirmwareError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput, format!("{} is empty; not archiving", src.display()),
-        )));
-    }
-    let new_sha = sha256_file(src)?;
-    let dir = archive_dir(data_dir, model, version);
-    let bin = dir.join("firmware.bin");
-
-    if dir.join("metadata.json").exists() {
-        let meta = load_meta(data_dir, model, version)?;
-        let existing = sha256_file(&bin)?;
-        if existing != meta.bin_sha256 {
-            return Err(FirmwareError::ChecksumMismatch { stored: meta.bin_sha256, computed: existing });
+        if fs::metadata(src)?.len() == 0 {
+            return Err(FirmwareError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput, format!("{} is empty; not archiving", src.display()),
+            )));
         }
-        return if existing == new_sha {
-            Ok(IngestOutcome::AlreadyPresent(meta))
-        } else {
-            Err(FirmwareError::ContentMismatch {
-                model: model.to_owned(), version: version.to_owned(), existing, new: new_sha,
-            })
+        let new_sha = sha256_file(src)?;
+        let dir = archive_dir(data_dir, model, version);
+        let bin = dir.join("firmware.bin");
+
+        if dir.join("metadata.json").exists() {
+            let meta = load_meta(data_dir, model, version)?;
+            let existing = sha256_file(&bin)?;
+            if existing != meta.bin_sha256 {
+                return Err(FirmwareError::ChecksumMismatch { stored: meta.bin_sha256, computed: existing });
+            }
+            return if existing == new_sha {
+                Ok(IngestOutcome::AlreadyPresent(meta))
+            } else {
+                Err(FirmwareError::ContentMismatch {
+                    model: model.to_owned(), version: version.to_owned(), existing, new: new_sha,
+                })
+            };
+        }
+        if bin.exists() {
+            return Err(FirmwareError::IncompleteArchive { path: dir.display().to_string() });
+        }
+
+        fs::create_dir_all(&dir)?;
+        let part = dir.join("firmware.bin.part");
+        fs::copy(src, &part)?;
+        let copied_sha = sha256_file(&part)?;
+        if copied_sha != new_sha {
+            let _ = fs::remove_file(&part); // best effort; the mismatch below is the real error
+            return Err(FirmwareError::ChecksumMismatch { stored: new_sha, computed: copied_sha });
+        }
+        let size = fs::metadata(&part)?.len();
+        fs::rename(&part, &bin)?;
+        if let Some(html) = source_page {
+            fs::write(dir.join("source-page.html"), html)?;
+        }
+
+        let meta = FirmwareMeta {
+            format_version: FIRMWARE_META_FORMAT_VERSION,
+            model: model.to_owned(),
+            firmware_version: version.to_owned(),
+            archived_at: provenance.retrieved_at.clone(),
+            archived_by: "fleet firmware fetch".into(),
+            bin_sha256: new_sha,
+            bin_size_bytes: size,
+            source_path: src.display().to_string(),
+            canonical_snapshot_path: None,
+            notes: None,
+            provenance: Some(provenance.clone()),
         };
-    }
-    if bin.exists() {
-        return Err(FirmwareError::IncompleteArchive { path: dir.display().to_string() });
-    }
-
-    fs::create_dir_all(&dir)?;
-    let part = dir.join("firmware.bin.part");
-    fs::copy(src, &part)?;
-    let copied_sha = sha256_file(&part)?;
-    if copied_sha != new_sha {
-        let _ = fs::remove_file(&part); // best effort; the mismatch below is the real error
-        return Err(FirmwareError::ChecksumMismatch { stored: new_sha, computed: copied_sha });
-    }
-    let size = fs::metadata(&part)?.len();
-    fs::rename(&part, &bin)?;
-    if let Some(html) = source_page {
-        fs::write(dir.join("source-page.html"), html)?;
-    }
-
-    let meta = FirmwareMeta {
-        format_version: FIRMWARE_META_FORMAT_VERSION,
-        model: model.to_owned(),
-        firmware_version: version.to_owned(),
-        archived_at: provenance.retrieved_at.clone(),
-        archived_by: "fleet firmware fetch".into(),
-        bin_sha256: new_sha,
-        bin_size_bytes: size,
-        source_path: src.display().to_string(),
-        canonical_snapshot_path: None,
-        notes: None,
-        provenance: Some(provenance.clone()),
-    };
-    save_meta(&meta, &dir)?;
-    Ok(IngestOutcome::Archived(meta))
+        save_meta(&meta, &dir)?;
+        Ok(IngestOutcome::Archived(meta))
+    })
 }
 
 // ─── Listing ─────────────────────────────────────────────────────────────────

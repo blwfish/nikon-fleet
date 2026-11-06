@@ -235,22 +235,24 @@ pub fn build_restore_plan<P: CameraPort + ?Sized>(
     port: &P,
     input: &RestorePlanInput<'_>,
 ) -> Result<RestorePlanReport, Refusal> {
-    same_body(input.source, input.target, input.body_policy)?;
-    let (steps, run) = plan_steps(port, input.source, input.only, Source::of(&input.source.camera.serial, &input.target.serial));
-    let would_change = count_changes(&steps);
-    Ok(RestorePlanReport {
-        digest: digest(input.source_bytes, &input.target.serial, input.only, &steps),
-        summary: summary_text(input.target, input.source_name, would_change, input.only),
-        source: input.source.camera.clone(),
-        source_label: input.source.label.clone(),
-        target: input.target.clone(),
-        only: input.only.map(|s| s.iter().cloned().collect()),
-        counts: run.counts(),
-        would_change,
-        unrestorable: if input.only.is_some() { run.unrestored() } else { Vec::new() },
-        caveats: plan_caveats(&steps, input.source, &input.target.model),
-        steps,
-        cannot_read: NOT_TRANSFERABLE,
+    crate::diag::scoped(crate::diag::Subsystem::Restore, "plan", crate::diag::Class::Top, &[], |_span| {
+        same_body(input.source, input.target, input.body_policy)?;
+        let (steps, run) = plan_steps(port, input.source, input.only, Source::of(&input.source.camera.serial, &input.target.serial));
+        let would_change = count_changes(&steps);
+        Ok(RestorePlanReport {
+            digest: digest(input.source_bytes, &input.target.serial, input.only, &steps),
+            summary: summary_text(input.target, input.source_name, would_change, input.only),
+            source: input.source.camera.clone(),
+            source_label: input.source.label.clone(),
+            target: input.target.clone(),
+            only: input.only.map(|s| s.iter().cloned().collect()),
+            counts: run.counts(),
+            would_change,
+            unrestorable: if input.only.is_some() { run.unrestored() } else { Vec::new() },
+            caveats: plan_caveats(&steps, input.source, &input.target.model),
+            steps,
+            cannot_read: NOT_TRANSFERABLE,
+        })
     })
 }
 
@@ -335,135 +337,137 @@ pub fn apply_restore<P: CameraPort + ?Sized>(
     req: &RestoreApplyRequest<'_>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<RestoreApplyReport, RestoreApplyError> {
-    require_confirmation(req.expected_digest, req.expected_summary)?;
-    same_body(req.plan.source, req.plan.target, req.plan.body_policy).map_err(RestoreApplyError::Refused)?;
+    crate::diag::scoped_with(crate::diag::Subsystem::Restore, "apply", crate::diag::Class::Top, &[("plan_digest", crate::diag::Val::hash(req.expected_digest.as_bytes()))], |_span| {
+        require_confirmation(req.expected_digest, req.expected_summary)?;
+        same_body(req.plan.source, req.plan.target, req.plan.body_policy).map_err(RestoreApplyError::Refused)?;
 
-    // 1. Recompute the plan on the live body and compare.
-    // A snapshot of another body does not carry the settings that read differently per body.
-    let scope = Source::of(&req.plan.source.camera.serial, &req.plan.target.serial);
-    let (steps_now, now_run) = plan_steps(port, req.plan.source, req.plan.only, scope);
-    let now_digest = digest(req.plan.source_bytes, &req.plan.target.serial, req.plan.only, &steps_now);
-    if now_digest != req.expected_digest.trim() {
-        return Err(ApplyError::StalePlan { what: "digest" }.into());
-    }
-    let n_change = count_changes(&steps_now);
-    if summary_text(req.plan.target, req.plan.source_name, n_change, req.plan.only) != req.expected_summary.trim() {
-        return Err(ApplyError::StalePlan { what: "summary" }.into());
-    }
-    progress(PHASE_PLAN_VERIFIED);
+        // 1. Recompute the plan on the live body and compare.
+        // A snapshot of another body does not carry the settings that read differently per body.
+        let scope = Source::of(&req.plan.source.camera.serial, &req.plan.target.serial);
+        let (steps_now, now_run) = plan_steps(port, req.plan.source, req.plan.only, scope);
+        let now_digest = digest(req.plan.source_bytes, &req.plan.target.serial, req.plan.only, &steps_now);
+        if now_digest != req.expected_digest.trim() {
+            return Err(ApplyError::StalePlan { what: "digest" }.into());
+        }
+        let n_change = count_changes(&steps_now);
+        if summary_text(req.plan.target, req.plan.source_name, n_change, req.plan.only) != req.expected_summary.trim() {
+            return Err(ApplyError::StalePlan { what: "summary" }.into());
+        }
+        progress(PHASE_PLAN_VERIFIED);
 
-    // 2. Nothing to change: say so, touch nothing. A targeted restore that cannot do
-    //    what was named is a failure, not a quiet success.
-    //    Writing a value the body already holds is not a change: a retry after success
-    //    lands here instead of making another restore point.
-    if n_change == 0 {
-        let dry = now_run;
-        let unrestored = if req.plan.only.is_some() { dry.unrestored() } else { Vec::new() };
-        // Nothing to write, but a range left alone because its scale changed is not "verified".
-        let status = if !unrestored.is_empty() {
+        // 2. Nothing to change: say so, touch nothing. A targeted restore that cannot do
+        //    what was named is a failure, not a quiet success.
+        //    Writing a value the body already holds is not a change: a retry after success
+        //    lands here instead of making another restore point.
+        if n_change == 0 {
+            let dry = now_run;
+            let unrestored = if req.plan.only.is_some() { dry.unrestored() } else { Vec::new() };
+            // Nothing to write, but a range left alone because its scale changed is not "verified".
+            let status = if !unrestored.is_empty() {
+                ApplyStatus::Failed
+            } else if dry.counts().skipped_scale > 0 {
+                ApplyStatus::AppliedUnverified
+            } else {
+                ApplyStatus::AppliedVerified
+            };
+            return Ok(RestoreApplyReport {
+                status,
+                no_op: true,
+                plan_digest: now_digest,
+                restore_point: None,
+                restore_point_gate_waived: false,
+                written: Vec::new(),
+                write_errors: Vec::new(),
+                unrestored,
+                counts: dry.counts(),
+                steps: dry.steps.into_iter().filter(|s| s.outcome != StepOutcome::NotSelected).collect(),
+                verification: None,
+                side_effects: None,
+                undo_set: Vec::new(),
+                undo_not_restorable: Vec::new(),
+            });
+        }
+
+        // 3. The restore point, before any write (the same sequence, and the same refusals, as a transplant).
+        let MadeRestorePoint { snapshot: restore_point, file: rp_file, label, gate_waived } = make_restore_point(
+            port,
+            req.plan.target,
+            RestoreOp::PreRestore,
+            req.name_lookup,
+            &req.captured_at,
+            req.snapshots_dir,
+            req.gate_policy,
+        )?;
+        progress(PHASE_RESTORE_POINT_WRITTEN);
+
+        // 4. The writes. From here on there is always a report.
+        progress(PHASE_WRITING);
+        let run = execute_from(port, &req.plan.source.properties, req.plan.only, false, scope);
+        let written = run.written_names();
+        let write_errors: Vec<WriteError> = run
+            .steps
+            .iter()
+            .filter_map(|s| match &s.outcome {
+                StepOutcome::WriteFailed(m) => Some(WriteError { name: s.name.clone(), message: m.clone() }),
+                _ => None,
+            })
+            .collect();
+        let unrestored = if req.plan.only.is_some() { run.unrestored() } else { Vec::new() };
+
+        // 5. Read back and judge what was written against the snapshot.
+        progress(PHASE_READ_BACK);
+        let verification =
+            verify_with(port, req.name_lookup, req.plan.target, req.plan.source, &written, &req.captured_at, req.gate_policy);
+        // The comparison can only fail on a model mismatch, which two snapshots of one Camera cannot
+        // have; if it ever did, the report must not read as a clean verified restore.
+        let effects_result = verification.readback.as_ref().map(|after| side_effects(&restore_point, after, &written));
+        let effects_failed = matches!(effects_result, Some(Err(_)));
+        let effects = effects_result.and_then(|r| r.ok());
+
+        // Writes were attempted and the body rejected every one of them by kind: nothing was written,
+        // which the read-back reports as "nothing to check". A few rejected kinds among written
+        // properties are routine on a full restore; all of them is not.
+        let all_rejected = written.is_empty()
+            && run.steps.iter().any(|s| matches!(s.outcome, StepOutcome::UnsupportedWriteType));
+
+        // A settable range the body's scale no longer matches was left alone: that is a property the
+        // restore did not put back, so on a full restore (where it is not named, hence not in
+        // `unrestored`) the result cannot be called verified.
+        let scale_skipped = run.counts().skipped_scale > 0;
+        let status = if !write_errors.is_empty() || !unrestored.is_empty() || all_rejected {
             ApplyStatus::Failed
-        } else if dry.counts().skipped_scale > 0 {
+        } else if scale_skipped {
             ApplyStatus::AppliedUnverified
         } else {
-            ApplyStatus::AppliedVerified
+            match verification.verdict {
+                Verdict::Verified | Verdict::NothingWritten if effects_failed => ApplyStatus::AppliedUnverified,
+                Verdict::Verified | Verdict::NothingWritten => ApplyStatus::AppliedVerified,
+                Verdict::ResidualFound | Verdict::ReadbackIncomplete | Verdict::Unjudged => ApplyStatus::AppliedUnverified,
+            }
         };
-        return Ok(RestoreApplyReport {
+
+        // What an undo can put back: what was written, what may have landed (a write that errored can
+        // still have changed the body), and what changed as a side effect, limited to what the restore
+        // point holds and the body will take.
+        let touched: BTreeSet<String> = written.iter().cloned().chain(write_errors.iter().map(|e| e.name.clone())).collect();
+        let undo = undo_set(&restore_point, port.capabilities(), &touched, effects.as_ref(), verification.readback.as_ref());
+        Ok(RestoreApplyReport {
             status,
-            no_op: true,
+            no_op: false,
             plan_digest: now_digest,
-            restore_point: None,
-            restore_point_gate_waived: false,
-            written: Vec::new(),
-            write_errors: Vec::new(),
+            restore_point: Some(RestorePoint { file: rp_file, label }),
+            restore_point_gate_waived: gate_waived,
+            written: written.into_iter().collect(),
+            write_errors,
             unrestored,
-            counts: dry.counts(),
-            steps: dry.steps.into_iter().filter(|s| s.outcome != StepOutcome::NotSelected).collect(),
-            verification: None,
-            side_effects: None,
-            undo_set: Vec::new(),
-            undo_not_restorable: Vec::new(),
-        });
-    }
-
-    // 3. The restore point, before any write (the same sequence, and the same refusals, as a transplant).
-    let MadeRestorePoint { snapshot: restore_point, file: rp_file, label, gate_waived } = make_restore_point(
-        port,
-        req.plan.target,
-        RestoreOp::PreRestore,
-        req.name_lookup,
-        &req.captured_at,
-        req.snapshots_dir,
-        req.gate_policy,
-    )?;
-    progress(PHASE_RESTORE_POINT_WRITTEN);
-
-    // 4. The writes. From here on there is always a report.
-    progress(PHASE_WRITING);
-    let run = execute_from(port, &req.plan.source.properties, req.plan.only, false, scope);
-    let written = run.written_names();
-    let write_errors: Vec<WriteError> = run
-        .steps
-        .iter()
-        .filter_map(|s| match &s.outcome {
-            StepOutcome::WriteFailed(m) => Some(WriteError { name: s.name.clone(), message: m.clone() }),
-            _ => None,
+            counts: run.counts(),
+            steps: run.steps.into_iter().filter(|s| s.outcome != StepOutcome::NotSelected).collect(),
+            verification: Some(verification),
+            side_effects: effects,
+            undo_set: undo.names,
+            undo_not_restorable: undo.not_restorable,
         })
-        .collect();
-    let unrestored = if req.plan.only.is_some() { run.unrestored() } else { Vec::new() };
-
-    // 5. Read back and judge what was written against the snapshot.
-    progress(PHASE_READ_BACK);
-    let verification =
-        verify_with(port, req.name_lookup, req.plan.target, req.plan.source, &written, &req.captured_at, req.gate_policy);
-    // The comparison can only fail on a model mismatch, which two snapshots of one Camera cannot
-    // have; if it ever did, the report must not read as a clean verified restore.
-    let effects_result = verification.readback.as_ref().map(|after| side_effects(&restore_point, after, &written));
-    let effects_failed = matches!(effects_result, Some(Err(_)));
-    let effects = effects_result.and_then(|r| r.ok());
-
-    // Writes were attempted and the body rejected every one of them by kind: nothing was written,
-    // which the read-back reports as "nothing to check". A few rejected kinds among written
-    // properties are routine on a full restore; all of them is not.
-    let all_rejected = written.is_empty()
-        && run.steps.iter().any(|s| matches!(s.outcome, StepOutcome::UnsupportedWriteType));
-
-    // A settable range the body's scale no longer matches was left alone: that is a property the
-    // restore did not put back, so on a full restore (where it is not named, hence not in
-    // `unrestored`) the result cannot be called verified.
-    let scale_skipped = run.counts().skipped_scale > 0;
-    let status = if !write_errors.is_empty() || !unrestored.is_empty() || all_rejected {
-        ApplyStatus::Failed
-    } else if scale_skipped {
-        ApplyStatus::AppliedUnverified
-    } else {
-        match verification.verdict {
-            Verdict::Verified | Verdict::NothingWritten if effects_failed => ApplyStatus::AppliedUnverified,
-            Verdict::Verified | Verdict::NothingWritten => ApplyStatus::AppliedVerified,
-            Verdict::ResidualFound | Verdict::ReadbackIncomplete | Verdict::Unjudged => ApplyStatus::AppliedUnverified,
-        }
-    };
-
-    // What an undo can put back: what was written, what may have landed (a write that errored can
-    // still have changed the body), and what changed as a side effect, limited to what the restore
-    // point holds and the body will take.
-    let touched: BTreeSet<String> = written.iter().cloned().chain(write_errors.iter().map(|e| e.name.clone())).collect();
-    let undo = undo_set(&restore_point, port.capabilities(), &touched, effects.as_ref(), verification.readback.as_ref());
-    Ok(RestoreApplyReport {
-        status,
-        no_op: false,
-        plan_digest: now_digest,
-        restore_point: Some(RestorePoint { file: rp_file, label }),
-        restore_point_gate_waived: gate_waived,
-        written: written.into_iter().collect(),
-        write_errors,
-        unrestored,
-        counts: run.counts(),
-        steps: run.steps.into_iter().filter(|s| s.outcome != StepOutcome::NotSelected).collect(),
-        verification: Some(verification),
-        side_effects: effects,
-        undo_set: undo.names,
-        undo_not_restorable: undo.not_restorable,
-    })
+    }, |r| match r { Ok(rep) => (rep.status.diag_outcome(), vec![("status", crate::diag::Val::text(rep.status.tag())), ("written", crate::diag::Val::U64(rep.written.len() as u64)), ("write_errors", crate::diag::Val::U64(rep.write_errors.len() as u64)), ("no_op", crate::diag::Val::Bool(rep.no_op))]), Err(_) => (crate::diag::Outcome::Failed, Vec::new()) })
 }
 
 #[cfg(test)]

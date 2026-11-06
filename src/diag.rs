@@ -133,10 +133,12 @@ pub enum Outcome {
     Indeterminate,
     Panicked,
     Abandoned,
+    /// The caller gave up on it (an MCP request cancelled by the client).
+    Cancelled,
 }
 
 impl Outcome {
-    pub const ALL: [Outcome; 7] = [
+    pub const ALL: [Outcome; 8] = [
         Outcome::Ok,
         Outcome::Failed,
         Outcome::Timeout,
@@ -144,6 +146,7 @@ impl Outcome {
         Outcome::Indeterminate,
         Outcome::Panicked,
         Outcome::Abandoned,
+        Outcome::Cancelled,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -155,6 +158,7 @@ impl Outcome {
             Outcome::Indeterminate => "indeterminate",
             Outcome::Panicked => "panicked",
             Outcome::Abandoned => "abandoned",
+            Outcome::Cancelled => "cancelled",
         }
     }
 }
@@ -243,6 +247,9 @@ pub struct Entry {
     pub subsystem: Subsystem,
     pub op: String,
     pub fields: Vec<(String, Val)>,
+    /// How many spans were already open on the same OS thread when this began. Per thread, not per
+    /// operation: async code that moves between threads gets a hint here, not a tree. Use `seq` and
+    /// `ts_ms` to order spans.
     pub depth: u32,
     pub thread: u64,
     /// `None` for an event.
@@ -390,6 +397,9 @@ pub struct Diag {
     failures: AtomicU64,
     /// True while the last write failed, so one streak warns once.
     in_failure_streak: AtomicBool,
+    /// Set by the first [`Diag::shutdown`]; a later one does nothing, so a process that reaches its exit by
+    /// two routes (the GUI's `on_exit`, then `main`) records one exit, with the first code.
+    exited: AtomicBool,
     state: Mutex<State>,
 }
 
@@ -432,6 +442,7 @@ impl Diag {
             seq: AtomicU64::new(0),
             failures: AtomicU64::new(0),
             in_failure_streak: AtomicBool::new(false),
+            exited: AtomicBool::new(false),
             state: Mutex::new(State { ring: VecDeque::new(), open: Vec::new(), ring_lines: 0, ring_file: Some(ring_file), trace_file }),
             cfg,
         })
@@ -517,6 +528,9 @@ impl Diag {
     /// otherwise; anything else still open ends [`Outcome::Abandoned`]. A process that hangs
     /// *before* this is reached keeps its spans open, which is the whole point.
     pub fn shutdown(&self, code: i32) {
+        if self.exited.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let thread = thread_num();
         let mut st = self.lock();
         let open = std::mem::take(&mut st.open);
@@ -742,6 +756,12 @@ pub struct Span<'a> {
     finished: bool,
 }
 
+impl std::fmt::Debug for Span<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Span").field("seq", &self.seq).field("recording", &self.diag.is_some()).finish()
+    }
+}
+
 impl Span<'static> {
     /// A span that records nothing: what the code uses when diagnostics are not running.
     pub fn none() -> Span<'static> {
@@ -760,6 +780,12 @@ impl Span<'_> {
 
     pub fn finish(self, outcome: Outcome) {
         self.finish_with(outcome, &[]);
+    }
+
+    /// Finish as [`Outcome::Ok`] or [`Outcome::Failed`] from a `Result`, without touching it. For
+    /// the common case where the only outcomes are success and failure.
+    pub fn done<T, E>(self, result: &Result<T, E>) {
+        self.finish(if result.is_ok() { Outcome::Ok } else { Outcome::Failed });
     }
 
     /// Finish with extra fields known only now (a response code, a byte count).
@@ -826,10 +852,109 @@ pub fn shutdown(code: i32) {
     }
 }
 
+/// Environment variable a parent sets for a child process so the two sides' records can be joined:
+/// the parent records the same value in its span (field `request_id`), and the child records it in
+/// its `start` event.
+pub const REQUEST_ID_ENV: &str = "NIKON_FLEET_REQUEST_ID";
+/// The operation name of the event [`start`] records.
+pub const OP_START: &str = "start";
+
+/// A request id unique within this process and, with the pid, across processes: `<pid>-<n>`.
+pub fn next_request_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Start diagnostics for this process in the standard way: find the directory, [`init`], install the
+/// panic hook (once), and record a `start` event with the parent process id and, when a parent set
+/// one, the [`REQUEST_ID_ENV`]. Never fatal: when diagnostics cannot be set up it says so once on
+/// stderr and returns `None`, and the program runs without them.
+pub fn start(role: Subsystem, trace_file: Option<&Path>) -> Option<&'static Diag> {
+    let Some(dir) = dir() else {
+        eprintln!("warning: diagnostics are off: no home directory is set and {DIR_ENV} is not set");
+        return None;
+    };
+    let mut cfg = Config::new(dir, role);
+    cfg.trace_file = trace_file.map(Path::to_path_buf);
+    let d = match init(cfg) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("warning: diagnostics are off: {e}");
+            return None;
+        }
+    };
+    install_panic_hook();
+    let mut fields: Vec<(&'static str, Val)> = vec![("role", Val::text(role.as_str()))];
+    #[cfg(unix)]
+    {
+        // SAFETY: getppid has no preconditions and cannot fail.
+        fields.push(("ppid", Val::U64(unsafe { libc::getppid() } as u64)));
+    }
+    if let Some(id) = std::env::var(REQUEST_ID_ENV).ok().filter(|v| !v.is_empty()) {
+        fields.push(("request_id", Val::text(&id)));
+    }
+    d.event(Subsystem::Diag, OP_START, &fields);
+    Some(d)
+}
+
+/// Run `f` inside a span on the process-wide recorder and judge its value: `judge` turns the value into
+/// the outcome and the extra fields known only now. For a body with several early returns (or `?`), wrap
+/// the body in the closure: a `return` or `?` inside it returns from the closure, so the span always ends
+/// through here. A panic in `f` unwinds through the span's drop and ends it [`Outcome::Panicked`]. When
+/// diagnostics are not running, `f` simply runs and `judge` is not called.
+pub fn scoped_with<T>(
+    subsystem: Subsystem,
+    op: &str,
+    class: Class,
+    fields: &[(&'static str, Val)],
+    f: impl FnOnce(&Span<'_>) -> T,
+    judge: impl FnOnce(&T) -> (Outcome, Vec<(&'static str, Val)>),
+) -> T {
+    match GLOBAL.get() {
+        Some(d) => d.scoped_with(subsystem, op, class, fields, f, judge),
+        None => f(&Span::none()),
+    }
+}
+
+/// [`scoped_with`] for a `Result`: `Ok` ends the span [`Outcome::Ok`], `Err` [`Outcome::Failed`].
+pub fn scoped<T, E>(
+    subsystem: Subsystem,
+    op: &str,
+    class: Class,
+    fields: &[(&'static str, Val)],
+    f: impl FnOnce(&Span<'_>) -> Result<T, E>,
+) -> Result<T, E> {
+    scoped_with(subsystem, op, class, fields, f, |r| (if r.is_ok() { Outcome::Ok } else { Outcome::Failed }, Vec::new()))
+}
+
+impl Diag {
+    /// [`scoped_with`] on this recorder.
+    pub fn scoped_with<T>(
+        &self,
+        subsystem: Subsystem,
+        op: &str,
+        class: Class,
+        fields: &[(&'static str, Val)],
+        f: impl FnOnce(&Span<'_>) -> T,
+        judge: impl FnOnce(&T) -> (Outcome, Vec<(&'static str, Val)>),
+    ) -> T {
+        let span = self.span(subsystem, op, class, fields);
+        let value = f(&span);
+        let (outcome, extra) = judge(&value);
+        span.finish_with(outcome, &extra);
+        value
+    }
+}
+
 /// Install a panic hook that records the panic (location and a bounded message) before the
 /// previous hook runs. With `panic = "abort"` the open spans are never dropped, so the in-flight file
 /// keeps them and this entry says why. Safe to call once per process.
 pub fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(install_panic_hook_once);
+}
+
+fn install_panic_hook_once() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Some(d) = GLOBAL.get() {
@@ -1031,9 +1156,12 @@ pub fn render(traces: &[ProcessTrace], now_ms: u64, last_n: usize) -> String {
         out.push_str(&format!("  state: {verdict}\n"));
         if let Some(f) = &t.inflight {
             if !f.spans.is_empty() {
-                out.push_str("  in flight (outermost first):\n");
+                // By start order, which is always right. `depth` (the indent) counts the spans open on the
+                // same OS thread, so for async code, where one operation's spans can run on different
+                // threads, it is a hint and the order and the "began ... ago" times are the facts.
+                out.push_str("  in flight (oldest first):\n");
                 let mut spans = f.spans.clone();
-                spans.sort_by_key(|s| (s.thread, s.depth));
+                spans.sort_by_key(|s| s.seq);
                 for s in &spans {
                     out.push_str(&format!(
                         "    {}{} {} {}  [began {} ago, thread {}]\n",

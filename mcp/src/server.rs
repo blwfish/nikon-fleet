@@ -908,11 +908,24 @@ impl ServerHandler for FleetMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        use nikon_fleet::diag::{self, Class, Outcome, Subsystem, Val};
+        // One span for every tool: the tool's name, and whether it ended in an error. A request the
+        // client cancels drops this future, and the span ends `abandoned`. The camera work inside is its
+        // own `worker_call` span (see Supervisor::run).
+        let span = diag::span(Subsystem::Mcp, "tool_call", Class::Top, &[("tool", Val::text(&request.name))]);
         let tcc = ToolCallContext::new(self, request, context);
-        let mut response = self.tool_router.call(tcc).await?;
+        let mut response = match self.tool_router.call(tcc).await {
+            Ok(r) => r,
+            Err(e) => {
+                span.finish_with(Outcome::Failed, &[("error_code", Val::text(&format!("{:?}", e.code)))]);
+                return Err(e);
+            }
+        };
+        let is_error = matches!(&response, CallToolResponse::Complete(r) if r.is_error == Some(true));
         if let CallToolResponse::Complete(result) = &mut response {
             self.report_previous_session(result);
         }
+        span.finish(if is_error { Outcome::Failed } else { Outcome::Ok });
         Ok(response)
     }
 

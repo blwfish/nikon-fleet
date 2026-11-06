@@ -57,11 +57,12 @@ fn the_hand_written_names_are_the_serde_names_and_all_lists_every_variant() {
             Outcome::Indeterminate => 4,
             Outcome::Panicked => 5,
             Outcome::Abandoned => 6,
+            Outcome::Cancelled => 7,
         }
     }
     let mut idx: Vec<usize> = Outcome::ALL.iter().map(|o| out_index(*o)).collect();
     idx.sort_unstable();
-    assert_eq!(idx, (0..7).collect::<Vec<_>>());
+    assert_eq!(idx, (0..8).collect::<Vec<_>>());
     // An unknown name is refused, not defaulted.
     assert!(serde_json::from_str::<Subsystem>("\"usbb\"").is_err());
     assert!(serde_json::from_str::<Outcome>("\"success\"").is_err());
@@ -462,7 +463,7 @@ fn shutdown_closes_what_is_still_open_by_code_and_class_and_then_reads_as_a_clea
 }
 
 #[test]
-fn a_hang_before_shutdown_is_still_a_hang_and_shutdown_twice_records_two_exits_harmlessly() {
+fn a_hang_before_shutdown_is_still_a_hang_and_shutdown_twice_records_one_exit() {
     let dir = tempdir().unwrap();
     let d = mk(dir.path(), 4031, 64);
     std::mem::forget(d.span(Subsystem::MaidSdk, "disconnect", Class::Leaf, &[]));
@@ -470,9 +471,10 @@ fn a_hang_before_shutdown_is_still_a_hang_and_shutdown_twice_records_two_exits_h
     let t = load(dir.path(), &|_| Some(true)).unwrap().pop().unwrap();
     assert_eq!(t.verdict(), Verdict::RunningWithSpansOpen);
     d.shutdown(0);
-    d.shutdown(0);
-    let exits = d.snapshot().iter().filter(|e| e.op == OP_EXIT).count();
-    assert_eq!(exits, 2);
+    d.shutdown(7);
+    let exits: Vec<_> = d.snapshot().into_iter().filter(|e| e.op == OP_EXIT).collect();
+    assert_eq!(exits.len(), 1, "a second shutdown is a no-op");
+    assert_eq!(exits[0].fields[0].1, Val::I64(0), "and the first code is the one kept");
 }
 
 #[test]
@@ -488,7 +490,7 @@ fn the_report_names_the_operation_in_flight_and_says_it_was_killed_or_crashed() 
     let text = render(&traces, unix_ms() + 2500, 10);
     assert!(text.contains("pid 4023"), "{text}");
     assert!(text.contains("killed or crashed"), "{text}");
-    assert!(text.contains("in flight (outermost first)"), "{text}");
+    assert!(text.contains("in flight (oldest first)"), "{text}");
     assert!(text.contains("usb ptp_txn op=0x90ee data_len=323B"), "{text}");
     assert!(text.contains("restore apply"), "{text}");
     assert!(text.contains("began 2."), "an age of about 2.5 s: {text}");
@@ -586,4 +588,124 @@ fn pid_alive_says_yes_for_this_process_and_no_for_one_that_cannot_exist() {
     }
     #[cfg(not(unix))]
     assert_eq!(pid_alive(std::process::id()), None);
+}
+
+// ── start(), request ids, Span::done ─────────────────────────────────────
+
+#[test]
+fn request_ids_are_unique_and_carry_the_pid() {
+    let a = next_request_id();
+    let b = next_request_id();
+    assert_ne!(a, b);
+    assert!(a.starts_with(&format!("{}-", std::process::id())), "{a}");
+    let n: u64 = a.rsplit('-').next().unwrap().parse().unwrap();
+    let m: u64 = b.rsplit('-').next().unwrap().parse().unwrap();
+    assert_eq!(m, n + 1, "consecutive");
+}
+
+#[test]
+fn span_done_maps_a_result_to_ok_or_failed_and_leaves_the_result_alone() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4060, 64);
+    let ok: Result<u8, String> = Ok(1);
+    let err: Result<u8, String> = Err("x".into());
+    d.span(Subsystem::Cli, "a", Class::Top, &[]).done(&ok);
+    d.span(Subsystem::Cli, "b", Class::Top, &[]).done(&err);
+    let ring = d.snapshot();
+    assert_eq!((ring[0].outcome, ring[1].outcome), (Some(Outcome::Ok), Some(Outcome::Failed)));
+    assert_eq!((ok, err), (Ok(1), Err("x".to_string())), "the results are borrowed, not consumed");
+}
+
+#[test]
+fn cancelled_is_an_ordinary_non_ok_outcome_that_ranks_as_a_failure_for_eviction() {
+    let e = Entry {
+        seq: 0, ts_ms: 0, kind: Kind::Span, class: Class::Leaf, subsystem: Subsystem::Mcp, op: String::new(), fields: vec![], depth: 0, thread: 0, outcome: Some(Outcome::Cancelled), dur_us: 0,
+    };
+    assert!(eviction_rank(&e) >= 2, "a cancelled call is kept in preference to routine successes");
+    assert_eq!(serde_json::to_string(&Outcome::Cancelled).unwrap(), "\"cancelled\"");
+}
+
+#[test]
+fn in_flight_spans_are_listed_by_start_order_whatever_their_per_thread_depth() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4070, 64);
+    // The first span begins on this thread; the second begins on another thread, where its depth is 0
+    // as well: an async operation that moved threads. A depth ordering would call them equal.
+    let first = d.span(Subsystem::Mcp, "outer", Class::Top, &[]);
+    std::thread::scope(|sc| {
+        sc.spawn(|| std::mem::forget(d.span(Subsystem::Mcp, "inner", Class::Top, &[])));
+    });
+    std::mem::forget(first);
+    let open = d.open_spans();
+    assert_eq!(open.iter().map(|o| o.depth).collect::<Vec<_>>(), vec![0, 0], "both are depth 0: they are on different threads");
+    let text = render(&load(dir.path(), &|_| Some(false)).unwrap(), unix_ms(), 10);
+    let outer = text.find("mcp outer").unwrap();
+    let inner = text.find("mcp inner").unwrap();
+    assert!(outer < inner, "started first, listed first: {text}");
+}
+
+// ── scoped_with / scoped ─────────────────────────────────────────────────
+
+#[test]
+fn scoped_with_ends_the_span_through_early_returns_and_question_marks_and_carries_the_judged_fields() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4080, 64);
+    fn work(d: &Diag, fail_early: bool) -> Result<u8, String> {
+        d.scoped_with(
+            Subsystem::Transplant,
+            "apply",
+            Class::Top,
+            &[("start", Val::U64(1))],
+            |_span| {
+                if fail_early {
+                    return Err("early".to_string());
+                }
+                let n: u8 = "7".parse().map_err(|_| "parse".to_string())?;
+                Ok(n)
+            },
+            |r| match r {
+                Ok(n) => (Outcome::Ok, vec![("n", Val::U64(u64::from(*n)))]),
+                Err(_) => (Outcome::Failed, Vec::new()),
+            },
+        )
+    }
+    assert_eq!(work(&d, false), Ok(7));
+    assert_eq!(work(&d, true), Err("early".to_string()));
+    let ring = d.snapshot();
+    assert_eq!(ring.len(), 2);
+    assert_eq!((ring[0].outcome, ring[0].fields.last().unwrap()), (Some(Outcome::Ok), &("n".to_string(), Val::U64(7))));
+    assert_eq!(ring[1].outcome, Some(Outcome::Failed), "a return inside the closure still ends the span");
+    assert_eq!(ring[0].fields[0], ("start".to_string(), Val::U64(1)), "fields known at the start come first");
+    assert!(d.open_spans().is_empty());
+}
+
+#[test]
+fn a_panic_inside_a_scoped_body_ends_the_span_panicked_and_the_value_is_never_judged() {
+    let dir = tempdir().unwrap();
+    let d = mk(dir.path(), 4081, 64);
+    let judged = std::cell::Cell::new(false);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        d.scoped_with(Subsystem::Restore, "execute_writes", Class::Top, &[], |_s| -> u8 { panic!("boom") }, |_v| {
+            judged.set(true);
+            (Outcome::Ok, Vec::new())
+        })
+    }));
+    assert!(r.is_err());
+    assert!(!judged.get());
+    assert_eq!(d.snapshot().pop().unwrap().outcome, Some(Outcome::Panicked));
+}
+
+#[test]
+fn the_free_scoped_functions_just_run_the_body_when_diagnostics_are_off() {
+    // No test in this binary calls `init`.
+    assert!(global().is_none());
+    let mut called = 0;
+    let r: Result<u8, ()> = scoped(Subsystem::Snapshot, "save_new", Class::Top, &[], |span| {
+        called += 1;
+        span.set("x", Val::U64(1));
+        Ok(3)
+    });
+    assert_eq!((r, called), (Ok(3), 1));
+    let v = scoped_with(Subsystem::Snapshot, "x", Class::Top, &[], |_| 9u8, |_| panic!("judge must not run when diagnostics are off"));
+    assert_eq!(v, 9);
 }

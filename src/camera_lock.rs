@@ -87,6 +87,10 @@ impl LockError {
 /// Held for as long as this value lives; released on drop or process death.
 #[derive(Debug)]
 pub struct CameraLock {
+    /// Open for as long as the lock is held, so the in-flight file says who holds the body and since
+    /// when: what another process's `camera_busy` is about. Declared first so it ends while the lock is
+    /// still held, then the file is closed and the lock released.
+    _hold: crate::diag::Span<'static>,
     _file: File,
     path: PathBuf,
 }
@@ -115,8 +119,13 @@ impl CameraLock {
             .truncate(false)
             .open(path)
             .map_err(io_err)?;
-        try_flock_exclusive(&file, path)?;
-        Ok(CameraLock { _file: file, path: path.to_path_buf() })
+        if let Err(e) = try_flock_exclusive(&file, path) {
+            // Fail-fast, so there is no wait to record: the refusal is the event.
+            crate::diag::event(crate::diag::Subsystem::Lock, "lock_refused", &[("reason", crate::diag::Val::text(e.tag()))]);
+            return Err(e);
+        }
+        let hold = crate::diag::span(crate::diag::Subsystem::Lock, "camera_lock_held", crate::diag::Class::Top, &[]);
+        Ok(CameraLock { _hold: hold, _file: file, path: path.to_path_buf() })
     }
 
     pub fn path(&self) -> &Path {

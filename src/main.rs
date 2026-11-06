@@ -3656,17 +3656,7 @@ fn cmd_diag_report(args: &DiagReportArgs) -> Result<()> {
 /// fatal: if they cannot be set up the command runs without them and says so once.
 fn start_diagnostics(trace: Option<&Path>, command: &str) -> Option<nikon_fleet::diag::Span<'static>> {
     use nikon_fleet::diag::{self, Class, Subsystem, Val};
-    let Some(dir) = diag::dir() else {
-        eprintln!("warning: diagnostics are off: no home directory is set and NIKON_FLEET_DIAG_DIR is not set");
-        return None;
-    };
-    let mut cfg = diag::Config::new(dir, Subsystem::Cli);
-    cfg.trace_file = trace.map(Path::to_path_buf);
-    if let Err(e) = diag::init(cfg) {
-        eprintln!("warning: diagnostics are off: {e}");
-        return None;
-    }
-    diag::install_panic_hook();
+    diag::start(Subsystem::Cli, trace)?;
     Some(diag::span(Subsystem::Cli, "command", Class::Top, &[("name", Val::text(command))]))
 }
 
