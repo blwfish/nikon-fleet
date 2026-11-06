@@ -1308,13 +1308,72 @@ mod tests {
         app.apply_viewer_edit(&ctx, &copy, ViewEdit::Property { name: VR.into(), text: "0".into() });
         gate.started();
         assert!(!app.viewers.find_mut(&copy).unwrap().controls_enabled(), "being written");
-        // a window drawn in that state asks for nothing (the wiring of `controls_enabled` into each widget is not driven by input here)
+        // a window drawn in that state asks for nothing; the wiring of `controls_enabled` into each widget is driven by input in
+        // `the_window_hands_its_enabled_state_to_every_editor_so_a_saving_window_cannot_be_typed_into`
         let mut asked = Vec::new();
         run_ui(|ui| asked.push(crate::draw_snapshot_viewer(ui, app.viewers.find_mut(&copy).unwrap())));
         assert!(asked.iter().all(Option::is_none), "{asked:?}");
         gate.release();
         wait_for_reload(&mut app, &copy);
         assert!(app.viewers.find_mut(&copy).unwrap().controls_enabled(), "idle again");
+    }
+
+    /// What the whole window asks for when focus is moved with Tab to its `tabs`-th focusable widget, a character is
+    /// typed and Enter pressed. Disabled widgets take no focus, so a widget that was handed `enabled = false` can
+    /// never answer here. (A click needs the widget's place on screen; the Tab walk needs nothing but the window.)
+    fn edits_asked_after_tabs(viewer: &crate::SnapshotViewer, tabs: usize) -> Vec<ViewEdit> {
+        let mut v = viewer.clone();
+        let mut frames: Vec<Vec<egui::Event>> = vec![vec![], vec![]];
+        for _ in 0..tabs {
+            frames.push(key(egui::Key::Tab));
+        }
+        frames.push(vec![egui::Event::Text("7".to_string())]);
+        frames.push(key(egui::Key::Enter));
+        frames.push(vec![]);
+        drive(frames, |ui, _| crate::draw_snapshot_viewer(ui, &mut v)).into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn the_window_hands_its_enabled_state_to_every_editor_so_a_saving_window_cannot_be_typed_into() {
+        let (mut app, _gate, _dir, copy, _ctx) = gated_copy();
+        let idle = app.viewers.find_mut(&copy).unwrap().clone();
+        assert!(idle.controls_enabled() && idle.edit.as_ref().is_some_and(|m| m.owner.is_some()), "an edited copy with an owner section");
+
+        // The positive control: walk the idle window until the keyboard has reached each of the three kinds of editor the
+        // window draws (a property cell, an owner/IPTC/FTP text field, an FTP row button). The silence below is then the
+        // window's doing and not a harness that cannot type.
+        let (mut property, mut owner, mut button) = (None, None, None);
+        for tabs in 0..60 {
+            for e in edits_asked_after_tabs(&idle, tabs) {
+                match e {
+                    ViewEdit::Property { .. } => property = property.or(Some(tabs)),
+                    ViewEdit::OwnerString { .. } | ViewEdit::Iptc { .. } | ViewEdit::FtpFields { .. } => owner = owner.or(Some(tabs)),
+                    ViewEdit::FtpMove { .. } | ViewEdit::FtpDuplicate(_) | ViewEdit::TestFtp { .. } | ViewEdit::FtpDelete(_) | ViewEdit::FtpAdd { .. } => button = button.or(Some(tabs)),
+                    _ => {}
+                }
+            }
+            if property.is_some() && owner.is_some() && button.is_some() {
+                break;
+            }
+        }
+        assert!(property.is_some(), "a property cell answers the keyboard in an idle window");
+        assert!(owner.is_some(), "a text field of the owner editor answers the keyboard in an idle window");
+        assert!(button.is_some(), "an FTP row button answers the keyboard in an idle window");
+
+        // A change in flight, and a file being read again. Disabled widgets take no focus, so the stops are not the
+        // idle window's (the same count lands on another widget): walk EVERY stop of the much shorter list. Focus
+        // wraps around, so 20 is more than enough to visit whatever a mis-wired section would have left focusable
+        // (a window of this size has three FTP rows of four buttons and a handful of fields).
+        let mut saving = idle.clone();
+        saving.saving = Some(1);
+        assert!(!saving.controls_enabled());
+        let mut reading = idle;
+        reading.reloading = true;
+        assert!(!reading.controls_enabled());
+        for tabs in 0..20 {
+            assert_eq!(edits_asked_after_tabs(&saving, tabs), vec![], "after {tabs} tabs: a window with a change in flight asks for a change");
+            assert_eq!(edits_asked_after_tabs(&reading, tabs), vec![], "after {tabs} tabs: a window being read again asks for a change");
+        }
     }
 
     #[test]
