@@ -67,6 +67,10 @@ pub struct SnapshotView {
     pub property_count: usize,
     pub page: Page,
     pub properties: Vec<PropertyView>,
+    /// The owner strings and FTP profiles, when the snapshot holds them. For an agent, so secrets are
+    /// always masked here, whatever a person may reveal in a viewer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extended: Option<crate::ops::render_extended::RenderedExtended>,
 }
 
 /// A page of a snapshot's properties, in name order. `name_contains` is a
@@ -89,6 +93,7 @@ pub fn snapshot_view(s: &Snapshot, name_contains: Option<&str>, offset: usize, l
             .iter()
             .map(|(n, e)| PropertyView { name: (*n).clone(), code: e.code, value: e.value.clone() })
             .collect(),
+        extended: s.extended.as_ref().map(|e| crate::ops::render_extended::render_extended(e, false)),
     }
 }
 
@@ -98,6 +103,8 @@ pub enum DiffEntry {
     Changed(Change),
     OnlyInA { name: String },
     OnlyInB { name: String },
+    /// A difference in the owner strings or FTP profiles; carries no secret.
+    Extended(crate::extended_diff::ExtendedChange),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -105,32 +112,35 @@ pub struct DiffCounts {
     pub changed: usize,
     pub only_in_a: usize,
     pub only_in_b: usize,
+    pub extended: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DiffView {
     pub counts: DiffCounts,
     pub page: Page,
-    /// Changed first, then only-in-A, then only-in-B, each in name order.
+    /// Changed first, then only-in-A, then only-in-B, each in name order; then the extended differences.
     pub entries: Vec<DiffEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub firmware_annotation: Option<FirmwareAnnotation>,
 }
 
 pub fn diff_view(d: &Diff, offset: usize, limit: usize) -> DiffView {
-    let total = d.changed.len() + d.only_in_a.len() + d.only_in_b.len();
+    let total = d.changed.len() + d.only_in_a.len() + d.only_in_b.len() + d.extended.len();
     let (start, end, page) = window(total, offset, limit);
     let entry = |i: usize| -> DiffEntry {
         if i < d.changed.len() {
             DiffEntry::Changed(d.changed[i].clone())
         } else if i < d.changed.len() + d.only_in_a.len() {
             DiffEntry::OnlyInA { name: d.only_in_a[i - d.changed.len()].clone() }
-        } else {
+        } else if i < d.changed.len() + d.only_in_a.len() + d.only_in_b.len() {
             DiffEntry::OnlyInB { name: d.only_in_b[i - d.changed.len() - d.only_in_a.len()].clone() }
+        } else {
+            DiffEntry::Extended(d.extended[i - d.changed.len() - d.only_in_a.len() - d.only_in_b.len()].clone())
         }
     };
     DiffView {
-        counts: DiffCounts { changed: d.changed.len(), only_in_a: d.only_in_a.len(), only_in_b: d.only_in_b.len() },
+        counts: DiffCounts { changed: d.changed.len(), only_in_a: d.only_in_a.len(), only_in_b: d.only_in_b.len(), extended: d.extended.len() },
         page,
         entries: (start..end).map(entry).collect(),
         firmware_annotation: d.firmware_annotation.clone(),
@@ -184,6 +194,7 @@ mod tests {
             changed: (0..c).map(|i| Change { name: format!("C{i}"), code: i as u32, value_a: json!(0), value_b: json!(1) }).collect(),
             only_in_a: (0..a).map(|i| format!("A{i}")).collect(),
             only_in_b: (0..b).map(|i| format!("B{i}")).collect(),
+            extended: Vec::new(),
             firmware_annotation: None,
         }
     }
@@ -283,6 +294,62 @@ mod tests {
     }
 
     #[test]
+    fn the_snapshot_view_carries_the_extended_section_with_secrets_masked() {
+        use crate::extended::{Extended, FtpProfileEntry, FtpState, FtpStore, ReadFrom, hex_encode};
+        use crate::ptp_usb::{FtpProfile, encode_ftp_profile};
+        let blob = encode_ftp_profile(&FtpProfile {
+            profile_name: "rig".into(),
+            ssid_24ghz: "net".into(),
+            ssid_5ghz: "wifi-key-xyz".into(),
+            host: "h".into(),
+            username: "u".into(),
+            password: "hunter2-pass".into(),
+            port: 8080,
+        })
+        .unwrap();
+        let mut s = snap(2);
+        s.extended = Some(Extended {
+            read_from: ReadFrom { model: "Z 9".into(), usb_serial: "1".into() },
+            props: Default::default(),
+            ftp: FtpState::Read(FtpStore {
+                count: 1,
+                limit: 20,
+                active_slot: Some(0),
+                device_name: String::new(),
+                truncated: false,
+                profiles: vec![FtpProfileEntry { slot: 0, hex: hex_encode(&blob) }],
+            }),
+        });
+        let json = serde_json::to_string(&snapshot_view(&s, None, 0, 100)).unwrap();
+        assert!(json.contains("\"extended\""), "{json}");
+        assert!(json.contains("\"rig\""));
+        assert!(!json.contains("hunter2-pass") && !json.contains("wifi-key-xyz"), "an agent must not receive the secrets: {json}");
+        assert!(!serde_json::to_string(&snapshot_view(&snap(2), None, 0, 100)).unwrap().contains("extended"), "absent when the snapshot has none");
+    }
+
+    #[test]
+    fn extended_differences_follow_the_property_ones_and_are_counted_and_paged_with_them() {
+        use crate::extended_diff::{ExtendedChange, ExtendedChangeKind};
+        let mut d = diff_of(1, 1, 1);
+        d.extended = (0..2)
+            .map(|i| ExtendedChange {
+                item: format!("E{i}"),
+                difference: ExtendedChangeKind::Changed,
+                a: Some("x".into()),
+                b: Some("y".into()),
+            })
+            .collect();
+        let all = diff_view(&d, 0, 100);
+        assert_eq!(all.counts.extended, 2);
+        assert_eq!(all.page.total, 5, "the page counts every kind of entry");
+        let last = diff_view(&d, 3, 100);
+        assert!(matches!(&last.entries[..], [DiffEntry::Extended(a), DiffEntry::Extended(b)] if a.item == "E0" && b.item == "E1"));
+        let json = serde_json::to_value(&last.entries[0]).unwrap();
+        assert_eq!(json["kind"], "extended");
+        assert_eq!(json["difference"], "changed", "the entry's own field does not collide with the tag");
+    }
+
+    #[test]
     fn diff_entries_run_changed_then_a_then_b_across_page_boundaries() {
         let d = diff_of(2, 2, 2);
         let names = |v: &DiffView| -> Vec<String> {
@@ -291,12 +358,13 @@ mod tests {
                 .map(|e| match e {
                     DiffEntry::Changed(c) => c.name.clone(),
                     DiffEntry::OnlyInA { name } | DiffEntry::OnlyInB { name } => name.clone(),
+                    DiffEntry::Extended(c) => c.item.clone(),
                 })
                 .collect()
         };
         let all = diff_view(&d, 0, 100);
         assert_eq!(names(&all), ["C0", "C1", "A0", "A1", "B0", "B1"]);
-        assert_eq!(all.counts, DiffCounts { changed: 2, only_in_a: 2, only_in_b: 2 });
+        assert_eq!(all.counts, DiffCounts { changed: 2, only_in_a: 2, only_in_b: 2, extended: 0 });
         let mid = diff_view(&d, 1, 3);
         assert_eq!(names(&mid), ["C1", "A0", "A1"]);
         assert_eq!(mid.page.next, Some(4));
@@ -307,7 +375,7 @@ mod tests {
     fn an_empty_diff_is_an_empty_untruncated_page() {
         let v = diff_view(&Diff::default(), 0, 10);
         assert_eq!((v.page.total, v.page.returned, v.page.truncated), (0, 0, false));
-        assert_eq!(v.counts, DiffCounts { changed: 0, only_in_a: 0, only_in_b: 0 });
+        assert_eq!(v.counts, DiffCounts { changed: 0, only_in_a: 0, only_in_b: 0, extended: 0 });
     }
 
     #[test]

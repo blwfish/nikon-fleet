@@ -19,6 +19,7 @@ pub mod plan;
 pub mod port;
 pub mod readback;
 pub mod render;
+pub mod render_extended;
 pub mod restore;
 pub mod restore_flow;
 pub mod retention;

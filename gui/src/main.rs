@@ -19,6 +19,7 @@ use nikon_fleet::ops::apply::ApplyStatus;
 use nikon_fleet::ops::labels::Labels;
 use nikon_fleet::ops::plan::planned_would_change;
 use nikon_fleet::ops::render::{self, Row, RowFilter};
+use nikon_fleet::ops::render_extended::{self, RenderedExtended};
 use nikon_fleet::ops::target::{is_id_fallback, storable_serial};
 use nikon_fleet::ptp_usb::{self, FtpField, FtpProfile};
 use nikon_fleet::settings::{self, Settings};
@@ -483,6 +484,10 @@ struct SnapshotViewer {
     show_codes: bool,
     /// Why some names are missing (no `sdk-runtime/`, an unreadable labels file), when they are.
     labels_note: Option<String>,
+    /// The owner strings and FTP profiles, when the snapshot holds them. Secrets arrive masked.
+    extended: Option<RenderedExtended>,
+    /// Show the secrets in the clear (the eye toggle). Per window, off whenever a window opens.
+    reveal_secrets: bool,
 }
 
 impl SnapshotViewer {
@@ -497,6 +502,8 @@ impl SnapshotViewer {
             filter: String::new(),
             show_codes: false,
             labels_note: None,
+            extended: None,
+            reveal_secrets: false,
         }
     }
 
@@ -509,12 +516,14 @@ impl SnapshotViewer {
                 self.header = Some(r.header);
                 self.rows = r.rows;
                 self.labels_note = r.labels_note;
+                self.extended = r.extended;
             }
             Err(e) => {
                 self.error = Some(e);
                 self.header = None;
                 self.rows.clear();
                 self.labels_note = None;
+                self.extended = None;
             }
         }
     }
@@ -1733,7 +1742,78 @@ fn draw_snapshot_viewer(ui: &mut egui::Ui, viewer: &mut SnapshotViewer) {
                 ui.end_row();
             }
         });
+        if let Some(ext) = &viewer.extended {
+            ui.add_space(8.0);
+            draw_extended(ui, &viewer.file, ext, &viewer.filter, show_codes, &mut viewer.reveal_secrets);
+        }
     });
+}
+
+/// The owner strings and FTP profiles below the property rows. Secrets are masked unless the eye toggle is
+/// on; the clear text is in the render's hidden field, so turning it on re-reads nothing.
+fn draw_extended(ui: &mut egui::Ui, file: &str, ext: &RenderedExtended, filter: &str, show_codes: bool, reveal: &mut bool) {
+    let needle = filter.trim().to_lowercase();
+    let warn = egui::Color32::from_rgb(200, 120, 0);
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("Owner strings and FTP profiles (read from {})", ext.read_from)).strong());
+        if ext.has_secrets() || *reveal {
+            let label = if *reveal { "👁 Hide passwords" } else { "👁 Show passwords" };
+            if ui.selectable_label(*reveal, label).clicked() {
+                *reveal = !*reveal;
+            }
+        }
+    });
+    egui::Grid::new(("extended_rows", file)).striped(true).show(ui, |ui| {
+        for row in ext.props.iter().filter(|r| render_extended::row_matches(r, &needle)) {
+            ui.label(egui::RichText::new(&row.name).monospace());
+            if show_codes {
+                ui.label(egui::RichText::new(row.code_hex()).monospace().weak());
+            }
+            let text = egui::RichText::new(&row.display).monospace();
+            ui.label(if row.is_problem() { text.color(warn) } else if row.state == "not_supported" { text.weak() } else { text });
+            ui.end_row();
+        }
+    });
+    let ftp = &ext.ftp;
+    match ftp.state {
+        "read" => {
+            ui.label(format!(
+                "FTP profiles: {} stored (limit {}), active slot {}",
+                ftp.count.unwrap_or(0),
+                ftp.limit.unwrap_or(0),
+                ftp.active_slot.map_or("none".to_string(), |s| s.to_string())
+            ));
+            if let Some(note) = &ftp.note {
+                ui.label(egui::RichText::new(note).small().color(warn));
+            }
+        }
+        "read_failed" => {
+            ui.label(egui::RichText::new(format!("FTP profiles: {}", ftp.note.as_deref().unwrap_or("not read"))).color(warn));
+        }
+        _ => {
+            ui.label(egui::RichText::new(format!("FTP profiles: {}", ftp.note.as_deref().unwrap_or("-"))).weak());
+        }
+    }
+    for p in ftp.profiles.iter().filter(|p| render_extended::profile_matches(p, &needle)) {
+        let title = format!("Profile {}{}", p.slot, if p.active { " (active)" } else { "" });
+        egui::CollapsingHeader::new(title).id_salt((file, "ftp_profile", p.slot)).default_open(false).show(ui, |ui| {
+            if let Some(why) = &p.undecoded {
+                ui.label(egui::RichText::new(format!("{} byte(s), could not be decoded: {why}", p.bytes)).color(warn));
+            }
+            egui::Grid::new((file, "ftp_fields", p.slot)).striped(true).show(ui, |ui| {
+                for f in &p.fields {
+                    ui.label(f.label);
+                    let shown = match (&f.secret, *reveal) {
+                        (Some(clear), true) => clear.reveal(),
+                        _ => f.value.as_str(),
+                    };
+                    ui.label(egui::RichText::new(shown).monospace());
+                    ui.end_row();
+                }
+            });
+        });
+    }
 }
 
 // ── Worker thread ─────────────────────────────────────────────────────────
@@ -5652,7 +5732,7 @@ mod tests {
     fn outcome_json(model: &str, firmware: &str, gate: GateOutcome, stats: CaptureStats) -> String {
         let camera = Camera { model: model.into(), serial: "30012345".into(), firmware: firmware.into() };
         let props = stats.read_ok;
-        serde_json::to_string_pretty(&CaptureOutcome::new("Z_9_30012345_x.json".into(), Some("x".into()), camera, props, stats, gate)).unwrap()
+        serde_json::to_string_pretty(&CaptureOutcome::new("Z_9_30012345_x.json".into(), Some("x".into()), camera, props, stats, gate, None)).unwrap()
     }
 
     #[test]

@@ -76,6 +76,12 @@ pub struct Snapshot {
     pub transport: Transport,
     /// Properties keyed by symbolic capability name (e.g. "kNkMAIDCapability_Aperture").
     pub properties: BTreeMap<String, PropertyEntry>,
+    /// What the body holds that the MAID SDK does not expose: Artist / Copyright / Image comment, the
+    /// copyright and IPTC-preset switches, and the stored FTP profiles (`crate::extended`). Absent in a
+    /// snapshot taken before this section existed, and in one captured with the section switched off;
+    /// present with per-item states otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extended: Option<crate::extended::Extended>,
 }
 
 #[derive(Debug, Error)]
@@ -193,6 +199,7 @@ impl Snapshot {
             label: None,
             transport,
             properties: BTreeMap::new(),
+            extended: None,
         }
     }
 
@@ -341,6 +348,35 @@ mod tests {
         let text = original.to_pretty_json().unwrap();
         let parsed = Snapshot::from_json(&text).unwrap();
         assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn a_snapshot_written_before_the_extended_section_loads_with_none_and_writes_no_key() {
+        let old = sample_snapshot();
+        let text = old.to_pretty_json().unwrap();
+        assert!(!text.contains("extended"), "an absent section is not written as null: {text}");
+        let back = Snapshot::from_json(&text).unwrap();
+        assert!(back.extended.is_none());
+        assert_eq!(back, old);
+    }
+
+    #[test]
+    fn an_extended_section_round_trips_through_the_file_format() {
+        use crate::extended::{Extended, ExtendedProp, FtpState, PropState, ReadFrom};
+        let mut snap = sample_snapshot();
+        let mut props = std::collections::BTreeMap::new();
+        props.insert(
+            "0xd072".to_string(),
+            ExtendedProp { code: 0xd072, name: "Artist".into(), state: PropState::Text { text: "Brian".into() } },
+        );
+        snap.extended = Some(Extended {
+            read_from: ReadFrom { model: "Z 9".into(), usb_serial: "1".into() },
+            props,
+            ftp: FtpState::NotOnModel,
+        });
+        let back = Snapshot::from_json(&snap.to_pretty_json().unwrap()).unwrap();
+        assert_eq!(back, snap);
+        assert_eq!(CURRENT_FORMAT_VERSION, 1, "the section is optional, so the version does not move");
     }
 
     #[test]

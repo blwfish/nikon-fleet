@@ -9,6 +9,8 @@ mod config_parse;
 pub mod diag;
 pub mod diff;
 pub mod exit_status;
+pub mod extended;
+pub mod extended_diff;
 pub mod firmware;
 pub mod firmware_browse;
 pub mod firmware_source;

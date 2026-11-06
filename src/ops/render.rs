@@ -296,6 +296,8 @@ fn write_py_json(v: &Value, out: &mut String) {
 pub struct RenderOptions<'a> {
     pub labels: Option<&'a Labels>,
     pub scale: ShowScale,
+    /// Show the extended section's secrets (FTP password, Wi-Fi key) in the clear. Off: masked.
+    pub reveal_secrets: bool,
 }
 
 impl<'a> RenderOptions<'a> {
@@ -306,7 +308,7 @@ impl<'a> RenderOptions<'a> {
 
     /// What the viewers show: names where `labels` has them, and every range's scale.
     pub fn viewer(labels: &'a Labels) -> Self {
-        RenderOptions { labels: Some(labels), scale: ShowScale::On }
+        RenderOptions { labels: Some(labels), scale: ShowScale::On, reveal_secrets: false }
     }
 }
 
@@ -627,6 +629,10 @@ pub struct RenderedSnapshot {
     /// How much of the snapshot the loaded labels name; present when labels were used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage: Option<Coverage>,
+    /// The owner strings and FTP profiles the snapshot holds beyond the MAID properties; absent for a
+    /// snapshot taken without them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extended: Option<crate::ops::render_extended::RenderedExtended>,
 }
 
 /// The snapshot as the plain strings show it: no names, no scales.
@@ -669,6 +675,7 @@ pub fn render_snapshot_opts(s: &Snapshot, filter: Option<&str>, opts: &RenderOpt
         rows,
         labels_note: opts.labels.and_then(Labels::note),
         coverage: None,
+        extended: s.extended.as_ref().map(|e| crate::ops::render_extended::render_extended(e, opts.reveal_secrets)),
     };
     if opts.labels.is_some() {
         out.coverage = Some(Coverage::of(&out));
@@ -791,6 +798,9 @@ impl RenderedSnapshot {
         }
         if self.truncated {
             out.push_str("note: some values are cut for display; the snapshot file has them whole\n");
+        }
+        if let Some(ext) = &self.extended {
+            out.push_str(&ext.to_text(&filter.map(str::to_lowercase).unwrap_or_default()));
         }
         out
     }
@@ -1409,7 +1419,7 @@ mod tests {
             let name = case["name"].as_str().expect("every case is named");
             let opts = match case["mode"].as_str().unwrap() {
                 "viewer" => RenderOptions::viewer(&labels),
-                "labels_only" => RenderOptions { labels: Some(&labels), scale: ShowScale::Off },
+                "labels_only" => RenderOptions { labels: Some(&labels), scale: ShowScale::Off, ..Default::default() },
                 "raw" => RenderOptions::raw(),
                 other => panic!("{name}: unknown mode {other}"),
             };

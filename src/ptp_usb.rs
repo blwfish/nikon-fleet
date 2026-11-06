@@ -112,6 +112,9 @@ const OP_GET_DEVICE_PROP_VALUE: u16 = 0x1015;
 /// Standard PTP `SetDevicePropValue`: one param (the property code) and a data-out phase holding the
 /// value. Used here only for the three string properties in [`STRING_PROPS`].
 const OP_SET_DEVICE_PROP_VALUE: u16 = 0x1016;
+/// `0x9412` — IPTC profile read, the pair of `0x9413` (write). One param, the slot (NX Field sent `1`, and `0` when
+/// the IPTC screen opened); the data phase is the profile. Never sent over USB before 2026-11-06.
+const OP_IPTC_READ: u16 = 0x9412;
 /// `0x943B` — generic vendor-property read wrapper. Param is
 /// `0x10000 | propcode`; response data is the property's raw bytes.
 const OP_VENDOR_PROP_READ: u16 = 0x943B;
@@ -186,7 +189,7 @@ pub const STRING_PROP_WRITE_CONFIRMED_PROPS: &[u16] = &[0xD072, 0xD073, 0xD090];
 /// still sent `0x90ED(0xff)` in that state and got `0x201F`
 /// (TransactionCancelled) with no data, five times in the captures; this
 /// module does not send it, since the `0x90EB` reply already says so.
-const FTP_NO_ACTIVE_SLOT: u32 = 0xff;
+pub const FTP_NO_ACTIVE_SLOT: u32 = 0xff;
 
 const RESP_OK: u16 = 0x2001;
 const RESP_SESSION_ALREADY_OPEN: u16 = 0x201E;
@@ -2904,6 +2907,15 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         Ok(VendorRead { data: reply.data, response_params: reply.params, warnings })
     }
 
+    /// `0x9412(slot)`: the IPTC profile in `slot`, undecoded. EXPERIMENTAL and read-only; the wire form is
+    /// inferred from an NX Field capture, never sent over USB before. An OK answer with no data container is
+    /// [`PtpUsbError::NoDataPhase`].
+    pub fn read_iptc_slot(&mut self, slot: u32) -> Result<VendorRead, PtpUsbError> {
+        let warnings: Vec<String> = unsurveyed_model_warning(self.model(), "the IPTC read").into_iter().collect();
+        let reply = self.transact_ok_with_data(OP_IPTC_READ, &[slot], None, TxidCheck::Unchecked)?;
+        Ok(VendorRead { data: reply.data, response_params: reply.params, warnings })
+    }
+
     /// Standard `GetDevicePropValue` (`0x1015`): the property's value bytes, undecoded. Read-only.
     /// This is the generic PTP path, distinct from the `0x943B` wrapper ([`Self::read_vendor_property`]):
     /// on a Z 9 `0x943B` answers `DevicePropNotSupported` for the artist and image-comment strings, so
@@ -3602,6 +3614,10 @@ pub struct FtpProbeReply {
 impl<T: BulkTransport> PtpUsbSession<T> {
     /// `0x90E8` setup, `0x90EB`, then `0x90ED(n)` for every stored profile (at most
     /// [`FTP_LIST_MAX_READ`]). Read-only.
+    pub fn read_ftp_list(&mut self) -> Result<FtpListState, PtpUsbError> {
+        self.ftp_list_state()
+    }
+
     fn ftp_list_state(&mut self) -> Result<FtpListState, PtpUsbError> {
         let (info, _) = self.read_ftp_info_step()?;
         let truncated = info.count > FTP_LIST_MAX_READ;
@@ -3790,6 +3806,12 @@ pub fn get_device_prop_locked(
     } else {
         session.get_device_prop_value(propcode)
     }
+}
+
+/// [`PtpUsbSession::read_iptc_slot`] for a caller already holding the [`CameraLock`]. Read-only.
+pub fn read_iptc_slot_locked(lock: CameraLock, serial: Option<&str>, slot: u32) -> Result<VendorRead, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.read_iptc_slot(slot)
 }
 
 /// [`PtpUsbSession::set_string_property`] for a caller already holding the [`CameraLock`].

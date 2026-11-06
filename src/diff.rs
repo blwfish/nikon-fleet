@@ -48,6 +48,9 @@ pub struct Diff {
     pub changed: Vec<Change>,
     pub only_in_a: Vec<String>,
     pub only_in_b: Vec<String>,
+    /// Differences in the owner strings and FTP profiles (`crate::extended`). Never holds a secret.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extended: Vec<crate::extended_diff::ExtendedChange>,
     /// Set when both snapshots have differing, non-empty firmware versions and
     /// the model has per-version schema sections. `None` for legacy snapshots
     /// or models with only a `common` section (e.g. Z 5).
@@ -58,7 +61,7 @@ pub struct Diff {
 impl Diff {
     /// True when there are no differences.
     pub fn is_empty(&self) -> bool {
-        self.changed.is_empty() && self.only_in_a.is_empty() && self.only_in_b.is_empty()
+        self.changed.is_empty() && self.only_in_a.is_empty() && self.only_in_b.is_empty() && self.extended.is_empty()
     }
 }
 
@@ -96,6 +99,10 @@ pub struct DiffOptions {
     /// Include properties from the volatile list, and compare enum
     /// `default_index` fields (see [`values_differ`]). Default: false.
     pub include_volatile: bool,
+    /// Leave the extended sections (owner strings, FTP profiles) out of the comparison. For a comparison against
+    /// a capture that cannot have one, such as `check`'s live MAID capture: its absent section is not a
+    /// difference. Default: false (compare them).
+    pub skip_extended: bool,
 }
 
 /// Whether two captured property values differ, for the purposes of `diff`.
@@ -174,6 +181,9 @@ pub fn diff(a: &Snapshot, b: &Snapshot, opts: &DiffOptions) -> Result<Diff, Diff
             continue;
         }
         result.only_in_b.push((*key).clone());
+    }
+    if !opts.skip_extended {
+        result.extended = crate::extended_diff::diff_extended(a.extended.as_ref(), b.extended.as_ref());
     }
 
     Ok(result)
@@ -404,7 +414,7 @@ mod tests {
     fn includes_volatile_when_asked() {
         let a = snap(&[("kNkMAIDCapability_BatteryLevel", 1, json!(80))]);
         let b = snap(&[("kNkMAIDCapability_BatteryLevel", 1, json!(45))]);
-        let opts = DiffOptions { include_volatile: true };
+        let opts = DiffOptions { include_volatile: true, ..Default::default() };
         let d = diff(&a, &b, &opts).unwrap();
         assert_eq!(d.changed.len(), 1);
     }
@@ -436,7 +446,7 @@ mod tests {
         let name = "kNkMAIDCapability_MovieWBFluorescentType";
         let a = snap(&[(name, 33892, enum_val(0, 0, 3))]);
         let b = snap(&[(name, 33892, enum_val(0, 1, 3))]);
-        let d = diff(&a, &b, &DiffOptions { include_volatile: true }).unwrap();
+        let d = diff(&a, &b, &DiffOptions { include_volatile: true, ..Default::default() }).unwrap();
         assert_eq!(d.changed.len(), 1, "opting in must still surface the raw difference");
     }
 

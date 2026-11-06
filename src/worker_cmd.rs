@@ -342,6 +342,21 @@ fn with_body(
     serial: &str,
     f: impl FnOnce(&mut Emitter<File>, &Body<'_, '_>) -> Outcome,
 ) -> i32 {
+    with_body_after(em, teardown, bundle, schema_path, serial, || (), |em, body, ()| f(em, body))
+}
+
+/// [`with_body`] with a step that runs after the serial, the bundle and the schema were validated and before the
+/// SDK is opened, whose result is handed to `f`. For work that needs the camera lock and the USB interface and so
+/// cannot overlap an SDK session (the raw-PTP reads of `capture`).
+fn with_body_after<X>(
+    em: &mut Emitter<File>,
+    teardown: Teardown,
+    bundle: &Path,
+    schema_path: &Path,
+    serial: &str,
+    before_sdk: impl FnOnce() -> X,
+    f: impl FnOnce(&mut Emitter<File>, &Body<'_, '_>, X) -> Outcome,
+) -> i32 {
     macro_rules! fail {
         ($tag:expr, $msg:expr) => {
             return finish(em, Outcome::err($tag, $msg, None))
@@ -361,6 +376,7 @@ fn with_body(
         Ok(s) => s,
         Err(e) => fail!("schema_unreadable", format!("{}: {e}", schema_path.display())),
     };
+    let before = before_sdk();
     let mut sdk = match open_sdk(bundle, true) {
         Ok(s) => s,
         Err(e) => match e.downcast_ref::<LockError>() {
@@ -398,7 +414,7 @@ fn with_body(
                 camera: Camera { model: target.name.clone(), serial: usb.serial.clone(), firmware: body_firmware(&target, &Some(usb.clone())) },
                 schema: &schema,
             };
-            f(em, &body)
+            f(em, &body, before)
         }
     };
     let code = finish(em, outcome);
@@ -428,7 +444,12 @@ fn capture(
     label: Option<&str>,
 ) -> i32 {
     progress(em, "starting");
-    with_body(em, teardown, bundle, schema_path, serial, |em, body| {
+    // The owner strings and FTP profiles are read over raw PTP, which cannot share the interface with an open
+    // SDK session, so they are read first (after the serial, bundle and schema checks, before the SDK opens) and
+    // the raw session is released before the SDK takes the camera. Their failure is recorded in the snapshot, not
+    // raised: the MAID capture does not depend on them.
+    let read_extended = || nikon_fleet::extended::read_extended_for_serial(Some(serial));
+    with_body_after(em, teardown, bundle, schema_path, serial, read_extended, |em, body, extended| {
         let name_lookup = body.schema.name_map_for_model(&body.camera.model);
         let captured_at = match now() {
             Ok(t) => t,
@@ -441,6 +462,7 @@ fn capture(
             label,
             name_lookup: &name_lookup,
             captured_at,
+            extended: Some(extended),
         };
         let mut phases: Vec<String> = Vec::new();
         let result = capture_snapshot(body.device, &req, &mut |p| phases.push(p.to_string()));

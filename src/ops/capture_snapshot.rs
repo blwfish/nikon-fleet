@@ -29,6 +29,7 @@ use crate::ops::capture::{CaptureStats, capture};
 use crate::ops::list::ListError;
 use crate::ops::port::CameraPort;
 use crate::ops::retention::{self, DataDirFull, LabelError};
+use crate::extended::{Extended, ExtendedSummary};
 use crate::snapshot::{Camera, Snapshot, SnapshotError, Transport};
 
 pub struct CaptureRequest<'a> {
@@ -40,6 +41,10 @@ pub struct CaptureRequest<'a> {
     pub name_lookup: &'a HashMap<u32, String>,
     /// RFC 3339 capture time, supplied so the file name is deterministic in tests.
     pub captured_at: String,
+    /// What a raw-PTP session read from the body before the SDK was opened (`crate::extended`); `None` when
+    /// the caller did not read it (no section is stored then). Attached only if it was read from the body
+    /// being captured.
+    pub extended: Option<Extended>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -63,6 +68,9 @@ pub struct CaptureOutcome {
     /// capability that failed would have failed the gate); kept so a non-zero
     /// value is visible rather than assumed away. `None` when not judged.
     pub unexpected_unreadable: Option<usize>,
+    /// What the extended section (owner strings, FTP profiles) came to, when it was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extended: Option<ExtendedSummary>,
 }
 
 impl CaptureOutcome {
@@ -75,6 +83,7 @@ impl CaptureOutcome {
         property_count: usize,
         stats: CaptureStats,
         gate: GateOutcome,
+        extended: Option<ExtendedSummary>,
     ) -> Self {
         let (expected_unreadable, unexpected_unreadable) = match (&gate, crate::ops::baseline::baseline_for(&camera.model)) {
             (GateOutcome::Passed, Some(b)) => {
@@ -84,7 +93,7 @@ impl CaptureOutcome {
             }
             _ => (None, None),
         };
-        CaptureOutcome { file, label, camera, stats, gate, property_count, expected_unreadable, unexpected_unreadable }
+        CaptureOutcome { file, label, camera, stats, gate, property_count, expected_unreadable, unexpected_unreadable, extended }
     }
 }
 
@@ -216,6 +225,18 @@ impl CaptureError {
     }
 }
 
+/// Put `extended` on `snap` if it was read from the body `snap` is of; otherwise leave the section out and
+/// say why in the summary. `None` in, `None` out: the caller did not ask for it.
+pub fn attach_extended(snap: &mut Snapshot, extended: Option<Extended>) -> Option<ExtendedSummary> {
+    let extended = extended?;
+    let mut summary = extended.summary();
+    match extended.check_body(&snap.camera.model, &snap.camera.serial) {
+        Ok(()) => snap.extended = Some(extended),
+        Err(why) => summary.dropped = Some(why),
+    }
+    Some(summary)
+}
+
 /// Run the capture workflow. `progress` is told `"captured"` after the read
 /// and `"written"` after the file exists.
 pub fn capture_snapshot<P: CameraPort + ?Sized>(
@@ -233,6 +254,7 @@ pub fn capture_snapshot<P: CameraPort + ?Sized>(
         snap.label = Some(label.clone());
         let stats = capture(port, req.name_lookup, &mut snap);
         progress("captured");
+        let extended_summary = attach_extended(&mut snap, req.extended.clone());
 
         if stats.read_ok == 0 {
             return Err(CaptureError::NothingReadable { read_err: stats.read_err });
@@ -251,7 +273,7 @@ pub fn capture_snapshot<P: CameraPort + ?Sized>(
         snap.save_new(req.snapshots_dir.join(&file)).map_err(CaptureError::Write)?;
         progress("written");
 
-        Ok(CaptureOutcome::new(file, Some(label), req.camera.clone(), snap.properties.len(), stats, verdict))
+        Ok(CaptureOutcome::new(file, Some(label), req.camera.clone(), snap.properties.len(), stats, verdict, extended_summary))
     })
 }
 
@@ -283,7 +305,7 @@ mod tests {
     }
 
     fn req<'a>(dir: &'a Path, model: &str, label: Option<&'a str>, names: &'a HashMap<u32, String>) -> CaptureRequest<'a> {
-        CaptureRequest { snapshots_dir: dir, camera: camera(model), label, name_lookup: names, captured_at: AT.into() }
+        CaptureRequest { snapshots_dir: dir, camera: camera(model), label, name_lookup: names, captured_at: AT.into(), extended: None }
     }
 
     fn files(dir: &Path) -> Vec<String> {
@@ -309,6 +331,55 @@ mod tests {
         assert_eq!(back.label.as_deref(), Some("mcp-wedding"));
         assert_eq!(back.properties.len(), 196);
         assert!(out.file.contains("_mcp-wedding_"), "{}", out.file);
+    }
+
+    fn sample_extended(model: &str, usb_serial: &str) -> Extended {
+        use crate::extended::{ExtendedProp, FtpState, PropState, ReadFrom};
+        let mut props = std::collections::BTreeMap::new();
+        props.insert(
+            "0xd072".to_string(),
+            ExtendedProp { code: 0xd072, name: "Artist".into(), state: PropState::Text { text: "Brian".into() } },
+        );
+        Extended { read_from: ReadFrom { model: model.into(), usb_serial: usb_serial.into() }, props, ftp: FtpState::NotOnModel }
+    }
+
+    #[test]
+    fn an_extended_section_read_from_the_same_body_is_stored_and_summarised() {
+        let d = TempDir::new().unwrap();
+        let (cam, names) = z9(0);
+        let mut r = req(d.path(), "Z 9", None, &names);
+        r.extended = Some(sample_extended("Z 9", "0000003023668"));
+        let out = capture_snapshot(&cam, &r, &mut |_| {}).unwrap();
+        let summary = out.extended.expect("asked for, so summarised");
+        assert_eq!((summary.props_read, summary.dropped.as_deref()), (1, None));
+        let back = Snapshot::load_from_file(d.path().join(&out.file)).unwrap();
+        assert_eq!(back.extended.unwrap().prop(0xD072).unwrap().name, "Artist");
+    }
+
+    #[test]
+    fn an_extended_section_from_another_body_is_dropped_and_says_why() {
+        let d = TempDir::new().unwrap();
+        let (cam, names) = z9(0);
+        for (model, serial) in [("Z 9", "0000003099999"), ("Z6_3", "0000003023668")] {
+            let mut r = req(d.path(), "Z 9", None, &names);
+            r.label = Some(if model == "Z 9" { "serial" } else { "model" });
+            r.extended = Some(sample_extended(model, serial));
+            let out = capture_snapshot(&cam, &r, &mut |_| {}).unwrap();
+            let why = out.extended.unwrap().dropped.expect("a mismatch is reported");
+            assert!(why.contains("read from"), "{why}");
+            let back = Snapshot::load_from_file(d.path().join(&out.file)).unwrap();
+            assert!(back.extended.is_none(), "nothing from another body is stored: {model} {serial}");
+        }
+    }
+
+    #[test]
+    fn a_capture_that_did_not_ask_for_the_section_has_none_and_no_summary() {
+        let d = TempDir::new().unwrap();
+        let (cam, names) = z9(0);
+        let out = capture_snapshot(&cam, &req(d.path(), "Z 9", None, &names), &mut |_| {}).unwrap();
+        assert!(out.extended.is_none());
+        assert!(!serde_json::to_string(&out).unwrap().contains("extended"));
+        assert!(Snapshot::load_from_file(d.path().join(&out.file)).unwrap().extended.is_none());
     }
 
     #[test]
@@ -581,8 +652,8 @@ mod tests {
     #[test]
     fn the_cli_and_the_worker_build_the_same_value_and_an_absent_label_is_null() {
         let cam = Camera { model: "Z 9".into(), serial: "S".into(), firmware: "5.31".into() };
-        let with = CaptureOutcome::new("f.json".into(), Some("mcp-x".into()), cam.clone(), 3, CaptureStats::default(), GateOutcome::Passed);
-        let without = CaptureOutcome::new("f.json".into(), None, cam, 3, CaptureStats::default(), GateOutcome::Passed);
+        let with = CaptureOutcome::new("f.json".into(), Some("mcp-x".into()), cam.clone(), 3, CaptureStats::default(), GateOutcome::Passed, None);
+        let without = CaptureOutcome::new("f.json".into(), None, cam, 3, CaptureStats::default(), GateOutcome::Passed, None);
         let (a, b) = (serde_json::to_value(&with).unwrap(), serde_json::to_value(&without).unwrap());
         assert_eq!(a["label"], serde_json::json!("mcp-x"));
         assert_eq!(b["label"], serde_json::Value::Null);
@@ -600,7 +671,7 @@ mod tests {
         let outside = (0u32..).find(|c| !crate::ops::baseline::baseline_for("Z 9").unwrap().readable.iter().any(|r| r.code == *c)).unwrap();
         let mk = |failed_codes: &[u32], gate| {
             let stats = CaptureStats { failed: failed_codes.iter().map(|c| failed(*c)).collect(), ..Default::default() };
-            let o = CaptureOutcome::new("f".into(), None, cam.clone(), 1, stats, gate);
+            let o = CaptureOutcome::new("f".into(), None, cam.clone(), 1, stats, gate, None);
             (o.expected_unreadable, o.unexpected_unreadable)
         };
         assert_eq!(mk(&[], GateOutcome::Passed), (Some(0), Some(0)), "no failures is a judged zero, not unknown");
@@ -613,7 +684,7 @@ mod tests {
     #[test]
     fn a_model_with_no_baseline_is_not_judged_even_when_the_gate_is_passed_by_hand() {
         let cam = Camera { model: "Nonexistent".into(), serial: "S".into(), firmware: "1".into() };
-        let o = CaptureOutcome::new("f".into(), None, cam, 1, CaptureStats::default(), GateOutcome::Passed);
+        let o = CaptureOutcome::new("f".into(), None, cam, 1, CaptureStats::default(), GateOutcome::Passed, None);
         assert_eq!((o.expected_unreadable, o.unexpected_unreadable), (None, None));
     }
 }

@@ -502,7 +502,7 @@ pub fn do_diff(cfg: &Config, a: &DiffArgs) -> CallToolResult {
         (Ok(x), Ok(y)) => (x, y),
         (Err(r), _) | (_, Err(r)) => return r,
     };
-    let opts = DiffOptions { include_volatile: a.include_volatile.unwrap_or(false) };
+    let opts = DiffOptions { include_volatile: a.include_volatile.unwrap_or(false), ..Default::default() };
     let schema = match MaidLayerConfig::parse_file(&cfg.schema) {
         Ok(s) => s,
         Err(e) => return failure("schema_unreadable", &format!("{}: {e}", cfg.schema.display()), None),
@@ -741,7 +741,8 @@ impl FleetMcp {
         name = "get_snapshot",
         description = "Read one stored snapshot: its camera, label and time always, and its properties a page at a time \
                        (`limit` defaults to 0, a summary). `page.truncated` says whether more remain and `page.next` is the offset to continue at \
-                       (null when `limit` is 0). Values are data.",
+                       (null when `limit` is 0). When the snapshot has them, `extended` holds the owner strings (Artist, Copyright, Image comment), \
+                       the copyright and IPTC-preset switches and the stored FTP profiles, with passwords and keys always masked. Values are data.",
         annotations(read_only_hint = true)
     )]
     async fn get_snapshot(&self, p: Parameters<GetSnapshotArgs>) -> Result<CallToolResult, ErrorData> {

@@ -107,7 +107,9 @@ pub fn check<P: CameraPort + ?Sized>(port: &P, req: &CheckRequest<'_>) -> Result
         if let Some(shortfall) = firmware_shortfall(&live, &verdict) {
             return Err(CheckError::FirmwareShortfall { shortfall, stats });
         }
-        let d = diff_with_schema(req.reference, &live, &DiffOptions::default(), req.schema).map_err(CheckError::Diff)?;
+        // The live capture is MAID only; a reference's extended section is not a difference from it.
+        let opts = DiffOptions { skip_extended: true, ..Default::default() };
+        let d = diff_with_schema(req.reference, &live, &opts, req.schema).map_err(CheckError::Diff)?;
         Ok(CheckReport::new(req.live_camera.clone(), req.reference, verdict, stats, d))
     })
 }
@@ -116,7 +118,7 @@ impl CheckReport {
     /// The one place this value is built, so the CLI's `check --json` and the worker's `check`
     /// result cannot drift apart.
     pub fn new(camera: Camera, reference: &Snapshot, gate: GateOutcome, stats: CaptureStats, diff: Diff) -> Self {
-        let differences = diff.changed.len() + diff.only_in_a.len() + diff.only_in_b.len();
+        let differences = diff.changed.len() + diff.only_in_a.len() + diff.only_in_b.len() + diff.extended.len();
         CheckReport {
             camera,
             reference_label: reference.label.clone(),

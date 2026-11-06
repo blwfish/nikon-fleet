@@ -223,6 +223,10 @@ enum Cmd {
     /// `vendor-read` (0x943B), which on a Z 9 answers DevicePropNotSupported for the artist and
     /// image-comment strings. Sends nothing else.
     VendorGetProp(VendorGetPropArgs),
+    /// EXPERIMENTAL, read-only. Send `0x9412(<slot>)` (the IPTC profile read, the pair of the write `0x9413`) and print the
+    /// bytes it returns as hex, plus a best-effort split into `[u32 length][UTF-8]` entries. Never sent over USB before
+    /// 2026-11-06. Changes nothing on the camera.
+    VendorReadIptc(VendorReadIptcArgs),
     #[command(after_help = VENDOR_SET_STRING_HELP)]
     /// EXPERIMENTAL. Write one string property (0xD072 Artist, 0xD073 Copyright, 0xD090 Image
     /// comment) with the standard PTP `SetDevicePropValue` (0x1016), then read it back and say whether
@@ -282,6 +286,11 @@ struct SnapshotArgs {
     /// progress and warnings go to stderr.
     #[arg(long)]
     json: bool,
+    /// Do not read the owner strings (Artist, Copyright, Image comment), the copyright and IPTC-preset
+    /// switches and the stored FTP profiles into the snapshot. They are read by default, from whatever the
+    /// body lists, before the SDK session opens.
+    #[arg(long)]
+    no_extended: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -431,6 +440,10 @@ struct ShowArgs {
     /// No names, labels or scales: the numbers as stored, with the code column.
     #[arg(long)]
     raw: bool,
+    /// Show the FTP profiles' password and Wi-Fi key in the clear. They are stored in the snapshot and masked
+    /// (asterisks) by default; with --json they are left out unless this is given.
+    #[arg(long)]
+    reveal: bool,
 }
 
 #[derive(Args, Debug)]
@@ -734,6 +747,16 @@ struct VendorGetPropArgs {
     /// instead of its value.
     #[arg(long)]
     desc: bool,
+    /// Camera serial to target; same rules as vendor-read's --serial.
+    #[arg(long)]
+    serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct VendorReadIptcArgs {
+    /// The IPTC slot (NX Field read slot 1; it also sent 0 when its IPTC screen opened).
+    #[arg(long, default_value_t = 1, value_parser = nikon_fleet::ptp_usb::parse_u32_number)]
+    slot: u32,
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
     serial: Option<String>,
@@ -1057,7 +1080,7 @@ fn cmd_diff(data_dir: &Path, schema_path: &Path, args: &DiffArgs) -> Result<()> 
         .with_context(|| format!("loading {}", a_path.display()))?;
     let b = Snapshot::load_from_file(&b_path)
         .with_context(|| format!("loading {}", b_path.display()))?;
-    let opts = DiffOptions { include_volatile: args.include_volatile };
+    let opts = DiffOptions { include_volatile: args.include_volatile, ..Default::default() };
     let schema = MaidLayerConfig::parse_file(schema_path)
         .with_context(|| format!("loading schema from {}", schema_path.display()))?;
     let d = diff_with_schema(&a, &b, &opts, &schema)?;
@@ -1099,6 +1122,18 @@ fn print_diff_human(a: &Snapshot, b: &Snapshot, d: &Diff) {
         println!("\nOnly in B ({}):", d.only_in_b.len());
         for name in &d.only_in_b {
             println!("  {name}");
+        }
+    }
+    if !d.extended.is_empty() {
+        println!("\nOwner strings and FTP profiles ({}):", d.extended.len());
+        for c in &d.extended {
+            println!("  {}", c.item);
+            if let Some(a) = &c.a {
+                println!("    A: {a}");
+            }
+            if let Some(b) = &c.b {
+                println!("    B: {b}");
+            }
         }
     }
     if let Some(fa) = &d.firmware_annotation {
@@ -1165,7 +1200,8 @@ fn cmd_show(data_dir: &Path, schema_path: &Path, args: &ShowArgs) -> Result<()> 
         let firmware = Some(snapshot.camera.firmware.as_str()).filter(|f| !f.is_empty());
         Labels::load_from(schema_path, &schema_path.with_file_name(labels::LABELS_FILE), &snapshot.camera.model, firmware)
     };
-    let opts = if args.raw { render::RenderOptions::raw() } else { render::RenderOptions::viewer(&labels) };
+    let mut opts = if args.raw { render::RenderOptions::raw() } else { render::RenderOptions::viewer(&labels) };
+    opts.reveal_secrets = args.reveal;
     let rendered = render::render_snapshot_opts(&snapshot, args.filter.as_deref(), &opts);
     if let Some(note) = &rendered.labels_note {
         eprintln!("note: {note}");
@@ -1321,12 +1357,8 @@ impl std::ops::DerefMut for SdkSession {
     }
 }
 
-/// Take the camera lock, then load and initialise the SDK. The lock comes
-/// first because `InitializeSDK` (and the USB reset before it) is exactly the
-/// step that must not overlap another session (F2, F3 in
-/// docs/mcp-hardware-findings.md). Contention fails at once with
-/// "camera busy"; there is no wait or retry.
-fn open_sdk(bundle_path: &Path, no_usb_reset: bool) -> Result<SdkSession> {
+/// The refusal for an SDK bundle that is not there, shared by `open_sdk` and the commands that do work before it.
+fn require_sdk_bundle(bundle_path: &Path) -> Result<()> {
     if !bundle_path.exists() {
         bail!(
             "SDK bundle not found at {}.\n\
@@ -1334,6 +1366,16 @@ fn open_sdk(bundle_path: &Path, no_usb_reset: bool) -> Result<SdkSession> {
             bundle_path.display()
         );
     }
+    Ok(())
+}
+
+/// Take the camera lock, then load and initialise the SDK. The lock comes
+/// first because `InitializeSDK` (and the USB reset before it) is exactly the
+/// step that must not overlap another session (F2, F3 in
+/// docs/mcp-hardware-findings.md). Contention fails at once with
+/// "camera busy"; there is no wait or retry.
+fn open_sdk(bundle_path: &Path, no_usb_reset: bool) -> Result<SdkSession> {
+    require_sdk_bundle(bundle_path)?;
     let camera_lock = CameraLock::acquire()?;
     let mut sdk = Sdk::open(bundle_path)
         .with_context(|| format!("loading SDK from {}", bundle_path.display()))?;
@@ -1619,6 +1661,17 @@ fn cmd_baseline(sub: &BaselineCmd) -> Result<()> {
 
 fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &SnapshotArgs, no_usb_reset: bool) -> Result<()> {
     let mut json_out = nikon_fleet::json_out::JsonOut::redirect(args.json)?;
+    // The owner strings and FTP profiles come over raw PTP, which cannot share the interface with an open SDK
+    // session: read them first and let that session go before the SDK takes the camera. Failures are recorded in
+    // the snapshot, not raised. `--serial id-N` names a body by its SDK id, which the raw side cannot resolve; that
+    // case records the reason instead.
+    require_sdk_bundle(bundle)?;
+    let extended = if args.no_extended {
+        None
+    } else {
+        say(args.json, "Reading owner strings and FTP profiles…\n");
+        Some(nikon_fleet::extended::read_extended_for_serial(args.serial.as_deref()))
+    };
     let mut sdk = open_sdk(bundle, no_usb_reset)?;
     let devices = sdk.devices()?;
     if devices.is_empty() {
@@ -1655,6 +1708,10 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
         captured_at,
     );
     snap.label = args.label.clone();
+    let extended_summary = nikon_fleet::ops::capture_snapshot::attach_extended(&mut snap, extended);
+    if let Some(summary) = &extended_summary {
+        say(args.json, &extended_line(summary));
+    }
 
     let stats = capture_capabilities(&device, &name_lookup, &mut snap);
     say(
@@ -1689,11 +1746,26 @@ fn cmd_snapshot(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &Snaps
             snap.properties.len(),
             stats.clone(),
             verdict,
+            extended_summary,
         );
         json_out.emit(&serde_json::to_string_pretty(&outcome)?)?;
     }
     // Read-only and finished: leave without closing the session (F24).
     nikon_fleet::process_exit::exit_now(0)
+}
+
+/// The one status line for the extended section of a capture.
+fn extended_line(s: &nikon_fleet::extended::ExtendedSummary) -> String {
+    let ftp = match (s.ftp.as_str(), s.ftp_profiles) {
+        ("read", Some(n)) => format!("{n} FTP profile(s)"),
+        ("not_on_model", _) => "no FTP profiles on this model".to_string(),
+        _ => "FTP profiles not read".to_string(),
+    };
+    let dropped = s.dropped.as_deref().map(|d| format!("; NOT kept: {d}")).unwrap_or_default();
+    format!(
+        "  extended: {} propert(ies) read, {} not on this model, {} failed; {ftp}{dropped}\n",
+        s.props_read, s.props_not_supported, s.props_failed
+    )
 }
 
 /// Read one vendor-only property via raw USB PTP (`0x943B`), bypassing the
@@ -2023,6 +2095,43 @@ fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
 
 /// `vendor-get-prop`: one standard-PTP property read, printed as bytes (and as a string when the
 /// bytes are one). Read-only.
+fn cmd_vendor_read_iptc(args: &VendorReadIptcArgs) -> Result<()> {
+    let read = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        nikon_fleet::ptp_usb::read_iptc_slot_locked(lock, serial, args.slot)
+    })
+        .with_context(|| format!("reading IPTC slot {} (0x9412) over USB PTP", args.slot))?;
+    for w in &read.warnings {
+        eprintln!("warning: {w}");
+    }
+    println!("0x9412({}) returned {} byte(s), response params {:?}", args.slot, read.data.len(), read.response_params);
+    println!("{}", nikon_fleet::ptp_usb::hex_bytes(&read.data));
+    let (entries, rest) = split_length_prefixed(&read.data);
+    for (i, e) in entries.iter().enumerate() {
+        println!("entry {i}: {e:?}");
+    }
+    if !rest.is_empty() {
+        println!("{} byte(s) left over after the last whole entry: {}", rest.len(), nikon_fleet::ptp_usb::hex_bytes(rest));
+    }
+    Ok(())
+}
+
+/// Best-effort split of `[u32 LE length incl. NUL][bytes]` entries (the 0x9413 data-phase shape). Stops at the first entry that
+/// does not fit; the unsplit tail is returned so nothing is hidden.
+fn split_length_prefixed(data: &[u8]) -> (Vec<String>, &[u8]) {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 4 <= data.len() {
+        let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        if pos + 4 + len > data.len() {
+            break;
+        }
+        let body = &data[pos + 4..pos + 4 + len];
+        out.push(String::from_utf8_lossy(body.strip_suffix(&[0]).unwrap_or(body)).into_owned());
+        pos += 4 + len;
+    }
+    (out, &data[pos..])
+}
+
 fn cmd_vendor_get_prop(args: &VendorGetPropArgs) -> Result<()> {
     let read = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
         nikon_fleet::ptp_usb::get_device_prop_locked(lock, serial, args.prop, args.desc)
@@ -2712,7 +2821,8 @@ fn cmd_check(data_dir: &Path, bundle: &Path, schema_path: &Path, args: &CheckArg
     }
     let reference = Snapshot::load_from_file(&ref_path)?;
 
-    let d = diff_with_schema(&reference, &live, &DiffOptions::default(), &schema)?;
+    // The live capture is MAID only; a reference's extended section is not a difference from it.
+    let d = diff_with_schema(&reference, &live, &DiffOptions { skip_extended: true, ..Default::default() }, &schema)?;
     if args.json {
         // The same value the MCP worker's `check` op returns.
         let report = nikon_fleet::ops::check::CheckReport::new(live.camera.clone(), &reference, verdict, stats, d);
@@ -3960,6 +4070,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::VendorWriteFtpBlob(args) => cmd_vendor_write_ftp_blob(args),
         Cmd::VendorOpSupport(args) => cmd_vendor_op_support(args),
         Cmd::VendorGetProp(args) => cmd_vendor_get_prop(args),
+        Cmd::VendorReadIptc(args) => cmd_vendor_read_iptc(args),
         Cmd::VendorSetString(args) => cmd_vendor_set_string(args),
         Cmd::DiagReport(args) => cmd_diag_report(args),
         Cmd::VendorProbeOp(args) => cmd_vendor_probe_op(args),

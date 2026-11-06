@@ -352,7 +352,9 @@ pub fn notes() -> Vec<Note> {
         .detail(
             "Two attached bodies of the same model are refused for capture, so capture one, have the user unplug it and attach the other. \
              diff_snapshots ignores settings that change by themselves and enum default indexes unless `include_volatile` is set; \
-             results come counts first, then pages (`page.next`, when set, is the offset to continue at; it is null for `limit` 0 and on the last page).",
+             results come counts first, then pages (`page.next`, when set, is the offset to continue at; it is null for `limit` 0 and on the last page). \
+             Differences in the owner strings and FTP profiles come as `extended` entries after the property ones; a changed password or key is \
+             reported as changed, never with its value.",
         )
         .tags(&["snapshots"])
         .addresses(&["differences between two cameras", "compare bodies", "what is different", "diff", "two z 9s"]),

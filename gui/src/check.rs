@@ -606,6 +606,7 @@ mod tests {
             changed: (0..n_changed).map(|i| changed(&format!("P{i}"), 100 + i as u32, serde_json::json!(1), serde_json::json!(2))).collect(),
             only_in_a: only_a.iter().map(|n| format!("kNkMAIDCapability_{n}")).collect(),
             only_in_b: only_b.iter().map(|n| format!("kNkMAIDCapability_{n}")).collect(),
+            extended: Vec::new(),
             firmware_annotation: None,
         }
     }
