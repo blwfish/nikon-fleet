@@ -74,5 +74,16 @@ live capture is MAID only, so a reference's section would otherwise show as a di
   `0x9412(1)` returned 72 bytes: `01 00 00 00 c9 00 01 00 00 00` and zeros. That body held no IPTC text, so the field
   layout is not decoded. Needs one slot with known text (every field labelled with its own name, as in the July
   Z6III capture). `vendor-read-iptc --slot N` prints the bytes.
+- **IPTC write experiments on the Z 9 (2026-11-06; all empty-slot, baseline restored byte for byte).**
+  `vendor-write-iptc` writes a slot; `vendor-set-iptc-preset` selects `0xD060`.
+  - Slots 1..10 read as 72 bytes (`01 00 00 00 c9 00 01 00 00 00` then zeros); slots 11..13 read as 20 bytes
+    (`01 00 00 00 c9 00 02 00 00 00` then zeros): two record types, not one layout.
+  - Writing the 72 bytes just read: accepted, unchanged. Writing the Z6III-capture layout (two leading entries, `""`
+    and `"1"`, then 14 length-prefixed names): refused, `0xA210`. Writing the 72-byte header plus 14 length-prefixed
+    names: accepted, **ignored** (slot still empty).
+  - `0xD060` set to 1: `AccessDenied` (0x200F), though its descriptor says read-write, 0..13. Probably the camera
+    only selects or accepts a registered preset, and all thirteen here are empty.
+  - So the write layout is still unknown. The way forward is ground truth: one preset typed in at the camera, then read
+    with `vendor-read-iptc`, then a modified copy written back.
 - **Other bodies.** Only a Z 9 has been captured with this section. Z6III (expect 5 properties, FTP) and Z 5 (expect
   `not_supported` for the IPTC preset at least, FTP `not_on_model`) still need a run each.

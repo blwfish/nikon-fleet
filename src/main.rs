@@ -227,6 +227,15 @@ enum Cmd {
     /// bytes it returns as hex, plus a best-effort split into `[u32 length][UTF-8]` entries. Never sent over USB before
     /// 2026-11-06. Changes nothing on the camera.
     VendorReadIptc(VendorReadIptcArgs),
+    /// EXPERIMENTAL. Write one IPTC slot with `0x9413(<slot>)`. Each `--entry` is one `[u32 length][UTF-8]` entry of the
+    /// data phase, in order (an empty string is an empty entry). The slot is read first and again after, in the same
+    /// session, and both are printed. It changes the camera. Confirmed only on a Z6III by replaying a captured blob; any
+    /// other model needs `--force-unconfirmed-model`. `--dry-run` prints the data phase and sends nothing.
+    VendorWriteIptc(VendorWriteIptcArgs),
+    /// EXPERIMENTAL. Select the IPTC preset (`0xD060`, 0..=13; 0 is none) with the standard `SetDevicePropValue`, and read
+    /// it back. This changes which IPTC profile the camera embeds in photos. The value before is printed so it can be put
+    /// back. Confirmed only on a Z6III; any other model needs `--force-unconfirmed-model`.
+    VendorSetIptcPreset(VendorSetIptcPresetArgs),
     #[command(after_help = VENDOR_SET_STRING_HELP)]
     /// EXPERIMENTAL. Write one string property (0xD072 Artist, 0xD073 Copyright, 0xD090 Image
     /// comment) with the standard PTP `SetDevicePropValue` (0x1016), then read it back and say whether
@@ -757,6 +766,39 @@ struct VendorReadIptcArgs {
     /// The IPTC slot (NX Field read slot 1; it also sent 0 when its IPTC screen opened).
     #[arg(long, default_value_t = 1, value_parser = nikon_fleet::ptp_usb::parse_u32_number)]
     slot: u32,
+    /// Camera serial to target; same rules as vendor-read's --serial.
+    #[arg(long)]
+    serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct VendorWriteIptcArgs {
+    #[arg(long, default_value_t = 1, value_parser = nikon_fleet::ptp_usb::parse_u32_number)]
+    slot: u32,
+    /// One entry of the data phase; repeat the flag, in order. Use `--entry ''` for an empty one.
+    #[arg(long = "entry", allow_hyphen_values = true)]
+    entries: Vec<String>,
+    /// Send these bytes as the data phase instead of encoding `--entry` values: hex digits, spaces allowed.
+    #[arg(long, conflicts_with = "entries")]
+    data_hex: Option<String>,
+    /// Print the data phase and send nothing (nothing is read from the camera either).
+    #[arg(long)]
+    dry_run: bool,
+    /// Write to a model an IPTC write has not been confirmed on.
+    #[arg(long)]
+    force_unconfirmed_model: bool,
+    /// Camera serial to target; same rules as vendor-read's --serial.
+    #[arg(long)]
+    serial: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct VendorSetIptcPresetArgs {
+    /// 0 (none) to 13.
+    #[arg(value_parser = clap::value_parser!(u8).range(0..=13))]
+    preset: u8,
+    #[arg(long)]
+    force_unconfirmed_model: bool,
     /// Camera serial to target; same rules as vendor-read's --serial.
     #[arg(long)]
     serial: Option<String>,
@@ -2095,6 +2137,60 @@ fn ftp_probe_text(p: &nikon_fleet::ptp_usb::FtpOpProbe) -> String {
 
 /// `vendor-get-prop`: one standard-PTP property read, printed as bytes (and as a string when the
 /// bytes are one). Read-only.
+fn print_iptc_bytes(data: &[u8]) {
+    println!("{} byte(s): {}", data.len(), nikon_fleet::ptp_usb::hex_bytes(data));
+    let (entries, rest) = split_length_prefixed(data);
+    for (i, e) in entries.iter().enumerate() {
+        println!("  entry {i}: {e:?}");
+    }
+    if !rest.is_empty() {
+        println!("  {} byte(s) after the last whole entry: {}", rest.len(), nikon_fleet::ptp_usb::hex_bytes(rest));
+    }
+}
+
+fn cmd_vendor_set_iptc_preset(args: &VendorSetIptcPresetArgs) -> Result<()> {
+    let r = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        nikon_fleet::ptp_usb::set_iptc_preset_locked(lock, serial, args.preset, args.force_unconfirmed_model)
+    })
+    .context("selecting the IPTC preset (0xD060) over USB PTP; if the reply never came the camera MAY have changed: read it with vendor-get-prop 0xD060")?;
+    println!("0xD060 was {}; wrote {}", nikon_fleet::ptp_usb::hex_bytes(&r.previous), r.written);
+    match &r.read_back {
+        Ok(b) => println!("read back {}: {}", nikon_fleet::ptp_usb::hex_bytes(b), if r.verified() { "verified" } else { "NOT what was written" }),
+        Err(e) => println!("could not be read back: {e}"),
+    }
+    if r.verified() {
+        Ok(())
+    } else {
+        Err(ExitCodeError { code: EXIT_WRITE_INDETERMINATE, message: "the camera answered OK but the read-back does not confirm the preset".to_string() }.into())
+    }
+}
+
+fn cmd_vendor_write_iptc(args: &VendorWriteIptcArgs) -> Result<()> {
+    let entries: Vec<&str> = args.entries.iter().map(String::as_str).collect();
+    let data = match &args.data_hex {
+        Some(hex) => nikon_fleet::extended::hex_decode(&hex.split_whitespace().collect::<String>())
+            .map_err(|e| anyhow::anyhow!("--data-hex: {e}"))?,
+        None => nikon_fleet::ptp_usb::encode_iptc_entries(&entries),
+    };
+    println!("data phase for 0x9413({}):", args.slot);
+    print_iptc_bytes(&data);
+    if args.dry_run {
+        return Ok(());
+    }
+    let out = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
+        nikon_fleet::ptp_usb::write_iptc_slot_locked(lock, serial, args.slot, &data, args.force_unconfirmed_model)
+    })
+    .with_context(|| format!("writing IPTC slot {} (0x9413) over USB PTP; if the reply never came the camera MAY have changed: read the slot again with vendor-read-iptc", args.slot))?;
+    println!("\nbefore:");
+    print_iptc_bytes(&out.before.data);
+    println!("\n0x9413 answered OK (response params {:?})\n\nafter:", out.response_params);
+    match &out.after {
+        Ok(after) => print_iptc_bytes(&after.data),
+        Err(e) => println!("  could not be read back: {e}"),
+    }
+    Ok(())
+}
+
 fn cmd_vendor_read_iptc(args: &VendorReadIptcArgs) -> Result<()> {
     let read = with_vendor_camera(args.serial.as_deref(), |lock, serial| {
         nikon_fleet::ptp_usb::read_iptc_slot_locked(lock, serial, args.slot)
@@ -4071,6 +4167,8 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::VendorOpSupport(args) => cmd_vendor_op_support(args),
         Cmd::VendorGetProp(args) => cmd_vendor_get_prop(args),
         Cmd::VendorReadIptc(args) => cmd_vendor_read_iptc(args),
+        Cmd::VendorWriteIptc(args) => cmd_vendor_write_iptc(args),
+        Cmd::VendorSetIptcPreset(args) => cmd_vendor_set_iptc_preset(args),
         Cmd::VendorSetString(args) => cmd_vendor_set_string(args),
         Cmd::DiagReport(args) => cmd_diag_report(args),
         Cmd::VendorProbeOp(args) => cmd_vendor_probe_op(args),

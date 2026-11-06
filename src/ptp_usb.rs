@@ -115,6 +115,16 @@ const OP_SET_DEVICE_PROP_VALUE: u16 = 0x1016;
 /// `0x9412` — IPTC profile read, the pair of `0x9413` (write). One param, the slot (NX Field sent `1`, and `0` when
 /// the IPTC screen opened); the data phase is the profile. Never sent over USB before 2026-11-06.
 const OP_IPTC_READ: u16 = 0x9412;
+/// `0x9413` — IPTC profile write. One param, the slot; data-out is the profile as `[u32 length incl. NUL][UTF-8][NUL]`
+/// entries (length 0: empty, no bytes). Worked over USB on a Z6III by replaying a captured blob (2026-09-06); the
+/// layout of the leading entries is inferred, not confirmed.
+const OP_IPTC_WRITE: u16 = 0x9413;
+/// Models an IPTC write has been confirmed on. Anything else needs the explicit override.
+pub const IPTC_WRITE_CONFIRMED_MODELS: &[&str] = &["Z6_3"];
+/// The IPTC preset selector, the one property `set_iptc_preset` writes: a u8, read-write, 0..=13 on a Z 9 and a Z6III.
+const PROP_IPTC_PRESET: u16 = 0xD060;
+/// The highest value the selector takes (13 presets; 0 is none).
+pub const IPTC_PRESET_MAX: u8 = 13;
 /// `0x943B` — generic vendor-property read wrapper. Param is
 /// `0x10000 | propcode`; response data is the property's raw bytes.
 const OP_VENDOR_PROP_READ: u16 = 0x943B;
@@ -2014,6 +2024,46 @@ pub struct PropWriteReceipt {
     pub warnings: Vec<String>,
 }
 
+/// What [`PtpUsbSession::write_iptc_slot`] saw: the slot before, the camera's answer to the write, the slot after.
+#[derive(Debug)]
+pub struct IptcWriteOutcome {
+    pub before: VendorRead,
+    pub response_params: Vec<u32>,
+    /// `Err` when the read after an accepted write failed: the write still happened.
+    pub after: Result<VendorRead, PtpUsbError>,
+}
+
+/// IPTC entries as the `0x9413` data phase carries them: each `[u32 LE length incl. NUL][UTF-8][NUL]`, an empty one
+/// just a zero length.
+pub fn encode_iptc_entries(entries: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for e in entries {
+        if e.is_empty() {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            out.extend_from_slice(&(e.len() as u32 + 1).to_le_bytes());
+            out.extend_from_slice(e.as_bytes());
+            out.push(0);
+        }
+    }
+    out
+}
+
+/// What [`PtpUsbSession::set_iptc_preset`] did. `Ok` from the camera is not proof: compare `read_back` with `written`.
+#[derive(Debug)]
+pub struct IptcPresetReceipt {
+    /// The selector's bytes before the write: what to write back to undo it.
+    pub previous: Vec<u8>,
+    pub written: u8,
+    pub read_back: Result<Vec<u8>, PtpUsbError>,
+}
+
+impl IptcPresetReceipt {
+    pub fn verified(&self) -> bool {
+        matches!(&self.read_back, Ok(b) if b == &[self.written])
+    }
+}
+
 /// What a vendor-property read returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VendorRead {
@@ -2916,6 +2966,52 @@ impl<T: BulkTransport> PtpUsbSession<T> {
         Ok(VendorRead { data: reply.data, response_params: reply.params, warnings })
     }
 
+    /// EXPERIMENTAL. `0x9412(slot)`, then `0x9413(slot)` with `data`, then `0x9412(slot)` again, in one session: what
+    /// the slot held, whether the camera accepted the write, and what it holds now. Nothing is verified or interpreted.
+    /// Refused before anything is sent for a model outside [`IPTC_WRITE_CONFIRMED_MODELS`] unless
+    /// `force_unconfirmed_model`. A reply that never came is an `Err` and the camera MAY have changed; read the slot
+    /// again in a new session.
+    pub fn write_iptc_slot(
+        &mut self,
+        slot: u32,
+        data: &[u8],
+        force_unconfirmed_model: bool,
+    ) -> Result<IptcWriteOutcome, PtpUsbError> {
+        if !force_unconfirmed_model && !IPTC_WRITE_CONFIRMED_MODELS.contains(&self.model()) {
+            return Err(PtpUsbError::UnconfirmedModel(self.model().to_string()));
+        }
+        let before = self.read_iptc_slot(slot)?;
+        let reply = self.transact(OP_IPTC_WRITE, &[slot], Some(data), TxidCheck::Unchecked)?;
+        Self::require_ok(OP_IPTC_WRITE, reply.code)?;
+        let after = self.read_iptc_slot(slot);
+        Ok(IptcWriteOutcome { before, response_params: reply.params, after })
+    }
+
+    /// EXPERIMENTAL. Select the IPTC preset (`0xD060`, 0..=[`IPTC_PRESET_MAX`]) with `SetDevicePropValue`: the value
+    /// before, the write, and the value read back. This changes which IPTC profile the camera embeds in photos; the
+    /// caller keeps `previous` to put it back. The value is range-checked before anything is sent, and the model gate
+    /// is the IPTC write's ([`IPTC_WRITE_CONFIRMED_MODELS`], overridable).
+    pub fn set_iptc_preset(&mut self, value: u8, force_unconfirmed_model: bool) -> Result<IptcPresetReceipt, PtpUsbError> {
+        let bad = |why: String| PtpUsbError::PropValueBad { propcode: PROP_IPTC_PRESET, why };
+        if value > IPTC_PRESET_MAX {
+            return Err(bad(format!("{value} is above the highest preset, {IPTC_PRESET_MAX}")));
+        }
+        if !force_unconfirmed_model && !IPTC_WRITE_CONFIRMED_MODELS.contains(&self.model()) {
+            return Err(PtpUsbError::UnconfirmedModel(self.model().to_string()));
+        }
+        let previous = self.get_device_prop_value(PROP_IPTC_PRESET)?.data;
+        let reply = match self.transact(OP_SET_DEVICE_PROP_VALUE, &[u32::from(PROP_IPTC_PRESET)], Some(&[value]), TxidCheck::Enforce) {
+            Ok(reply) => reply,
+            Err(e) if self.data_phase_started => {
+                return Err(PtpUsbError::PropWriteIndeterminate { propcode: PROP_IPTC_PRESET, cause: Box::new(e) })
+            }
+            Err(e) => return Err(e),
+        };
+        Self::require_ok(OP_SET_DEVICE_PROP_VALUE, reply.code)?;
+        let read_back = self.get_device_prop_value(PROP_IPTC_PRESET).map(|r| r.data);
+        Ok(IptcPresetReceipt { previous, written: value, read_back })
+    }
+
     /// Standard `GetDevicePropValue` (`0x1015`): the property's value bytes, undecoded. Read-only.
     /// This is the generic PTP path, distinct from the `0x943B` wrapper ([`Self::read_vendor_property`]):
     /// on a Z 9 `0x943B` answers `DevicePropNotSupported` for the artist and image-comment strings, so
@@ -3812,6 +3908,29 @@ pub fn get_device_prop_locked(
 pub fn read_iptc_slot_locked(lock: CameraLock, serial: Option<&str>, slot: u32) -> Result<VendorRead, PtpUsbError> {
     let mut session = PtpUsbSession::open_locked(lock, serial)?;
     session.read_iptc_slot(slot)
+}
+
+/// [`PtpUsbSession::write_iptc_slot`] for a caller already holding the [`CameraLock`]. WRITES TO THE CAMERA.
+pub fn write_iptc_slot_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    slot: u32,
+    data: &[u8],
+    force_unconfirmed_model: bool,
+) -> Result<IptcWriteOutcome, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.write_iptc_slot(slot, data, force_unconfirmed_model)
+}
+
+/// [`PtpUsbSession::set_iptc_preset`] for a caller already holding the [`CameraLock`]. WRITES TO THE CAMERA.
+pub fn set_iptc_preset_locked(
+    lock: CameraLock,
+    serial: Option<&str>,
+    value: u8,
+    force_unconfirmed_model: bool,
+) -> Result<IptcPresetReceipt, PtpUsbError> {
+    let mut session = PtpUsbSession::open_locked(lock, serial)?;
+    session.set_iptc_preset(value, force_unconfirmed_model)
 }
 
 /// [`PtpUsbSession::set_string_property`] for a caller already holding the [`CameraLock`].
@@ -5036,6 +5155,77 @@ mod tests {
     #[test]
     fn hex_bytes_empty_input() {
         assert_eq!(hex_bytes(&[]), "");
+    }
+
+    #[test]
+    fn iptc_entries_are_length_prefixed_with_the_nul_counted_and_an_empty_one_is_just_a_zero() {
+        assert_eq!(encode_iptc_entries(&[]), Vec::<u8>::new());
+        assert_eq!(encode_iptc_entries(&[""]), [0, 0, 0, 0]);
+        assert_eq!(encode_iptc_entries(&["1"]), [2, 0, 0, 0, b'1', 0]);
+        assert_eq!(encode_iptc_entries(&["", "ab", ""]), [0, 0, 0, 0, 3, 0, 0, 0, b'a', b'b', 0, 0, 0, 0, 0]);
+        // Length counts bytes, not characters.
+        assert_eq!(encode_iptc_entries(&["é"]), [3, 0, 0, 0, 0xC3, 0xA9, 0]);
+    }
+
+    #[test]
+    fn an_iptc_write_reads_the_slot_sends_the_data_then_reads_it_again() {
+        let (mut s, t) = session(
+            vec![
+                data_c(OP_IPTC_READ, &[1, 2]),
+                resp(RESP_OK),
+                resp(RESP_OK),
+                data_c(OP_IPTC_READ, &[3, 4, 5]),
+                resp(RESP_OK),
+            ],
+            "Z6_3",
+        );
+        let out = s.write_iptc_slot(1, &[9, 9], false).unwrap();
+        assert_eq!(out.before.data, [1, 2]);
+        assert_eq!(out.after.unwrap().data, [3, 4, 5]);
+        let sent = t.sent();
+        let write = sent.iter().find(|(kind, op, ..)| *kind == CONTAINER_DATA && *op == OP_IPTC_WRITE).expect("data-out sent");
+        assert_eq!(write.3, [9, 9]);
+        let cmds: Vec<u16> = sent.iter().filter(|(k, ..)| *k == CONTAINER_COMMAND).map(|c| c.1).collect();
+        assert_eq!(cmds, [OP_IPTC_READ, OP_IPTC_WRITE, OP_IPTC_READ], "read, write, read");
+    }
+
+    #[test]
+    fn an_iptc_write_to_an_unconfirmed_model_sends_nothing_unless_forced() {
+        let (mut s, t) = session(vec![], "Z 9");
+        assert!(matches!(s.write_iptc_slot(1, &[1], false).unwrap_err(), PtpUsbError::UnconfirmedModel(m) if m == "Z 9"));
+        assert!(t.sent().is_empty(), "refused before any I/O");
+        for model in ["Z6_3"] {
+            assert!(IPTC_WRITE_CONFIRMED_MODELS.contains(&model));
+        }
+        assert_eq!(IPTC_WRITE_CONFIRMED_MODELS, ["Z6_3"], "the list is exactly what was confirmed");
+    }
+
+    #[test]
+    fn the_iptc_preset_is_range_checked_and_gated_before_anything_is_sent() {
+        // At the edge: 13 passes the range check (and then meets the model gate), 14 does not.
+        let (mut s, t) = session(vec![], "Z 9");
+        assert!(matches!(s.set_iptc_preset(14, true).unwrap_err(), PtpUsbError::PropValueBad { .. }), "14 is above the highest preset");
+        assert!(matches!(s.set_iptc_preset(13, false).unwrap_err(), PtpUsbError::UnconfirmedModel(_)), "13 is in range; the model is not confirmed");
+        assert!(t.sent().is_empty());
+    }
+
+    #[test]
+    fn selecting_an_iptc_preset_reads_writes_and_reads_back() {
+        let (mut s, t) = session(
+            vec![data_c(OP_GET_DEVICE_PROP_VALUE, &[0]), resp(RESP_OK), resp(RESP_OK), data_c(OP_GET_DEVICE_PROP_VALUE, &[1]), resp(RESP_OK)],
+            "Z6_3",
+        );
+        let r = s.set_iptc_preset(1, false).unwrap();
+        assert_eq!((r.previous.clone(), r.written, r.verified()), (vec![0], 1, true));
+        let sent = t.sent();
+        let set = sent.iter().find(|(k, op, ..)| *k == CONTAINER_DATA && *op == OP_SET_DEVICE_PROP_VALUE).expect("value sent");
+        assert_eq!(set.3, [1]);
+        // A read-back that disagrees is not verified.
+        let (mut s, _t) = session(
+            vec![data_c(OP_GET_DEVICE_PROP_VALUE, &[0]), resp(RESP_OK), resp(RESP_OK), data_c(OP_GET_DEVICE_PROP_VALUE, &[0]), resp(RESP_OK)],
+            "Z6_3",
+        );
+        assert!(!s.set_iptc_preset(1, false).unwrap().verified());
     }
 
     // ── model gate ───────────────────────────────────────────────────────
