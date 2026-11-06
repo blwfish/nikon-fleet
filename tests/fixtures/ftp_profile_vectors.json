@@ -1,0 +1,1904 @@
+{
+ "_about": "Golden vectors shared by tests/ftp_profile_python_parity.rs (the Rust decoder in src/ptp_usb.rs) and scripts/test_ptpip_read_ftp.py (the Python decoder in scripts/ptpip_read_ftp.py). The profile blobs are the real Z 9 captures and camera-read profiles from the Rust decoder's own tests (placeholder names/credentials); `expected` is checked by BOTH decoders. `rejects` are edits of the `reference` blob; `what`/`offset` are the Rust error's field and byte offset and both decoders must report exactly them. `truncations.errors[i]` is the (what, offset) of the reference blob cut to i bytes.",
+ "write_confirmed_models": [
+  "Z 9",
+  "Z6_3"
+ ],
+ "profiles": [
+  {
+   "name": "reference",
+   "about": "the reference blob (profile CLAUDE) from the 2026-07-09 pcap",
+   "hex": "f4010743004c00410055004400450000001030003000300030003000300030003000540030003000300030003000300000001030003000300030003000300030003000540030003000300030003000300000000203035742a8c0180000000000000000030001000b0000006e696b6f6e2d736e6f6f700404090000006e696b6f6e3567687a010d3100390032002e003100360038002e00360036002e003100000000150005000000666c6565740800000031323334353637380500901f000000000027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a303030304027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303081",
+   "expected": {
+    "profile_name": "CLAUDE",
+    "timestamps": [
+     "00000000T000000",
+     "00000000T000000"
+    ],
+    "camera_ipv4": [
+     192,
+     168,
+     66,
+     87
+    ],
+    "prefix_len": 24,
+    "ssid24_lead": 3,
+    "ssid24_kind": 1,
+    "ssid_24ghz": "nikon-snoop",
+    "ssid5_kind": 4,
+    "ssid_5ghz": "nikon5ghz",
+    "host": "192.168.66.1",
+    "folder": "",
+    "ftp_port": 21,
+    "username": "fleet",
+    "password": "12345678",
+    "option_flags": 5,
+    "second_port": 8080,
+    "ipv6_fields": [
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000"
+    ]
+   }
+  },
+  {
+   "name": "z9_317",
+   "about": "317-byte Z 9 blob, profile C2, empty folder",
+   "hex": "f401034300320000001030003000300030003000300030003000540030003000300030003000300000001030003000300030003000300030003000540030003000300030003000300000000203035742a8c0180000000000000000030001000b0000006e696b6f6e2d736e6f6f700404090000006e696b6f6e3567687a010d3100390032002e003100360038002e00360036002e003100000000150005000000666c6565740800000031323334353637380500901f000000000027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a303030304027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303081",
+   "expected": {
+    "profile_name": "C2",
+    "timestamps": [
+     "00000000T000000",
+     "00000000T000000"
+    ],
+    "camera_ipv4": [
+     192,
+     168,
+     66,
+     87
+    ],
+    "prefix_len": 24,
+    "ssid24_lead": 3,
+    "ssid24_kind": 1,
+    "ssid_24ghz": "nikon-snoop",
+    "ssid5_kind": 4,
+    "ssid_5ghz": "nikon5ghz",
+    "host": "192.168.66.1",
+    "folder": "",
+    "ftp_port": 21,
+    "username": "fleet",
+    "password": "12345678",
+    "option_flags": 5,
+    "second_port": 8080,
+    "ipv6_fields": [
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000"
+    ]
+   }
+  },
+  {
+   "name": "z9_331_folder",
+   "about": "331-byte Z 9 blob with a destination folder",
+   "hex": "f401034300320000001030003000300030003000300030003000540030003000300030003000300000001030003000300030003000300030003000540030003000300030003000300000000203035742a8c0180000000000000000030001000b0000006e696b6f6e2d736e6f6f700404090000006e696b6f6e3567687a010d3100390032002e003100360038002e00360036002e00310000000743006c0061007500640065000000150005000000666c6565740800000031323334353637380100901f000000000027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a303030304027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303081",
+   "expected": {
+    "profile_name": "C2",
+    "timestamps": [
+     "00000000T000000",
+     "00000000T000000"
+    ],
+    "camera_ipv4": [
+     192,
+     168,
+     66,
+     87
+    ],
+    "prefix_len": 24,
+    "ssid24_lead": 3,
+    "ssid24_kind": 1,
+    "ssid_24ghz": "nikon-snoop",
+    "ssid5_kind": 4,
+    "ssid_5ghz": "nikon5ghz",
+    "host": "192.168.66.1",
+    "folder": "Claude",
+    "ftp_port": 21,
+    "username": "fleet",
+    "password": "12345678",
+    "option_flags": 1,
+    "second_port": 8080,
+    "ipv6_fields": [
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000"
+    ]
+   }
+  },
+  {
+   "name": "sftp_port22",
+   "about": "port-22 SFTP-style profile, option flags 0x0d, /22 network",
+   "hex": "f4010a500052004f00460049004c0045002d00420000001030003000300030003000300030003000540030003000300030003000300000001030003000300030003000300030003000540030003000300030003000300000000203035344a8c01600000000000000000300010006000000737369642d61040406000000737369642d6201106600740070002e006500780061006d0070006c0065002e0063006f006d00000000160004000000757365720800000070617373313233340d00901f000000000027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a303030304027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303081",
+   "expected": {
+    "profile_name": "PROFILE-B",
+    "timestamps": [
+     "00000000T000000",
+     "00000000T000000"
+    ],
+    "camera_ipv4": [
+     192,
+     168,
+     68,
+     83
+    ],
+    "prefix_len": 22,
+    "ssid24_lead": 3,
+    "ssid24_kind": 1,
+    "ssid_24ghz": "ssid-a",
+    "ssid5_kind": 4,
+    "ssid_5ghz": "ssid-b",
+    "host": "ftp.example.com",
+    "folder": "",
+    "ftp_port": 22,
+    "username": "user",
+    "password": "pass1234",
+    "option_flags": 13,
+    "second_port": 8080,
+    "ipv6_fields": [
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000"
+    ]
+   }
+  },
+  {
+   "name": "hotspot_anonymous",
+   "about": "phone-hotspot profile: 5 GHz tag 06 04, empty login",
+   "hex": "f4010a500052004f00460049004c0045002d0043000000103000300030003000300030003000300054003000300030003000300030000000103000300030003000300030003000300054003000300030003000300030000000020303fb00000a180000000000000000030001000400000061702d6106040400000070772d62010b310030002e0030002e0030002e00310030003700000000ad0800000000000000000700901f000000000027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a303030304027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303081",
+   "expected": {
+    "profile_name": "PROFILE-C",
+    "timestamps": [
+     "00000000T000000",
+     "00000000T000000"
+    ],
+    "camera_ipv4": [
+     10,
+     0,
+     0,
+     251
+    ],
+    "prefix_len": 24,
+    "ssid24_lead": 3,
+    "ssid24_kind": 1,
+    "ssid_24ghz": "ap-a",
+    "ssid5_kind": 6,
+    "ssid_5ghz": "pw-b",
+    "host": "10.0.0.107",
+    "folder": "",
+    "ftp_port": 2221,
+    "username": "",
+    "password": "",
+    "option_flags": 7,
+    "second_port": 8080,
+    "ipv6_fields": [
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000"
+    ]
+   }
+  },
+  {
+   "name": "hotspot_no_address",
+   "about": "hotspot profile with no camera address, 2.4 GHz tag 03 00 30 00",
+   "hex": "f4010a500052004f00460049004c0045002d004400000010300030003000300030003000300030005400300030003000300030003000000010300030003000300030003000300030005400300030003000300030003000000002030300000000000000000000000000030030000400000061702d6406040400000070772d64010c3100390032002e0030002e0032002e00320034003300000000ad08000000000000000007000000000000000027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a303030304027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303027000000303030303a303030303a303030303a303030303a303030303a303030303a303030303a3030303081",
+   "expected": {
+    "profile_name": "PROFILE-D",
+    "timestamps": [
+     "00000000T000000",
+     "00000000T000000"
+    ],
+    "camera_ipv4": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "prefix_len": 0,
+    "ssid24_lead": 3,
+    "ssid24_kind": 48,
+    "ssid_24ghz": "ap-d",
+    "ssid5_kind": 6,
+    "ssid_5ghz": "pw-d",
+    "host": "192.0.2.243",
+    "folder": "",
+    "ftp_port": 2221,
+    "username": "",
+    "password": "",
+    "option_flags": 7,
+    "second_port": 0,
+    "ipv6_fields": [
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000",
+     "0000:0000:0000:0000:0000:0000:0000:0000"
+    ]
+   }
+  }
+ ],
+ "rejects": [
+  {
+   "name": "empty_blob",
+   "base": "reference",
+   "edit": {
+    "truncate": 0
+   },
+   "what": "blob header",
+   "offset": 0
+  },
+  {
+   "name": "header_wrong",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      0,
+      "f5"
+     ]
+    ]
+   },
+   "what": "blob header",
+   "offset": 0
+  },
+  {
+   "name": "trailing_byte",
+   "base": "reference",
+   "edit": {
+    "append": "00"
+   },
+   "what": "blob end",
+   "offset": 325
+  },
+  {
+   "name": "name_embedded_nul",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      7,
+      "00"
+     ]
+    ]
+   },
+   "what": "profile name",
+   "offset": 2
+  },
+  {
+   "name": "name_missing_terminator",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      15,
+      "41"
+     ]
+    ]
+   },
+   "what": "profile name",
+   "offset": 2
+  },
+  {
+   "name": "name_unpaired_surrogate",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      3,
+      "00"
+     ],
+     [
+      4,
+      "d8"
+     ]
+    ]
+   },
+   "what": "profile name",
+   "offset": 2
+  },
+  {
+   "name": "network_tag_wrong",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      83,
+      "03"
+     ]
+    ]
+   },
+   "what": "network tag",
+   "offset": 83
+  },
+  {
+   "name": "ssid24_lead_bad",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      99,
+      "02"
+     ]
+    ]
+   },
+   "what": "2.4 GHz SSID tag",
+   "offset": 99
+  },
+  {
+   "name": "ssid24_tag_byte1_bad",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      100,
+      "01"
+     ]
+    ]
+   },
+   "what": "2.4 GHz SSID tag",
+   "offset": 99
+  },
+  {
+   "name": "ssid24_tag_byte3_bad",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      102,
+      "01"
+     ]
+    ]
+   },
+   "what": "2.4 GHz SSID tag",
+   "offset": 99
+  },
+  {
+   "name": "ssid24_length_exceeds_blob",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      103,
+      "ffffffff"
+     ]
+    ]
+   },
+   "what": "2.4 GHz SSID",
+   "offset": 103
+  },
+  {
+   "name": "ssid24_length_one_past_the_end",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      103,
+      "c0010000"
+     ]
+    ]
+   },
+   "what": "2.4 GHz SSID",
+   "offset": 103
+  },
+  {
+   "name": "ssid24_non_ascii",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      107,
+      "c3"
+     ]
+    ]
+   },
+   "what": "2.4 GHz SSID",
+   "offset": 103
+  },
+  {
+   "name": "ssid5_tag_bad",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      119,
+      "05"
+     ]
+    ]
+   },
+   "what": "5 GHz SSID tag",
+   "offset": 118
+  },
+  {
+   "name": "host_tag_bad",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      133,
+      "02"
+     ]
+    ]
+   },
+   "what": "host tag",
+   "offset": 133
+  },
+  {
+   "name": "port_section_padding_nonzero",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      189,
+      "01"
+     ]
+    ]
+   },
+   "what": "port-section padding",
+   "offset": 189
+  },
+  {
+   "name": "ipv6_field1_length_exceeds_blob",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      194,
+      "ffffffff"
+     ]
+    ]
+   },
+   "what": "IPv6 field 1",
+   "offset": 194
+  },
+  {
+   "name": "ipv6_separator_bad",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      237,
+      "41"
+     ]
+    ]
+   },
+   "what": "IPv6 separator",
+   "offset": 237
+  },
+  {
+   "name": "ipv6_field3_length_exceeds_blob",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      281,
+      "ffffffff"
+     ]
+    ]
+   },
+   "what": "IPv6 field 3",
+   "offset": 281
+  },
+  {
+   "name": "trailer_bad",
+   "base": "reference",
+   "edit": {
+    "set": [
+     [
+      324,
+      "80"
+     ]
+    ]
+   },
+   "what": "blob trailer",
+   "offset": 324
+  }
+ ],
+ "truncations": {
+  "base": "reference",
+  "errors": [
+   [
+    "blob header",
+    0
+   ],
+   [
+    "blob header",
+    0
+   ],
+   [
+    "profile name",
+    2
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "profile name",
+    3
+   ],
+   [
+    "timestamp 1",
+    17
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 1",
+    18
+   ],
+   [
+    "timestamp 2",
+    50
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "timestamp 2",
+    51
+   ],
+   [
+    "network tag",
+    83
+   ],
+   [
+    "network tag",
+    83
+   ],
+   [
+    "network tag",
+    83
+   ],
+   [
+    "camera address",
+    86
+   ],
+   [
+    "camera address",
+    86
+   ],
+   [
+    "camera address",
+    86
+   ],
+   [
+    "camera address",
+    86
+   ],
+   [
+    "camera prefix length",
+    90
+   ],
+   [
+    "network padding",
+    91
+   ],
+   [
+    "network padding",
+    91
+   ],
+   [
+    "network padding",
+    91
+   ],
+   [
+    "network padding",
+    91
+   ],
+   [
+    "network padding",
+    91
+   ],
+   [
+    "network padding",
+    91
+   ],
+   [
+    "network padding",
+    91
+   ],
+   [
+    "network padding",
+    91
+   ],
+   [
+    "2.4 GHz SSID tag",
+    99
+   ],
+   [
+    "2.4 GHz SSID tag",
+    99
+   ],
+   [
+    "2.4 GHz SSID tag",
+    99
+   ],
+   [
+    "2.4 GHz SSID tag",
+    99
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "2.4 GHz SSID",
+    103
+   ],
+   [
+    "5 GHz SSID tag",
+    118
+   ],
+   [
+    "5 GHz SSID tag",
+    118
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "5 GHz SSID",
+    120
+   ],
+   [
+    "host tag",
+    133
+   ],
+   [
+    "host",
+    134
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "host",
+    135
+   ],
+   [
+    "folder",
+    161
+   ],
+   [
+    "FTP port",
+    162
+   ],
+   [
+    "FTP port",
+    162
+   ],
+   [
+    "username",
+    164
+   ],
+   [
+    "username",
+    164
+   ],
+   [
+    "username",
+    164
+   ],
+   [
+    "username",
+    164
+   ],
+   [
+    "username",
+    164
+   ],
+   [
+    "username",
+    164
+   ],
+   [
+    "username",
+    164
+   ],
+   [
+    "username",
+    164
+   ],
+   [
+    "username",
+    164
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "password",
+    173
+   ],
+   [
+    "option flags",
+    185
+   ],
+   [
+    "option flags",
+    185
+   ],
+   [
+    "second port",
+    187
+   ],
+   [
+    "second port",
+    187
+   ],
+   [
+    "port-section padding",
+    189
+   ],
+   [
+    "port-section padding",
+    189
+   ],
+   [
+    "port-section padding",
+    189
+   ],
+   [
+    "port-section padding",
+    189
+   ],
+   [
+    "port-section padding",
+    189
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 field 1",
+    194
+   ],
+   [
+    "IPv6 separator",
+    237
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 2",
+    238
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "IPv6 field 3",
+    281
+   ],
+   [
+    "blob trailer",
+    324
+   ]
+  ]
+ },
+ "infos": [
+  {
+   "name": "three_profiles_slot0",
+   "hex": "c800030000001400000000000000abababababababababababababababab0c5a005f0039005f0030003000300030003000300031000000f401",
+   "expected": {
+    "header": 200,
+    "count": 3,
+    "limit": 20,
+    "slot": 0,
+    "guid": "abababababababababababababababab",
+    "device_name": "Z_9_0000001",
+    "trailer": 500
+   }
+  },
+  {
+   "name": "no_active_slot",
+   "hex": "c8000600000014000000ff000000abababababababababababababababab0d5a0036005f0033005f0030003000300030003000300032000000f401",
+   "expected": {
+    "header": 200,
+    "count": 6,
+    "limit": 20,
+    "slot": 255,
+    "guid": "abababababababababababababababab",
+    "device_name": "Z6_3_0000002",
+    "trailer": 500
+   }
+  },
+  {
+   "name": "empty_device_name",
+   "hex": "c8000000000014000000ff000000abababababababababababababababab00f401",
+   "expected": {
+    "header": 200,
+    "count": 0,
+    "limit": 20,
+    "slot": 255,
+    "guid": "abababababababababababababababab",
+    "device_name": "",
+    "trailer": 500
+   }
+  }
+ ],
+ "info_rejects": [
+  {
+   "name": "trailing_byte",
+   "hex": "c800030000001400000000000000abababababababababababababababab0c5a005f0039005f0030003000300030003000300031000000f40100",
+   "what": "info end",
+   "offset": 57
+  },
+  {
+   "name": "truncated_before_trailer",
+   "hex": "c800030000001400000000000000abababababababababababababababab0c5a005f0039005f0030003000300030003000300031000000f4",
+   "what": "info trailer",
+   "offset": 55
+  },
+  {
+   "name": "empty",
+   "hex": "",
+   "what": "info header",
+   "offset": 0
+  },
+  {
+   "name": "name_without_terminator",
+   "hex": "c800030000001400000000000000abababababababababababababababab0241004200f401",
+   "what": "info device name",
+   "offset": 30
+  }
+ ],
+ "device_infos": [
+  {
+   "name": "z9",
+   "hex": "6400ffffffff6e00224d006900630072006f0073006f00660074002e0063006f006d002f00440065007600690063006500530065007200760069006300650073003a00200031002e003000000000000300000001100210e89001000000034002000000015001d00100000001380200000000300138124e0069006b006f006e00200043006f00720070006f0072006100740069006f006e000000045a0020003900000006560035002e0033003100000021300030003000300030003000300030003000300030003000300030003000300030003000300030003000300030003000300033003000320033003600360038000000",
+   "model": "Z 9"
+  },
+  {
+   "name": "z6iii",
+   "hex": "6400ffffffff6e00224d006900630072006f0073006f00660074002e0063006f006d002f00440065007600690063006500530065007200760069006300650073003a00200031002e003000000000000300000001100210e89001000000034002000000015001d00100000001380200000000300138124e0069006b006f006e00200043006f00720070006f0072006100740069006f006e000000055a0036005f003300000006560035002e0033003100000021300030003000300030003000300030003000300030003000300030003000300030003000300030003000300030003000300033003000320033003600360038000000",
+   "model": "Z6_3"
+  },
+  {
+   "name": "z5",
+   "hex": "6400ffffffff6e00224d006900630072006f0073006f00660074002e0063006f006d002f00440065007600690063006500530065007200760069006300650073003a00200031002e003000000000000300000001100210e89001000000034002000000015001d00100000001380200000000300138124e0069006b006f006e00200043006f00720070006f0072006100740069006f006e000000045a0020003500000006560035002e0033003100000021300030003000300030003000300030003000300030003000300030003000300030003000300030003000300030003000300033003000320033003600360038000000",
+   "model": "Z 5"
+  }
+ ],
+ "device_info_model_not_well_formed": [
+  {
+   "name": "model_missing_terminator",
+   "hex": "6400ffffffff6e00224d006900630072006f0073006f00660074002e0063006f006d002f00440065007600690063006500530065007200760069006300650073003a00200031002e003000000000000300000001100210e89001000000034002000000015001d00100000001380200000000300138124e0069006b006f006e00200043006f00720070006f0072006100740069006f006e000000035a002000390006560035002e0033003100000021300030003000300030003000300030003000300030003000300030003000300030003000300030003000300030003000300033003000320033003600360038000000"
+  },
+  {
+   "name": "model_embedded_nul",
+   "hex": "6400ffffffff6e00224d006900630072006f0073006f00660074002e0063006f006d002f00440065007600690063006500530065007200760069006300650073003a00200031002e003000000000000300000001100210e89001000000034002000000015001d00100000001380200000000300138124e0069006b006f006e00200043006f00720070006f0072006100740069006f006e000000045a0000003900000006560035002e0033003100000021300030003000300030003000300030003000300030003000300030003000300030003000300030003000300030003000300033003000320033003600360038000000"
+  },
+  {
+   "name": "model_unpaired_surrogate",
+   "hex": "6400ffffffff6e00224d006900630072006f0073006f00660074002e0063006f006d002f00440065007600690063006500530065007200760069006300650073003a00200031002e003000000000000300000001100210e89001000000034002000000015001d00100000001380200000000300138124e0069006b006f006e00200043006f00720070006f0072006100740069006f006e0000000300d83900000006560035002e0033003100000021300030003000300030003000300030003000300030003000300030003000300030003000300030003000300030003000300033003000320033003600360038000000"
+  }
+ ]
+}

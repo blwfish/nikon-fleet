@@ -146,6 +146,14 @@ raw blob. Dry run unless `--send`. It refuses a slot at or past the stored count
 `--allow-create`. Camera: the same one as above, two stored profiles at the start. Raw blobs come from
 `--out`.
 
+Gates (added 2026-11-05, matching the Rust write path): the file must pass the strict decoder (the
+same checks as `decode_ftp_profile`, trailing bytes included), the camera's GetDeviceInfo model must be
+`Z 9` or `Z6_3` (`--force-unconfirmed-model` overrides), and the `0x90E8` setup and `0x90EB` info must be
+answered OK before `0x90EE` is sent. Reads refuse a slot at or past the stored count. A refused or
+failed write exits 1, a write whose reply never arrived exits 4. `--out` creates its file 0600 and
+refuses to overwrite. The model gate assumes PTP/IP `GetDeviceInfo` reports the same model string as
+over USB (`Z 9`, `Z6_3`); that has not been checked on a camera.
+
 | Call | Reply | Effect (read back over a fresh connection) |
 |---|---|---|
 | `0x90EE(1, 0)` with the profile already in slot 1 | `0x2001` | that profile is now slot 0; the old slot 0 is slot 1 |

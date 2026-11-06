@@ -54,6 +54,8 @@ gui/            egui GUI (`fleet-gui`, a workspace member) — shells out to the
   tests-fixtures/ Tables the GUI's and `ops::render`'s tests share
 examples/       Standalone probes for exercising the SDK/parsers without the full CLI
 scripts/        setup-sdk-runtime.{sh,ps1} — stage the vendor SDK into sdk-runtime/
+                ptpip_read_ftp.py — experimental PTP/IP FTP-profile reader (read-only by default; `--write FILE --send` writes, model-gated);
+                held to the Rust decoder by tests/fixtures/ftp_profile_vectors.json (`cargo test --test ftp_profile_python_parity` runs its unit tests)
 docs/
   firmware-archive-spec.md   Design spec for the firmware archive feature (see below)
   todo.md                    Backlog — PTP/IP reverse-engineering, resource-string labels, etc.
@@ -181,6 +183,7 @@ cargo build --workspace         # debug build: target/debug/nikon-fleet and flee
 # cargo build --release          # release build: only at a release point, not day to day
 cargo test --workspace         # Rust unit tests: 108+23 in the nikon-fleet lib/bin, 35+ in gui/ (all offline)
 python3 -m unittest scripts/test_extract_maid_labels.py   # the SDK-document extractor (invented inputs; offline)
+python3 -I scripts/test_ptpip_read_ftp.py                 # the PTP/IP FTP-profile probe (scripted camera; also run by `cargo test`)
 ```
 
 To name what `nikon-fleet show` prints (display names, enumeration value names), run
