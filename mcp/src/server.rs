@@ -122,10 +122,10 @@ pub struct Config {
 
 impl Config {
     fn snapshots(&self) -> PathBuf {
-        self.data_dir.join("snapshots")
+        nikon_fleet::ops::paths::snapshots_dir(&self.data_dir)
     }
     fn references(&self) -> PathBuf {
-        self.data_dir.join("references")
+        nikon_fleet::ops::paths::references_dir(&self.data_dir)
     }
 }
 

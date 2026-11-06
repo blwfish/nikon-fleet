@@ -854,7 +854,7 @@ pub fn find_named(dirs: &[&Path], name: &str) -> Result<PathBuf, PathError> {
 /// failing that a file of that name in the current directory.
 pub fn locate(data_dir: &Path, arg: &Path) -> Result<PathBuf, PathError> {
     let Some(name) = is_bare_name(arg) else { return Ok(arg.to_path_buf()) };
-    let dirs = [data_dir.join("snapshots"), data_dir.join("references")];
+    let dirs = [crate::ops::paths::snapshots_dir(data_dir), crate::ops::paths::references_dir(data_dir)];
     match find_named(&[&dirs[0], &dirs[1]], name) {
         Err(PathError::NotFound { .. }) if arg.is_file() => Ok(arg.to_path_buf()),
         other => other,
