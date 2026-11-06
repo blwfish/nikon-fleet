@@ -523,11 +523,11 @@ Exit status:
 const VENDOR_SET_STRING_HELP: &str = "\
 Exit status:
   0  the camera accepted the value and the read-back matched (a dry run: the plan was printed)
-  1  any other error, including a write refused before anything was sent; or the camera accepted
-     the write but the read-back differed or could not be read (look with `vendor-get-prop`)
+  1  any other error, including a write refused before anything was sent
   2  command-line usage error
-  4  the value was sent but the camera's reply was lost: the camera MAY have changed. Read it with
-     `vendor-get-prop` before retrying";
+  4  the value was sent but the camera MAY now hold something other than what it had: its reply was lost, or
+     it accepted the write and the read-back did not confirm the value. Read it with `vendor-get-prop`
+     before retrying";
 
 const VENDOR_WRITE_BLOB_HELP: &str = "\
 Exit status:
@@ -2075,10 +2075,27 @@ fn cmd_vendor_set_string(args: &VendorSetStringArgs) -> Result<()> {
         eprintln!("warning: {w}");
     }
     println!("{}", vendor_set_string_text(&receipt));
-    if !receipt.verified {
-        bail!("the camera did not confirm holding the value that was sent; the previous value was {:?}", receipt.previous);
+    if let Some(e) = string_write_unconfirmed(&receipt) {
+        return Err(e.into());
     }
     Ok(())
+}
+
+/// The exit-4 error for a string write the camera accepted but whose read-back did not confirm the value sent
+/// (`None` when it did). The camera MAY now hold something other than what it had, so this is the same status as a
+/// write whose reply was lost, not a plain failure that invites a blind retry.
+fn string_write_unconfirmed(receipt: &nikon_fleet::ptp_usb::PropWriteReceipt) -> Option<ExitCodeError> {
+    if receipt.verified {
+        return None;
+    }
+    Some(ExitCodeError {
+        code: EXIT_WRITE_INDETERMINATE,
+        message: format!(
+            "the camera accepted the write but the read-back did not confirm the value that was sent; the camera MAY have \
+             changed. The previous value was {:?}; read the property with vendor-get-prop before deciding whether to repeat the write",
+            receipt.previous
+        ),
+    })
 }
 
 /// The name `STRING_PROPS` gives `propcode`, for messages. One lookup for both `vendor-set-string` texts.
@@ -5554,6 +5571,30 @@ mod tests {
         assert!(undecodable.contains("READ-BACK UNDECODABLE"), "{undecodable}");
         let failed = ftp_blob_outcome_text(&outcome_with(V::ReadBackFailed { error: PtpUsbError::NoDataPhase { op: 0x90ED } }));
         assert!(failed.contains("READ-BACK FAILED") && failed.contains("neither confirmed nor contradicted"), "{failed}");
+    }
+
+    /// #14: a string write the camera accepted but whose read-back differs (it stored something else) or
+    /// could not be read is exit 4 ("the camera MAY have changed"), not a plain failure; only a verified
+    /// read-back is a clean finish.
+    #[test]
+    fn a_string_write_that_is_not_confirmed_ends_with_the_may_have_changed_status() {
+        use nikon_fleet::ptp_usb::PropWriteReceipt;
+        let receipt = |read_back: Result<String, String>, verified: bool| PropWriteReceipt {
+            propcode: 0xD090,
+            previous: "old".into(),
+            written: "new".into(),
+            read_back,
+            verified,
+            warnings: vec![],
+        };
+        assert!(string_write_unconfirmed(&receipt(Ok("new".into()), true)).is_none());
+        for r in [receipt(Ok("ne".into()), false), receipt(Err("read failed".into()), false)] {
+            let e = string_write_unconfirmed(&r).expect("an unconfirmed write is an error");
+            assert_eq!(e.code, EXIT_WRITE_INDETERMINATE);
+            assert!(e.message.contains("\"old\""), "the previous value is named so it can be restored: {}", e.message);
+            let any: anyhow::Error = e.into();
+            assert_eq!(exit_code_for(&any), 4);
+        }
     }
 
     /// Only a verified read-back is a success; every other result must end the command with the

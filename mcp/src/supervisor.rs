@@ -127,6 +127,16 @@ impl std::fmt::Display for SpawnError {
     }
 }
 
+impl SpawnError {
+    /// A closed tag for diagnostics: the kind of failure, never the OS error text (which can carry paths).
+    fn tag(&self) -> &'static str {
+        match self {
+            SpawnError::Pipe(_) => "pipe",
+            SpawnError::Spawn { .. } => "spawn",
+        }
+    }
+}
+
 impl std::error::Error for SpawnError {}
 
 /// The call a worker is running right now, as far as the supervisor has seen.
@@ -327,7 +337,7 @@ impl Supervisor {
                 vec![("cause", Val::text(cause.tag())), ("garbage_lines", Val::U64(*garbage_lines as u64))],
             ),
             Ok(Finished::CancelledBeforeStart) => (DiagOutcome::Cancelled, vec![("cause", Val::text("cancelled_before_start"))]),
-            Err(e) => (DiagOutcome::Failed, vec![("error", Val::text(&e.to_string()))]),
+            Err(e) => (DiagOutcome::Failed, vec![("error_kind", Val::text(e.tag()))]),
         };
         span.finish_with(outcome, &extra);
         result
@@ -446,7 +456,7 @@ impl Supervisor {
             Err(e) => {
                 eprintln!("fleet-mcp: {e}");
                 let outcome = if matches!(e, ReapError::TimedOut(_)) { DiagOutcome::Timeout } else { DiagOutcome::Failed };
-                span.finish_with(outcome, &[("error", Val::text(&e.to_string()))]);
+                span.finish_with(outcome, &[("error_kind", Val::text(e.tag()))]);
             }
         }
     }
@@ -469,6 +479,16 @@ impl std::fmt::Display for ReapError {
                  abandoning it so the queue is not held"
             ),
             ReapError::Kill(e) => write!(f, "killing the worker: {e}"),
+        }
+    }
+}
+
+impl ReapError {
+    /// A closed tag for diagnostics (not the OS error text).
+    fn tag(&self) -> &'static str {
+        match self {
+            ReapError::TimedOut(_) => "timed_out",
+            ReapError::Kill(_) => "kill_failed",
         }
     }
 }
@@ -672,6 +692,20 @@ pub fn ok_data(o: &Outcome) -> Option<&Value> {
 
 #[cfg(test)]
 mod tests {
+    /// #31/#48: the diagnostics for a failed spawn or reap record a closed tag, never the OS error text.
+    #[test]
+    fn spawn_and_reap_errors_have_closed_tags_that_carry_no_error_text() {
+        let io = || std::io::Error::new(std::io::ErrorKind::NotFound, "secret-path-text");
+        let spawn = SpawnError::Spawn { program: PathBuf::from("/x/y"), source: io() };
+        let pipe = SpawnError::Pipe(io());
+        assert_eq!((spawn.tag(), pipe.tag()), ("spawn", "pipe"));
+        assert_eq!(ReapError::TimedOut(Duration::from_secs(1)).tag(), "timed_out");
+        assert_eq!(ReapError::Kill(io()).tag(), "kill_failed");
+        for t in [spawn.tag(), pipe.tag()] {
+            assert!(!t.contains("secret") && !t.contains('/'));
+        }
+    }
+
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
